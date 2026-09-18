@@ -1971,13 +1971,11 @@ name = "starpls_hir"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "crossbeam",
  "dashmap",
  "either",
  "expect-test",
  "id-arena",
  "itertools 0.12.1",
- "parking_lot",
  "rustc-hash 1.1.0",
  "salsa-2022",
  "smallvec",

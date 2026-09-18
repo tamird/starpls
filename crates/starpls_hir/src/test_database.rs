@@ -2,7 +2,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 use starpls_bazel::APIContext;
@@ -21,18 +20,26 @@ use starpls_test_util::FixtureType;
 use crate::BuiltinDefs;
 use crate::Db;
 use crate::Dialect;
-use crate::GlobalContext;
+use crate::Environment;
 use crate::InferenceOptions;
 
-#[derive(Default)]
 #[salsa::db(starpls_common::Jar, crate::Jar)]
 pub(crate) struct TestDatabase {
-    builtin_defs: Arc<DashMap<Dialect, BuiltinDefs>>,
     storage: salsa::Storage<Self>,
     files: Arc<DashMap<FileId, File>>,
-    prelude_file: Option<FileId>,
-    all_workspace_targets: Arc<Vec<String>>,
-    pub(crate) gcx: Arc<GlobalContext>,
+    environment: Option<Environment>,
+}
+
+impl Default for TestDatabase {
+    fn default() -> Self {
+        let mut db = Self {
+            storage: Default::default(),
+            files: Default::default(),
+            environment: None,
+        };
+        db.environment = Some(Environment::initialize(&db, InferenceOptions::default()));
+        db
+    }
 }
 
 impl salsa::Database for TestDatabase {}
@@ -45,6 +52,17 @@ impl starpls_common::Db for TestDatabase {
         info: Option<FileInfo>,
         contents: String,
     ) -> File {
+        // Cancel snapshots before publishing files into the shared lazy-load map.
+        let environment = self.environment();
+        let revision = environment.load_revision(self) + 1;
+        environment.set_load_revision(self).to(revision);
+        let existing = self.files.get(&file_id).map(|file| *file);
+        if let Some(file) = existing {
+            file.set_dialect(self).to(dialect);
+            file.set_info(self).to(info);
+            file.set_contents(self).to(contents);
+            return file;
+        }
         let file = File::new(self, file_id, dialect, info, contents);
         self.files.insert(file_id, file);
         file
@@ -72,6 +90,7 @@ impl starpls_common::Db for TestDatabase {
     }
 
     fn get_file(&self, file_id: FileId) -> Option<File> {
+        self.environment().load_revision(self);
         self.files.get(&file_id).map(|file| *file)
     }
 
@@ -98,46 +117,37 @@ impl starpls_common::Db for TestDatabase {
 }
 
 impl crate::Db for TestDatabase {
+    fn environment(&self) -> Environment {
+        self.environment
+            .expect("database initialization is complete")
+    }
+
     fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins) {
-        let defs = match self.builtin_defs.entry(dialect) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                entry.insert(BuiltinDefs::new(self, builtins, rules));
-                return;
-            }
-        };
+        let defs = self.environment().builtin_defs(self, dialect);
         defs.set_builtins(self).to(builtins);
+        defs.set_rules(self).to(rules);
     }
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs {
-        self.builtin_defs
-            .get(dialect)
-            .map(|defs| *defs)
-            .unwrap_or(BuiltinDefs::new(
-                self,
-                Builtins::default(),
-                Builtins::default(),
-            ))
+        self.environment().builtin_defs(self, *dialect)
     }
 
     fn set_bazel_prelude_file(&mut self, file_id: FileId) {
-        self.prelude_file = Some(file_id)
+        self.environment().set_prelude_file(self).to(Some(file_id));
     }
 
     fn get_bazel_prelude_file(&self) -> Option<FileId> {
-        self.prelude_file
-    }
-
-    fn gcx(&self) -> &GlobalContext {
-        &self.gcx
+        self.environment().prelude_file(self)
     }
 
     fn set_all_workspace_targets(&mut self, targets: Vec<String>) {
-        self.all_workspace_targets = Arc::new(targets)
+        self.environment()
+            .set_all_workspace_targets(self)
+            .to(Arc::new(targets));
     }
 
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.all_workspace_targets)
+        self.environment().all_workspace_targets(self)
     }
 }
 
@@ -169,10 +179,8 @@ impl TestDatabaseBuilder {
     }
 
     pub fn build(self) -> TestDatabase {
-        let mut db = TestDatabase {
-            gcx: Arc::new(GlobalContext::new(self.options)),
-            ..Default::default()
-        };
+        let mut db = TestDatabase::default();
+        db.environment().set_options(&mut db).to(self.options);
         db.set_builtin_defs(
             Dialect::Bazel,
             make_test_builtins(self.functions, self.globals, self.types),

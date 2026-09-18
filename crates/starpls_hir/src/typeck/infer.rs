@@ -75,7 +75,6 @@ use crate::typeck::TyContext;
 use crate::typeck::TyData;
 use crate::typeck::TyKind;
 use crate::typeck::TypeRef;
-use crate::typeck::TypecheckCancelled;
 use crate::Name;
 
 impl TyContext<'_> {
@@ -96,7 +95,7 @@ impl TyContext<'_> {
             return;
         }
 
-        if !self.shared_state.options.use_code_flow_analysis {
+        if !self.options.use_code_flow_analysis {
             for stmt in stmts.iter() {
                 self.walk_stmt(file, *stmt);
             }
@@ -322,7 +321,7 @@ impl TyContext<'_> {
         self.infer_all_params(file);
         self.walk_stmts(file, &module.top_level);
 
-        if !self.shared_state.options.allow_unused_definitions {
+        if !self.options.allow_unused_definitions {
             self.report_unused_definitions(file);
         }
 
@@ -347,12 +346,6 @@ impl TyContext<'_> {
             .collect()
     }
 
-    fn unwind_if_cancelled(&self) {
-        if self.shared_state.cancelled.load() {
-            TypecheckCancelled.throw();
-        }
-    }
-
     pub(crate) fn infer_expr(&mut self, file: File, expr: ExprId) -> Ty {
         if let Some(ty) = self
             .cx
@@ -362,8 +355,6 @@ impl TyContext<'_> {
         {
             return ty;
         }
-
-        self.unwind_if_cancelled();
 
         let db = self.db;
         let curr_module = module(db, file);
@@ -1503,7 +1494,7 @@ impl TyContext<'_> {
                                 }
                             }
 
-                            if self.shared_state.options.use_code_flow_analysis {
+                            if self.options.use_code_flow_analysis {
                                 var_defs.push((file, *expr, *source));
                                 continue;
                             } else {
@@ -1920,7 +1911,6 @@ impl TyContext<'_> {
         }
 
         let ty = self
-            .shared_state
             .options
             .infer_ctx_attributes
             .then(|| self.infer_param_from_rule_usage(file, param))

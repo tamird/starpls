@@ -6,8 +6,7 @@ use crate::def::Param as HirDefParam;
 use crate::module;
 use crate::typeck::builtins::BuiltinFunctionParam;
 use crate::typeck::intrinsics::IntrinsicFunctionParam;
-use crate::typeck::resolve_type_ref;
-use crate::typeck::with_tcx;
+use crate::typeck::queries;
 use crate::typeck::Protocol;
 use crate::typeck::RuleKind;
 use crate::typeck::Tuple;
@@ -156,8 +155,8 @@ impl DisplayWithDb for TyKind {
                         f.write_str(", ")?;
                     }
 
-                    let format_type_ref = |f, type_ref| {
-                        with_tcx(db, |tcx| resolve_type_ref(tcx, type_ref, def.stmt()).0).fmt(db, f)
+                    let format_type_ref = |f, type_ref: &TypeRef| {
+                        queries::resolve_type(db, type_ref.clone(), def.stmt()).fmt(db, f)
                     };
 
                     match param {

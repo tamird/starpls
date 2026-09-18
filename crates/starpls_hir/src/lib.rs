@@ -26,8 +26,7 @@ use starpls_syntax::TextSize;
 use starpls_syntax::T;
 use typeck::builtins::BuiltinFunction;
 use typeck::intrinsics::IntrinsicFunction;
-use typeck::resolve_type_ref;
-use typeck::with_tcx;
+use typeck::queries;
 use typeck::Field;
 use typeck::FieldInner;
 use typeck::Macro;
@@ -47,11 +46,10 @@ pub use crate::display::DisplayWithDb;
 pub use crate::display::DisplayWithDbWrapper;
 pub use crate::test_database::Fixture;
 pub use crate::typeck::builtins::BuiltinDefs;
+pub use crate::typeck::queries::diagnostics as inference_diagnostics;
 pub use crate::typeck::Cancelled;
-pub use crate::typeck::GlobalContext;
 pub use crate::typeck::InferenceOptions;
 pub use crate::typeck::Ty;
-pub use crate::typeck::TyContext;
 use crate::typeck::TyKind;
 use crate::typeck::TypeRef;
 
@@ -71,6 +69,14 @@ pub(crate) struct ModuleInfo {
 
 #[salsa::jar(db = Db)]
 pub struct Jar(
+    Environment,
+    queries::infer_expr,
+    queries::infer_param,
+    queries::infer_load_item,
+    queries::resolve_load_stmt,
+    queries::resolve_type_query,
+    queries::active_parameter,
+    queries::diagnostics,
     lower,
     ModuleInfo,
     def::Function,
@@ -108,18 +114,49 @@ pub struct Jar(
 const TARGET_DOC: &str = "The BUILD target for a dependency. Appears in the fields of `ctx.attr` corresponding to dependency attributes (`label` or `label_list`).";
 
 pub trait Db: salsa::DbWithJar<Jar> + starpls_common::Db {
-    fn gcx(&self) -> &GlobalContext;
+    fn environment(&self) -> Environment;
+
     fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins);
+
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs;
+
     fn set_bazel_prelude_file(&mut self, file_id: FileId);
     fn get_bazel_prelude_file(&self) -> Option<FileId>;
     fn set_all_workspace_targets(&mut self, targets: Vec<String>);
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>>;
 }
 
+/// Inputs shared by semantic queries. Input identities remain stable when the
+/// host changes configuration or discovers previously unavailable modules.
+#[salsa::input]
+pub struct Environment {
+    #[return_ref]
+    pub options: InferenceOptions,
+    pub standard_builtins: BuiltinDefs,
+    pub bazel_builtins: BuiltinDefs,
+    pub prelude_file: Option<FileId>,
+    pub all_workspace_targets: Arc<Vec<String>>,
+    pub load_revision: u64,
+}
+
+impl Environment {
+    pub fn initialize(db: &dyn Db, options: InferenceOptions) -> Self {
+        let standard = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
+        let bazel = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
+        Self::new(db, options, standard, bazel, None, Arc::default(), 0)
+    }
+
+    pub fn builtin_defs(self, db: &dyn Db, dialect: Dialect) -> BuiltinDefs {
+        match dialect {
+            Dialect::Standard => self.standard_builtins(db),
+            Dialect::Bazel => self.bazel_builtins(db),
+        }
+    }
+}
+
 /// Return the diagnostics accumulated by Salsa queries on the given file.
 /// This does not include diagnostics from type inference, which are reported
-/// by [`typeck::TyContext`] instead.
+/// by [`inference_diagnostics`] instead.
 pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> {
     module_scopes::accumulated::<Diagnostics>(db, file).into_iter()
 }
@@ -184,13 +221,7 @@ impl<'a> Semantics<'a> {
             .flat_map(|segment| segment.value())
             .map(|token| Name::from_str(token.text()))
             .collect::<SmallVec<_>>();
-        Some(
-            with_tcx(self.db, |tcx| {
-                // TODO(withered-magic): The clone here is a bit ugly but should be fine.
-                resolve_type_ref(tcx, &TypeRef::Path(segments.clone(), None), usage).0
-            })
-            .into(),
-        )
+        Some(queries::resolve_type(self.db, TypeRef::Path(segments, None), usage).into())
     }
 
     pub fn resolve_call_expr(&self, file: File, expr: &ast::CallExpr) -> Option<Callable> {
@@ -229,7 +260,7 @@ impl<'a> Semantics<'a> {
     pub fn type_of_expr(&self, file: File, expr: &ast::Expression) -> Option<Type> {
         let ptr = AstPtr::new(expr);
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
-        Some(with_tcx(self.db, |tcx| tcx.infer_expr(file, *expr).into()))
+        Some(queries::infer_expr(self.db, file, *expr).into())
     }
 
     pub fn resolve_param(&self, file: File, param: &ast::Parameter) -> Option<(Param, Type)> {
@@ -249,7 +280,7 @@ impl<'a> Semantics<'a> {
                 func,
                 index: *index,
             }),
-            with_tcx(self.db, |tcx| tcx.infer_param(file, *param)).into(),
+            queries::infer_param(self.db, file, *param).into(),
         ))
     }
 
@@ -260,7 +291,7 @@ impl<'a> Semantics<'a> {
             Stmt::Load { load_stmt, .. } => load_stmt,
             _ => return None,
         };
-        with_tcx(self.db, |tcx| tcx.resolve_load_stmt(file, load_stmt))
+        queries::resolve_load_stmt(self.db, file, load_stmt)
     }
 
     pub fn resolve_load_item(&self, file: File, load_item: &ast::LoadItem) -> Option<LoadItem> {
@@ -299,9 +330,7 @@ impl<'a> Semantics<'a> {
     ) -> Option<usize> {
         let ptr = AstPtr::new(&ast::Expression::Call(expr.clone()));
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
-        with_tcx(self.db, |tcx| {
-            tcx.resolve_call_expr_active_param(file, *expr, active_arg)
-        })
+        queries::active_parameter(self.db, file, *expr, active_arg)
     }
 
     pub fn def_for_load_item(&self, load_item: &LoadItem) -> Option<ScopeDef> {
@@ -805,12 +834,10 @@ impl ScopeDef {
     pub fn ty(&self, db: &dyn Db) -> Type {
         match self {
             ScopeDef::Variable(Variable { expr: Some(expr) }) => {
-                with_tcx(db, |tcx| tcx.infer_expr(expr.file, expr.value))
+                queries::infer_expr(db, expr.file, expr.value)
             }
             ScopeDef::Callable(callable) => return callable.ty(db),
-            ScopeDef::LoadItem(LoadItem { id }) => {
-                with_tcx(db, |tcx| tcx.infer_load_item(id.file, id.value))
-            }
+            ScopeDef::LoadItem(LoadItem { id }) => queries::infer_load_item(db, id.file, id.value),
             _ => Ty::unknown(),
         }
         .into()

@@ -20,9 +20,9 @@ use starpls_common::Source;
 use starpls_hir::BuiltinDefs;
 pub use starpls_hir::Cancelled;
 use starpls_hir::Db as _;
+use starpls_hir::Environment;
 #[cfg(test)]
 use starpls_hir::Fixture;
-use starpls_hir::GlobalContext;
 pub use starpls_hir::InferenceOptions;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
@@ -54,23 +54,23 @@ mod signature_help;
 mod source;
 mod util;
 
+#[cfg(test)]
+mod incremental;
+
 pub type Cancellable<T> = Result<T, Cancelled>;
 
 #[salsa::db(starpls_common::Jar, starpls_hir::Jar)]
 pub(crate) struct Database {
-    builtin_defs: Arc<DashMap<Dialect, BuiltinDefs>>,
     storage: salsa::Storage<Self>,
     files: Arc<DashMap<FileId, File>>,
     loader: Arc<dyn FileLoader>,
-    gcx: Arc<GlobalContext>,
-    prelude_file: Option<FileId>,
-    all_workspace_targets: Arc<Vec<String>>,
+    environment: Option<Environment>,
+    #[cfg(test)]
+    executions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Database {
     fn apply_file_changes(&mut self, changes: Vec<(FileId, FileChange)>) {
-        let gcx = self.gcx.clone();
-        let _guard = gcx.cancel();
         for (file_id, change) in changes {
             match change {
                 FileChange::Create {
@@ -88,18 +88,25 @@ impl Database {
     }
 }
 
-impl salsa::Database for Database {}
+impl salsa::Database for Database {
+    #[cfg(test)]
+    fn salsa_event(&self, event: salsa::Event) {
+        if matches!(event.kind, salsa::EventKind::WillExecute { .. }) {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 impl salsa::ParallelDatabase for Database {
     fn snapshot(&self) -> salsa::Snapshot<Self> {
         salsa::Snapshot::new(Database {
-            builtin_defs: self.builtin_defs.clone(),
             files: self.files.clone(),
-            gcx: self.gcx.clone(),
+            environment: self.environment,
+            #[cfg(test)]
+            executions: self.executions.clone(),
             loader: self.loader.clone(),
             storage: self.storage.snapshot(),
-            prelude_file: self.prelude_file,
-            all_workspace_targets: self.all_workspace_targets.clone(),
         })
     }
 }
@@ -112,6 +119,17 @@ impl starpls_common::Db for Database {
         info: Option<FileInfo>,
         contents: String,
     ) -> File {
+        // Cancel snapshots before publishing files into the shared lazy-load map.
+        let environment = self.environment();
+        let revision = environment.load_revision(self) + 1;
+        environment.set_load_revision(self).to(revision);
+        let existing = self.files.get(&file_id).map(|file| *file);
+        if let Some(file) = existing {
+            file.set_dialect(self).to(dialect);
+            file.set_info(self).to(info);
+            file.set_contents(self).to(contents);
+            return file;
+        }
         let file = File::new(self, file_id, dialect, info, contents);
         self.files.insert(file_id, file);
         file
@@ -129,6 +147,7 @@ impl starpls_common::Db for Database {
         dialect: Dialect,
         from: FileId,
     ) -> anyhow::Result<Option<File>> {
+        self.environment().load_revision(self);
         let res = match self.loader.load_file(path, dialect, from)? {
             Some(res) => res,
             None => return Ok(None),
@@ -146,6 +165,7 @@ impl starpls_common::Db for Database {
     }
 
     fn get_file(&self, file_id: FileId) -> Option<File> {
+        self.environment().load_revision(self);
         self.files.get(&file_id).map(|file| *file)
     }
 
@@ -167,6 +187,7 @@ impl starpls_common::Db for Database {
         dialect: Dialect,
         from: FileId,
     ) -> anyhow::Result<Option<ResolvedPath>> {
+        self.environment().load_revision(self);
         let mut resolved_path = match self.loader.resolve_path(path, dialect, from)? {
             Some(resolved_path) => resolved_path,
             None => return Ok(None),
@@ -201,46 +222,37 @@ impl starpls_common::Db for Database {
 }
 
 impl starpls_hir::Db for Database {
+    fn environment(&self) -> Environment {
+        self.environment
+            .expect("database initialization is complete")
+    }
+
     fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins) {
-        let defs = match self.builtin_defs.entry(dialect) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                entry.insert(BuiltinDefs::new(self, builtins, rules));
-                return;
-            }
-        };
+        let defs = self.environment().builtin_defs(self, dialect);
         defs.set_builtins(self).to(builtins);
+        defs.set_rules(self).to(rules);
     }
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs {
-        self.builtin_defs
-            .get(dialect)
-            .map(|defs| *defs)
-            .unwrap_or(BuiltinDefs::new(
-                self,
-                Builtins::default(),
-                Builtins::default(),
-            ))
+        self.environment().builtin_defs(self, *dialect)
     }
 
     fn set_bazel_prelude_file(&mut self, file_id: FileId) {
-        self.prelude_file = Some(file_id)
+        self.environment().set_prelude_file(self).to(Some(file_id));
     }
 
     fn get_bazel_prelude_file(&self) -> Option<FileId> {
-        self.prelude_file
+        self.environment().prelude_file(self)
     }
 
     fn set_all_workspace_targets(&mut self, targets: Vec<String>) {
-        self.all_workspace_targets = Arc::new(targets)
+        self.environment()
+            .set_all_workspace_targets(self)
+            .to(Arc::new(targets));
     }
 
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.all_workspace_targets)
-    }
-
-    fn gcx(&self) -> &GlobalContext {
-        &self.gcx
+        self.environment().all_workspace_targets(self)
     }
 }
 
@@ -261,9 +273,16 @@ enum FileChange {
 #[derive(Debug, Default)]
 pub struct Change {
     changed_files: Vec<(FileId, FileChange)>,
+    invalidate_loads: bool,
 }
 
 impl Change {
+    /// Notify analysis that host load resolution changed, for example after
+    /// fetching an external repository. Content-only edits do not need this.
+    pub fn invalidate_loads(&mut self) {
+        self.invalidate_loads = true;
+    }
+
     pub fn create_file(
         &mut self,
         file_id: FileId,
@@ -294,21 +313,29 @@ pub struct Analysis {
 
 impl Analysis {
     pub fn new(loader: Arc<dyn FileLoader>, options: InferenceOptions) -> Self {
-        Self {
-            db: Database {
-                builtin_defs: Default::default(),
-                files: Default::default(),
-                gcx: Arc::new(GlobalContext::new(options)),
-                storage: Default::default(),
-                loader,
-                prelude_file: None,
-                all_workspace_targets: Arc::default(),
-            },
-        }
+        let mut db = Database {
+            files: Default::default(),
+            storage: Default::default(),
+            loader,
+            environment: None,
+            #[cfg(test)]
+            executions: Default::default(),
+        };
+        db.environment = Some(Environment::initialize(&db, options));
+        Self { db }
     }
 
     pub fn apply_change(&mut self, change: Change) {
-        self.db.apply_file_changes(change.changed_files);
+        let Change {
+            changed_files,
+            invalidate_loads,
+        } = change;
+        self.db.apply_file_changes(changed_files);
+        if invalidate_loads {
+            let environment = self.db.environment();
+            let revision = environment.load_revision(&self.db) + 1;
+            environment.set_load_revision(&mut self.db).to(revision);
+        }
     }
 
     pub fn snapshot(&self) -> AnalysisSnapshot {
@@ -475,14 +502,17 @@ pub trait FileLoader: Send + Sync + 'static {
 /// Simple implementation of [`FileLoader`] backed by a HashMap.
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct SimpleFileLoader(DashMap<String, LoadFileResult>);
+pub(crate) struct SimpleFileLoader {
+    files: DashMap<String, LoadFileResult>,
+    requests: std::sync::Mutex<Vec<String>>,
+}
 
 #[cfg(test)]
 impl SimpleFileLoader {
     pub(crate) fn add_files_from_fixture(&self, db: &dyn Db, fixture: &Fixture) {
         for (path, file_id) in &fixture.path_to_file_id {
             let file = db.get_file(*file_id).unwrap();
-            self.0.insert(
+            self.files.insert(
                 path.to_string_lossy().to_string(),
                 LoadFileResult {
                     file_id: *file_id,
@@ -512,7 +542,8 @@ impl FileLoader for SimpleFileLoader {
         _dialect: Dialect,
         _from: FileId,
     ) -> anyhow::Result<Option<LoadFileResult>> {
-        Ok(self.0.get(path).map(|res| res.clone()))
+        self.requests.lock().unwrap().push(path.to_owned());
+        Ok(self.files.get(path).map(|res| res.clone()))
     }
 
     fn list_load_candidates(

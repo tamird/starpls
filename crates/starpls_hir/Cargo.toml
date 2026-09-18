@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "cbff046555e11add566bc35a3b29ef8ecf8ebdb0" }
-crossbeam = "0.8.3"
 dashmap = "5.5.3"
 id-arena = "2.2.1"
 salsa = { git = "https://github.com/withered-magic/salsa", package = "salsa-2022", rev = "91fdda90b344ef74e9bf35c3a5bb0fbae22ed6fb" }
@@ -17,7 +16,6 @@ starpls_intern = { path = "../starpls_intern" }
 starpls_syntax = { path = "../starpls_syntax" }
 starpls_test_util = { path = "../starpls_test_util" }
 rustc-hash = "1.1.0"
-parking_lot = "0.12.1"
 smol_str = "0.2.0"
 smallvec = "1.11.2"
 either = "1.10.0"
