@@ -62,29 +62,29 @@ pub fn validate(source: &str, parsed: &Parsed<py::ModModule>, errors: &mut dyn F
 
 /// Whether an expression has a Starlark representation. Unsupported expressions
 /// are omitted from semantic lowering as well as from the temporary editor tree.
-pub fn supports_expr(expr: &Expr, tokens: &Tokens) -> bool {
+pub fn supports_expr(expr: py::ExprRef<'_>, tokens: &Tokens) -> bool {
     match expr {
-        Expr::Name(py::ExprName {
+        py::ExprRef::Name(py::ExprName {
             node_index: _,
             range: _,
             id,
             ctx: _,
         }) => id != "load",
-        Expr::NumberLiteral(py::ExprNumberLiteral {
+        py::ExprRef::NumberLiteral(py::ExprNumberLiteral {
             node_index: _,
             range: _,
             value,
         }) => !value.is_complex(),
-        Expr::StringLiteral(_) => single_string_token(expr.range(), tokens),
-        Expr::BytesLiteral(_) => single_string_token(expr.range(), tokens),
-        Expr::BinOp(py::ExprBinOp {
+        py::ExprRef::StringLiteral(_) => single_string_token(expr.range(), tokens),
+        py::ExprRef::BytesLiteral(_) => single_string_token(expr.range(), tokens),
+        py::ExprRef::BinOp(py::ExprBinOp {
             node_index: _,
             range: _,
             left: _,
             op,
             right: _,
         }) => !matches!(op, py::Operator::Pow | py::Operator::MatMult),
-        Expr::Compare(py::ExprCompare {
+        py::ExprRef::Compare(py::ExprCompare {
             node_index: _,
             range: _,
             operands: _,
@@ -92,26 +92,26 @@ pub fn supports_expr(expr: &Expr, tokens: &Tokens) -> bool {
         }) => !ops
             .iter()
             .any(|op| matches!(op, py::CmpOp::Is | py::CmpOp::IsNot)),
-        Expr::DictComp(py::ExprDictComp {
+        py::ExprRef::DictComp(py::ExprDictComp {
             node_index: _,
             range: _,
             key,
             value: _,
             generators: _,
         }) => key.is_some(),
-        Expr::BooleanLiteral(_) => true,
-        Expr::NoneLiteral(_) => true,
-        Expr::BoolOp(_) => true,
-        Expr::UnaryOp(_) => true,
-        Expr::If(_) => true,
-        Expr::Lambda(_) => true,
-        Expr::List(_) => true,
-        Expr::Tuple(_) => true,
-        Expr::Dict(_) => true,
-        Expr::ListComp(_) => true,
-        Expr::Attribute(_) => true,
-        Expr::Call(_) => true,
-        Expr::Subscript(_) => true,
+        py::ExprRef::BooleanLiteral(_) => true,
+        py::ExprRef::NoneLiteral(_) => true,
+        py::ExprRef::BoolOp(_) => true,
+        py::ExprRef::UnaryOp(_) => true,
+        py::ExprRef::If(_) => true,
+        py::ExprRef::Lambda(_) => true,
+        py::ExprRef::List(_) => true,
+        py::ExprRef::Tuple(_) => true,
+        py::ExprRef::Dict(_) => true,
+        py::ExprRef::ListComp(_) => true,
+        py::ExprRef::Attribute(_) => true,
+        py::ExprRef::Call(_) => true,
+        py::ExprRef::Subscript(_) => true,
         _ => false,
     }
 }
@@ -332,7 +332,7 @@ impl Validator<'_> {
     }
 
     fn expression(&mut self, expr: &Expr) {
-        if !supports_expr(expr, self.tokens) {
+        if !supports_expr(expr.into(), self.tokens) {
             self.unsupported(expr.range());
             return;
         }

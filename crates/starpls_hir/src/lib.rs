@@ -16,15 +16,12 @@ use ruff_python_ast::Parameter;
 use ruff_python_ast::StmtFunctionDef;
 use smallvec::SmallVec;
 use starpls_bazel::Builtins;
-use starpls_common::parse;
 use starpls_common::Diagnostic;
 use starpls_common::Diagnostics;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
-use starpls_common::Parse;
 use starpls_syntax::ast;
-use starpls_syntax::ast::AstNode;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 use typeck::builtins::BuiltinFunction;
@@ -190,10 +187,6 @@ impl<'a> Semantics<'a> {
         Self { db }
     }
 
-    pub fn parse(&self, file: File) -> &'a Parse {
-        parse(self.db, file)
-    }
-
     pub fn resolve_path_type(
         &self,
         file: File,
@@ -291,13 +284,6 @@ impl<'a> Semantics<'a> {
             .contains_key(&expr.node_index().load())
     }
 
-    /// Temporary entry point for editor consumers still using Rowan.
-    pub fn type_of_syntax_expr(&self, file: File, expr: &ast::Expression) -> Option<Type<'a>> {
-        let range = expr.syntax().text_range();
-        let expr = source_map(self.db, file).expr_map.get(&range)?;
-        Some(Type::new(*self, queries::infer_expr(self.db, file, *expr)))
-    }
-
     /// Resolve a parameter from the canonical parsed revision of `file`.
     pub fn resolve_param(&self, file: File, param: &Parameter) -> Option<(Param<'a>, Type<'a>)> {
         let module = module(self.db, file);
@@ -331,12 +317,11 @@ impl<'a> Semantics<'a> {
         self.loaded_file(file, stmt)
     }
 
-    /// Temporary entry point for completion's Rowan marker parse.
-    pub fn resolve_syntax_load_stmt(&self, file: File, node: &ast::LoadStmt) -> Option<File> {
-        let stmt = *source_map(self.db, file)
-            .stmt_map
-            .get(&node.syntax().text_range())?;
-        self.loaded_file(file, stmt)
+    /// Whether a call in the canonical parse represents a Starlark load.
+    pub fn is_load_stmt(&self, file: File, call: &ExprCall) -> bool {
+        source_map(self.db, file)
+            .stmt_nodes
+            .contains_key(&call.node_index().load())
     }
 
     fn loaded_file(&self, file: File, stmt: def::StmtId) -> Option<File> {

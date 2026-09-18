@@ -53,7 +53,7 @@ pub(crate) fn names<'a>(
         let Expr::StringLiteral(_) = value else {
             return None;
         };
-        if !starpls_syntax::supports_expr(value, tokens)
+        if !starpls_syntax::supports_expr(value.into(), tokens)
             || expr_range(value, (&call.arguments).into(), tokens) != value.range()
         {
             return None;

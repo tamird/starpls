@@ -66,11 +66,8 @@ pub(crate) struct ModuleSourceMap {
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
-    // Temporary correspondence for Rowan editor callers. Native consumers
-    // will use Ruff node indices; synthetic HIR retains source ranges.
-    pub expr_map: FxHashMap<TextRange, ExprId>,
+    // Source ranges also cover synthetic HIR nodes with no Ruff identity.
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
-    pub stmt_map: FxHashMap<TextRange, StmtId>,
     pub stmt_map_back: FxHashMap<StmtId, TextRange>,
     pub param_map_back: FxHashMap<ParamId, TextRange>,
     pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
@@ -102,9 +99,7 @@ impl ModuleSourceMap {
             function_names: _,
             keyword_names: _,
             type_comment_owners: _,
-            expr_map: _,
             expr_map_back,
-            stmt_map: _,
             stmt_map_back,
             param_map_back: _,
             load_item_map_back: _,

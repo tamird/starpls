@@ -24,7 +24,10 @@ pub(crate) enum Selection<'a> {
         call: &'a ExprCall,
     },
     LoadModule(&'a ExprCall),
-    LoadItem(ArgOrKeyword<'a>),
+    LoadItem {
+        call: &'a ExprCall,
+        item: ArgOrKeyword<'a>,
+    },
     String(&'a ExprStringLiteral),
 }
 
@@ -52,7 +55,7 @@ pub(crate) fn classify<'a>(node: &CoveringNode<'a>, range: TextRange) -> Option<
                 ArgOrKeyword::Arg(_) => Some(if index == 0 {
                     Selection::LoadModule(call)
                 } else {
-                    Selection::LoadItem(arg)
+                    Selection::LoadItem { call, item: arg }
                 }),
                 ArgOrKeyword::Keyword(keyword) => {
                     if keyword
@@ -62,7 +65,7 @@ pub(crate) fn classify<'a>(node: &CoveringNode<'a>, range: TextRange) -> Option<
                     {
                         return None;
                     }
-                    Some(Selection::LoadItem(arg))
+                    Some(Selection::LoadItem { call, item: arg })
                 }
             };
         }

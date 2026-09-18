@@ -239,7 +239,7 @@ def f():
 }
 
 #[test]
-fn source_ranges_remain_distinct_during_edits() {
+fn native_nodes_follow_recovered_syntax() {
     let mut db = TestDatabase::default();
     let file = starpls_common::open_document(
         &mut db,
@@ -275,8 +275,17 @@ fn source_ranges_remain_distinct_during_edits() {
         {
             starpls_common::update_file(&mut db, file, input.clone());
             let map = crate::source_map(&db, file);
-            assert_eq!(map.expr_map.len(), map.expr_map_back.len(), "{input}");
-            assert_eq!(map.stmt_map.len(), map.stmt_map_back.len(), "{input}");
+            let parsed = starpls_common::parsed_module(&db, file).load(&db);
+            for (node, expr) in &map.expr_nodes {
+                use ruff_text_size::Ranged;
+                let native = parsed.get_by_index(*node).range();
+                let lowered = map.expr_map_back[expr];
+                assert!(
+                    u32::from(lowered.start()) <= u32::from(native.start())
+                        && u32::from(native.end()) <= u32::from(lowered.end()),
+                    "{input}"
+                );
+            }
         }
     }
 }
@@ -309,7 +318,9 @@ fn native_declarations_preserve_editor_ranges() {
             && ast::Statement::cast(node.clone()).is_some()
         {
             assert!(
-                map.stmt_map.contains_key(&node.text_range()),
+                map.stmt_map_back
+                    .values()
+                    .any(|range| *range == node.text_range()),
                 "{} at {:?}",
                 node,
                 node.text_range()

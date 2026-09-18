@@ -129,7 +129,7 @@ pub(crate) fn hover(
             }
             Some(text.into())
         }
-        Selection::LoadItem(item) => {
+        Selection::LoadItem { call: _, item } => {
             let item = sema.resolve_load_item(file, item)?;
             let def = item.definition()?;
             Some(format_for_name(item.name().as_str(), &def.ty()).into())
@@ -206,7 +206,7 @@ fn module_doc(sema: &Semantics<'_>, file: File) -> Option<Box<str>> {
     let Expr::StringLiteral(_) = stmt.value.as_ref() else {
         return None;
     };
-    if !starpls_syntax::supports_expr(&stmt.value, parsed.tokens())
+    if !starpls_syntax::supports_expr(stmt.value.as_ref().into(), parsed.tokens())
         || expr_range(&stmt.value, stmt.into(), parsed.tokens()) != stmt.value.range()
     {
         return None;
