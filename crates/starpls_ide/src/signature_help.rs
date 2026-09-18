@@ -1,13 +1,22 @@
 use std::fmt::Write;
 
+use ruff_python_ast::find_node::covering_node;
+use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::token::Tokens;
+use ruff_python_ast::AnyNodeRef;
+use ruff_python_ast::ArgOrKeyword;
+use ruff_python_ast::ExprCall;
+use ruff_python_ast::ModModule;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use starpls_common::parsed_module;
 use starpls_hir::Semantics;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::Direction;
-use starpls_syntax::ast::{self};
-use starpls_syntax::T;
+use starpls_syntax::source::expr_range;
 
-use crate::util::pick_best_token;
+use crate::util::pick_source_token;
 use crate::util::unindent_doc;
+use crate::util::CursorToken;
 use crate::Database;
 use crate::FilePosition;
 
@@ -38,18 +47,15 @@ pub(crate) fn signature_help(
 ) -> Option<SignatureHelp> {
     let sema = Semantics::new(db);
     let file = file_id;
-    let parse = sema.parse(file);
-    let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
-        // '(', ')', and ',' are typically the main tokens in a call expression that are not part of
-        // one of the arguments.
-        T!['('] | T![')'] | T![,] => 0,
-        kind if kind.is_trivia_token() => 0,
-        _ => 1,
-    })?;
-
-    // Find the argument node containing the current token.
-    let expr = token.parent_ancestors().find_map(ast::CallExpr::cast)?;
-    let func = sema.resolve_syntax_call_expr(file, &expr)?;
+    let parsed = parsed_module(db, file).load(db);
+    let source = file.contents(db);
+    let (expr, active_arg) = call_at_cursor(
+        parsed.syntax(),
+        parsed.tokens(),
+        u32::from(pos).into(),
+        TextSize::of(&*source),
+    )?;
+    let func = sema.resolve_call_expr(file, expr)?;
     let params = func.params();
     let param_labels: Vec<String> = params
         .iter()
@@ -117,30 +123,8 @@ pub(crate) fn signature_help(
     label.push_str(") -> ");
     let _ = write!(&mut label, "{}", func.ret_ty());
 
-    // Check if token's direct parent is an `Arguments` node. If so, that means we are at a ',', '(', or ')'.
-    // The active parameter index is equal to the number of commas that we see to the left (including ourselves).
-    // If the number of commas is greater than the number of arguments in the CallExpr, then
-    // the active parameter is considered fake.
-    let active_arg = if ast::Arguments::can_cast(token.parent()?.kind()) {
-        token
-            .siblings_with_tokens(Direction::Prev)
-            .filter_map(|el| el.into_token())
-            .filter(|token| token.kind() == T![,])
-            .count()
-    } else {
-        // Otherwise, check if there is a parent `Argument` node. If so, the active parameter index
-        // is equal to the number of `Argument`s to the left of us. The active parameter is never fake
-        // in this scenario.
-        let arg = token.parent_ancestors().find_map(ast::Argument::cast)?;
-        arg.syntax()
-            .siblings(Direction::Prev)
-            .skip(1)
-            .filter_map(ast::Argument::cast)
-            .count()
-    };
-
     let active_parameter = sema
-        .resolve_call_expr_active_param(file, &expr, active_arg)
+        .resolve_call_expr_active_param(file, expr, active_arg)
         .unwrap_or(DEFAULT_ACTIVE_PARAMETER_INDEX); // active_parameter defaults to 0, so we just add a crazy high value here to avoid a false positive
 
     Some(SignatureHelp {
@@ -162,10 +146,144 @@ pub(crate) fn signature_help(
     })
 }
 
+/// Select the call and argument using concrete tokens, including trivia that
+/// Ruff does not store in the AST. Commas inside an argument belong to it, even
+/// when they are not bracketed (for example, lambda parameters).
+fn call_at_cursor<'a>(
+    module: &'a ModModule,
+    tokens: &Tokens,
+    offset: TextSize,
+    source_len: TextSize,
+) -> Option<(&'a ExprCall, usize)> {
+    let selected = pick_source_token(tokens, offset, source_len, |token| {
+        let CursorToken::Token(token) = token else {
+            return 0;
+        };
+        match token.kind() {
+            TokenKind::Lpar => 0,
+            TokenKind::Rpar => 0,
+            TokenKind::Comma => 0,
+            TokenKind::Comment => 0,
+            TokenKind::NonLogicalNewline => 0,
+            TokenKind::Indent => 0,
+            _ => 1,
+        }
+    })?;
+    let node = covering_node(module.into(), selected.range());
+    let enclosing_call = |node: AnyNodeRef<'a>| match node {
+        AnyNodeRef::ExprCall(call) => Some(call),
+        _ => None,
+    };
+    let call = if let Some(call) = node.ancestors().find_map(enclosing_call) {
+        call
+    } else {
+        // A recovered call may end at its last argument, before trailing
+        // whitespace. Only an actually unmatched call can own that gap.
+        let CursorToken::Gap(gap) = selected else {
+            return None;
+        };
+        let previous = tokens
+            .before(gap.start())
+            .iter()
+            .rev()
+            .find(|token| !token.range().is_empty())?;
+        let node = covering_node(module.into(), previous.range());
+        let call = node.ancestors().filter_map(enclosing_call).find(|call| {
+            let mut depth = 0;
+            for token in tokens.in_range(TextRange::new(call.arguments.start(), gap.start())) {
+                match token.kind() {
+                    TokenKind::Lpar => depth += 1,
+                    TokenKind::Rpar => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    return false;
+                }
+            }
+            depth > 0
+        })?;
+        call
+    };
+    if selected.start() < call.arguments.start() {
+        return None;
+    }
+    let ranges = call
+        .arguments
+        .iter_source_order()
+        .map(|arg| match arg {
+            ArgOrKeyword::Arg(expr) => expr_range(expr, (&call.arguments).into(), tokens),
+            ArgOrKeyword::Keyword(keyword) => TextRange::new(
+                keyword.start(),
+                expr_range(&keyword.value, keyword.into(), tokens).end(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    if let Some(index) = ranges
+        .iter()
+        .position(|range| range.contains_range(selected.range()))
+    {
+        return Some((call, index));
+    }
+    let mut arguments = ranges.iter().peekable();
+    let commas = tokens
+        .in_range(call.arguments.range())
+        .iter()
+        .take_while(|token| token.start() <= selected.start())
+        .filter(|token| token.kind() == TokenKind::Comma)
+        .filter(|token| {
+            while arguments
+                .peek()
+                .is_some_and(|range| range.end() <= token.start())
+            {
+                arguments.next();
+            }
+            !arguments
+                .peek()
+                .is_some_and(|range| range.contains_range(token.range()))
+        })
+        .count();
+    Some((call, commas))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Analysis;
     use crate::FilePosition;
+
+    #[test]
+    fn call_and_argument_cursor_boundaries() {
+        for (call, active) in [
+            ("f($0)", Some(0)),
+            ("f(0$0)", Some(0)),
+            ("f(0,$0)", Some(1)),
+            ("f(0,$0 )", Some(1)),
+            ("f(0,,$0)", Some(100)),
+            ("f(lambda x,$0 y: x, 0)", Some(0)),
+            ("f((0,$0 1), 0)", Some(0)),
+            ("f((0)$0, 1)", Some(1)),
+            ("f((0)$0 , 1)", Some(0)),
+            ("f(0, # type: in$0t\n 1)", Some(1)),
+            ("f(x=(0,$0 1), y=0)", Some(0)),
+            ("f(g() $0", Some(0)),
+            ("f(0, g$0())", None),
+            ("f$0()", None),
+            ("f()$0", Some(0)),
+            ("f()$0 ", None),
+            ("f()\n$0", None),
+        ] {
+            let source = format!("def f(x, y): pass\ndef g(): pass\n{call}");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let help = analysis
+                .snapshot()
+                .signature_help(FilePosition { file_id, pos })
+                .unwrap();
+            let actual = help
+                .as_ref()
+                .and_then(|help| help.signatures[0].active_parameter);
+            assert_eq!(actual, active, "{call}: {help:?}");
+        }
+    }
 
     #[test]
     fn imported_rule_default_follows_source_edits() {
