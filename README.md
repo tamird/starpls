@@ -85,6 +85,20 @@ def _impl(ctx):
 
 then you'll get autocomplete suggestions for the attributes on `ctx`, like `ctx.actions`, `ctx.attr`, and so on!
 
+For repository helpers, use `repository_ctx`:
+
+```python
+def _download(ctx, artifacts):
+    # type: (repository_ctx, dict) -> None
+    ctx.download(url = artifacts["url"])
+    ctx.file("BUILD.bazel", content = "")
+```
+
+This enables method completion, hover, and signature help inside the helper.
+The experimental context inference described below recognizes functions passed
+directly to `rule` or `repository_rule`, including rules without `attrs`.
+It does not propagate argument types into unannotated helper functions.
+
 ## Experimental features
 
 Starpls has a number of experimental features that can be enabled via command-line arguments:

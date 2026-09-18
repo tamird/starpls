@@ -403,6 +403,76 @@ mod builtin_tests {
     }
 
     #[test]
+    fn repository_context_methods_in_annotated_helpers() {
+        let source = "\
+def helper(ctx, artifacts):
+    # type: (repository_ctx, dict) -> None
+    ctx.download(url = artifacts['url'])
+    ctx.file('BUILD.bazel', content = '')
+def _impl(ctx):
+    ctx.file('notice', content = '')
+    helper(ctx, {})
+repo = repository_rule(implementation = _impl)
+";
+        for infer_ctx_attributes in [false, true] {
+            let mut analysis = analysis(infer_ctx_attributes);
+            let file = open(&mut analysis, "/workspace/main.bzl", source);
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            for method in ["download", "file"] {
+                let start = source.find(&format!("ctx.{method}")).unwrap() + "ctx.".len();
+                let hover = snapshot
+                    .hover(FilePosition {
+                        file_id: file,
+                        pos: (start as u32).into(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    hover.contents.value.contains(&format!("def {method}(")),
+                    "{}",
+                    hover.contents.value
+                );
+                let signatures = snapshot
+                    .signature_help(FilePosition {
+                        file_id: file,
+                        pos: ((start + method.len() + 1) as u32).into(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert!(signatures
+                    .signatures
+                    .iter()
+                    .any(|signature| signature.label.contains(method)));
+            }
+            let completions = snapshot
+                .completions(
+                    FilePosition {
+                        file_id: file,
+                        pos: ((source.find("ctx.download").unwrap() + "ctx.".len()) as u32).into(),
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            for name in ["download", "file", "execute"] {
+                assert!(completions.iter().any(|item| item.label == name), "{name}");
+            }
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id: file,
+                    pos: ((source.rfind("ctx.file").unwrap() + "ctx.".len()) as u32).into(),
+                })
+                .unwrap();
+            assert_eq!(hover.is_some(), infer_ctx_attributes);
+            if let Some(hover) = hover {
+                assert!(hover.contents.value.contains("def file("));
+            }
+        }
+    }
+
+    #[test]
     fn loaded_transition_controls_label_attribute_shape() {
         let mut analysis = analysis(true);
         open(
