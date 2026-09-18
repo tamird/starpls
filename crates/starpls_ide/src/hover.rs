@@ -218,8 +218,10 @@ fn format_for_name(name: &str, ty: &Type<'_>) -> String {
     let mut text = String::from("```python\n");
 
     // Handle special `def` formatting for function types.
-    if ty.is_function() {
+    if ty.is_user_defined_function() {
         text.push_str("(function) ");
+    } else if ty.is_function() {
+        text.push_str("(builtin function) ");
     } else {
         text.push_str("(variable) ");
         text.push_str(name);
@@ -259,6 +261,48 @@ mod tests {
             .unwrap();
 
         expect.assert_eq(&hover.contents.value);
+    }
+
+    #[test]
+    fn builtin_function_provenance() {
+        for (input, label, navigates) in [
+            ("repository_r$0ule", "(builtin function)", false),
+            ("le$0n", "(builtin function)", false),
+            (
+                "alias = repository_rule\nali$0as",
+                "(builtin function)",
+                true,
+            ),
+            (
+                "def repository_rule():\n    pass\nrepository_r$0ule",
+                "(function)",
+                true,
+            ),
+            ("repository_rule = 1\nrepository_r$0ule", "(variable)", true),
+            ("custom = rule()\ncu$0stom", "(variable)", true),
+        ] {
+            let (analysis, fixture) = Analysis::from_single_file_fixture(input);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let position = FilePosition { file_id, pos };
+            let snapshot = analysis.snapshot();
+            let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .starts_with(&format!("```python\n{label} ")),
+                "{input}: {}",
+                hover.contents.value,
+            );
+            assert_eq!(
+                snapshot
+                    .goto_definition(position, false)
+                    .unwrap()
+                    .is_some_and(|locations| !locations.is_empty()),
+                navigates,
+                "{input}"
+            );
+        }
     }
 
     #[test]
