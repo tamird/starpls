@@ -110,7 +110,7 @@ impl DisplayWithDb for TyKind {
             TyKind::Int(Some(x)) => return write!(f, "Literal[{}]", x),
             TyKind::Int(None) => "int",
             TyKind::Float => "float",
-            TyKind::String(Some(s)) => return write!(f, "Literal[{:?}]", s.value(db)),
+            TyKind::String(Some(s)) => return write!(f, "Literal[{:?}]", s.as_ref()),
             TyKind::String(None) => "string",
             TyKind::StringElems => "string.elems",
             TyKind::Bytes => "bytes",
@@ -142,11 +142,11 @@ impl DisplayWithDb for TyKind {
             }
             TyKind::Range => "range",
             TyKind::Function(def) => {
-                let module = module(db, def.func().file(db));
-                write!(f, "def {}(", def.func().name(db).as_str())?;
+                let module = module(db, def.func().file);
+                write!(f, "def {}(", def.func().name.as_str())?;
                 for (i, param) in def
                     .func()
-                    .params(db)
+                    .params
                     .iter()
                     .map(|param| &module[*param])
                     .enumerate()
@@ -194,12 +194,15 @@ impl DisplayWithDb for TyKind {
                 return write!(
                     f,
                     ") -> {}",
-                    def.func().ret_type_ref(db).unwrap_or(TypeRef::Unknown)
+                    def.func()
+                        .ret_type_ref
+                        .as_ref()
+                        .unwrap_or(&TypeRef::Unknown)
                 );
             }
             TyKind::IntrinsicFunction(func, subst) => {
-                write!(f, "def {}(", func.name(db).as_str())?;
-                for (i, param) in func.params(db).iter().enumerate() {
+                write!(f, "def {}(", func.name.as_str())?;
+                for (i, param) in func.params.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
@@ -227,11 +230,11 @@ impl DisplayWithDb for TyKind {
                     }
                 }
                 f.write_str(") -> ")?;
-                return func.ret_ty(db).substitute(&subst.args).fmt(db, f);
+                return func.ret_ty.substitute(&subst.args).fmt(db, f);
             }
             TyKind::BuiltinFunction(func) => {
-                write!(f, "def {}(", func.name(db).as_str())?;
-                for (i, param) in func.params(db).iter().enumerate() {
+                write!(f, "def {}(", func.name.as_str())?;
+                for (i, param) in func.params.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
@@ -271,9 +274,9 @@ impl DisplayWithDb for TyKind {
                     }
                 }
                 f.write_str(") -> ")?;
-                return func.ret_type_ref(db).fmt(f);
+                return func.ret_type_ref.fmt(f);
             }
-            TyKind::BuiltinType(ty, _) => return f.write_str(ty.name(db).as_str()),
+            TyKind::BuiltinType(ty, _) => return f.write_str(ty.name.as_str()),
             TyKind::BoundVar(index) => return write!(f, "'{}", index),
             TyKind::Protocol(proto) => {
                 let (name, ty) = match proto {
@@ -292,13 +295,9 @@ impl DisplayWithDb for TyKind {
                 RuleKind::Repository => "repository_rule",
             },
             TyKind::Provider(provider) => {
-                return write!(
-                    f,
-                    "Provider[{}]",
-                    provider.name(db).map_or("_", Name::as_str)
-                );
+                return write!(f, "Provider[{}]", provider.name().map_or("_", Name::as_str));
             }
-            TyKind::ProviderInstance(provider) => provider.name(db).map_or("_", Name::as_str),
+            TyKind::ProviderInstance(provider) => provider.name().map_or("_", Name::as_str),
             TyKind::ProviderRawConstructor(_, _) => "ProviderRawConstructor",
             TyKind::TagClass(_) => "tag_class",
             TyKind::ModuleExtension(_) => "module_extension",

@@ -5,6 +5,7 @@ use either::Either;
 use id_arena::Arena;
 use id_arena::Id;
 use rustc_hash::FxHashMap;
+use salsa::Accumulator;
 use starpls_common::Diagnostic;
 use starpls_common::Diagnostics;
 use starpls_common::File;
@@ -42,22 +43,9 @@ pub(crate) enum ExecutionScopeId {
     Lambda(ExprId),
 }
 
-#[salsa::tracked]
-pub(crate) struct ModuleScopes {
-    #[return_ref]
-    pub(crate) scopes: Scopes,
-}
-
-#[salsa::tracked]
-pub(crate) fn module_scopes_query(db: &dyn Db, info: ModuleInfo) -> ModuleScopes {
-    let scopes = Scopes::new_for_module(db, info);
-    ModuleScopes::new(db, scopes)
-}
-
-#[salsa::tracked]
-pub(crate) fn module_scopes(db: &dyn Db, file: File) -> ModuleScopes {
-    let info = lower(db, file);
-    module_scopes_query(db, info)
+#[salsa::tracked(returns(ref))]
+pub(crate) fn module_scopes(db: &dyn Db, file: File) -> Scopes {
+    Scopes::new_for_module(db, lower(db, file))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,10 +90,10 @@ pub(crate) enum FunctionDef {
 }
 
 impl FunctionDef {
-    pub(crate) fn func(&self) -> Function {
+    pub(crate) fn func(&self) -> &Function {
         match self {
-            FunctionDef::Def { func, .. } => *func,
-            FunctionDef::Lambda { func } => *func,
+            FunctionDef::Def { func, .. } => func,
+            FunctionDef::Lambda { func } => func,
         }
     }
 
@@ -163,13 +151,13 @@ struct FunctionData {
 }
 
 impl Scopes {
-    fn new_for_module(db: &dyn Db, info: ModuleInfo) -> Self {
+    fn new_for_module(db: &dyn Db, info: &ModuleInfo) -> Self {
         ScopeCollector {
             db,
             deferred: VecDeque::new(),
-            file: info.file(db),
-            module: info.module(db),
-            source_map: info.source_map(db),
+            file: info.file,
+            module: &info.module,
+            source_map: &info.source_map,
             scopes: Scopes {
                 scopes: Default::default(),
                 scopes_by_hir_id: Default::default(),
@@ -265,7 +253,7 @@ impl ScopeCollector<'_> {
                             name.clone(),
                             ScopeDef::Parameter(ParameterDef {
                                 index,
-                                func: data.func,
+                                func: data.func.clone(),
                             }),
                         );
                     }
@@ -312,24 +300,24 @@ impl ScopeCollector<'_> {
     ) {
         match &self.module.stmts[stmt] {
             Stmt::Def { func, stmts } => {
-                self.collect_params(func.params(self.db), *current);
+                self.collect_params(&func.params, *current);
                 *current = self.alloc_scope(*current);
                 self.scopes.add_decl(
                     *current,
-                    func.name(self.db).clone(),
+                    func.name.clone(),
                     ScopeDef::Function(FunctionDef::Def {
                         stmt: InFile {
                             file: self.file,
                             value: stmt,
                         },
-                        func: *func,
+                        func: func.clone(),
                     }),
                 );
                 deferred.push_back(FunctionData {
                     def_stmt: stmt,
-                    params: func.params(self.db).clone(),
+                    params: func.params.clone(),
                     stmts: stmts.clone(),
-                    func: *func,
+                    func: func.clone(),
                 });
             }
             Stmt::If {
@@ -426,24 +414,22 @@ impl ScopeCollector<'_> {
                     self.record_expr_scope(expr, current);
                 }
                 Expr::Missing => {}
-                _ => Diagnostics::push(
-                    self.db,
-                    Diagnostic {
-                        message: "Expression is not assignable".to_string(),
-                        severity: Severity::Error,
-                        range: FileRange {
-                            file_id: self.file.id(self.db),
-                            range: self
-                                .source_map
-                                .expr_map_back
-                                .get(&expr)
-                                .expect("expected expr to exist in source map")
-                                .syntax_node_ptr()
-                                .text_range(),
-                        },
-                        tags: None,
+                _ => Diagnostics(Diagnostic {
+                    message: "Expression is not assignable".to_string(),
+                    severity: Severity::Error,
+                    range: FileRange {
+                        file_id: self.file.id(self.db),
+                        range: self
+                            .source_map
+                            .expr_map_back
+                            .get(&expr)
+                            .expect("expected expr to exist in source map")
+                            .syntax_node_ptr()
+                            .text_range(),
                     },
-                ),
+                    tags: None,
+                })
+                .accumulate(self.db),
             }
         } else {
             match &self.module[expr] {
@@ -454,7 +440,7 @@ impl ScopeCollector<'_> {
                 Expr::Lambda { func, body } => {
                     self.with_execution_scope(ExecutionScopeId::Lambda(expr), |this| {
                         let scope = this.alloc_scope(current);
-                        for (index, param) in func.params(self.db).iter().copied().enumerate() {
+                        for (index, param) in func.params.iter().copied().enumerate() {
                             match &this.module.params[param] {
                                 Param::Simple { name, .. }
                                 | Param::ArgsList { name, .. }
@@ -462,7 +448,10 @@ impl ScopeCollector<'_> {
                                     this.scopes.add_decl(
                                         scope,
                                         name.clone(),
-                                        ScopeDef::Parameter(ParameterDef { func: *func, index }),
+                                        ScopeDef::Parameter(ParameterDef {
+                                            func: func.clone(),
+                                            index,
+                                        }),
                                     );
                                 }
                             }

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Index;
+use std::sync::Arc;
 
 use either::Either;
 use id_arena::Arena;
@@ -9,6 +10,8 @@ use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use starpls_common::File;
 use starpls_common::InFile;
+use starpls_intern::impl_internable;
+use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
 use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::BinaryOp;
@@ -361,9 +364,10 @@ impl Param {
     }
 }
 
-#[salsa::tracked]
-pub struct LoadStmt {
-    #[return_ref]
+pub type LoadStmt = Arc<LoadStmtData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LoadStmtData {
     pub(crate) module: Box<str>,
     pub(crate) ptr: SyntaxNodePtr,
 }
@@ -402,19 +406,19 @@ pub(crate) struct DictEntry {
 pub(crate) enum Literal {
     Int(u64),
     Float,
-    String(InternedString),
+    String(Arc<str>),
     Bytes,
     Bool(bool),
     None,
 }
 
 impl Literal {
-    fn from_ast_literal(db: &dyn Db, value: &ast::LiteralKind) -> Self {
+    fn from_ast_literal(value: &ast::LiteralKind) -> Self {
         match value {
             ast::LiteralKind::Int(lit) => Literal::Int(lit.value().unwrap_or(0)),
             ast::LiteralKind::Float(_) => Literal::Float,
             ast::LiteralKind::String(lit) => {
-                Literal::String(InternedString::new(db, lit.value().unwrap_or_default()))
+                Literal::String(Arc::<str>::from(lit.value().unwrap_or_default()))
             }
             ast::LiteralKind::Bytes(_) => Literal::Bytes,
             ast::LiteralKind::Bool(lit) => Literal::Bool(*lit),
@@ -466,29 +470,26 @@ impl fmt::Display for Name {
     }
 }
 
-#[salsa::interned]
-pub(crate) struct InternedString {
-    #[return_ref]
-    pub(crate) value: Box<str>,
-}
-
 /// Used for both function definitions and lambda expressions.
-#[salsa::tracked]
-pub(crate) struct Function {
+pub(crate) type Function = Interned<FunctionData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FunctionData {
     pub(crate) file: File,
     pub(crate) name: Name,
     pub(crate) ret_type_ref: Option<TypeRef>,
     pub(crate) doc: Option<Box<str>>,
-    ptr: SyntaxNodePtr,
-    #[return_ref]
+    pub(crate) ptr: SyntaxNodePtr,
     pub(crate) params: Box<[ParamId]>,
 }
 
-impl Function {
-    pub(crate) fn syntax_node_ptr(&self, db: &dyn Db) -> InFile<SyntaxNodePtr> {
+impl FunctionData {
+    pub(crate) fn syntax_node_ptr(&self) -> InFile<SyntaxNodePtr> {
         InFile {
-            file: self.file(db),
-            value: self.ptr(db),
+            file: self.file,
+            value: self.ptr,
         }
     }
 }
+
+impl_internable!(FunctionData);

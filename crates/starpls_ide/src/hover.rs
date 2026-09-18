@@ -39,7 +39,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
     let file = db.get_file(file_id)?;
     let sema = Semantics::new(db);
     let parse = sema.parse(file);
-    let token = pick_best_token(parse.syntax(db).token_at_offset(pos), |kind| match kind {
+    let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
         T![ident] => 2,
         T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
         kind if kind.is_trivia_token() => 0,
@@ -75,7 +75,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
             let ty = sema.type_of_expr(file, &expr.expr()?)?;
             let fields = ty.fields(db);
             let (field, field_ty) = fields.into_iter().find_map(|(field, ty)| {
-                if field.name(db).as_str() == name_text {
+                if field.name().as_str() == name_text {
                     Some((field, ty))
                 } else {
                     None
@@ -94,7 +94,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
             write!(&mut text, "{}", field_ty.display(db)).unwrap();
             text.push_str("\n```\n");
 
-            let doc = field.doc(db);
+            let doc = field.doc();
             if !doc.is_empty() {
                 text.push_str(&unindent_doc(&doc));
                 text.push('\n');
@@ -104,8 +104,8 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
         } else if let Some(stmt) = ast::DefStmt::cast(parent.clone()) {
             let func = sema.callable_for_def(file, stmt)?;
             let mut text = String::from("```python\n(function) ");
-            write!(text, "{}\n```\n", func.ty(db).display(db)).ok()?;
-            if let Some(doc) = func.doc(db) {
+            write!(text, "{}\n```\n", func.ty().display(db)).ok()?;
+            if let Some(doc) = func.doc() {
                 text.push_str(&unindent_doc(&doc));
                 text.push('\n');
             }
@@ -164,7 +164,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
         let path_ty = ast::PathType::cast(segment.syntax().parent()?)?;
         let ty = sema.resolve_path_type(file, &path_ty)?;
         let mut text = format!("```python\n(type) {}\n```\n", ty.display(db));
-        if let Some(doc) = ty.doc(db) {
+        if let Some(doc) = ty.doc() {
             text.push_str(&unindent_doc(&doc));
             text.push('\n');
         }
@@ -178,7 +178,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
         let loaded_file = sema.resolve_load_stmt(file, &load_stmt)?;
         let parsed = sema.parse(loaded_file);
         let mut text = format!("```python\n(module) {}\n```\n", token.text());
-        if let Some(doc) = parsed.tree(db).doc().and_then(|doc| doc.value()) {
+        if let Some(doc) = parsed.tree().doc().and_then(|doc| doc.value()) {
             text.push_str(&unindent_doc(&doc));
             text.push('\n');
         }
@@ -203,7 +203,7 @@ fn format_for_name(db: &Database, name: &str, ty: &Type) -> String {
     write!(&mut text, "{}", ty.display(db)).unwrap();
     text.push_str("\n```\n");
 
-    if let Some(doc) = ty.doc(db) {
+    if let Some(doc) = ty.doc() {
         text.push_str(&unindent_doc(&doc));
         text.push('\n');
     }

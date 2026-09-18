@@ -2,11 +2,11 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use ruff_source_file::LineIndex;
+use salsa::Accumulator;
 use starpls_bazel::APIContext;
 use starpls_syntax::parse_module;
 use starpls_syntax::Module;
 use starpls_syntax::ParseTree;
-use starpls_syntax::SyntaxNode;
 
 pub use crate::diagnostics::Diagnostic;
 pub use crate::diagnostics::DiagnosticTag;
@@ -16,16 +16,6 @@ pub use crate::diagnostics::Severity;
 
 mod diagnostics;
 mod util;
-
-#[salsa::jar(db = Db)]
-pub struct Jar(
-    Diagnostics,
-    File,
-    LineIndexResult,
-    Parse,
-    parse,
-    line_index_query,
-);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -62,7 +52,8 @@ pub enum ResolvedPath {
 }
 
 /// The base Salsa database. Supports file-related operations, like getting/setting file contents.
-pub trait Db: salsa::DbWithJar<Jar> {
+#[salsa::db]
+pub trait Db: salsa::Database {
     /// Creates a file or updates the existing input for this identity. Opening
     /// a previously loaded file must preserve its importers' dependencies.
     fn create_file(
@@ -108,12 +99,15 @@ pub enum FileInfo {
     },
 }
 
-#[salsa::input]
+#[salsa::input(debug)]
 pub struct File {
+    #[returns(clone)]
     pub id: FileId,
+    #[returns(clone)]
     pub dialect: Dialect,
+    #[returns(clone)]
     pub info: Option<FileInfo>,
-    #[return_ref]
+    #[returns(ref)]
     pub contents: String,
 }
 
@@ -131,55 +125,28 @@ impl File {
     }
 }
 
-#[salsa::tracked]
-pub struct Parse {
-    pub file: File,
-    module: ParseTree<Module>,
-}
+pub type Parse = ParseTree<Module>;
 
-impl Parse {
-    pub fn tree(&self, db: &dyn Db) -> Module {
-        self.module(db).tree()
-    }
-
-    pub fn syntax(&self, db: &dyn Db) -> SyntaxNode {
-        self.module(db).syntax()
-    }
-}
-
-#[salsa::tracked]
+#[salsa::tracked(returns(ref))]
 pub fn parse(db: &dyn Db, file: File) -> Parse {
     let parse = parse_module(file.contents(db), &mut |err| {
-        Diagnostics::push(
-            db,
-            Diagnostic {
-                message: err.message,
-                range: FileRange {
-                    file_id: file.id(db),
-                    range: err.range,
-                },
-                severity: Severity::Error,
-                tags: None,
+        Diagnostics(Diagnostic {
+            message: err.message,
+            range: FileRange {
+                file_id: file.id(db),
+                range: err.range,
             },
-        )
+            severity: Severity::Error,
+            tags: None,
+        })
+        .accumulate(db)
     });
-    Parse::new(db, file, parse)
+    parse
 }
 
-#[salsa::tracked]
-struct LineIndexResult {
-    #[return_ref]
-    pub inner: LineIndex,
-}
-
-#[salsa::tracked]
-fn line_index_query(db: &dyn Db, file: File) -> LineIndexResult {
-    let line_index = LineIndex::from_source_text(file.contents(db));
-    LineIndexResult::new(db, line_index)
-}
-
-pub fn line_index(db: &dyn Db, file: File) -> &LineIndex {
-    line_index_query(db, file).inner(db)
+#[salsa::tracked(returns(ref))]
+pub fn line_index(db: &dyn Db, file: File) -> LineIndex {
+    LineIndex::from_source_text(file.contents(db))
 }
 
 /// Text and its index borrowed from the same file revision.

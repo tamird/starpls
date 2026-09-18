@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
+use salsa::Setter;
 use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_common::File;
@@ -23,7 +24,8 @@ use crate::Dialect;
 use crate::Environment;
 use crate::InferenceOptions;
 
-#[salsa::db(starpls_common::Jar, crate::Jar)]
+#[salsa::db]
+#[derive(Clone)]
 pub(crate) struct TestDatabase {
     storage: salsa::Storage<Self>,
     files: Arc<DashMap<FileId, File>>,
@@ -42,8 +44,10 @@ impl Default for TestDatabase {
     }
 }
 
+#[salsa::db]
 impl salsa::Database for TestDatabase {}
 
+#[salsa::db]
 impl starpls_common::Db for TestDatabase {
     fn create_file(
         &mut self,
@@ -116,6 +120,7 @@ impl starpls_common::Db for TestDatabase {
     }
 }
 
+#[salsa::db]
 impl crate::Db for TestDatabase {
     fn environment(&self) -> Environment {
         self.environment

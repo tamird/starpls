@@ -1,10 +1,14 @@
+use std::sync::Arc;
+
 use either::Either;
+use salsa::Accumulator;
 use starpls_common::line_index;
 use starpls_common::Diagnostic;
 use starpls_common::Diagnostics;
 use starpls_common::File;
 use starpls_common::FileRange;
 use starpls_common::Severity;
+use starpls_intern::Interned;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::AstToken;
@@ -20,12 +24,13 @@ use crate::def::DictEntry;
 use crate::def::Expr;
 use crate::def::ExprId;
 use crate::def::ExprPtr;
-use crate::def::Function;
+use crate::def::FunctionData;
 use crate::def::Literal;
 use crate::def::LoadItem;
 use crate::def::LoadItemId;
 use crate::def::LoadItemPtr;
 use crate::def::LoadStmt;
+use crate::def::LoadStmtData;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 use crate::def::Name;
@@ -116,17 +121,22 @@ impl<'a> LoweringContext<'a> {
                     &doc,
                 );
                 let stmts = self.lower_suite_opt(node.suite());
-                let func = Function::new(
-                    self.db,
-                    self.file,
+                let func = Interned::new(FunctionData {
+                    file: self.file,
                     name,
-                    spec.map(|spec| spec.1),
+                    ret_type_ref: spec.map(|spec| spec.1),
                     doc,
-                    ptr.syntax_node_ptr(),
+                    ptr: ptr.syntax_node_ptr(),
                     params,
+                });
+                let stmt = self.alloc_stmt(
+                    Stmt::Def {
+                        func: func.clone(),
+                        stmts,
+                    },
+                    ptr,
                 );
-                let stmt = self.alloc_stmt(Stmt::Def { func, stmts }, ptr);
-                for (i, param) in func.params(self.db).iter().enumerate() {
+                for (i, param) in func.params.iter().enumerate() {
                     self.module.param_to_def_stmt.insert(*param, (stmt, i));
                 }
                 return stmt;
@@ -180,8 +190,8 @@ impl<'a> LoweringContext<'a> {
             ast::Statement::Load(stmt) => {
                 let ptr = SyntaxNodePtr::new(stmt.syntax());
                 let module = self.lower_string_opt(stmt.module().and_then(|module| module.name()));
-                let load_stmt = LoadStmt::new(self.db, module, ptr);
-                let items = self.lower_load_items(load_stmt, stmt.items());
+                let load_stmt = Arc::new(LoadStmtData { module, ptr });
+                let items = self.lower_load_items(load_stmt.clone(), stmt.items());
                 Stmt::Load { load_stmt, items }
             }
             ast::Statement::Expr(stmt) => {
@@ -215,7 +225,7 @@ impl<'a> LoweringContext<'a> {
                 Expr::Name { name }
             }
             ast::Expression::Literal(node) => {
-                let literal = Literal::from_ast_literal(self.db, &node.kind());
+                let literal = Literal::from_ast_literal(&node.kind());
                 Expr::Literal { literal }
             }
             ast::Expression::If(node) => {
@@ -241,15 +251,14 @@ impl<'a> LoweringContext<'a> {
             }
             ast::Expression::Lambda(node) => {
                 let params = self.lower_params_opt(node.parameters(), &[], &None);
-                let func = Function::new(
-                    self.db,
-                    self.file,
-                    Name::new_inline("lambda"),
-                    None,
-                    None,
-                    ptr.syntax_node_ptr(),
+                let func = Interned::new(FunctionData {
+                    file: self.file,
+                    name: Name::new_inline("lambda"),
+                    ret_type_ref: None,
+                    doc: None,
+                    ptr: ptr.syntax_node_ptr(),
                     params,
-                );
+                });
                 let body = self.lower_expr_opt(node.body());
                 Expr::Lambda { func, body }
             }
@@ -580,14 +589,14 @@ impl<'a> LoweringContext<'a> {
                 let load_item = match load_item {
                     ast::LoadItem::Direct(item) => LoadItem::Direct {
                         name: self.lower_string_opt(item.name()),
-                        load_stmt,
+                        load_stmt: load_stmt.clone(),
                     },
                     ast::LoadItem::Aliased(item) => {
                         let alias = self.lower_name_opt(item.alias());
                         LoadItem::Aliased {
                             alias,
                             name: self.lower_string_opt(item.name()),
-                            load_stmt,
+                            load_stmt: load_stmt.clone(),
                         }
                     }
                 };
@@ -695,17 +704,15 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn add_error_diagnostic(&self, message: &str, syntax: &SyntaxNode) {
-        Diagnostics::push(
-            self.db,
-            Diagnostic {
-                message: message.into(),
-                severity: Severity::Error,
-                range: FileRange {
-                    file_id: self.file.id(self.db),
-                    range: syntax.text_range(),
-                },
-                tags: None,
+        Diagnostics(Diagnostic {
+            message: message.into(),
+            severity: Severity::Error,
+            range: FileRange {
+                file_id: self.file.id(self.db),
+                range: syntax.text_range(),
             },
-        );
+            tags: None,
+        })
+        .accumulate(self.db);
     }
 }

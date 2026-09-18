@@ -339,19 +339,11 @@ pub(crate) fn lower_to_code_flow_graph(module: &Module, scopes: &Scopes) -> Code
     cx.result
 }
 
-#[salsa::tracked]
-pub(crate) struct CodeFlowGraphResult {
-    #[return_ref]
-    pub(crate) cfg: CodeFlowGraph,
-}
-
-#[allow(unused)]
-#[salsa::tracked]
-pub(crate) fn code_flow_graph(db: &dyn Db, file: File) -> CodeFlowGraphResult {
+#[salsa::tracked(returns(ref))]
+pub(crate) fn code_flow_graph(db: &dyn Db, file: File) -> CodeFlowGraph {
     let info = lower(db, file);
     let scopes = module_scopes(db, file);
-    let cfg = lower_to_code_flow_graph(info.module(db), scopes.scopes(db));
-    CodeFlowGraphResult::new(db, cfg)
+    lower_to_code_flow_graph(&info.module, scopes)
 }
 
 #[cfg(test)]
@@ -368,8 +360,7 @@ mod tests {
         let db = TestDatabase::default();
         let file_id = FileId(0);
         let file = File::new(&db, file_id, Dialect::Standard, None, input.to_string());
-        let res = code_flow_graph(&db, file);
-        let cfg = res.cfg(&db);
+        let cfg = code_flow_graph(&db, file);
         expect.assert_eq(&cfg.pretty_print());
     }
 

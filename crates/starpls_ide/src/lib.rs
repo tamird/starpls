@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use salsa::ParallelDatabase;
+use salsa::Setter;
 use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_common::Db;
@@ -59,7 +59,8 @@ mod incremental;
 
 pub type Cancellable<T> = Result<T, Cancelled>;
 
-#[salsa::db(starpls_common::Jar, starpls_hir::Jar)]
+#[salsa::db]
+#[derive(Clone)]
 pub(crate) struct Database {
     storage: salsa::Storage<Self>,
     files: Arc<DashMap<FileId, File>>,
@@ -88,29 +89,10 @@ impl Database {
     }
 }
 
-impl salsa::Database for Database {
-    #[cfg(test)]
-    fn salsa_event(&self, event: salsa::Event) {
-        if matches!(event.kind, salsa::EventKind::WillExecute { .. }) {
-            self.executions
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
+#[salsa::db]
+impl salsa::Database for Database {}
 
-impl salsa::ParallelDatabase for Database {
-    fn snapshot(&self) -> salsa::Snapshot<Self> {
-        salsa::Snapshot::new(Database {
-            files: self.files.clone(),
-            environment: self.environment,
-            #[cfg(test)]
-            executions: self.executions.clone(),
-            loader: self.loader.clone(),
-            storage: self.storage.snapshot(),
-        })
-    }
-}
-
+#[salsa::db]
 impl starpls_common::Db for Database {
     fn create_file(
         &mut self,
@@ -221,6 +203,7 @@ impl starpls_common::Db for Database {
     }
 }
 
+#[salsa::db]
 impl starpls_hir::Db for Database {
     fn environment(&self) -> Environment {
         self.environment
@@ -321,6 +304,15 @@ impl Analysis {
             #[cfg(test)]
             executions: Default::default(),
         };
+        #[cfg(test)]
+        {
+            let executions = db.executions.clone();
+            db.storage = salsa::Storage::new(Some(Box::new(move |event| {
+                if matches!(event.kind, salsa::EventKind::WillExecute { .. }) {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })));
+        }
         db.environment = Some(Environment::initialize(&db, options));
         Self { db }
     }
@@ -340,7 +332,7 @@ impl Analysis {
 
     pub fn snapshot(&self) -> AnalysisSnapshot {
         AnalysisSnapshot {
-            db: self.db.snapshot(),
+            db: self.db.clone(),
         }
     }
 
@@ -373,7 +365,7 @@ impl Analysis {
 }
 
 pub struct AnalysisSnapshot {
-    db: salsa::Snapshot<Database>,
+    db: Database,
 }
 
 impl AnalysisSnapshot {

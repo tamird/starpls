@@ -128,7 +128,7 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
         }),
         input.to_string(),
     );
-    let root = parse(&db, file).syntax(&db);
+    let root = parse(&db, file).syntax();
     let source_map = source_map(&db, file);
     let mut res = String::new();
 
@@ -2333,8 +2333,6 @@ def f():
 
 #[test]
 fn test_assign_int_literal_to_bool() {
-    let db = TestDatabaseBuilder::default().build();
-
-    assert!(assign_tys(&db, &TyKind::Int(Some(1)).intern(), &Ty::bool()));
-    assert!(assign_tys(&db, &TyKind::Int(Some(0)).intern(), &Ty::bool()));
+    assert!(assign_tys(&TyKind::Int(Some(1)).intern(), &Ty::bool()));
+    assert!(assign_tys(&TyKind::Int(Some(0)).intern(), &Ty::bool()));
 }

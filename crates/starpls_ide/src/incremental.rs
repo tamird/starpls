@@ -13,6 +13,7 @@ use crate::Analysis;
 use crate::Change;
 use crate::FilePosition;
 use crate::LoadFileResult;
+use crate::LocationLink;
 
 fn hover_value(analysis: &Analysis, file_id: FileId) -> String {
     let file = analysis.db.get_file(file_id).unwrap();
@@ -67,6 +68,102 @@ fn imported_types_follow_edits_and_open_buffers() {
     analysis.apply_change(change);
     assert_eq!(analysis.db.get_file(dependency), Some(file));
     assert_eq!(hover_value(&analysis, main), original);
+}
+
+#[test]
+fn imported_function_views_follow_reparsed_definitions() {
+    let (mut analysis, loader) = Analysis::new_for_test();
+    let mut fixture = Fixture::new(&mut analysis.db);
+    let source = "load(\"dep.bzl\", \"value\")\nvalue(1)\n";
+    let main = fixture.add_file(&mut analysis.db, "main.bzl", source);
+    let original = "def value(first):\n    \"\"\"Original docs.\"\"\"\n    pass\n";
+    let changed = "\n\ndef value(second, first = 0):\n    \"\"\"Changed docs.\"\"\"\n    pass\n";
+    let dependency = fixture.add_file(&mut analysis.db, "dep.bzl", original);
+    loader.add_files_from_fixture(&analysis.db, &fixture);
+
+    for (contents, names, doc) in [
+        (original, vec!["first"], "Original docs."),
+        (changed, vec!["second", "first"], "Changed docs."),
+        (original, vec!["first"], "Original docs."),
+    ] {
+        let mut change = Change::default();
+        change.update_file(dependency, contents.into());
+        analysis.apply_change(change);
+        let snapshot = analysis.snapshot();
+        let help = snapshot
+            .signature_help(FilePosition {
+                file_id: main,
+                pos: (source.rfind('1').unwrap() as u32).into(),
+            })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("expected one signature: {help:?}");
+        };
+        assert_eq!(signature.documentation.as_deref().map(str::trim), Some(doc));
+        assert_eq!(
+            signature
+                .parameters
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|param| param.label.as_str())
+                .collect::<Vec<_>>(),
+            names,
+        );
+        let definitions = snapshot
+            .goto_definition(
+                FilePosition {
+                    file_id: main,
+                    pos: (source.rfind("value").unwrap() as u32).into(),
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let [LocationLink::Local {
+            origin_selection_range: _,
+            target_range: _,
+            target_selection_range,
+            target_file_id,
+        }] = definitions.as_slice()
+        else {
+            panic!("expected one local definition: {definitions:?}");
+        };
+        assert_eq!(*target_file_id, dependency);
+        assert_eq!(
+            u32::from(target_selection_range.start()),
+            contents.find("value").unwrap() as u32,
+        );
+    }
+}
+
+#[test]
+fn accumulated_diagnostics_follow_edits() {
+    for invalid in ["value = (\n", "1 = 2\n"] {
+        let (mut analysis, _) = Analysis::from_single_file_fixture(invalid);
+        let original = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+        assert!(!original.is_empty());
+        assert_eq!(
+            analysis.snapshot().diagnostics(FileId(0)).unwrap(),
+            original
+        );
+        let mut change = Change::default();
+        change.update_file(FileId(0), "value = 1\n".into());
+        analysis.apply_change(change);
+        assert!(analysis
+            .snapshot()
+            .diagnostics(FileId(0))
+            .unwrap()
+            .is_empty());
+        let mut change = Change::default();
+        change.update_file(FileId(0), invalid.into());
+        analysis.apply_change(change);
+        assert_eq!(
+            analysis.snapshot().diagnostics(FileId(0)).unwrap(),
+            original
+        );
+    }
 }
 
 #[test]

@@ -32,4 +32,5 @@ pub enum DiagnosticTag {
 }
 
 #[salsa::accumulator]
-pub struct Diagnostics(Diagnostic);
+#[derive(Clone, Debug)]
+pub struct Diagnostics(pub Diagnostic);

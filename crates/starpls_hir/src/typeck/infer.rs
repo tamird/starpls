@@ -36,7 +36,6 @@ use crate::def::scope::VariableDef;
 use crate::def::Argument;
 use crate::def::Expr;
 use crate::def::ExprId;
-use crate::def::InternedString;
 use crate::def::Literal;
 use crate::def::LoadItem;
 use crate::def::LoadItemId;
@@ -102,7 +101,7 @@ impl TyContext<'_> {
             return;
         }
 
-        let cfg = code_flow_graph(self.db, file).cfg(self.db);
+        let cfg = code_flow_graph(self.db, file);
         let mut prev_flow_node_or_unreachable = {
             self.walk_stmt(file, stmts[0]);
             if let Some(flow_node_id) = cfg.hir_to_flow_node.get(&ScopeHirId::Stmt(stmts[0])) {
@@ -163,7 +162,7 @@ impl TyContext<'_> {
 
         match &module[stmt] {
             Stmt::Load { load_stmt, items } => {
-                self.resolve_load_stmt(file, *load_stmt);
+                self.resolve_load_stmt(file, load_stmt.clone());
                 for load_item in items.iter().copied() {
                     self.infer_load_item(file, load_item);
                 }
@@ -172,7 +171,7 @@ impl TyContext<'_> {
                 Expr::Index { .. } => {
                     let lhs_ty = self.infer_expr(file, *lhs);
                     let rhs_ty = self.infer_expr(file, *rhs);
-                    if !assign_tys(self.db, &rhs_ty, &lhs_ty) {
+                    if !assign_tys(&rhs_ty, &lhs_ty) {
                         self.add_expr_diagnostic_error(
                             file,
                             *lhs,
@@ -201,7 +200,7 @@ impl TyContext<'_> {
                         );
                     } else if let Some(name) = ty
                         .fields(self.db)
-                        .and_then(|mut fields| fields.find(|(el, _)| &el.name(self.db) == field))
+                        .and_then(|mut fields| fields.find(|(el, _)| &el.name() == field))
                         .and_then(|(field, ty)| {
                             if matches!(
                                 ty.kind(),
@@ -209,7 +208,7 @@ impl TyContext<'_> {
                                     | TyKind::BuiltinFunction(_)
                                     | TyKind::IntrinsicFunction(_, _)
                             ) {
-                                Some(field.name(self.db))
+                                Some(field.name())
                             } else {
                                 None
                             }
@@ -278,7 +277,7 @@ impl TyContext<'_> {
             .iter()
             .filter_map(|(id, stmt)| match stmt {
                 Stmt::Def { func, .. } => {
-                    let name = func.name(self.db);
+                    let name = func.name.clone();
                     if name.is_missing() {
                         None
                     } else {
@@ -299,7 +298,7 @@ impl TyContext<'_> {
                     name: &Name,
                 ) -> Option<()> {
                     // Don't report exported functions as unused.
-                    let scopes = module_scopes(tcx.db, file).scopes(tcx.db);
+                    let scopes = module_scopes(tcx.db, file);
                     let scope = scopes.scopes_by_hir_id.get(&ScopeHirId::Stmt(stmt))?;
                     if scopes.scopes[*scope].execution_scope == ExecutionScopeId::Module
                         && !name.as_str().starts_with('_')
@@ -310,7 +309,7 @@ impl TyContext<'_> {
                     let ptr = source_map(tcx.db, file).stmt_map_back.get(&stmt)?;
                     let node = ptr
                         .syntax_node_ptr()
-                        .try_to_node(&parse(tcx.db, file).syntax(tcx.db))?;
+                        .try_to_node(&parse(tcx.db, file).syntax())?;
                     let def_stmt = ast::DefStmt::cast(node)?;
                     let name_node = def_stmt.name()?;
 
@@ -426,7 +425,7 @@ impl TyContext<'_> {
                     .filter_map(|entry| match &curr_module[entry.key] {
                         Expr::Literal {
                             literal: Literal::String(s),
-                        } => Some((*s, self.infer_expr(file, entry.value))),
+                        } => Some((s.clone(), self.infer_expr(file, entry.value))),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -449,7 +448,7 @@ impl TyContext<'_> {
             Expr::Literal { literal } => match literal {
                 Literal::Int(x) => TyKind::Int(i64::try_from(*x).ok()).intern(),
                 Literal::Float => self.float_ty(),
-                Literal::String(s) => TyKind::String(Some(*s)).intern(),
+                Literal::String(s) => TyKind::String(Some(s.clone())).intern(),
                 Literal::Bytes => self.bytes_ty(),
                 Literal::Bool(b) => TyKind::Bool(Some(*b)).intern(),
                 Literal::None => self.none_ty(),
@@ -481,10 +480,10 @@ impl TyContext<'_> {
                         }
 
                         receiver_ty
-                            .fields(db)
+                            .fields(self.db)
                             .and_then(|mut fields| {
                                 fields.find_map(|(f, ty)| {
-                                    if &f.name(db) == field {
+                                    if &f.name() == field {
                                         Some(ty.clone())
                                     } else {
                                         None
@@ -581,12 +580,12 @@ impl TyContext<'_> {
                                 TyKind::Provider(provider),
                             ) => Some(TyKind::ProviderInstance(provider.clone()).intern()),
                             (TyKind::Any | TyKind::Unknown, _) => Some(Ty::unknown()),
-                            (TyKind::BuiltinType(ty, _), _) => match ty.indexable_by(db) {
+                            (TyKind::BuiltinType(ty, _), _) => match &ty.indexable_by {
                                 Some((expected_index_ty, return_ty)) => {
                                     let expected_index_ty =
-                                        resolve_builtin_type_ref(db, &expected_index_ty).0;
-                                    let return_ty = resolve_builtin_type_ref(db, &return_ty).0;
-                                    if assign_tys(db, &index_ty, &expected_index_ty) {
+                                        resolve_builtin_type_ref(db, expected_index_ty).0;
+                                    let return_ty = resolve_builtin_type_ref(db, return_ty).0;
+                                    if assign_tys(&index_ty, &expected_index_ty) {
                                         Some(return_ty)
                                     } else {
                                         None
@@ -608,7 +607,7 @@ impl TyContext<'_> {
                     }
                 };
 
-                if assign_tys(db, &index_ty, target) {
+                if assign_tys(&index_ty, target) {
                     value.clone()
                 } else {
                     self.add_expr_diagnostic_warning_ty(
@@ -686,8 +685,8 @@ impl TyContext<'_> {
                 // TODO(withered-magic): This is hilariously non-DRY, should probably clean this up at some point.
                 match callee_ty.kind() {
                     TyKind::Function(def) => {
-                        let module = module(db, def.func().file(db));
-                        let params = def.func().params(db).iter().copied();
+                        let module = module(db, def.func().file);
+                        let params = def.func().params.iter().copied();
                         let mut slots: Slots = params
                             .clone()
                             .map(|param| module[param].clone())
@@ -722,7 +721,7 @@ impl TyContext<'_> {
                                 }
                                 SlotProvider::Single(expr, index) => {
                                     let ty = &arg_tys[index];
-                                    if !assign_tys(db, ty, &param_ty) {
+                                    if !assign_tys(ty, &param_ty) {
                                         self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
                                     }
                                 }
@@ -756,12 +755,13 @@ impl TyContext<'_> {
                         }
 
                         def.func()
-                            .ret_type_ref(db)
-                            .map(|type_ref| resolve_type_ref(self, &type_ref, def.stmt()).0)
+                            .ret_type_ref
+                            .as_ref()
+                            .map(|type_ref| resolve_type_ref(self, type_ref, def.stmt()).0)
                             .unwrap_or_else(|| self.unknown_ty())
                     }
                     TyKind::IntrinsicFunction(func, subst) => {
-                        let params = func.params(db);
+                        let params = &func.params;
                         let mut slots: Slots = params[..].into();
                         let errors = slots.assign_args(args, None).0;
 
@@ -794,7 +794,7 @@ impl TyContext<'_> {
                                 }
                                 SlotProvider::Single(expr, index) => {
                                     let ty = &arg_tys[index];
-                                    if !assign_tys(db, ty, &param_ty) {
+                                    if !assign_tys(ty, &param_ty) {
                                         self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
                                     }
                                     if let IntrinsicFunctionParam::Keyword {
@@ -809,9 +809,9 @@ impl TyContext<'_> {
                                                 .expr_map_back
                                                 .get(&expr)
                                                 .and_then(|arg_value_ptr| {
-                                                    arg_value_ptr.syntax_node_ptr().try_to_node(
-                                                        &parse(self.db, file).syntax(self.db),
-                                                    )
+                                                    arg_value_ptr
+                                                        .syntax_node_ptr()
+                                                        .try_to_node(&parse(self.db, file).syntax())
                                                 })
                                                 .and_then(|arg_value_node| arg_value_node.parent())
                                                 .and_then(ast::KeywordArgument::cast)
@@ -845,11 +845,11 @@ impl TyContext<'_> {
                             }
                         }
 
-                        func.maybe_unique_ret_type(db, args_with_ty)
-                            .unwrap_or_else(|| func.ret_ty(db).substitute(&subst.args))
+                        func.maybe_unique_ret_type(args_with_ty)
+                            .unwrap_or_else(|| func.ret_ty.substitute(&subst.args))
                     }
                     TyKind::BuiltinFunction(func) => {
-                        let params = func.params(db);
+                        let params = &func.params;
                         let mut slots: Slots = params[..].into();
                         let errors = slots.assign_args(args, None).0;
 
@@ -873,7 +873,7 @@ impl TyContext<'_> {
                                 }
                                 SlotProvider::Single(expr, index) => {
                                     let ty = &arg_tys[index];
-                                    if !assign_tys(db, ty, &param_ty) {
+                                    if !assign_tys(ty, &param_ty) {
                                         self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
                                     }
                                 }
@@ -907,9 +907,7 @@ impl TyContext<'_> {
                         }
 
                         func.maybe_unique_ret_type(self, file, expr, args_with_ty)
-                            .unwrap_or_else(|| {
-                                resolve_type_ref(self, func.ret_type_ref(db), None).0
-                            })
+                            .unwrap_or_else(|| resolve_type_ref(self, &func.ret_type_ref, None).0)
                     }
                     TyKind::Rule(rule) => {
                         let mut slots = Slots::from_rule(db, rule);
@@ -923,7 +921,7 @@ impl TyContext<'_> {
                                 match provider {
                                     SlotProvider::Single(expr, index) => {
                                         let ty = &arg_tys[index];
-                                        if !assign_tys(db, ty, &expected_ty) {
+                                        if !assign_tys(ty, &expected_ty) {
                                             self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
                                         }
                                     }
@@ -974,7 +972,7 @@ impl TyContext<'_> {
                                 match provider {
                                     SlotProvider::Single(expr, index) => {
                                         let ty = &arg_tys[index];
-                                        if !assign_tys(db, ty, &expected_ty) {
+                                        if !assign_tys(ty, &expected_ty) {
                                             self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
                                         }
                                     }
@@ -1033,7 +1031,7 @@ impl TyContext<'_> {
                                 match provider {
                                     SlotProvider::Single(expr, index) => {
                                         let ty = &arg_tys[index];
-                                        if !assign_tys(db, ty, &expected_ty) {
+                                        if !assign_tys(ty, &expected_ty) {
                                             self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
                                         }
                                     }
@@ -1099,8 +1097,7 @@ impl TyContext<'_> {
             } => {
                 let mut check_slice_component = |expr| {
                     let ty = self.infer_expr(file, expr);
-                    if !assign_tys(db, &ty, &self.int_ty()) && !assign_tys(db, &ty, &self.none_ty())
-                    {
+                    if !assign_tys(&ty, &self.int_ty()) && !assign_tys(&ty, &self.none_ty()) {
                         self.add_expr_diagnostic_error(
                             file,
                             expr,
@@ -1136,7 +1133,7 @@ impl TyContext<'_> {
             }
             Expr::Paren { expr } => self.infer_expr(file, *expr),
             Expr::Lambda { func, .. } => {
-                TyKind::Function(FunctionDef::Lambda { func: *func }).intern()
+                TyKind::Function(FunctionDef::Lambda { func: func.clone() }).intern()
             }
             _ => self.unknown_ty(),
         };
@@ -1212,13 +1209,13 @@ impl TyContext<'_> {
         match op {
             BinaryOp::Arith(op) => match (lhs_kind, rhs_kind, op) {
                 (TyKind::String(Some(s1)), TyKind::String(Some(s2)), ArithOp::Add) => {
-                    let s1 = &s1.value(db);
-                    let s2 = &s2.value(db);
+                    let s1 = &s1.as_ref();
+                    let s2 = &s2.as_ref();
                     let mut s = String::with_capacity(s1.len() + s2.len());
                     s.push_str(s1);
                     s.push_str(s2);
-                    let interned = InternedString::new(db, s.into_boxed_str());
-                    TyKind::String(Some(interned)).intern()
+                    let literal = Arc::<str>::from(s);
+                    TyKind::String(Some(literal)).intern()
                 }
                 (TyKind::String(_), TyKind::String(_), ArithOp::Add)
                 | (TyKind::String(_), _, ArithOp::Mod) => self.string_ty(), // concatenation, string interpolcation
@@ -1371,7 +1368,7 @@ impl TyContext<'_> {
             _ => return,
         };
         let parent = source_ptr
-            .to_node(&parse(db, file).syntax(db))
+            .to_node(&parse(db, file).syntax())
             .syntax()
             .parent()
             .unwrap();
@@ -1529,7 +1526,7 @@ impl TyContext<'_> {
                             TyKind::Function(def.clone()).intern()
                         }
                         ScopeDef::Parameter(ParameterDef { func, index }) => {
-                            self.infer_param(file, func.params(self.db)[*index])
+                            self.infer_param(file, func.params[*index])
                         }
                         ScopeDef::LoadItem(LoadItemDef { load_item, .. }) => {
                             self.infer_load_item(file, *load_item)
@@ -1605,7 +1602,7 @@ impl TyContext<'_> {
     ) -> Option<Ty> {
         // If an expression is missing its corresponding node in the code flow graph, that
         // means the expression is unreachable. We use the `Never` type to represent this case.
-        let cfg = code_flow_graph(self.db, file).cfg(self.db);
+        let cfg = code_flow_graph(self.db, file);
         let start_node = match cfg.hir_to_flow_node.get(&usage.into()) {
             Some(start_node) => start_node,
             None => return Some(TyKind::Never.intern()),
@@ -1785,7 +1782,7 @@ impl TyContext<'_> {
                 // If we have an expected type from a type comment, use that.
                 // We also emit any error if the source and expected types aren't compatible.
                 if let Some(expected_ty) = expected_ty {
-                    if !assign_tys(self.db, &source_ty, &expected_ty) {
+                    if !assign_tys(&source_ty, &expected_ty) {
                         self.add_expr_diagnostic_error(
                             file,
                             root,
@@ -2044,8 +2041,8 @@ impl TyContext<'_> {
 
     fn infer_param_from_rule_usage(&mut self, file: File, param: ParamId) -> Option<Ty> {
         let module = module(self.db, file);
-        let name = match module[module.param_to_def_stmt.get(&param)?.0] {
-            Stmt::Def { func, .. } if func.params(self.db).len() == 1 => func.name(self.db),
+        let name = match &module[module.param_to_def_stmt.get(&param)?.0] {
+            Stmt::Def { func, .. } if func.params.len() == 1 => func.name.clone(),
             _ => return None,
         };
         match self
@@ -2053,16 +2050,17 @@ impl TyContext<'_> {
             .kind()
         {
             TyKind::Rule(rule) => {
-                let ty = builtin_types(self.db, file.dialect(self.db))
-                    .types(self.db)
-                    .get(match rule.kind {
-                        RuleKind::Build => "ctx",
-                        RuleKind::Repository => "repository_ctx",
-                    })?;
+                let ty =
+                    builtin_types(self.db, file.dialect(self.db))
+                        .types
+                        .get(match rule.kind {
+                            RuleKind::Build => "ctx",
+                            RuleKind::Repository => "repository_ctx",
+                        })?;
                 match (ty.kind(), &rule.attrs) {
                     (TyKind::BuiltinType(ty, _), Some(attrs)) => Some(
                         TyKind::BuiltinType(
-                            *ty,
+                            ty.clone(),
                             Some(TyData::Attributes(rule.kind.clone(), attrs.clone())),
                         )
                         .intern(),
@@ -2126,7 +2124,7 @@ impl TyContext<'_> {
             | LoadItem::Aliased {
                 name, load_stmt, ..
             } => {
-                self.resolve_load_stmt(file, *load_stmt)
+                self.resolve_load_stmt(file, load_stmt.clone())
                     .map(|loaded_file| {
                         // Check for potential circular imports, including importing the current file.
                         if file == loaded_file {
@@ -2149,20 +2147,20 @@ impl TyContext<'_> {
                             let mut message = String::from("Detected circular import\n");
                             for (_, load_stmt) in self.cx.load_resolution_stack.iter() {
                                 message.push_str("- ");
-                                message.push_str(load_stmt.module(db));
+                                message.push_str(&load_stmt.module);
                                 message.push('\n');
                             }
                             message.push_str("- ");
-                            message.push_str(load_stmt.module(db));
+                            message.push_str(&load_stmt.module);
                             message.push('\n');
 
                             // Use a range here to avoid having to allocate.
                             for i in 0..self.cx.load_resolution_stack.len() {
-                                let (file, load_stmt) = self.cx.load_resolution_stack[i];
+                                let (file, load_stmt) = self.cx.load_resolution_stack[i].clone();
                                 self.add_diagnostic_for_range(
                                     file,
                                     Severity::Warning,
-                                    load_stmt.ptr(db).text_range(),
+                                    load_stmt.ptr.text_range(),
                                     None,
                                     message.clone(),
                                 )
@@ -2172,7 +2170,7 @@ impl TyContext<'_> {
                             self.add_diagnostic_for_range(
                                 file,
                                 Severity::Warning,
-                                load_stmt.ptr(db).text_range(),
+                                load_stmt.ptr.text_range(),
                                 None,
                                 message,
                             );
@@ -2181,7 +2179,7 @@ impl TyContext<'_> {
                         }
 
                         // Add the current file to the load resolution stack.
-                        self.push_load_resolution(file, *load_stmt, |tcx| {
+                        self.push_load_resolution(file, load_stmt.clone(), |tcx| {
                             // TODO(withered-magic): This is potentially super slow.
                             // tcx.infer_all_load_items(loaded_file);
 
@@ -2202,8 +2200,7 @@ impl TyContext<'_> {
                                         None,
                                         format!(
                                             "Could not resolve symbol \"{}\" in module \"{}\"",
-                                            name,
-                                            load_stmt.module(db)
+                                            name, load_stmt.module
                                         ),
                                     );
                                     tcx.unknown_ty()
@@ -2222,13 +2219,13 @@ impl TyContext<'_> {
     }
 
     pub fn resolve_load_stmt(&mut self, file: File, load_stmt: LoadStmt) -> Option<File> {
-        let id = FileLoadStmt::new(file, load_stmt);
+        let id = FileLoadStmt::new(file, load_stmt.clone());
 
         if let Some(loaded_file) = self.cx.resolved_load_stmts.get(&id) {
             return *loaded_file;
         }
 
-        let module = load_stmt.module(self.db);
+        let module = &load_stmt.module;
         let res = match self
             .db
             .load_file(module, file.dialect(self.db), file.id(self.db))
@@ -2239,13 +2236,9 @@ impl TyContext<'_> {
                 self.add_diagnostic_for_range(
                     file,
                     Severity::Warning,
-                    load_stmt.ptr(self.db).text_range(),
+                    load_stmt.ptr.text_range(),
                     None,
-                    format!(
-                        "Could not resolve module \"{}\": {}",
-                        load_stmt.module(self.db),
-                        err
-                    ),
+                    format!("Could not resolve module \"{}\": {}", load_stmt.module, err),
                 );
                 None
             }
@@ -2296,19 +2289,19 @@ impl TyContext<'_> {
                 let callee_ty = self.infer_expr(file, *callee);
                 let mut slots: Slots = match callee_ty.kind() {
                     TyKind::Function(def) => {
-                        let module = module(db, def.func().file(db));
-                        let params = def.func().params(db).iter().copied();
+                        let module = module(db, def.func().file);
+                        let params = def.func().params.iter().copied();
                         params
                             .clone()
                             .map(|param| module[param].clone())
                             .collect::<Vec<_>>()[..]
                             .into()
                     }
-                    TyKind::IntrinsicFunction(func, _) => func.params(db)[..].into(),
-                    TyKind::BuiltinFunction(func) => func.params(db)[..].into(),
+                    TyKind::IntrinsicFunction(func, _) => func.params[..].into(),
+                    TyKind::BuiltinFunction(func) => func.params[..].into(),
                     TyKind::Rule(rule) => Slots::from_rule(db, rule),
                     TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
-                        Slots::from_provider(db, provider)
+                        Slots::from_provider(provider)
                     }
                     TyKind::Tag(tag_class) => Slots::from_tag_class(tag_class),
                     TyKind::Macro(makro) => Slots::from_macro(makro),
@@ -2322,7 +2315,7 @@ impl TyContext<'_> {
     }
 
     fn types(&self) -> &IntrinsicTypes {
-        self.intrinsics.types(self.db)
+        &self.intrinsics.types
     }
 
     fn any_ty(&self) -> Ty {
