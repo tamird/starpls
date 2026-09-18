@@ -64,6 +64,8 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
             root: source_range(TextRange::up_to(TextSize::of(&*source))),
             expr_nodes: Default::default(),
             stmt_nodes: Default::default(),
+            param_nodes: Default::default(),
+            load_item_nodes: Default::default(),
             function_names: Default::default(),
             keyword_names: Default::default(),
             type_comment_owners: Default::default(),
@@ -71,9 +73,7 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
             expr_map_back: Default::default(),
             stmt_map: Default::default(),
             stmt_map_back: Default::default(),
-            param_map: Default::default(),
             param_map_back: Default::default(),
-            load_item_map: Default::default(),
             load_item_map_back: Default::default(),
         },
     }
@@ -851,10 +851,18 @@ impl<'a> LoweringContext<'a> {
                         load_stmt: load_stmt.clone(),
                     },
                 };
-                self.alloc_load_item(item, source_range(arg.range()))
+                let id = self.alloc_load_item(item, source_range(arg.range()));
+                self.source_map
+                    .load_item_nodes
+                    .insert(crate::def::load_item_node(arg), id);
+                id
             })
             .collect();
-        self.alloc_stmt(Stmt::Load { load_stmt, items }, range, None)
+        let id = self.alloc_stmt(Stmt::Load { load_stmt, items }, range, None);
+        self.source_map
+            .stmt_nodes
+            .insert(call.node_index().load(), id);
+        id
     }
 
     fn name(&self, name: &str) -> Name {
@@ -1058,6 +1066,15 @@ impl<'a> LoweringContext<'a> {
                 }
             }
             let id = self.alloc_param(param, range);
+            if let Some(parameter) = parameter {
+                let node = match parameter {
+                    py::AnyParameterRef::NonVariadic(param) => &param.parameter,
+                    py::AnyParameterRef::Variadic(param) => param,
+                };
+                self.source_map
+                    .param_nodes
+                    .insert(node.node_index().load(), id);
+            }
             if let Some(range) = comment_range {
                 self.source_map
                     .type_comment_owners
@@ -1236,7 +1253,6 @@ impl<'a> LoweringContext<'a> {
 
     fn alloc_param(&mut self, param: Param, range: starpls_syntax::TextRange) -> ParamId {
         let id = self.module.params.alloc(param);
-        self.source_map.param_map.insert(range, id);
         self.source_map.param_map_back.insert(id, range);
         id
     }
@@ -1247,7 +1263,6 @@ impl<'a> LoweringContext<'a> {
         range: starpls_syntax::TextRange,
     ) -> LoadItemId {
         let id = self.module.load_items.alloc(load_item);
-        self.source_map.load_item_map.insert(range, id);
         self.source_map.load_item_map_back.insert(id, range);
         id
     }

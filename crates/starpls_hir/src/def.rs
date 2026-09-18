@@ -15,7 +15,6 @@ use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
 use starpls_syntax::ast::BinaryOp;
 use starpls_syntax::ast::UnaryOp;
-use starpls_syntax::ast::{self};
 use starpls_syntax::TextRange;
 
 use crate::typeck::TypeRef;
@@ -62,6 +61,8 @@ pub(crate) struct ModuleSourceMap {
     pub root: TextRange,
     pub expr_nodes: FxHashMap<NodeIndex, ExprId>,
     pub stmt_nodes: FxHashMap<NodeIndex, StmtId>,
+    pub param_nodes: FxHashMap<NodeIndex, ParamId>,
+    pub load_item_nodes: FxHashMap<NodeIndex, LoadItemId>,
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
@@ -71,10 +72,16 @@ pub(crate) struct ModuleSourceMap {
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
     pub stmt_map: FxHashMap<TextRange, StmtId>,
     pub stmt_map_back: FxHashMap<StmtId, TextRange>,
-    pub param_map: FxHashMap<TextRange, ParamId>,
     pub param_map_back: FxHashMap<ParamId, TextRange>,
-    pub load_item_map: FxHashMap<TextRange, LoadItemId>,
     pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
+}
+
+pub(crate) fn load_item_node(item: ruff_python_ast::ArgOrKeyword<'_>) -> NodeIndex {
+    use ruff_python_ast::HasNodeIndex;
+    match item {
+        ruff_python_ast::ArgOrKeyword::Arg(expr) => expr.node_index().load(),
+        ruff_python_ast::ArgOrKeyword::Keyword(keyword) => keyword.node_index().load(),
+    }
 }
 
 /// The HIR declaration whose type is described by a comment.
@@ -90,6 +97,8 @@ impl ModuleSourceMap {
             root,
             expr_nodes: _,
             stmt_nodes: _,
+            param_nodes: _,
+            load_item_nodes: _,
             function_names: _,
             keyword_names: _,
             type_comment_owners: _,
@@ -97,9 +106,7 @@ impl ModuleSourceMap {
             expr_map_back,
             stmt_map: _,
             stmt_map_back,
-            param_map: _,
             param_map_back: _,
-            load_item_map: _,
             load_item_map_back: _,
         } = self;
         match hir {
@@ -462,14 +469,6 @@ impl Name {
 
     pub fn is_missing(&self) -> bool {
         &self.0 == "[missing name]"
-    }
-
-    pub fn from_ast_name(name: ast::Name) -> Self {
-        Self::from_str(name.name().as_ref().map_or_else(|| "", |name| name.text()))
-    }
-
-    pub fn from_ast_name_ref(name: ast::NameRef) -> Self {
-        Self::from_str(name.name().as_ref().map_or_else(|| "", |name| name.text()))
     }
 
     pub fn as_str(&self) -> &str {
