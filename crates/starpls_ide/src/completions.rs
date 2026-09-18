@@ -276,7 +276,7 @@ pub(crate) fn completions(
         CompletionAnalysis::String(StringContext::LoadItem { file_id, load_stmt }) => {
             let sema = Semantics::new(db);
             let file = file_id;
-            let loaded_file = sema.resolve_load_stmt(file, &load_stmt)?;
+            let loaded_file = sema.resolve_syntax_load_stmt(file, &load_stmt)?;
             let scope = sema.scope_for_module(loaded_file);
             for (name, def) in scope.exports() {
                 items.push(CompletionItem {
@@ -303,7 +303,7 @@ pub(crate) fn completions(
         CompletionAnalysis::String(StringContext::DictKey { file_id, lhs }) => {
             let sema = Semantics::new(db);
             let file = file_id;
-            let ty = sema.type_of_expr(file, &lhs)?;
+            let ty = sema.type_of_syntax_expr(file, &lhs)?;
 
             for key in ty.known_keys()?.into_iter() {
                 items.push(CompletionItem {
@@ -505,7 +505,7 @@ impl<'a> CompletionContext<'a> {
                 .and_then(|arg| arg.syntax().parent())
                 .and_then(ast::CallExpr::cast)
                 .and_then(|expr| expr.callee())
-                .and_then(|expr| sema.type_of_expr(file, &expr))
+                .and_then(|expr| sema.type_of_syntax_expr(file, &expr))
                 .map(|ty| {
                     ty.params()
                         .into_iter()
@@ -551,7 +551,7 @@ impl<'a> CompletionContext<'a> {
             let parent = name.syntax().parent()?;
             CompletionAnalysis::Name(if let Some(expr) = ast::DotExpr::cast(parent) {
                 NameContext::Dot {
-                    receiver_ty: sema.type_of_expr(file, &expr.expr()?)?,
+                    receiver_ty: sema.type_of_syntax_expr(file, &expr.expr()?)?,
                 }
             } else {
                 NameContext::Def

@@ -1,3 +1,4 @@
+use ruff_python_ast::find_node::covering_node;
 use ruff_text_size::Ranged;
 use starpls_common::File;
 use starpls_common::InFile;
@@ -5,14 +6,12 @@ use starpls_hir::LoadItem;
 use starpls_hir::Name;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::{self};
-use starpls_syntax::match_ast;
-use starpls_syntax::SyntaxToken;
+use starpls_syntax::source::string_value;
 use starpls_syntax::TextRange;
-use starpls_syntax::T;
 
-use crate::util::pick_best_token;
+use crate::selection::Selection;
+use crate::util::navigation_token;
+use crate::util::text_range;
 use crate::Database;
 use crate::FilePosition;
 use crate::LocationLink;
@@ -21,92 +20,87 @@ use crate::ResolvedPath;
 struct GotoDefinitionHandler<'a> {
     sema: Semantics<'a>,
     file: File,
-    token: SyntaxToken,
+    origin: TextRange,
     skip_re_exports: bool,
 }
 
-impl<'a> GotoDefinitionHandler<'a> {
-    fn new(
-        db: &'a Database,
-        FilePosition { file_id, pos }: FilePosition,
-        skip_re_exports: bool,
-    ) -> Option<Self> {
-        let sema = Semantics::new(db);
-        let file = file_id;
-        let parse = sema.parse(file);
-        let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
-            T![ident] => 2,
-            T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
-            kind if kind.is_trivia_token() => 0,
-            _ => 1,
-        })?;
-
-        Some(Self {
+impl GotoDefinitionHandler<'_> {
+    fn handle(&self, selection: Selection<'_>, source: &str) -> Option<Vec<LocationLink>> {
+        let Self {
             sema,
             file,
-            token,
-            skip_re_exports,
-        })
-    }
-
-    fn handle_goto_definition(&self) -> Option<Vec<LocationLink>> {
-        let parent = self.token.parent()?;
-
-        match_ast! {
-            match parent {
-                ast::NameRef(name_ref) => self.handle_name_ref(name_ref, self.skip_re_exports),
-                ast::Name(name) => {
-                    let parent = name.syntax().parent()?;
-                    match_ast! {
-                        match parent {
-                            ast::DotExpr(dot_expr) => self.handle_dot_expr(dot_expr),
-                            ast::KeywordArgument(arg) => self.handle_keyword_argument(arg),
-                            _ => None
-                        }
-                    }
-                },
-                ast::LoadModule(load_module) => self.handle_load_module(load_module),
-                ast::LoadItem(load_item) => self.handle_load_item(load_item, self.skip_re_exports),
-                ast::LiteralExpr(lit) => self.handle_literal_expr(lit),
-                _ => None
+            origin,
+            skip_re_exports: _,
+        } = self;
+        match selection {
+            Selection::Reference(name) => {
+                let scope = sema.scope_for_expr(*file, name.into())?;
+                Some(
+                    scope
+                        .resolve_name(&Name::from(name.id.as_str()))
+                        .into_iter()
+                        .filter_map(|def| {
+                            if let ScopeDef::LoadItem(item) = def {
+                                self.load_item_location(&item)
+                            } else {
+                                self.def_to_location_link(def)
+                            }
+                        })
+                        .collect(),
+                )
             }
+            Selection::Attribute(expr) => {
+                let ty = sema.type_of_expr(*file, expr.value.as_ref().into())?;
+                Some(vec![location_link(
+                    ty.field_definition(expr.attr.as_str())?,
+                )])
+            }
+            Selection::Keyword { keyword, call } => {
+                let callable = sema.resolve_call_expr(*file, call)?;
+                Some(vec![location_link(
+                    callable.keyword_definition(keyword.arg.as_ref()?.as_str())?,
+                )])
+            }
+            Selection::LoadModule(call) => Some(vec![LocationLink::Local {
+                origin_selection_range: Some(*origin),
+                target_range: Default::default(),
+                target_selection_range: Default::default(),
+                target_file_id: sema.resolve_load_stmt(*file, call)?,
+            }]),
+            Selection::LoadItem(item) => {
+                let item = sema.resolve_load_item(*file, item)?;
+                self.load_item_location(&item)
+                    .map(|location| vec![location])
+            }
+            Selection::String(expr) => {
+                // The node must belong to Starlark lowering, not to an ignored
+                // Python-only annotation or unsupported statement subtree.
+                if !sema.contains_expr(*file, expr.into()) {
+                    return None;
+                }
+                let (value, _) = string_value(&source[expr.range()])?;
+                self.string_location(&value)
+            }
+            Selection::Definition(_) => None,
+            Selection::Parameter(_) => None,
         }
     }
 
-    fn handle_name_ref(
-        &self,
-        name_ref: ast::NameRef,
-        skip_re_exports: bool,
-    ) -> Option<Vec<LocationLink>> {
-        let name = Name::from_ast_name_ref(name_ref.clone());
-        let scope = self.sema.scope_for_syntax_expr(
-            self.file,
-            &ast::Expression::cast(name_ref.syntax().clone())?,
-        )?;
-        Some(
-            scope
-                .resolve_name(&name)
-                .into_iter()
-                .flat_map(|def| match def {
-                    ScopeDef::LoadItem(load_item) => {
-                        if skip_re_exports {
-                            self.try_resolve_re_export(&load_item)
-                        } else {
-                            let def = load_item.definition()?;
-                            self.def_to_location_link(def)
-                        }
-                    }
-                    _ => self.def_to_location_link(def),
-                })
-                .collect(),
-        )
+    fn load_item_location(&self, item: &LoadItem<'_>) -> Option<LocationLink> {
+        let Self {
+            sema: _,
+            file: _,
+            origin: _,
+            skip_re_exports,
+        } = self;
+        if *skip_re_exports {
+            self.try_resolve_re_export(item)
+        } else {
+            self.def_to_location_link(item.definition()?)
+        }
     }
 
-    // Re-exporting symbols is a common pattern in Starlark, but the default
-    // behavior in this scenario isn't ideal from a UX perspective - the user
-    // might need to issue multiple "Go to Definition" commands to get to
-    // the actual definition of a re-exported symbol.
-    fn try_resolve_re_export(&self, load_item: &LoadItem) -> Option<LocationLink> {
+    fn try_resolve_re_export(&self, load_item: &LoadItem<'_>) -> Option<LocationLink> {
         let def = load_item.definition()?;
         if let ScopeDef::Variable(variable) = &def {
             if let Some(item) = variable.re_export() {
@@ -118,95 +112,41 @@ impl<'a> GotoDefinitionHandler<'a> {
         self.def_to_location_link(def)
     }
 
-    fn handle_dot_expr(&self, dot_expr: ast::DotExpr) -> Option<Vec<LocationLink>> {
-        let ty = self.sema.type_of_expr(self.file, &dot_expr.expr()?)?;
-        let source = ty.field_definition(self.token.text())?;
-        Some(vec![location_link(source)])
-    }
-
-    fn handle_keyword_argument(&self, arg: ast::KeywordArgument) -> Option<Vec<LocationLink>> {
-        let call_expr = arg
-            .syntax()
-            .parent()
-            .and_then(ast::Arguments::cast)
-            .and_then(|args| args.syntax().parent())
-            .and_then(ast::CallExpr::cast)?;
-        let callable = self.sema.resolve_call_expr(self.file, &call_expr)?;
-        let name = arg.name()?.name()?;
-        let source = callable.keyword_definition(name.text())?;
-        Some(vec![location_link(source)])
-    }
-
-    fn handle_load_module(&self, load_module: ast::LoadModule) -> Option<Vec<LocationLink>> {
-        let load_stmt = ast::LoadStmt::cast(load_module.syntax().parent()?)?;
-        let file = self.sema.resolve_load_stmt(self.file, &load_stmt)?;
-        Some(vec![LocationLink::Local {
-            origin_selection_range: Some(self.token.text_range()),
-            target_range: Default::default(),
-            target_selection_range: Default::default(),
-            target_file_id: file,
-        }])
-    }
-
-    fn handle_load_item(
-        &self,
-        load_item: ast::LoadItem,
-        skip_re_exports: bool,
-    ) -> Option<Vec<LocationLink>> {
-        let load_item = self.sema.resolve_load_item(self.file, &load_item)?;
-        if skip_re_exports {
-            self.try_resolve_re_export(&load_item)
-        } else {
-            let def = load_item.definition()?;
-            self.def_to_location_link(def)
-        }
-        .map(|loc| vec![loc])
-    }
-
-    fn handle_literal_expr(&self, lit: ast::LiteralExpr) -> Option<Vec<LocationLink>> {
-        let value = match lit.kind() {
-            ast::LiteralKind::String(s) => s.value()?,
-            _ => return None,
-        };
-        let resolved_path = self
-            .sema
-            .db
-            .resolve_path(&value, self.file.dialect, self.file)
-            .ok()??;
-
-        match resolved_path {
+    fn string_location(&self, value: &str) -> Option<Vec<LocationLink>> {
+        let Self {
+            sema,
+            file,
+            origin,
+            skip_re_exports: _,
+        } = self;
+        match sema.db.resolve_path(value, file.dialect, *file).ok()?? {
             ResolvedPath::Source { path } => path.try_exists().ok()?.then(|| {
                 vec![LocationLink::External {
-                    origin_selection_range: Some(self.token.text_range()),
+                    origin_selection_range: Some(*origin),
                     target_path: path,
                 }]
             }),
-            ResolvedPath::BuildTarget {
-                build_file: build_file_id,
-                target,
-            } => {
-                let source = build_file_id.contents(self.sema.db);
-                let parsed =
-                    starpls_common::parsed_module(self.sema.db, build_file_id).load(self.sema.db);
+            ResolvedPath::BuildTarget { build_file, target } => {
+                let source = build_file.contents(sema.db);
+                let parsed = starpls_common::parsed_module(sema.db, build_file).load(sema.db);
                 let range = crate::build_targets::calls(parsed.syntax(), parsed.tokens())
                     .find(|call| {
                         crate::build_targets::names(call, &source, parsed.tokens())
                             .any(|name| *name == target)
                     })
-                    .map(|call| crate::util::text_range(call.range()))
+                    .map(|call| text_range(call.range()))
                     .unwrap_or_default();
-
                 Some(vec![LocationLink::Local {
-                    origin_selection_range: Some(self.token.text_range()),
+                    origin_selection_range: Some(*origin),
                     target_range: range,
                     target_selection_range: range,
-                    target_file_id: build_file_id,
+                    target_file_id: build_file,
                 }])
             }
         }
     }
 
-    fn def_to_location_link(&self, def: ScopeDef) -> Option<LocationLink> {
+    fn def_to_location_link(&self, def: ScopeDef<'_>) -> Option<LocationLink> {
         Some(location_link(def.definition_range()?))
     }
 }
@@ -222,10 +162,32 @@ fn location_link(InFile { file, value: range }: InFile<TextRange>) -> LocationLi
 
 pub(crate) fn goto_definition(
     db: &Database,
-    pos: FilePosition,
+    FilePosition { file_id: file, pos }: FilePosition,
     skip_re_exports: bool,
 ) -> Option<Vec<LocationLink>> {
-    GotoDefinitionHandler::new(db, pos, skip_re_exports)?.handle_goto_definition()
+    let sema = Semantics::new(db);
+    let source = file.contents(db);
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let token = navigation_token(&source, parsed.tokens(), u32::from(pos).into())?;
+    if crate::selection::type_comment_at_cursor(
+        starpls_common::syntax_info(db, file),
+        u32::from(pos).into(),
+        token,
+        &source,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    let node = covering_node(parsed.syntax().into(), token.range());
+    let selection = crate::selection::classify(&node, token.range())?;
+    GotoDefinitionHandler {
+        sema,
+        file,
+        origin: text_range(token.range()),
+        skip_re_exports,
+    }
+    .handle(selection, &source)
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ pub(crate) fn signature_help(
 
     // Find the argument node containing the current token.
     let expr = token.parent_ancestors().find_map(ast::CallExpr::cast)?;
-    let func = sema.resolve_call_expr(file, &expr)?;
+    let func = sema.resolve_syntax_call_expr(file, &expr)?;
     let params = func.params();
     let param_labels: Vec<String> = params
         .iter()

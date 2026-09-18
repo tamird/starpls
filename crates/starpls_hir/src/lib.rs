@@ -8,8 +8,11 @@ use def::scope::ParameterDef;
 use def::Function;
 use def::LoadItemId;
 use def::Stmt;
+use ruff_python_ast::ArgOrKeyword;
+use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprRef;
 use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::Parameter;
 use ruff_python_ast::StmtFunctionDef;
 use smallvec::SmallVec;
 use starpls_bazel::Builtins;
@@ -191,15 +194,16 @@ impl<'a> Semantics<'a> {
         parse(self.db, file)
     }
 
-    pub fn resolve_path_type(&self, file: File, node: &ast::PathType) -> Option<Type<'a>> {
-        let usage = node
-            .syntax()
-            .ancestors()
-            .find_map(ast::TypeComment::cast)
-            .and_then(|comment| {
-                let owner = source_map(self.db, file)
-                    .type_comment_owners
-                    .get(&comment.syntax().text_range())?;
+    pub fn resolve_path_type(
+        &self,
+        file: File,
+        comment_range: TextRange,
+        node: &ast::PathType,
+    ) -> Option<Type<'a>> {
+        let usage = source_map(self.db, file)
+            .type_comment_owners
+            .get(&comment_range)
+            .and_then(|owner| {
                 let value = match owner {
                     TypeCommentOwner::Statement(stmt) => *stmt,
                     TypeCommentOwner::Parameter(param) => {
@@ -219,8 +223,23 @@ impl<'a> Semantics<'a> {
         ))
     }
 
-    pub fn resolve_call_expr(&self, file: File, expr: &ast::CallExpr) -> Option<Callable<'a>> {
-        let ty = self.type_of_expr(file, &expr.callee()?)?;
+    /// Resolve a call from the canonical parsed revision of `file`.
+    pub fn resolve_call_expr(&self, file: File, expr: &ExprCall) -> Option<Callable<'a>> {
+        let ty = self.type_of_expr(file, expr.func.as_ref().into())?;
+        self.callable_from_type(ty)
+    }
+
+    /// Temporary entry point for editor consumers still using Rowan.
+    pub fn resolve_syntax_call_expr(
+        &self,
+        file: File,
+        expr: &ast::CallExpr,
+    ) -> Option<Callable<'a>> {
+        let ty = self.type_of_syntax_expr(file, &expr.callee()?)?;
+        self.callable_from_type(ty)
+    }
+
+    fn callable_from_type(&self, ty: Type<'a>) -> Option<Callable<'a>> {
         Some(match ty.ty.kind() {
             TyKind::Function(def) => Callable::new(*self, CallableInner::HirDef(def.clone())),
             TyKind::IntrinsicFunction(func, subst) => Callable::new(
@@ -252,14 +271,6 @@ impl<'a> Semantics<'a> {
         self.callable_for_stmt(file, stmt)
     }
 
-    /// Temporary entry point for editor consumers still using Rowan.
-    pub fn resolve_syntax_def_stmt(&self, file: File, node: &ast::DefStmt) -> Option<Callable<'a>> {
-        let stmt = *source_map(self.db, file)
-            .stmt_map
-            .get(&node.syntax().text_range())?;
-        self.callable_for_stmt(file, stmt)
-    }
-
     fn callable_for_stmt(&self, file: File, stmt: def::StmtId) -> Option<Callable<'a>> {
         let Self { db } = self;
         let Stmt::Def { func, stmts: _ } = &module(*db, file)[stmt] else {
@@ -274,21 +285,35 @@ impl<'a> Semantics<'a> {
         ))
     }
 
-    pub fn type_of_expr(&self, file: File, expr: &ast::Expression) -> Option<Type<'a>> {
+    /// Infer an expression from the canonical parsed revision of `file`.
+    pub fn type_of_expr(&self, file: File, expr: ExprRef<'_>) -> Option<Type<'a>> {
+        let Self { db } = self;
+        let expr = *source_map(*db, file)
+            .expr_nodes
+            .get(&expr.node_index().load())?;
+        Some(Type::new(*self, queries::infer_expr(*db, file, expr)))
+    }
+
+    /// Whether an expression in the canonical parse belongs to Starlark HIR.
+    pub fn contains_expr(&self, file: File, expr: ExprRef<'_>) -> bool {
+        source_map(self.db, file)
+            .expr_nodes
+            .contains_key(&expr.node_index().load())
+    }
+
+    /// Temporary entry point for editor consumers still using Rowan.
+    pub fn type_of_syntax_expr(&self, file: File, expr: &ast::Expression) -> Option<Type<'a>> {
         let range = expr.syntax().text_range();
         let expr = source_map(self.db, file).expr_map.get(&range)?;
         Some(Type::new(*self, queries::infer_expr(self.db, file, *expr)))
     }
 
-    pub fn resolve_param(
-        &self,
-        file: File,
-        param: &ast::Parameter,
-    ) -> Option<(Param<'a>, Type<'a>)> {
+    /// Resolve a parameter from the canonical parsed revision of `file`.
+    pub fn resolve_param(&self, file: File, param: &Parameter) -> Option<(Param<'a>, Type<'a>)> {
         let module = module(self.db, file);
         let param = source_map(self.db, file)
-            .param_map
-            .get(&param.syntax().text_range())?;
+            .param_nodes
+            .get(&param.node_index().load())?;
         let (func, index) = module
             .param_to_def_stmt
             .get(param)
@@ -308,19 +333,43 @@ impl<'a> Semantics<'a> {
         ))
     }
 
-    pub fn resolve_load_stmt(&self, file: File, load_stmt: &ast::LoadStmt) -> Option<File> {
-        let range = load_stmt.syntax().text_range();
-        let stmt = source_map(self.db, file).stmt_map.get(&range)?;
-        let load_stmt = match module(self.db, file)[*stmt] {
-            Stmt::Load { ref load_stmt, .. } => load_stmt.clone(),
-            _ => return None,
-        };
-        queries::resolve_load_stmt(self.db, file, load_stmt)
+    /// Resolve a load call from the canonical parsed revision of `file`.
+    pub fn resolve_load_stmt(&self, file: File, node: &ExprCall) -> Option<File> {
+        let stmt = *source_map(self.db, file)
+            .stmt_nodes
+            .get(&node.node_index().load())?;
+        self.loaded_file(file, stmt)
     }
 
-    pub fn resolve_load_item(&self, file: File, load_item: &ast::LoadItem) -> Option<LoadItem<'a>> {
-        let range = load_item.syntax().text_range();
-        let load_item = source_map(self.db, file).load_item_map.get(&range)?;
+    /// Temporary entry point for completion's Rowan marker parse.
+    pub fn resolve_syntax_load_stmt(&self, file: File, node: &ast::LoadStmt) -> Option<File> {
+        let stmt = *source_map(self.db, file)
+            .stmt_map
+            .get(&node.syntax().text_range())?;
+        self.loaded_file(file, stmt)
+    }
+
+    fn loaded_file(&self, file: File, stmt: def::StmtId) -> Option<File> {
+        let Self { db } = self;
+        let Stmt::Load {
+            load_stmt,
+            items: _,
+        } = &module(*db, file)[stmt]
+        else {
+            return None;
+        };
+        queries::resolve_load_stmt(*db, file, load_stmt.clone())
+    }
+
+    /// Resolve a load argument from the canonical parsed revision of `file`.
+    pub fn resolve_load_item(
+        &self,
+        file: File,
+        load_item: ArgOrKeyword<'_>,
+    ) -> Option<LoadItem<'a>> {
+        let load_item = source_map(self.db, file)
+            .load_item_nodes
+            .get(&def::load_item_node(load_item))?;
         Some(LoadItem {
             sema: *self,
             id: InFile {
@@ -343,18 +392,6 @@ impl<'a> Semantics<'a> {
         let expr = *source_map(self.db, file)
             .expr_nodes
             .get(&expr.node_index().load())?;
-        Some(self.scope_for_hir_expr(file, expr))
-    }
-
-    /// Temporary entry point for editor consumers still using Rowan.
-    pub fn scope_for_syntax_expr(
-        &self,
-        file: File,
-        expr: &ast::Expression,
-    ) -> Option<SemanticsScope<'a>> {
-        let expr = *source_map(self.db, file)
-            .expr_map
-            .get(&expr.syntax().text_range())?;
         Some(self.scope_for_hir_expr(file, expr))
     }
 

@@ -49,6 +49,7 @@ mod document_symbols;
 mod find_references;
 mod goto_definition;
 mod hover;
+mod selection;
 mod show_hir;
 mod show_syntax_tree;
 mod signature_help;

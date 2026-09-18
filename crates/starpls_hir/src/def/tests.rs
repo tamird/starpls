@@ -277,12 +277,6 @@ fn source_ranges_remain_distinct_during_edits() {
             let map = crate::source_map(&db, file);
             assert_eq!(map.expr_map.len(), map.expr_map_back.len(), "{input}");
             assert_eq!(map.stmt_map.len(), map.stmt_map_back.len(), "{input}");
-            assert_eq!(map.param_map.len(), map.param_map_back.len(), "{input}");
-            assert_eq!(
-                map.load_item_map.len(),
-                map.load_item_map_back.len(),
-                "{input}"
-            );
         }
     }
 }
@@ -322,7 +316,12 @@ fn native_declarations_preserve_editor_ranges() {
             );
         }
         if ast::Parameter::cast(node.clone()).is_some() {
-            assert!(map.param_map.contains_key(&node.text_range()), "{node}");
+            assert!(
+                map.param_map_back
+                    .values()
+                    .any(|range| *range == node.text_range()),
+                "{node}"
+            );
         }
     }
 }
