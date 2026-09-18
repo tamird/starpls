@@ -1086,8 +1086,7 @@ pub(crate) fn lower_query(
         dialect,
         info,
     };
-    let parse = parse(db, file);
-    let (module, source_map) = Module::new_with_source_map(db, file, parse.tree());
+    let (module, source_map) = Module::new_with_source_map(db, file);
     ModuleInfo {
         file,
         module,

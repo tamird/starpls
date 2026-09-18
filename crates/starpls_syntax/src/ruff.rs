@@ -20,9 +20,7 @@ use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 
-use crate::parser::build_type_comment;
 use crate::StarlarkLanguage;
-use crate::SyntaxError;
 use crate::SyntaxKind;
 use crate::SyntaxKind::*;
 
@@ -52,9 +50,8 @@ impl Node {
 pub(super) fn parse(
     source: &str,
     parsed: &Parsed<py::ModModule>,
-    errors: &mut dyn FnMut(SyntaxError),
+    comments: &[crate::TypeComment],
 ) -> GreenNode {
-    crate::validation::validate(source, parsed, errors);
     let mut adapter = Adapter {
         tokens: parsed.tokens(),
     };
@@ -71,7 +68,7 @@ pub(super) fn parse(
         tokens: parsed.tokens().iter().copied().peekable(),
         offset: TextSize::new(0),
         builder: &mut builder,
-        errors,
+        comments: comments.iter(),
     };
     writer.node(root);
     builder.finish()
@@ -231,45 +228,13 @@ impl Adapter<'_> {
         fallback_end: TextSize,
         next_clause: Option<TextSize>,
     ) -> Node {
-        let fallback_end = next_clause.map_or(fallback_end, |next| fallback_end.min(next));
-        let header_end = body
-            .first()
-            .map_or(fallback_end, Ranged::start)
-            .min(fallback_end)
-            .max(after);
-        let header = self.tokens.in_range(TextRange::new(after, header_end));
-        let Some(colon) = header.iter().find(|token| token.kind() == TokenKind::Colon) else {
+        let Some(range) =
+            crate::source::suite_range(self.tokens, body, after, fallback_end, next_clause)
+        else {
             return Node::leaf(SUITE, TextRange::empty(after));
         };
-        let start = colon.end();
-        let Some(first) = body.first() else {
-            return Node::leaf(SUITE, TextRange::new(start, fallback_end.max(start)));
-        };
-        let mut depth = 0;
-        let mut end = fallback_end;
-        for token in self.tokens.after(start) {
-            let boundary = match token.kind() {
-                TokenKind::Indent => {
-                    depth += 1;
-                    None
-                }
-                TokenKind::Dedent => {
-                    depth -= 1;
-                    (depth == 0).then_some(token.start())
-                }
-                TokenKind::Newline => {
-                    (depth == 0 && first.start() < token.start()).then_some(token.end())
-                }
-                _ => None,
-            };
-            if let Some(boundary) = boundary {
-                // Recovery may omit a dedent. Never consume a later clause.
-                end = next_clause.map_or(boundary, |next| boundary.min(next));
-                break;
-            }
-        }
         let children = body.iter().map(|stmt| self.statement(stmt)).collect();
-        Node::new(SUITE, TextRange::new(start, end.max(start)), children)
+        Node::new(SUITE, range, children)
     }
 
     fn loop_variables(&mut self, target: &Expr, parent: AnyNodeRef<'_>) -> Node {
@@ -313,21 +278,13 @@ impl Adapter<'_> {
     }
 
     fn parameters(&mut self, parameters: &py::Parameters) -> Node {
-        let py::Parameters {
-            node_index: _,
-            range,
-            posonlyargs: _,
-            args,
-            vararg,
-            kwonlyargs,
-            kwarg,
-        } = parameters;
         let mut children = Vec::new();
         for parameter in parameters.iter_source_order() {
+            let range = crate::source::parameter_range(parameter, parameters, self.tokens);
             let node = match parameter {
                 py::AnyParameterRef::NonVariadic(param) => {
                     let py::ParameterWithDefault {
-                        range,
+                        range: _,
                         node_index: _,
                         parameter,
                         default,
@@ -336,24 +293,13 @@ impl Adapter<'_> {
                     if let Some(default) = default {
                         children.push(self.expr(default, param.into()));
                     }
-                    Node::new(SIMPLE_PARAMETER, *range, children)
+                    Node::new(SIMPLE_PARAMETER, range, children)
                 }
                 py::AnyParameterRef::Variadic(param) => {
-                    let is_kwargs = kwarg
+                    let is_kwargs = parameters
+                        .kwarg
                         .as_deref()
                         .is_some_and(|kwargs| kwargs.range() == param.range());
-                    let marker = if is_kwargs {
-                        TokenKind::DoubleStar
-                    } else {
-                        TokenKind::Star
-                    };
-                    let start = self
-                        .tokens
-                        .before(param.name.start())
-                        .iter()
-                        .rev()
-                        .find(|token| token.kind() == marker)
-                        .map_or(param.start(), Ranged::start);
                     let name = self.parameter_name(param);
                     Node::new(
                         if is_kwargs {
@@ -361,27 +307,18 @@ impl Adapter<'_> {
                         } else {
                             ARGS_LIST_PARAMETER
                         },
-                        TextRange::new(start, param.end()),
+                        range,
                         vec![name],
                     )
                 }
             };
             children.push(node);
         }
-        if vararg.is_none() && !kwonlyargs.is_empty() {
-            let start = args.last().map_or(range.start(), Ranged::end);
-            let end = kwonlyargs[0].start();
-            if let Some(star) = self
-                .tokens
-                .in_range(TextRange::new(start, end))
-                .iter()
-                .find(|token| token.kind() == TokenKind::Star)
-            {
-                children.push(Node::leaf(ARGS_LIST_PARAMETER, star.range()));
-            }
+        if let Some(range) = crate::source::bare_star_range(parameters, self.tokens) {
+            children.push(Node::leaf(ARGS_LIST_PARAMETER, range));
         }
         children.sort_by_key(|child| child.range.start());
-        Node::new(PARAMETERS, *range, children)
+        Node::new(PARAMETERS, parameters.range(), children)
     }
 
     fn parameter_name(&mut self, param: &py::Parameter) -> Node {
@@ -715,7 +652,7 @@ struct Writer<'a, 'b> {
     tokens: std::iter::Peekable<std::iter::Copied<std::slice::Iter<'a, Token>>>,
     offset: TextSize,
     builder: &'b mut GreenNodeBuilder<'static>,
-    errors: &'b mut dyn FnMut(SyntaxError),
+    comments: std::slice::Iter<'a, crate::TypeComment>,
 }
 
 impl Writer<'_, '_> {
@@ -767,7 +704,25 @@ impl Writer<'_, '_> {
             let text = &self.source[token.range()];
             let kind = token_kind(token, text);
             if kind == COMMENT && text.starts_with("# type: ") {
-                build_type_comment(self.builder, text, usize::from(token.start()), self.errors);
+                let comment = self.comments.next().expect("parsed type comment");
+                debug_assert_eq!(comment.range, token.range());
+                for event in comment.parsed.syntax().preorder_with_tokens() {
+                    match event {
+                        rowan::WalkEvent::Enter(element) => match element {
+                            rowan::NodeOrToken::Node(node) => self
+                                .builder
+                                .start_node(StarlarkLanguage::kind_to_raw(node.kind())),
+                            rowan::NodeOrToken::Token(token) => self
+                                .builder
+                                .token(StarlarkLanguage::kind_to_raw(token.kind()), token.text()),
+                        },
+                        rowan::WalkEvent::Leave(element) => {
+                            if element.as_node().is_some() {
+                                self.builder.finish_node();
+                            }
+                        }
+                    }
+                }
             } else {
                 self.builder
                     .token(StarlarkLanguage::kind_to_raw(kind), text);

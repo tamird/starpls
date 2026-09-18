@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use ruff_source_file::LineIndex;
 use salsa::Accumulator;
 use starpls_bazel::APIContext;
-use starpls_syntax::from_parsed_module;
+use starpls_syntax::editor_tree;
 use starpls_syntax::Module;
 use starpls_syntax::ParseTree;
 pub use system::DocumentStamp;
@@ -220,6 +220,29 @@ fn parse_query(
         dialect,
         info,
     };
+    let comments = syntax_info(db, file);
+    let contents = file.contents(db);
+    let parsed = parsed_module(db, file).load(db);
+    editor_tree(&contents, &parsed, comments)
+}
+
+/// Language validation and type comments independent of the module editor tree.
+pub fn syntax_info(db: &dyn Db, file: File) -> &[starpls_syntax::TypeComment] {
+    syntax_info_query(db, file.source, (file.dialect, file.info))
+}
+
+#[salsa::tracked(returns(ref))]
+fn syntax_info_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (Dialect, Option<FileInfo>),
+) -> Vec<starpls_syntax::TypeComment> {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     let contents = file.contents(db);
     if let Some(error) = contents.read_error() {
         Diagnostics(diagnostic(
@@ -233,7 +256,7 @@ fn parse_query(
         .accumulate(db);
     }
     let parsed = parsed_module(db, file).load(db);
-    from_parsed_module(&contents, &parsed, &mut |err| {
+    let mut errors = |err: starpls_syntax::SyntaxError| {
         Diagnostics(diagnostic(
             file,
             DiagnosticId::InvalidSyntax,
@@ -242,8 +265,10 @@ fn parse_query(
             err.message,
             [],
         ))
-        .accumulate(db)
-    })
+        .accumulate(db);
+    };
+    starpls_syntax::validate(&contents, &parsed, &mut errors);
+    starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors)
 }
 
 pub fn line_index(db: &dyn Db, file: File) -> LineIndex {

@@ -2536,3 +2536,16 @@ def possibly_empty(xs):
         "#]],
     );
 }
+
+#[test]
+fn test_prefixed_integer_values() {
+    check_infer(
+        "0x10\n0X2a\n0o17\n0O20\n",
+        expect![[r#"
+        0..4 "0x10": Literal[16]
+        5..9 "0X2a": Literal[42]
+        10..14 "0o17": Literal[15]
+        15..19 "0O20": Literal[16]
+    "#]],
+    );
+}

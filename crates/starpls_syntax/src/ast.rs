@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::fmt::Write;
 use std::marker::PhantomData;
-use std::str::Chars;
 
 pub use rowan::ast::AstNode;
 pub use rowan::ast::AstPtr;
@@ -347,30 +346,6 @@ impl AssignStmt {
         children(self.syntax()).nth(1)
     }
 
-    pub fn assign_op_info(&self) -> Option<(SyntaxToken, AssignOp)> {
-        self.syntax()
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find_map(|token| {
-                let op = match token.kind() {
-                    T![=] => AssignOp::Normal,
-                    T![+=] => AssignOp::Arith(ArithAssignOp::Add),
-                    T![-=] => AssignOp::Arith(ArithAssignOp::Sub),
-                    T![*=] => AssignOp::Arith(ArithAssignOp::Mul),
-                    T![/=] => AssignOp::Arith(ArithAssignOp::Div),
-                    T!["//="] => AssignOp::Arith(ArithAssignOp::Flr),
-                    T![%=] => AssignOp::Arith(ArithAssignOp::Mod),
-                    T![&=] => AssignOp::Bitwise(BitwiseAssignOp::And),
-                    T![|=] => AssignOp::Bitwise(BitwiseAssignOp::Or),
-                    T![>>=] => AssignOp::Bitwise(BitwiseAssignOp::Shl),
-                    T![<<=] => AssignOp::Bitwise(BitwiseAssignOp::Shr),
-                    T![^=] => AssignOp::Bitwise(BitwiseAssignOp::Xor),
-                    _ => return None,
-                };
-                Some((token, op))
-            })
-    }
-
     pub fn type_comment(&self) -> Option<TypeComment> {
         self.syntax
             .siblings_with_tokens(Direction::Next)
@@ -564,24 +539,6 @@ ast_node! {
     child expr -> Expression;
 }
 
-impl UnaryExpr {
-    pub fn unary_op_info(&self) -> Option<(SyntaxToken, UnaryOp)> {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find_map(|token| {
-                let op = match token.kind() {
-                    T![+] => UnaryOp::Arith(UnaryArithOp::Add),
-                    T![-] => UnaryOp::Arith(UnaryArithOp::Sub),
-                    T![~] => UnaryOp::Inv,
-                    T![not] => UnaryOp::Not,
-                    _ => return None,
-                };
-                Some((token, op))
-            })
-    }
-}
-
 ast_node! {
     BinaryExpr => BINARY_EXPR
     child lhs -> Expression;
@@ -590,39 +547,6 @@ ast_node! {
 impl BinaryExpr {
     pub fn rhs(&self) -> Option<Expression> {
         children(self.syntax()).nth(1)
-    }
-
-    pub fn binary_op_info(&self) -> Option<(SyntaxToken, BinaryOp)> {
-        self.syntax
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find_map(|token| {
-                let op = match token.kind() {
-                    T![+] => BinaryOp::Arith(ArithOp::Add),
-                    T![-] => BinaryOp::Arith(ArithOp::Sub),
-                    T![*] => BinaryOp::Arith(ArithOp::Mul),
-                    T![/] => BinaryOp::Arith(ArithOp::Div),
-                    T!["//"] => BinaryOp::Arith(ArithOp::Flr),
-                    T![%] => BinaryOp::Arith(ArithOp::Mod),
-                    T![&] => BinaryOp::Bitwise(BitwiseOp::And),
-                    T![|] => BinaryOp::Bitwise(BitwiseOp::Or),
-                    T![^] => BinaryOp::Bitwise(BitwiseOp::Xor),
-                    T![<<] => BinaryOp::Bitwise(BitwiseOp::Shl),
-                    T![>>] => BinaryOp::Bitwise(BitwiseOp::Shr),
-                    T![==] => BinaryOp::Cmp(CmpOp::Eq),
-                    T![!=] => BinaryOp::Cmp(CmpOp::Ne),
-                    T![<] => BinaryOp::Cmp(CmpOp::Lt),
-                    T![>] => BinaryOp::Cmp(CmpOp::Gt),
-                    T![<=] => BinaryOp::Cmp(CmpOp::Le),
-                    T![>=] => BinaryOp::Cmp(CmpOp::Ge),
-                    T![and] => BinaryOp::Logic(LogicOp::And),
-                    T![or] => BinaryOp::Logic(LogicOp::Or),
-                    T![in] => BinaryOp::MemberOp(MemberOp::In),
-                    T![not] => BinaryOp::MemberOp(MemberOp::NotIn),
-                    _ => return None,
-                };
-                Some((token, op))
-            })
     }
 }
 
@@ -1213,23 +1137,6 @@ ast_token! {
     Int => INT
 }
 
-impl Int {
-    pub fn value(&self) -> Option<u64> {
-        let text = self.syntax.text();
-        if let Some(stripped) = text.strip_prefix('0') {
-            return Some(if text.len() == 1 {
-                0
-            } else {
-                u64::from_str_radix(stripped, 8).ok()?
-            });
-        }
-        if let Some(stripped) = text.strip_prefix("0x") {
-            return u64::from_str_radix(stripped, 16).ok();
-        }
-        text.parse::<u64>().ok()
-    }
-}
-
 ast_token! {
     Float => FLOAT
 }
@@ -1240,85 +1147,7 @@ ast_token! {
 
 impl String {
     pub fn value_and_offset(&self) -> Option<(Box<str>, u32)> {
-        let mut cursor = Cursor::new(self.text());
-        let mut is_raw = false;
-        let mut is_bytes = false;
-
-        // Determine the string's prefix.
-        // "r" -> raw string
-        // "b" -> bytes
-        // "rb", "br" -> raw bytes
-        match cursor.first() {
-            Some('r') => {
-                is_raw = true;
-                cursor.bump();
-                if let Some('b') = cursor.first() {
-                    is_bytes = true;
-                    cursor.bump();
-                }
-            }
-            Some('b') => {
-                is_bytes = true;
-                cursor.bump();
-                if let Some('r') = cursor.first() {
-                    is_raw = true;
-                    cursor.bump();
-                }
-            }
-            None => return None,
-            _ => {}
-        }
-
-        // Determine the opening quote, whether the string literal is triple
-        // quoted, and if it's terminated.
-        let suffix = match cursor.first() {
-            Some('\'') => {
-                cursor.bump();
-                match (cursor.first(), cursor.second()) {
-                    (Some('\''), Some('\'')) => {
-                        cursor.bump();
-                        cursor.bump();
-                        "'''"
-                    }
-                    _ => "'",
-                }
-            }
-            Some('"') => {
-                cursor.bump();
-                match (cursor.first(), cursor.second()) {
-                    (Some('"'), Some('"')) => {
-                        cursor.bump();
-                        cursor.bump();
-                        "\"\"\""
-                    }
-                    _ => "\"",
-                }
-            }
-            _ => return None,
-        };
-
-        if is_bytes || !cursor.text().ends_with(suffix) {
-            return None;
-        }
-
-        let mut ok = true;
-        let mut s = std::string::String::new();
-        crate::unescape::unescape_string(
-            &cursor.text()[..cursor.text().len() - suffix.len()],
-            is_raw,
-            suffix.len() == 3,
-            &mut |_, res| match res {
-                Ok(c) => s.push(c),
-                Err(_) => ok = false,
-            },
-        );
-
-        ok.then(|| {
-            (
-                s.into_boxed_str(),
-                (self.text().len() - cursor.text().len()) as u32,
-            )
-        })
+        crate::source::string_value(self.text())
     }
 
     pub fn value(&self) -> Option<Box<str>> {
@@ -1514,34 +1343,4 @@ ast_node! {
 ast_node! {
     KwargsDictParameterType => KWARGS_DICT_PARAMETER_TYPE
     child type_ -> Type;
-}
-
-struct Cursor<'a> {
-    chars: Chars<'a>,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(text: &'a str) -> Self {
-        Cursor {
-            chars: text.chars(),
-        }
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        self.chars.next()
-    }
-
-    fn first(&self) -> Option<char> {
-        self.chars.clone().next()
-    }
-
-    fn second(&self) -> Option<char> {
-        let mut chars = self.chars.clone();
-        chars.next();
-        chars.next()
-    }
-
-    fn text(&self) -> &str {
-        self.chars.as_str()
-    }
 }

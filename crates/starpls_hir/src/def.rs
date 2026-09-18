@@ -83,21 +83,31 @@ pub(crate) enum TypeCommentOwner {
 
 impl ModuleSourceMap {
     pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
+        let Self {
+            root,
+            function_names: _,
+            keyword_names: _,
+            type_comment_owners: _,
+            expr_map: _,
+            expr_map_back,
+            stmt_map: _,
+            stmt_map_back,
+            param_map: _,
+            param_map_back: _,
+            load_item_map: _,
+            load_item_map_back: _,
+        } = self;
         match hir {
-            scope::ScopeHirId::Module => self.root,
-            scope::ScopeHirId::Expr(expr) => self.expr_map_back[&expr],
-            scope::ScopeHirId::Stmt(stmt) => self.stmt_map_back[&stmt],
+            scope::ScopeHirId::Module => *root,
+            scope::ScopeHirId::Expr(expr) => expr_map_back[&expr],
+            scope::ScopeHirId::Stmt(stmt) => stmt_map_back[&stmt],
         }
     }
 }
 
 impl Module {
-    pub(crate) fn new_with_source_map(
-        db: &dyn Db,
-        file: File,
-        syntax: ast::Module,
-    ) -> (Module, ModuleSourceMap) {
-        lower::lower_module(db, file, syntax)
+    pub(crate) fn new_with_source_map(db: &dyn Db, file: File) -> (Module, ModuleSourceMap) {
+        lower::lower_module(db, file)
     }
 }
 
@@ -431,21 +441,6 @@ pub(crate) enum Literal {
     Bytes,
     Bool(bool),
     None,
-}
-
-impl Literal {
-    fn from_ast_literal(value: &ast::LiteralKind) -> Self {
-        match value {
-            ast::LiteralKind::Int(lit) => Literal::Int(lit.value().unwrap_or(0)),
-            ast::LiteralKind::Float(_) => Literal::Float,
-            ast::LiteralKind::String(lit) => {
-                Literal::String(Arc::<str>::from(lit.value().unwrap_or_default()))
-            }
-            ast::LiteralKind::Bytes(_) => Literal::Bytes,
-            ast::LiteralKind::Bool(lit) => Literal::Bool(*lit),
-            ast::LiteralKind::None => Literal::None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

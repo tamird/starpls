@@ -17,11 +17,7 @@ use ruff_text_size::TextRange;
 
 use crate::SyntaxError;
 
-pub(crate) fn validate(
-    source: &str,
-    parsed: &Parsed<py::ModModule>,
-    errors: &mut dyn FnMut(SyntaxError),
-) {
+pub fn validate(source: &str, parsed: &Parsed<py::ModModule>, errors: &mut dyn FnMut(SyntaxError)) {
     crate::lexical::validate(source, parsed.tokens(), errors);
     let mut validator = Validator {
         tokens: parsed.tokens(),
@@ -66,7 +62,7 @@ pub(crate) fn validate(
 
 /// Whether an expression has a Starlark representation. Unsupported expressions
 /// are omitted from semantic lowering as well as from the temporary editor tree.
-pub(crate) fn supports_expr(expr: &Expr, tokens: &Tokens) -> bool {
+pub fn supports_expr(expr: &Expr, tokens: &Tokens) -> bool {
     match expr {
         Expr::Name(py::ExprName {
             node_index: _,
