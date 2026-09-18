@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use rustc_hash::FxHashMap;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_common::LoadItemCandidateKind;
 use starpls_hir::Db;
 use starpls_hir::Name;
@@ -112,19 +112,19 @@ struct NameRefContext<'a> {
 
 enum StringContext {
     LoadModule {
-        file_id: FileId,
+        file_id: File,
         text: ast::String,
     },
     LoadItem {
-        file_id: FileId,
+        file_id: File,
         load_stmt: ast::LoadStmt,
     },
     DictKey {
-        file_id: FileId,
+        file_id: File,
         lhs: ast::Expression,
     },
     Label {
-        file_id: FileId,
+        file_id: File,
         text: Box<str>,
     },
 }
@@ -275,7 +275,7 @@ pub(crate) fn completions(
         }
         CompletionAnalysis::String(StringContext::LoadItem { file_id, load_stmt }) => {
             let sema = Semantics::new(db);
-            let file = db.get_file(file_id)?;
+            let file = file_id;
             let loaded_file = sema.resolve_load_stmt(file, &load_stmt)?;
             let scope = sema.scope_for_module(loaded_file);
             for (name, def) in scope.exports() {
@@ -302,7 +302,7 @@ pub(crate) fn completions(
         }
         CompletionAnalysis::String(StringContext::DictKey { file_id, lhs }) => {
             let sema = Semantics::new(db);
-            let file = db.get_file(file_id)?;
+            let file = file_id;
             let ty = sema.type_of_expr(file, &lhs)?;
 
             for key in ty.known_keys()?.into_iter() {
@@ -411,7 +411,7 @@ fn add_keywords(items: &mut Vec<CompletionItem>, is_in_def: bool, is_in_for: boo
     }
 }
 
-fn maybe_str_context(file_id: FileId, root: &SyntaxNode, pos: TextSize) -> Option<StringContext> {
+fn maybe_str_context(file_id: File, root: &SyntaxNode, pos: TextSize) -> Option<StringContext> {
     let token = root.token_at_offset(pos).right_biased()?;
     let text = ast::String::cast(token.clone())?;
     let parent = token.parent()?;
@@ -449,7 +449,7 @@ impl<'a> CompletionContext<'a> {
     ) -> Option<Self> {
         // Reparse the file with a dummy identifier inserted at the current offset.
         let sema = Semantics::new(db);
-        let file = db.get_file(file_id)?;
+        let file = file_id;
         let parse = sema.parse(file);
 
         if let Some(cx) = maybe_str_context(file_id, &parse.syntax(), pos) {

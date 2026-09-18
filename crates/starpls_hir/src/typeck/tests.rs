@@ -6,9 +6,7 @@ use expect_test::Expect;
 use itertools::Itertools;
 use starpls_bazel::APIContext;
 use starpls_common::parse;
-use starpls_common::Db as _;
 use starpls_common::Dialect;
-use starpls_common::FileId;
 use starpls_common::FileInfo;
 use starpls_syntax::ast::AstNode;
 use starpls_test_util::FixtureType;
@@ -118,16 +116,18 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
     builder.set_inference_options(options);
 
     let mut db = builder.build();
-    let file_id = FileId(0);
-    let file = db.create_file(
-        file_id,
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
         Dialect::Bazel,
         Some(FileInfo::Bazel {
             api_context: APIContext::Bzl,
             is_external: false,
         }),
         input.to_string(),
-    );
+        0,
+    )
+    .unwrap();
     let root = parse(&db, file).syntax();
     let source_map = source_map(&db, file);
     let mut res = String::new();

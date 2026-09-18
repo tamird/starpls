@@ -43,8 +43,27 @@ pub(crate) enum ExecutionScopeId {
     Lambda(ExprId),
 }
 
+pub(crate) fn module_scopes(db: &dyn Db, file: File) -> &Scopes {
+    let File {
+        source,
+        dialect,
+        info,
+    } = file;
+    module_scopes_query(db, source, (dialect, info))
+}
+
 #[salsa::tracked(returns(ref))]
-pub(crate) fn module_scopes(db: &dyn Db, file: File) -> Scopes {
+pub(crate) fn module_scopes_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> Scopes {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     Scopes::new_for_module(db, lower(db, file))
 }
 
@@ -418,7 +437,7 @@ impl ScopeCollector<'_> {
                     message: "Expression is not assignable".to_string(),
                     severity: Severity::Error,
                     range: FileRange {
-                        file_id: self.file.id(self.db),
+                        file_id: self.file,
                         range: self
                             .source_map
                             .expr_map_back

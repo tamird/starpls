@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ruff_db = { workspace = true }
 ruff_source_file = { workspace = true }
 anyhow = "1.0.75"
 crossbeam-channel = "0.5.8"

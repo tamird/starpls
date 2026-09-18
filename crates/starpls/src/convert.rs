@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::anyhow;
+use ruff_source_file::LineIndex;
 use ruff_source_file::OneIndexed;
 use ruff_source_file::PositionEncoding;
 use ruff_source_file::SourceLocation;
 use starpls_common::Diagnostic;
 use starpls_common::DiagnosticTag;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_common::Severity;
 use starpls_common::Source;
 use starpls_ide::DocumentSymbol;
@@ -24,7 +25,7 @@ pub(crate) fn path_buf_from_url(url: &lsp_types::Url) -> anyhow::Result<PathBuf>
 
 pub(crate) fn lsp_diagnostic_from_native(
     diagnostic: Diagnostic,
-    source: Source<'_>,
+    source: &Source,
 ) -> Option<lsp_types::Diagnostic> {
     Some(lsp_types::Diagnostic {
         range: lsp_range_from_text_range(diagnostic.range.range, source)?,
@@ -48,50 +49,48 @@ pub(crate) fn lsp_diagnostic_from_native(
 
 pub(crate) fn lsp_range_from_text_range(
     text_range: TextRange,
-    source: Source<'_>,
+    source: &Source,
 ) -> Option<lsp_types::Range> {
-    let start = lsp_position_from_offset(source, text_range.start())?;
-    let end = lsp_position_from_offset(source, text_range.end())?;
+    let start = lsp_position_from_offset(&source.text, &source.index, text_range.start())?;
+    let end = lsp_position_from_offset(&source.text, &source.index, text_range.end())?;
     Some(lsp_types::Range { start, end })
 }
 
-fn lsp_position_from_offset(source: Source<'_>, offset: TextSize) -> Option<lsp_types::Position> {
-    if !source.text.is_char_boundary(usize::from(offset)) {
+fn lsp_position_from_offset(
+    text: &str,
+    index: &LineIndex,
+    offset: TextSize,
+) -> Option<lsp_types::Position> {
+    if !text.is_char_boundary(usize::from(offset)) {
         return None;
     }
-    let location = source.index.source_location(
-        u32::from(offset).into(),
-        source.text,
-        PositionEncoding::Utf16,
-    );
+    let location = index.source_location(u32::from(offset).into(), text, PositionEncoding::Utf16);
     let line = u32::try_from(location.line.to_zero_indexed()).ok()?;
     let character = u32::try_from(location.character_offset.to_zero_indexed()).ok()?;
     Some(lsp_types::Position { line, character })
 }
 
 pub(crate) fn offset_from_lsp_position(
-    source: Source<'_>,
+    text: &str,
+    index: &LineIndex,
     pos: lsp_types::Position,
 ) -> Option<TextSize> {
-    if pos.line as usize >= source.index.line_count() {
+    if pos.line as usize >= index.line_count() {
         return None;
     }
     let location = SourceLocation {
         line: OneIndexed::from_zero_indexed(pos.line as usize),
         character_offset: OneIndexed::from_zero_indexed(pos.character as usize),
     };
-    let range = source.index.line_range(location.line, source.text);
-    let line = source.text[range].trim_end_matches(['\r', '\n']);
+    let range = index.line_range(location.line, text);
+    let line = text[range].trim_end_matches(['\r', '\n']);
     let length = u32::try_from(line.len()).ok()?;
     let end = (u32::from(range.start()) + length).into();
     // LSP clamps columns beyond the text of a line, excluding its newline.
-    let offset = source
-        .index
-        .offset(location, source.text, PositionEncoding::Utf16)
+    let offset = index
+        .offset(location, text, PositionEncoding::Utf16)
         .min(end);
-    let actual = source
-        .index
-        .source_location(offset, source.text, PositionEncoding::Utf16);
+    let actual = index.source_location(offset, text, PositionEncoding::Utf16);
     // Ruff rounds positions inside a surrogate pair forward. Such a position
     // cannot identify a byte boundary for an editor operation.
     if actual.character_offset > location.character_offset {
@@ -102,13 +101,11 @@ pub(crate) fn offset_from_lsp_position(
 
 pub(crate) fn text_size_from_lsp_position(
     snapshot: &ServerSnapshot,
-    file_id: FileId,
+    file_id: File,
     pos: lsp_types::Position,
 ) -> anyhow::Result<Option<TextSize>> {
-    let Some(source) = snapshot.analysis_snapshot.source(file_id)? else {
-        return Ok(None);
-    };
-    Ok(offset_from_lsp_position(source, pos))
+    let source = snapshot.analysis_snapshot.source(file_id)?;
+    Ok(offset_from_lsp_position(&source.text, &source.index, pos))
 }
 
 fn lsp_severity_from_native(severity: Severity) -> lsp_types::DiagnosticSeverity {
@@ -130,7 +127,7 @@ pub(crate) fn lsp_document_symbol_from_native(
         selection_range,
         children,
     }: DocumentSymbol,
-    source: Source<'_>,
+    source: &Source,
 ) -> Option<lsp_types::DocumentSymbol> {
     Some(lsp_types::DocumentSymbol {
         name,
@@ -186,7 +183,6 @@ pub(crate) fn lsp_document_symbol_from_native(
 mod tests {
     use lsp_types::Position;
     use ruff_source_file::LineIndex;
-    use starpls_common::Source;
 
     use super::lsp_position_from_offset;
     use super::offset_from_lsp_position;
@@ -195,10 +191,6 @@ mod tests {
     fn utf16_positions_preserve_bom_and_crlf() {
         let text = "\u{feff}a😀\r\nβ\n";
         let index = LineIndex::from_source_text(text);
-        let source = Source {
-            text,
-            index: &index,
-        };
         for (offset, line, character) in [
             (0, 0, 0),
             (3, 0, 1),
@@ -210,24 +202,30 @@ mod tests {
         ] {
             let position = Position::new(line, character);
             assert_eq!(
-                lsp_position_from_offset(source, offset.into()),
+                lsp_position_from_offset(text, &index, offset.into()),
                 Some(position)
             );
             assert_eq!(
-                offset_from_lsp_position(source, position),
+                offset_from_lsp_position(text, &index, position),
                 Some(offset.into())
             );
         }
-        assert_eq!(offset_from_lsp_position(source, Position::new(0, 3)), None);
-        assert_eq!(offset_from_lsp_position(source, Position::new(3, 0)), None);
-        assert_eq!(lsp_position_from_offset(source, 2.into()), None);
-        assert_eq!(lsp_position_from_offset(source, 14.into()), None);
         assert_eq!(
-            offset_from_lsp_position(source, Position::new(0, 99)),
+            offset_from_lsp_position(text, &index, Position::new(0, 3)),
+            None
+        );
+        assert_eq!(
+            offset_from_lsp_position(text, &index, Position::new(3, 0)),
+            None
+        );
+        assert_eq!(lsp_position_from_offset(text, &index, 2.into()), None);
+        assert_eq!(lsp_position_from_offset(text, &index, 14.into()), None);
+        assert_eq!(
+            offset_from_lsp_position(text, &index, Position::new(0, 99)),
             Some(8.into())
         );
         assert_eq!(
-            offset_from_lsp_position(source, Position::new(1, 99)),
+            offset_from_lsp_position(text, &index, Position::new(1, 99)),
             Some(12.into())
         );
     }
@@ -235,22 +233,18 @@ mod tests {
     fn line_endings_use_the_parser_convention() {
         for text in ["a\nb", "a\r\nb", "a\rb"] {
             let index = LineIndex::from_source_text(text);
-            let source = Source {
-                text,
-                index: &index,
-            };
             let offset = u32::try_from(text.find('b').unwrap()).unwrap();
             let position = Position::new(1, 0);
             assert_eq!(
-                lsp_position_from_offset(source, offset.into()),
+                lsp_position_from_offset(text, &index, offset.into()),
                 Some(position)
             );
             assert_eq!(
-                offset_from_lsp_position(source, position),
+                offset_from_lsp_position(text, &index, position),
                 Some(offset.into())
             );
             assert_eq!(
-                offset_from_lsp_position(source, Position::new(0, 99)),
+                offset_from_lsp_position(text, &index, Position::new(0, 99)),
                 Some(1.into())
             );
         }

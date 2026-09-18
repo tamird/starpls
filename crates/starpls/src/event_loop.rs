@@ -4,13 +4,12 @@ use lsp_server::Connection;
 use lsp_types::InitializeParams;
 use lsp_types::WorkDoneProgressCreateParams;
 use rustc_hash::FxHashSet;
-use starpls_common::FileId;
+use starpls_common::File;
 
 use crate::commands::server::ServerCommand;
 use crate::config::ServerConfig;
 use crate::convert;
 use crate::dispatcher::RequestDispatcher;
-use crate::document::DocumentSource;
 use crate::extensions;
 use crate::handlers::notifications;
 use crate::handlers::requests;
@@ -33,12 +32,12 @@ macro_rules! match_notification {
 #[derive(Debug)]
 pub(crate) enum FetchExternalReposProgress {
     Begin(FxHashSet<String>),
-    End(FxHashSet<FileId>, Vec<String>),
+    End(FxHashSet<File>, Vec<String>),
 }
 
 #[derive(Debug)]
 pub(crate) struct FetchExternalRepoRequest {
-    pub(crate) file_id: FileId,
+    pub(crate) file_id: File,
     pub(crate) repo: String,
 }
 
@@ -50,9 +49,15 @@ pub(crate) enum RefreshAllWorkspaceTargetsProgress {
 
 #[derive(Debug)]
 pub(crate) enum Task {
-    AnalysisRequested(Vec<FileId>),
+    AnalysisRequested(Vec<File>),
     /// A new set of diagnostics has been processed and is ready for forwarding.
-    DiagnosticsReady(Vec<(FileId, Vec<lsp_types::Diagnostic>)>),
+    DiagnosticsReady(
+        Vec<(
+            File,
+            crate::diagnostics::DiagnosticTicket,
+            Vec<lsp_types::Diagnostic>,
+        )>,
+    ),
     /// A request has been evaluated and its response is ready.
     ResponseReady(lsp_server::Response),
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
@@ -150,55 +155,27 @@ impl Server {
             self.update_diagnostics(files_to_update);
         }
 
-        let changed_file_ids = self.diagnostics_manager.take_changes();
-
-        for file_id in changed_file_ids {
-            let document_manager = self.document_manager.read();
-            // Only send diagnostics for currently open editors.
-            let version = match document_manager
-                .get(file_id)
-                .map(|document| document.source)
-            {
-                Some(DocumentSource::Editor(version)) => version,
-                _ => continue,
-            };
-            let diagnostics = self
-                .diagnostics_manager
-                .get_diagnostics(file_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let path = document_manager.lookup_by_file_id(file_id);
-            let uri = lsp_types::Url::from_file_path(path).unwrap();
-
-            drop(document_manager);
-
-            self.send_notification::<lsp_types::notification::PublishDiagnostics>(
-                lsp_types::PublishDiagnosticsParams {
-                    uri,
-                    diagnostics,
-                    version: Some(version),
-                },
-            );
-        }
-
         Ok(())
     }
 
-    fn update_diagnostics(&mut self, file_ids: Vec<FileId>) {
+    fn update_diagnostics(&mut self, file_ids: Vec<File>) {
         let snapshot = self.snapshot();
+        let jobs: Vec<_> = file_ids
+            .into_iter()
+            .filter_map(|file| {
+                self.diagnostics_manager
+                    .request(&snapshot.analysis_snapshot, file)
+            })
+            .collect();
         self.task_pool_handle.spawn(move || {
-            let mut res = Vec::new();
-
-            // Query the database for diagnostics for each file and convert them to an LSP-compatible format.
-            for file_id in file_ids {
-                let diagnostics = match collect_diagnostics(&snapshot, file_id) {
-                    Some(diagnositcs) => diagnositcs,
-                    None => continue,
-                };
-                res.push((file_id, diagnostics));
-            }
-
-            Task::DiagnosticsReady(res)
+            let results = jobs
+                .into_iter()
+                .filter_map(|(file, ticket)| {
+                    let diagnostics = collect_diagnostics(&snapshot, file)?;
+                    Some((file, ticket, diagnostics))
+                })
+                .collect();
+            Task::DiagnosticsReady(results)
         });
     }
 
@@ -236,10 +213,21 @@ impl Server {
     fn handle_task(&mut self, task: Task) {
         match task {
             Task::AnalysisRequested(file_ids) => self.analysis_requested_for_files = Some(file_ids),
-            Task::DiagnosticsReady(diagnostics) => {
-                for (file_id, diagnostics) in diagnostics {
-                    self.diagnostics_manager
-                        .set_diagnostics(file_id, diagnostics);
+            Task::DiagnosticsReady(results) => {
+                let snapshot = self.analysis.snapshot();
+                for (file, ticket, diagnostics) in results {
+                    let path = snapshot.path(file);
+                    let stamp = snapshot.document(path).map(|document| document.stamp());
+                    if self.diagnostics_manager.complete(file, ticket, stamp) {
+                        let uri = lsp_types::Url::from_file_path(path).expect("absolute file path");
+                        self.send_notification::<lsp_types::notification::PublishDiagnostics>(
+                            lsp_types::PublishDiagnosticsParams {
+                                uri,
+                                diagnostics,
+                                version: Some(ticket.document.version),
+                            },
+                        );
+                    }
                 }
             }
             Task::ResponseReady(resp) => {
@@ -367,9 +355,9 @@ where
 
 fn collect_diagnostics(
     snapshot: &ServerSnapshot,
-    file_id: FileId,
+    file_id: File,
 ) -> Option<Vec<lsp_types::Diagnostic>> {
-    let source = snapshot.analysis_snapshot.source(file_id).ok()??;
+    let source = snapshot.analysis_snapshot.source(file_id).ok()?;
 
     // Get the diagnostics for the current path. If the operation was cancelled, simply continue to the next file.
     let diagnostics = snapshot.analysis_snapshot.diagnostics(file_id).ok()?;
@@ -378,7 +366,7 @@ fn collect_diagnostics(
     Some(
         diagnostics
             .into_iter()
-            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, source))
+            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, &source))
             .collect::<Vec<_>>(),
     )
 }

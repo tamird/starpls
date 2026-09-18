@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,19 +14,17 @@ use starpls_bazel::client::BazelCLI;
 use starpls_bazel::client::BazelInfo;
 use starpls_common::Diagnostic;
 use starpls_common::Dialect;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_common::Severity;
 use starpls_ide::Analysis;
 use starpls_ide::AnalysisSnapshot;
-use starpls_ide::Change;
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 
 use crate::bazel::BazelContext;
 use crate::commands::InferenceOptions;
 use crate::document::DefaultFileLoader;
-use crate::document::PathInterner;
 use crate::document::{self};
 use crate::server::load_bazel_builtins;
 
@@ -59,10 +55,8 @@ impl CheckCommand {
             .map_err(|err| anyhow!("failed to initialize Bazel context: {}", err))?;
         let builtins = load_bazel_builtins();
         let (fetch_repo_sender, _) = crossbeam_channel::unbounded();
-        let interner = Arc::new(PathInterner::default());
         let loader = DefaultFileLoader::new(
             bazel_client,
-            interner.clone(),
             bazel_cx.info.workspace.clone(),
             bazel_cx.info.workspace_name.clone(),
             bazel_cx.info.output_base.join("external"),
@@ -77,7 +71,7 @@ impl CheckCommand {
                 use_code_flow_analysis: self.inference_options.use_code_flow_analysis,
                 ..Default::default()
             },
-        );
+        )?;
 
         analysis.set_builtin_defs(builtins, bazel_cx.rules);
 
@@ -96,7 +90,6 @@ impl CheckCommand {
         let checker = Checker::new(
             analysis,
             bazel_cx.info,
-            interner,
             self.paths,
             self.ignore_patterns,
             &extensions,
@@ -105,22 +98,17 @@ impl CheckCommand {
     }
 }
 
-struct FileMetadata {
-    path: PathBuf,
-    contents: String,
-}
-
 struct Checker {
     analysis: Analysis,
     bazel_info: BazelInfo,
-    interner: Arc<PathInterner>,
-    files: HashMap<FileId, FileMetadata>,
+    files: indexmap::IndexMap<File, PathBuf>,
     ignored_files: HashSet<PathBuf>,
 }
 
 fn diagnostic_to_message<'a>(
     diagnostic: &'a Diagnostic,
-    metadata: &'a FileMetadata,
+    path: &'a Path,
+    contents: &'a str,
 ) -> Message<'a> {
     let start: usize = diagnostic.range.range.start().into();
     let end: usize = diagnostic.range.range.end().into();
@@ -130,8 +118,8 @@ fn diagnostic_to_message<'a>(
         Severity::Error => Level::Error,
     };
     level.title(&diagnostic.message).snippet(
-        Snippet::source(&metadata.contents)
-            .origin(metadata.path.as_os_str().to_str().unwrap_or(""))
+        Snippet::source(contents)
+            .origin(path.as_os_str().to_str().unwrap_or(""))
             .fold(true)
             .line_start(1)
             .annotation(level.span(start..end)),
@@ -153,19 +141,16 @@ impl Checker {
     fn new(
         analysis: Analysis,
         bazel_info: BazelInfo,
-        interner: Arc<PathInterner>,
         paths: Vec<String>,
         ignore_patterns: Vec<String>,
         extensions: &[&str],
     ) -> anyhow::Result<Self> {
         let mut checker = Self {
             analysis,
-            interner,
             bazel_info,
             files: Default::default(),
             ignored_files: Default::default(),
         };
-        let mut change = Change::default();
 
         for path in paths {
             for entry in WalkDir::new(&path).into_iter().filter_entry(|e| {
@@ -177,26 +162,21 @@ impl Checker {
                 let entry = entry?;
                 if entry.file_type().is_file() {
                     let is_explicit = entry.path().as_os_str().to_str() == Some(path.as_str());
-                    checker.load_file(&mut change, entry.path(), is_explicit, extensions)?;
+                    checker.load_file(entry.path(), is_explicit, extensions)?;
                 }
             }
         }
 
-        checker.analysis.apply_change(change);
         Ok(checker)
     }
 
     fn load_file(
         &mut self,
-        change: &mut Change,
         path: &Path,
         is_explicit: bool,
         extensions: &[&str],
     ) -> anyhow::Result<()> {
         let canonical_path = PathBuf::from(&path).canonicalize()?;
-        if self.interner.lookup_by_path_buf(&canonical_path).is_some() {
-            return Ok(());
-        }
 
         let (dialect, api_context) = match document::dialect_and_api_context_for_workspace_path(
             &self.bazel_info.workspace,
@@ -221,22 +201,13 @@ impl Checker {
             return Ok(());
         }
 
-        let contents = fs::read_to_string(&canonical_path)?;
-
         let info = api_context.map(|api_context| FileInfo::Bazel {
             api_context,
             is_external: canonical_path.starts_with(&self.bazel_info.output_base),
         });
 
-        let file_id = self.interner.intern_path(canonical_path);
-        change.create_file(file_id, dialect, info, contents.clone());
-        self.files.insert(
-            file_id,
-            FileMetadata {
-                path: path.to_path_buf(),
-                contents,
-            },
-        );
+        let file = self.analysis.file(&canonical_path, dialect, info)?;
+        self.files.entry(file).or_insert_with(|| path.to_path_buf());
 
         Ok(())
     }
@@ -244,12 +215,13 @@ impl Checker {
     fn report_diagnostics_for_file(
         &self,
         snapshot: &AnalysisSnapshot,
-        file_id: FileId,
-        metadata: &FileMetadata,
+        file_id: File,
+        path: &Path,
         num_errors: &mut usize,
         num_warnings: &mut usize,
         num_infos: &mut usize,
     ) -> anyhow::Result<()> {
+        let source = snapshot.source(file_id)?;
         let renderer = Renderer::styled();
         for diagnostic in snapshot.diagnostics(file_id)? {
             match diagnostic.severity {
@@ -259,7 +231,7 @@ impl Checker {
             }
             anstream::print!(
                 "{}\n\n",
-                renderer.render(diagnostic_to_message(&diagnostic, metadata))
+                renderer.render(diagnostic_to_message(&diagnostic, path, &source.text))
             );
         }
         Ok(())
@@ -284,14 +256,11 @@ impl Checker {
             num_warnings += 1;
         }
 
-        let mut files = self.files.iter().collect::<Vec<_>>();
-        files.sort_by_key(|(file_id, _)| **file_id);
-
-        for (file_id, metadata) in files {
+        for (file_id, path) in &self.files {
             self.report_diagnostics_for_file(
                 &snapshot,
                 *file_id,
-                metadata,
+                path,
                 &mut num_errors,
                 &mut num_warnings,
                 &mut num_infos,

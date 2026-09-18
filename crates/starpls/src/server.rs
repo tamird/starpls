@@ -1,4 +1,3 @@
-use std::fs;
 use std::mem;
 use std::panic;
 use std::path::Path;
@@ -11,7 +10,6 @@ use log::error;
 use log::info;
 use lsp_server::Connection;
 use lsp_server::ReqQueue;
-use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
 use starpls_bazel::build_language::decode_rules;
 use starpls_bazel::client::BazelCLI;
@@ -20,11 +18,10 @@ use starpls_bazel::decode_builtins;
 use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_common::Dialect;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_ide::Analysis;
 use starpls_ide::AnalysisSnapshot;
-use starpls_ide::Change;
 use starpls_ide::InferenceOptions;
 
 use crate::bazel::BazelContext;
@@ -32,9 +29,6 @@ use crate::config::ServerConfig;
 use crate::debouncer::AnalysisDebouncer;
 use crate::diagnostics::DiagnosticsManager;
 use crate::document::DefaultFileLoader;
-use crate::document::DocumentChangeKind;
-use crate::document::DocumentManager;
-use crate::document::PathInterner;
 use crate::event_loop::FetchExternalReposProgress;
 use crate::event_loop::RefreshAllWorkspaceTargetsProgress;
 use crate::event_loop::Task;
@@ -48,15 +42,17 @@ pub(crate) struct Server {
     pub(crate) connection: Connection,
     pub(crate) req_queue: ReqQueue<(), ()>,
     pub(crate) task_pool_handle: TaskPoolHandle<Task>,
-    pub(crate) document_manager: Arc<RwLock<DocumentManager>>,
+    pub(crate) workspace: PathBuf,
+    pub(crate) changed_files: Vec<File>,
+    pub(crate) documents_changed: bool,
     pub(crate) diagnostics_manager: DiagnosticsManager,
     pub(crate) analysis: Analysis,
     pub(crate) analysis_debouncer: AnalysisDebouncer,
-    pub(crate) analysis_requested_for_files: Option<Vec<FileId>>,
+    pub(crate) analysis_requested_for_files: Option<Vec<File>>,
     pub(crate) bazel_client: Arc<dyn BazelClient>,
     pub(crate) pending_repos: FxHashSet<String>,
-    pub(crate) pending_files: FxHashSet<FileId>,
-    pub(crate) force_analysis_for_files: FxHashSet<FileId>,
+    pub(crate) pending_files: FxHashSet<File>,
+    pub(crate) force_analysis_for_files: FxHashSet<File>,
     pub(crate) fetched_repos: FxHashSet<String>,
     pub(crate) is_fetching_repos: bool,
     pub(crate) is_refreshing_all_workspace_targets: bool,
@@ -66,7 +62,6 @@ pub(crate) struct Server {
 pub(crate) struct ServerSnapshot {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) analysis_snapshot: AnalysisSnapshot,
-    pub(crate) document_manager: Arc<RwLock<DocumentManager>>,
 }
 
 impl Server {
@@ -118,10 +113,8 @@ impl Server {
             Default::default()
         };
 
-        let path_interner = Arc::new(PathInterner::default());
         let loader = DefaultFileLoader::new(
             bazel_client.clone(),
-            path_interner.clone(),
             bazel_cx.info.workspace.clone(),
             bazel_cx.info.workspace_name,
             bazel_cx.info.output_base.join("external"),
@@ -135,28 +128,27 @@ impl Server {
                 use_code_flow_analysis: config.args.inference_options.use_code_flow_analysis,
                 ..Default::default()
             },
-        );
+        )?;
 
         analysis.set_all_workspace_targets(targets);
         analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules);
 
         // Check for a prelude file. We skip verifying that `//tools/build_tools` is actually a package (i.e.
         // that it actually contains a `BUILD.bazel`) file for simplicity.
-        if let Ok((prelude, contents)) = load_bazel_prelude(&bazel_cx.info.workspace) {
+        let prelude = bazel_cx
+            .info
+            .workspace
+            .join("tools/build_rules/prelude_bazel");
+        if let Ok(file) = analysis.file(
+            &prelude,
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Prelude,
+                is_external: false,
+            }),
+        ) {
             info!("found prelude file at {:?}", prelude);
-            let file_id = path_interner.intern_path(prelude);
-            let mut change = Change::default();
-            change.create_file(
-                file_id,
-                Dialect::Bazel,
-                Some(FileInfo::Bazel {
-                    api_context: APIContext::Bzl,
-                    is_external: false,
-                }),
-                contents,
-            );
-            analysis.apply_change(change);
-            analysis.set_bazel_prelude_file(file_id);
+            analysis.set_bazel_prelude_file(file);
         }
 
         let analysis_debounce_interval = config.args.analysis_debounce_interval;
@@ -165,10 +157,9 @@ impl Server {
             connection,
             req_queue: Default::default(),
             task_pool_handle,
-            document_manager: Arc::new(RwLock::new(DocumentManager::new(
-                path_interner,
-                bazel_cx.info.workspace,
-            ))),
+            workspace: bazel_cx.info.workspace,
+            changed_files: Vec::new(),
+            documents_changed: false,
             diagnostics_manager: Default::default(),
             analysis,
             analysis_debouncer: AnalysisDebouncer::new(
@@ -197,65 +188,42 @@ impl Server {
         ServerSnapshot {
             config: self.config.clone(),
             analysis_snapshot: self.analysis.snapshot(),
-            document_manager: Arc::clone(&self.document_manager),
         }
     }
 
-    pub(crate) fn process_changes(&mut self) -> (Vec<FileId>, bool) {
-        let mut change = Change::default();
-        let mut document_manager = self.document_manager.write();
-        let (has_opened_or_closed_documents, changes) = document_manager.take_changes();
-        let changed_file_ids = changes.iter().map(|(file_id, _)| *file_id).collect();
-
-        if changes.is_empty() && self.force_analysis_for_files.is_empty() {
-            return (changed_file_ids, has_opened_or_closed_documents);
-        }
-
-        let mut prelude_file = None;
-
-        for (file_id, change_kind) in changes {
-            let document = match document_manager.get(file_id) {
-                Some(document) => document,
-                None => continue,
-            };
-            match change_kind {
-                DocumentChangeKind::Create => {
-                    if matches!(
-                        document.info,
-                        Some(FileInfo::Bazel {
-                            api_context: APIContext::Prelude,
-                            ..
-                        })
-                    ) {
-                        prelude_file = Some(file_id)
-                    }
-
-                    change.create_file(
-                        file_id,
-                        document.dialect,
-                        document.info.clone(),
-                        document.contents.clone(),
-                    );
-                }
-                DocumentChangeKind::Update => {
-                    change.update_file(file_id, document.contents.clone());
-                }
-            }
-        }
-
-        drop(document_manager);
-
+    pub(crate) fn process_changes(&mut self) -> (Vec<File>, bool) {
+        let changed_files = mem::take(&mut self.changed_files);
+        let changed = mem::take(&mut self.documents_changed) || !changed_files.is_empty();
         if !self.force_analysis_for_files.is_empty() {
-            change.invalidate_loads();
+            self.analysis.invalidate_loads();
         }
+        (changed_files, changed)
+    }
 
-        // Apply the change to our analyzer. This will cancel any affected active Salsa operations.
-        self.analysis.apply_change(change);
-        if let Some(prelude_file) = prelude_file {
-            self.analysis.set_bazel_prelude_file(prelude_file);
+    pub(crate) fn open_document(
+        &mut self,
+        path: &Path,
+        contents: String,
+        version: i32,
+    ) -> anyhow::Result<()> {
+        let Some((dialect, api_context)) =
+            crate::document::dialect_and_api_context_for_workspace_path(&self.workspace, path)
+        else {
+            return Ok(());
+        };
+        let info = api_context.map(|api_context| FileInfo::Bazel {
+            api_context,
+            is_external: !path.starts_with(&self.workspace),
+        });
+        let file = self
+            .analysis
+            .open_document(path, dialect, info, contents, version)?;
+        if api_context == Some(APIContext::Prelude) {
+            self.analysis.set_bazel_prelude_file(file);
         }
-
-        (changed_file_ids, true)
+        self.changed_files.push(file);
+        self.documents_changed = true;
+        Ok(())
     }
 
     pub(crate) fn send_request<R: lsp_types::request::Request>(&mut self, params: R::Params) {
@@ -376,10 +344,4 @@ pub(crate) fn load_bazel_builtins() -> Builtins {
 pub(crate) fn load_bazel_build_language(client: &dyn BazelClient) -> anyhow::Result<Builtins> {
     let build_language_output = client.build_language()?;
     decode_rules(&build_language_output)
-}
-
-fn load_bazel_prelude(workspace: impl AsRef<Path>) -> anyhow::Result<(PathBuf, String)> {
-    let prelude = workspace.as_ref().join("tools/build_rules/prelude_bazel");
-    let contents = fs::read_to_string(&prelude)?;
-    Ok((prelude, contents))
 }

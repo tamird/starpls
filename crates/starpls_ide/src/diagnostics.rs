@@ -1,15 +1,11 @@
-use starpls_common::Db;
 use starpls_common::Diagnostic;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_hir::diagnostics_for_file;
 
 use crate::Database;
 
-pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
-    let file = match db.get_file(file_id) {
-        Some(file) => file,
-        None => return Vec::new(),
-    };
+pub(crate) fn diagnostics(db: &Database, file_id: File) -> Vec<Diagnostic> {
+    let file = file_id;
 
     let diagnostics = starpls_hir::inference_diagnostics(db, file);
 
@@ -25,11 +21,9 @@ pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
 mod tests {
     use std::sync::Arc;
 
-    use starpls_common::FileId;
     use starpls_hir::Fixture;
 
     use crate::Analysis;
-    use crate::Change;
     use crate::InferenceOptions;
     use crate::SimpleFileLoader;
 
@@ -39,19 +33,25 @@ mod tests {
             use_code_flow_analysis: true,
             ..Default::default()
         };
-        let mut analysis = Analysis::new(Arc::new(SimpleFileLoader::default()), options);
+        let mut analysis = Analysis::with_system(
+            Arc::new(SimpleFileLoader::default()),
+            options,
+            ruff_db::system::InMemorySystem::default(),
+        );
         let original = "fail()\nx = 1\n";
-        Fixture::from_single_file(&mut analysis.db, original);
+        let (fixture, _) = Fixture::from_single_file(&mut analysis.db, original);
 
         for (source, unreachable) in [
             (original, true),
             ("str()\nx = 1\n", false),
             (original, true),
         ] {
-            let mut change = Change::default();
-            change.update_file(FileId(0), source.to_owned());
-            analysis.apply_change(change);
-            let diagnostics = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+            analysis.update_file(fixture.main_file(), source.to_owned());
+
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
             assert_eq!(
                 diagnostics
                     .iter()
@@ -69,8 +69,11 @@ mod tests {
             "if x\n    pass\ny = {\"a\": 1}\n",
             "if x:\nif y:\n    pass\nz = 1\n",
         ] {
-            let (analysis, _) = Analysis::from_single_file_fixture(source);
-            let diagnostics = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+            let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
             assert!(!diagnostics.is_empty(), "{source}");
         }
     }

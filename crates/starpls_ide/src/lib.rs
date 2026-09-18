@@ -3,16 +3,14 @@ use std::panic;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::mapref::entry::Entry;
+#[cfg(test)]
 use dashmap::DashMap;
 use salsa::Setter;
-use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_common::Db;
 use starpls_common::Diagnostic;
 use starpls_common::Dialect;
 use starpls_common::File;
-use starpls_common::FileId;
 use starpls_common::FileInfo;
 use starpls_common::LoadItemCandidate;
 use starpls_common::ResolvedPath;
@@ -51,6 +49,7 @@ mod hover;
 mod show_hir;
 mod show_syntax_tree;
 mod signature_help;
+#[cfg(test)]
 mod source;
 mod util;
 
@@ -63,143 +62,100 @@ pub type Cancellable<T> = Result<T, Cancelled>;
 #[derive(Clone)]
 pub(crate) struct Database {
     storage: salsa::Storage<Self>,
-    files: Arc<DashMap<FileId, File>>,
+    files: ruff_db::files::Files,
+    system: Arc<starpls_common::SourceSystem>,
+    vendored: ruff_db::vendored::VendoredFileSystem,
     loader: Arc<dyn FileLoader>,
     environment: Option<Environment>,
     #[cfg(test)]
     executions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl Database {
-    fn apply_file_changes(&mut self, changes: Vec<(FileId, FileChange)>) {
-        for (file_id, change) in changes {
-            match change {
-                FileChange::Create {
-                    dialect,
-                    info,
-                    contents,
-                } => {
-                    self.create_file(file_id, dialect, info, contents);
-                }
-                FileChange::Update { contents } => {
-                    self.update_file(file_id, contents);
-                }
-            }
-        }
-    }
-}
-
 #[salsa::db]
 impl salsa::Database for Database {}
 
 #[salsa::db]
+impl ruff_db::Db for Database {
+    fn vendored(&self) -> &ruff_db::vendored::VendoredFileSystem {
+        let Self {
+            storage: _,
+            files: _,
+            system: _,
+            vendored,
+            loader: _,
+            environment: _,
+            #[cfg(test)]
+                executions: _,
+        } = self;
+        vendored
+    }
+    fn system(&self) -> &dyn ruff_db::system::System {
+        let Self {
+            storage: _,
+            files: _,
+            system,
+            vendored: _,
+            loader: _,
+            environment: _,
+            #[cfg(test)]
+                executions: _,
+        } = self;
+        system.as_ref()
+    }
+    fn files(&self) -> &ruff_db::files::Files {
+        let Self {
+            storage: _,
+            files,
+            system: _,
+            vendored: _,
+            loader: _,
+            environment: _,
+            #[cfg(test)]
+                executions: _,
+        } = self;
+        files
+    }
+}
+#[salsa::db]
 impl starpls_common::Db for Database {
-    fn create_file(
-        &mut self,
-        file_id: FileId,
-        dialect: Dialect,
-        info: Option<FileInfo>,
-        contents: String,
-    ) -> File {
-        // Cancel snapshots before publishing files into the shared lazy-load map.
-        let environment = self.environment();
-        let revision = environment.load_revision(self) + 1;
-        environment.set_load_revision(self).to(revision);
-        let existing = self.files.get(&file_id).map(|file| *file);
-        if let Some(file) = existing {
-            file.set_dialect(self).to(dialect);
-            file.set_info(self).to(info);
-            file.set_contents(self).to(contents);
-            return file;
-        }
-        let file = File::new(self, file_id, dialect, info, contents);
-        self.files.insert(file_id, file);
-        file
+    fn source_system_mut(&mut self) -> &mut starpls_common::SourceSystem {
+        salsa::Database::trigger_cancellation(self);
+        let Self {
+            storage: _,
+            files: _,
+            system,
+            vendored: _,
+            loader: _,
+            environment: _,
+            #[cfg(test)]
+                executions: _,
+        } = self;
+        Arc::get_mut(system).expect("snapshots have drained")
     }
 
-    fn update_file(&mut self, file_id: FileId, contents: String) {
-        if let Some(file) = self.files.get(&file_id).map(|file_id| *file_id) {
-            file.set_contents(self).to(contents);
-        }
-    }
-
-    fn load_file(
-        &self,
-        path: &str,
-        dialect: Dialect,
-        from: FileId,
-    ) -> anyhow::Result<Option<File>> {
+    fn load_file(&self, path: &str, dialect: Dialect, from: File) -> anyhow::Result<Option<File>> {
         self.environment().load_revision(self);
-        let res = match self.loader.load_file(path, dialect, from)? {
-            Some(res) => res,
-            None => return Ok(None),
-        };
-        Ok(Some(match self.files.entry(res.file_id) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => *entry.insert(File::new(
-                self,
-                res.file_id,
-                dialect,
-                res.info,
-                res.contents.unwrap_or_default(),
-            )),
-        }))
+        self.loader.load_file(self, path, dialect, from)
     }
-
-    fn get_file(&self, file_id: FileId) -> Option<File> {
-        self.environment().load_revision(self);
-        self.files.get(&file_id).map(|file| *file)
-    }
-
     fn list_load_candidates(
         &self,
         path: &str,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<Vec<LoadItemCandidate>>> {
-        let dialect = match self.get_file(from) {
-            Some(file) => file.dialect(self),
-            None => return Ok(None),
-        };
-        self.loader.list_load_candidates(path, dialect, from)
+        self.loader
+            .list_load_candidates(self, path, from.dialect, from)
     }
-
     fn resolve_path(
         &self,
         path: &str,
         dialect: Dialect,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<ResolvedPath>> {
         self.environment().load_revision(self);
-        let mut resolved_path = match self.loader.resolve_path(path, dialect, from)? {
-            Some(resolved_path) => resolved_path,
-            None => return Ok(None),
-        };
-
-        if let ResolvedPath::BuildTarget {
-            build_file,
-            ref mut contents,
-            ..
-        } = resolved_path
-        {
-            if let Entry::Vacant(entry) = self.files.entry(build_file) {
-                entry.insert(File::new(
-                    self,
-                    build_file,
-                    Dialect::Bazel,
-                    Some(FileInfo::Bazel {
-                        api_context: APIContext::Build,
-                        is_external: false,
-                    }),
-                    contents.take().unwrap_or_default(),
-                ));
-            }
-        }
-
-        Ok(Some(resolved_path))
+        self.loader.resolve_path(self, path, dialect, from)
     }
-
-    fn resolve_build_file(&self, file_id: FileId) -> Option<String> {
-        self.loader.resolve_build_file(file_id)
+    fn resolve_build_file(&self, file: File) -> Option<String> {
+        self.loader.resolve_build_file(self, file)
     }
 }
 
@@ -220,11 +176,11 @@ impl starpls_hir::Db for Database {
         self.environment().builtin_defs(self, *dialect)
     }
 
-    fn set_bazel_prelude_file(&mut self, file_id: FileId) {
+    fn set_bazel_prelude_file(&mut self, file_id: File) {
         self.environment().set_prelude_file(self).to(Some(file_id));
     }
 
-    fn get_bazel_prelude_file(&self) -> Option<FileId> {
+    fn get_bazel_prelude_file(&self) -> Option<File> {
         self.environment().prelude_file(self)
     }
 
@@ -239,65 +195,31 @@ impl starpls_hir::Db for Database {
     }
 }
 
-#[derive(Debug)]
-enum FileChange {
-    Create {
-        dialect: Dialect,
-        info: Option<FileInfo>,
-        contents: String,
-    },
-    Update {
-        contents: String,
-    },
-}
-
-/// A batch of changes to be applied to the database. For now, this consists simply of a map of changed file IDs to
-/// their updated contents.
-#[derive(Debug, Default)]
-pub struct Change {
-    changed_files: Vec<(FileId, FileChange)>,
-    invalidate_loads: bool,
-}
-
-impl Change {
-    /// Notify analysis that host load resolution changed, for example after
-    /// fetching an external repository. Content-only edits do not need this.
-    pub fn invalidate_loads(&mut self) {
-        self.invalidate_loads = true;
-    }
-
-    pub fn create_file(
-        &mut self,
-        file_id: FileId,
-        dialect: Dialect,
-        info: Option<FileInfo>,
-        contents: String,
-    ) {
-        self.changed_files.push((
-            file_id,
-            FileChange::Create {
-                dialect,
-                info,
-                contents,
-            },
-        ))
-    }
-
-    pub fn update_file(&mut self, file_id: FileId, contents: String) {
-        self.changed_files
-            .push((file_id, FileChange::Update { contents }))
-    }
-}
-
 /// Provides the main API for querying facts about the source code. This wraps the main `Database` struct.
 pub struct Analysis {
     db: Database,
 }
 
 impl Analysis {
-    pub fn new(loader: Arc<dyn FileLoader>, options: InferenceOptions) -> Self {
+    pub fn new(loader: Arc<dyn FileLoader>, options: InferenceOptions) -> anyhow::Result<Self> {
+        let cwd = std::env::current_dir()?;
+        let cwd = starpls_common::system_path(&cwd)?;
+        Ok(Self::with_system(
+            loader,
+            options,
+            ruff_db::system::OsSystem::new(cwd),
+        ))
+    }
+
+    pub fn with_system(
+        loader: Arc<dyn FileLoader>,
+        options: InferenceOptions,
+        system: impl ruff_db::system::System + 'static,
+    ) -> Self {
         let mut db = Database {
             files: Default::default(),
+            system: Arc::new(starpls_common::SourceSystem::new(system)),
+            vendored: Default::default(),
             storage: Default::default(),
             loader,
             environment: None,
@@ -317,41 +239,89 @@ impl Analysis {
         Self { db }
     }
 
-    pub fn apply_change(&mut self, change: Change) {
-        let Change {
-            changed_files,
-            invalidate_loads,
-        } = change;
-        self.db.apply_file_changes(changed_files);
-        if invalidate_loads {
-            let environment = self.db.environment();
-            let revision = environment.load_revision(&self.db) + 1;
-            environment.set_load_revision(&mut self.db).to(revision);
-        }
+    pub fn file(
+        &self,
+        path: &std::path::Path,
+        dialect: Dialect,
+        info: Option<FileInfo>,
+    ) -> anyhow::Result<File> {
+        let Self { db } = self;
+        File::from_path(db, path, dialect, info)
+    }
+
+    pub fn open_document(
+        &mut self,
+        path: &std::path::Path,
+        dialect: Dialect,
+        info: Option<FileInfo>,
+        contents: String,
+        version: i32,
+    ) -> anyhow::Result<File> {
+        let Self { db } = self;
+        starpls_common::open_document(db, path, dialect, info, contents, version)
+    }
+
+    pub fn close_document(&mut self, path: &std::path::Path) -> anyhow::Result<Option<File>> {
+        let Self { db } = self;
+        let path = starpls_common::system_path(path)?;
+        let Some(document) = db.system.document(path) else {
+            return Ok(None);
+        };
+        let file = File::from_path(db, path.as_std_path(), document.dialect, document.info)?;
+        db.source_system_mut().close(path);
+        ruff_db::files::File::sync_path(db, path);
+        Ok(Some(file))
+    }
+
+    pub fn document(&self, path: &std::path::Path) -> Option<&starpls_common::OpenDocument> {
+        let Self { db } = self;
+        db.system.document(starpls_common::system_path(path).ok()?)
+    }
+
+    pub fn update_file(&mut self, file: File, contents: String) {
+        let Self { db } = self;
+        starpls_common::update_file(db, file, contents);
+    }
+
+    /// Refresh filesystem metadata after fetching external repositories, then
+    /// invalidate host resolution results that did not yet identify a file.
+    pub fn invalidate_loads(&mut self) {
+        let Self { db } = self;
+        salsa::Database::trigger_cancellation(db);
+        ruff_db::files::Files::sync_all(db);
+        let environment = db.environment();
+        let revision = environment.load_revision(db) + 1;
+        environment.set_load_revision(db).to(revision);
     }
 
     pub fn snapshot(&self) -> AnalysisSnapshot {
-        AnalysisSnapshot {
-            db: self.db.clone(),
-        }
+        let Self { db } = self;
+        AnalysisSnapshot { db: db.clone() }
     }
 
     pub fn set_builtin_defs(&mut self, builtins: Builtins, rules: Builtins) {
-        self.db.set_builtin_defs(Dialect::Bazel, builtins, rules);
+        let Self { db } = self;
+        db.set_builtin_defs(Dialect::Bazel, builtins, rules);
     }
 
-    pub fn set_bazel_prelude_file(&mut self, file_id: FileId) {
-        self.db.set_bazel_prelude_file(file_id);
+    pub fn set_bazel_prelude_file(&mut self, file_id: File) {
+        let Self { db } = self;
+        db.set_bazel_prelude_file(file_id);
     }
 
     pub fn set_all_workspace_targets(&mut self, targets: Vec<String>) {
-        self.db.set_all_workspace_targets(targets);
+        let Self { db } = self;
+        db.set_all_workspace_targets(targets);
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test() -> (Analysis, Arc<SimpleFileLoader>) {
         let loader = Arc::new(SimpleFileLoader::default());
-        let analysis = Analysis::new(loader.clone(), Default::default());
+        let analysis = Analysis::with_system(
+            loader.clone(),
+            Default::default(),
+            ruff_db::system::InMemorySystem::default(),
+        );
         (analysis, loader)
     }
 
@@ -359,7 +329,7 @@ impl Analysis {
     pub(crate) fn from_single_file_fixture(fixture: &str) -> (Analysis, Fixture) {
         let (mut analysis, loader) = Self::new_for_test();
         let (fixture, _) = Fixture::from_single_file(&mut analysis.db, fixture);
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         (analysis, fixture)
     }
 }
@@ -369,6 +339,25 @@ pub struct AnalysisSnapshot {
 }
 
 impl AnalysisSnapshot {
+    pub fn path(&self, file: File) -> &std::path::Path {
+        let Self { db } = self;
+        file.path(db)
+    }
+
+    pub fn document(&self, path: &std::path::Path) -> Option<&starpls_common::OpenDocument> {
+        let Self { db } = self;
+        db.system.document(starpls_common::system_path(path).ok()?)
+    }
+
+    pub fn open_file(&self, path: &std::path::Path) -> Cancellable<Option<File>> {
+        self.query(|db| {
+            let document = db
+                .system
+                .document(starpls_common::system_path(path).ok()?)?;
+            File::from_path(db, path, document.dialect, document.info).ok()
+        })
+    }
+
     pub fn completions(
         &self,
         pos: FilePosition,
@@ -377,11 +366,11 @@ impl AnalysisSnapshot {
         self.query(|db| completions::completions(db, pos, trigger_character))
     }
 
-    pub fn diagnostics(&self, file_id: FileId) -> Cancellable<Vec<Diagnostic>> {
+    pub fn diagnostics(&self, file_id: File) -> Cancellable<Vec<Diagnostic>> {
         self.query(|db| diagnostics::diagnostics(db, file_id))
     }
 
-    pub fn document_symbols(&self, file_id: FileId) -> Cancellable<Option<Vec<DocumentSymbol>>> {
+    pub fn document_symbols(&self, file_id: File) -> Cancellable<Option<Vec<DocumentSymbol>>> {
         self.query(|db| document_symbols::document_symbols(db, file_id))
     }
 
@@ -401,15 +390,15 @@ impl AnalysisSnapshot {
         self.query(|db| hover::hover(db, pos))
     }
 
-    pub fn source(&self, file_id: FileId) -> Cancellable<Option<Source<'_>>> {
-        self.query(move |db| source::source(db, file_id))
+    pub fn source(&self, file_id: File) -> Cancellable<Source> {
+        self.query(move |db| starpls_common::source(db, file_id))
     }
 
-    pub fn show_hir(&self, file_id: FileId) -> Cancellable<Option<String>> {
+    pub fn show_hir(&self, file_id: File) -> Cancellable<Option<String>> {
         self.query(|db| show_hir::show_hir(db, file_id))
     }
 
-    pub fn show_syntax_tree(&self, file_id: FileId) -> Cancellable<Option<String>> {
+    pub fn show_syntax_tree(&self, file_id: File) -> Cancellable<Option<String>> {
         self.query(|db| show_syntax_tree::show_syntax_tree(db, file_id))
     }
 
@@ -422,7 +411,10 @@ impl AnalysisSnapshot {
     where
         F: FnOnce(&'a Database) -> T + panic::UnwindSafe,
     {
-        starpls_hir::Cancelled::catch(|| f(&self.db))
+        starpls_hir::Cancelled::catch(|| {
+            let Self { db } = self;
+            f(db)
+        })
     }
 }
 
@@ -430,7 +422,7 @@ impl panic::RefUnwindSafe for AnalysisSnapshot {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
-    pub file_id: FileId,
+    pub file_id: File,
     pub range: TextRange,
 }
 
@@ -440,7 +432,7 @@ pub enum LocationLink {
         origin_selection_range: Option<TextRange>,
         target_range: TextRange,
         target_selection_range: TextRange,
-        target_file_id: FileId,
+        target_file_id: File,
     },
     External {
         origin_selection_range: Option<TextRange>,
@@ -450,69 +442,55 @@ pub enum LocationLink {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePosition {
-    pub file_id: FileId,
+    pub file_id: File,
     pub pos: TextSize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadFileResult {
-    pub file_id: FileId,
-    pub dialect: Dialect,
-    pub info: Option<FileInfo>,
-    pub contents: Option<String>,
 }
 
 /// A trait for loading a path and listing its exported symbols.
 pub trait FileLoader: Send + Sync + 'static {
     fn resolve_path(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<ResolvedPath>>;
 
     /// Open the Starlark file corresponding to the given `path` and of the given `Dialect`.
     fn load_file(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
-    ) -> anyhow::Result<Option<LoadFileResult>>;
+        from: File,
+    ) -> anyhow::Result<Option<File>>;
 
     /// Returns a list of Starlark modules that can be loaded from the given `path`.
     fn list_load_candidates(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<Vec<LoadItemCandidate>>>;
 
     /// If the specified file is a BUILD file, returns its package.
-    fn resolve_build_file(&self, file_id: FileId) -> Option<String>;
+    fn resolve_build_file(&self, db: &dyn Db, file_id: File) -> Option<String>;
 }
 
 /// Simple implementation of [`FileLoader`] backed by a HashMap.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SimpleFileLoader {
-    files: DashMap<String, LoadFileResult>,
+    files: DashMap<String, File>,
     requests: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
 impl SimpleFileLoader {
-    pub(crate) fn add_files_from_fixture(&self, db: &dyn Db, fixture: &Fixture) {
-        for (path, file_id) in &fixture.path_to_file_id {
-            let file = db.get_file(*file_id).unwrap();
-            self.files.insert(
-                path.to_string_lossy().to_string(),
-                LoadFileResult {
-                    file_id: *file_id,
-                    dialect: file.dialect(db),
-                    info: file.info(db),
-                    contents: Some(file.contents(db).clone()),
-                },
-            );
+    pub(crate) fn add_files_from_fixture(&self, fixture: &Fixture) {
+        for (path, file) in &fixture.path_to_file_id {
+            self.files.insert(path.to_string_lossy().to_string(), *file);
         }
     }
 }
@@ -521,33 +499,41 @@ impl SimpleFileLoader {
 impl FileLoader for SimpleFileLoader {
     fn resolve_path(
         &self,
+        _db: &dyn Db,
         _path: &str,
         _dialect: Dialect,
-        _from: FileId,
+        _from: File,
     ) -> anyhow::Result<Option<ResolvedPath>> {
         Ok(None)
     }
 
     fn load_file(
         &self,
+        db: &dyn Db,
         path: &str,
-        _dialect: Dialect,
-        _from: FileId,
-    ) -> anyhow::Result<Option<LoadFileResult>> {
+        dialect: Dialect,
+        _from: File,
+    ) -> anyhow::Result<Option<File>> {
         self.requests.lock().unwrap().push(path.to_owned());
-        Ok(self.files.get(path).map(|res| res.clone()))
+        let result = if let Some(file) = self.files.get(path) {
+            File::from_path(db, file.path(db), file.dialect, file.info)
+        } else {
+            File::from_path(db, std::path::Path::new(path), dialect, None)
+        };
+        result.map(Some)
     }
 
     fn list_load_candidates(
         &self,
+        _db: &dyn Db,
         _path: &str,
         _dialect: Dialect,
-        _from: FileId,
+        _from: File,
     ) -> anyhow::Result<Option<Vec<LoadItemCandidate>>> {
         Ok(None)
     }
 
-    fn resolve_build_file(&self, _file_id: FileId) -> Option<String> {
+    fn resolve_build_file(&self, _db: &dyn Db, _file_id: File) -> Option<String> {
         None
     }
 }

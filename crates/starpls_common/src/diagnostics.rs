@@ -1,6 +1,6 @@
 use starpls_syntax::TextRange;
 
-use crate::FileId;
+use crate::File;
 
 /// An IDE diagnostic. This is the common data structure used to report errors to the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,7 +13,7 @@ pub struct Diagnostic {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRange {
-    pub file_id: FileId,
+    pub file_id: File,
     pub range: TextRange,
 }
 

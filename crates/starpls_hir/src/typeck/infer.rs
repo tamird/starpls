@@ -329,7 +329,7 @@ impl TyContext<'_> {
             .diagnostics
             .iter()
             .filter(|diagnostic| {
-                if diagnostic.range.file_id != file.id(self.db) {
+                if diagnostic.range.file_id != file {
                     return false;
                 }
                 let start_line = line_index
@@ -1895,7 +1895,7 @@ impl TyContext<'_> {
             message: message.into(),
             severity,
             range: FileRange {
-                file_id: file.id(self.db),
+                file_id: file,
                 range,
             },
             tags,
@@ -1956,13 +1956,12 @@ impl TyContext<'_> {
             .kind()
         {
             TyKind::Rule(rule) => {
-                let ty =
-                    builtin_types(self.db, file.dialect(self.db))
-                        .types
-                        .get(match rule.kind {
-                            RuleKind::Build => "ctx",
-                            RuleKind::Repository => "repository_ctx",
-                        })?;
+                let ty = builtin_types(self.db, file.dialect)
+                    .types
+                    .get(match rule.kind {
+                        RuleKind::Build => "ctx",
+                        RuleKind::Repository => "repository_ctx",
+                    })?;
                 match (ty.kind(), &rule.attrs) {
                     (TyKind::BuiltinType(ty, _), Some(attrs)) => Some(
                         TyKind::BuiltinType(
@@ -2033,7 +2032,7 @@ impl TyContext<'_> {
                 self.resolve_load_stmt(file, load_stmt.clone())
                     .map(|loaded_file| {
                         // Check for potential circular imports, including importing the current file.
-                        if file == loaded_file {
+                        if file.source == loaded_file.source {
                             self.add_diagnostic_for_range(
                                 file,
                                 Severity::Warning,
@@ -2048,7 +2047,7 @@ impl TyContext<'_> {
                             .cx
                             .load_resolution_stack
                             .iter()
-                            .any(|(entry_file, _)| loaded_file == *entry_file)
+                            .any(|(entry_file, _)| loaded_file.source == entry_file.source)
                         {
                             let mut message = String::from("Detected circular import\n");
                             for (_, load_stmt) in self.cx.load_resolution_stack.iter() {
@@ -2132,10 +2131,7 @@ impl TyContext<'_> {
         }
 
         let module = &load_stmt.module;
-        let res = match self
-            .db
-            .load_file(module, file.dialect(self.db), file.id(self.db))
-        {
+        let res = match self.db.load_file(module, file.dialect, file) {
             Ok(Some(loaded_file)) => Some(loaded_file),
             Ok(None) => return None,
             Err(err) => {

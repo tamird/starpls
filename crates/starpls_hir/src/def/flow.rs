@@ -392,8 +392,27 @@ impl Builder<'_> {
     }
 }
 
+pub(crate) fn flow_index(db: &dyn Db, file: File) -> &FlowIndex {
+    let File {
+        source,
+        dialect,
+        info,
+    } = file;
+    flow_index_query(db, source, (dialect, info))
+}
+
 #[salsa::tracked(returns(ref))]
-pub(crate) fn flow_index(db: &dyn Db, file: File) -> FlowIndex {
+pub(crate) fn flow_index_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> FlowIndex {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     let info = lower(db, file);
     let scopes = module_scopes(db, file);
     let module = &info.module;

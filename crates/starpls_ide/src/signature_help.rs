@@ -1,6 +1,5 @@
 use std::fmt::Write;
 
-use starpls_common::Db as _;
 use starpls_hir::Semantics;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::Direction;
@@ -38,7 +37,7 @@ pub(crate) fn signature_help(
     FilePosition { file_id, pos }: FilePosition,
 ) -> Option<SignatureHelp> {
     let sema = Semantics::new(db);
-    let file = db.get_file(file_id)?;
+    let file = file_id;
     let parse = sema.parse(file);
     let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
         // '(', ')', and ',' are typically the main tokens in a call expression that are not part of

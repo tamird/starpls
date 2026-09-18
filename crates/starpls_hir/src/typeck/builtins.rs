@@ -165,7 +165,7 @@ impl BuiltinFunctionData {
 
             let path = next_string_arg()?;
             let name = next_string_arg()?;
-            let loaded_file = db.load_file(path, file.dialect(db), file.id(db)).ok()??;
+            let loaded_file = db.load_file(path, file.dialect, file).ok()??;
 
             Some(
                 match Resolver::resolve_export_in_file(db, loaded_file, &Name::from_str(name))? {

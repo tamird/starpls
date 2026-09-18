@@ -1,7 +1,4 @@
-use std::collections::HashMap;
 use std::fs;
-use std::hash::BuildHasherDefault;
-use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
 use std::path::MAIN_SEPARATOR;
@@ -10,10 +7,6 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::bail;
 use crossbeam_channel::Sender;
-use dashmap::DashMap;
-use indexmap::IndexSet;
-use parking_lot::RwLock;
-use rustc_hash::FxHasher;
 use starpls_bazel::client::BazelClient;
 use starpls_bazel::label::PartialParse;
 use starpls_bazel::label::RepoKind;
@@ -21,14 +14,14 @@ use starpls_bazel::APIContext;
 use starpls_bazel::Label;
 use starpls_bazel::ParseError;
 use starpls_bazel::{self};
+use starpls_common::Db;
 use starpls_common::Dialect;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_common::LoadItemCandidate;
 use starpls_common::LoadItemCandidateKind;
 use starpls_common::ResolvedPath;
 use starpls_ide::FileLoader;
-use starpls_ide::LoadFileResult;
 
 use crate::event_loop::FetchExternalRepoRequest;
 use crate::event_loop::Task;
@@ -42,163 +35,11 @@ macro_rules! try_opt {
     };
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum DocumentSource {
-    Editor(i32),
-    Disk,
-}
-
-impl From<Option<i32>> for DocumentSource {
-    fn from(value: Option<i32>) -> Self {
-        value.map(Self::Editor).unwrap_or(Self::Disk)
-    }
-}
-
-/// Represents an active text document. Text documents may either be sourced from disk
-/// or from the editor.
-pub(crate) struct Document {
-    pub(crate) contents: String,
-    pub(crate) dialect: Dialect,
-    pub(crate) info: Option<FileInfo>,
-    pub(crate) source: DocumentSource,
-}
-
-impl Document {
-    fn new(
-        contents: String,
-        dialect: Dialect,
-        info: Option<FileInfo>,
-        version: Option<i32>,
-    ) -> Self {
-        Self {
-            contents,
-            dialect,
-            info,
-            source: version.into(),
-        }
-    }
-}
-
-pub(crate) enum DocumentChangeKind {
-    Create,
-    Update,
-}
-
-/// A collection of documents.
-pub(crate) struct DocumentManager {
-    documents: HashMap<FileId, Document>,
-    has_closed_or_opened_documents: bool,
-    changed_file_ids: Vec<(FileId, DocumentChangeKind)>,
-    path_interner: Arc<PathInterner>,
-    workspace: PathBuf,
-}
-
-impl DocumentManager {
-    pub(crate) fn new(path_interner: Arc<PathInterner>, workspace: PathBuf) -> Self {
-        Self {
-            documents: Default::default(),
-            has_closed_or_opened_documents: false,
-            changed_file_ids: Default::default(),
-            path_interner,
-            workspace,
-        }
-    }
-
-    pub(crate) fn open(&mut self, path: PathBuf, version: i32, contents: String) {
-        // Create/update the document with the given contents.
-        self.has_closed_or_opened_documents = true;
-        let (dialect, info) =
-            match dialect_and_api_context_for_workspace_path(&self.workspace, &path) {
-                Some((dialect, api_context)) => (
-                    dialect,
-                    api_context.map(|api_context| FileInfo::Bazel {
-                        api_context,
-                        is_external: !path.starts_with(&self.workspace),
-                    }),
-                ),
-                None => return,
-            };
-        let file_id = self.path_interner.intern_path(path);
-        self.documents.insert(
-            file_id,
-            Document::new(contents, dialect, info, Some(version)),
-        );
-        self.changed_file_ids
-            .push((file_id, DocumentChangeKind::Create));
-    }
-
-    pub(crate) fn close(&mut self, path: &PathBuf) {
-        if let Some(file_id) = self.path_interner.lookup_by_path_buf(path) {
-            self.has_closed_or_opened_documents = true;
-            if let Some(document) = self.documents.get_mut(&file_id) {
-                document.source = DocumentSource::Disk;
-            };
-        }
-    }
-
-    pub(crate) fn modify(&mut self, file_id: FileId, contents: String, version: Option<i32>) {
-        if let Some(document) = self.documents.get_mut(&file_id) {
-            document.contents = contents;
-            document.source = version.into();
-            self.changed_file_ids
-                .push((file_id, DocumentChangeKind::Update));
-        };
-    }
-
-    pub(crate) fn take_changes(&mut self) -> (bool, Vec<(FileId, DocumentChangeKind)>) {
-        let changed_documents = mem::take(&mut self.changed_file_ids);
-        let has_opened_or_closed_documents = self.has_closed_or_opened_documents;
-        self.has_closed_or_opened_documents = false;
-        (has_opened_or_closed_documents, changed_documents)
-    }
-
-    pub(crate) fn get(&self, file_id: FileId) -> Option<&Document> {
-        self.documents.get(&file_id)
-    }
-
-    pub(crate) fn lookup_by_file_id(&self, file_id: FileId) -> PathBuf {
-        self.path_interner.lookup_by_file_id(file_id)
-    }
-
-    pub(crate) fn lookup_by_path_buf(&self, path: &PathBuf) -> Option<FileId> {
-        self.path_interner.lookup_by_path_buf(path)
-    }
-}
-
-#[derive(Default, Debug)]
-pub(crate) struct PathInterner {
-    map: RwLock<IndexSet<PathBuf, BuildHasherDefault<FxHasher>>>,
-}
-
-impl PathInterner {
-    pub(crate) fn intern_path(&self, path: PathBuf) -> FileId {
-        let index = self.map.write().insert_full(path).0;
-        FileId(index as u32)
-    }
-
-    pub(crate) fn lookup_by_path_buf(&self, path: &PathBuf) -> Option<FileId> {
-        self.map
-            .read()
-            .get_index_of(path)
-            .map(|index| FileId(index as u32))
-    }
-
-    pub(crate) fn lookup_by_file_id(&self, file_id: FileId) -> PathBuf {
-        self.map
-            .read()
-            .get_index(file_id.0 as usize)
-            .expect("unknown file_id")
-            .clone()
-    }
-}
-
 pub(crate) struct DefaultFileLoader {
     bazel_client: Arc<dyn BazelClient>,
-    interner: Arc<PathInterner>,
     workspace: PathBuf,
     workspace_name: Option<String>,
     external_output_base: PathBuf,
-    cached_load_results: DashMap<String, PathBuf>,
     fetch_repo_sender: Sender<Task>,
     bzlmod_enabled: bool,
 }
@@ -206,7 +47,6 @@ pub(crate) struct DefaultFileLoader {
 impl DefaultFileLoader {
     pub(crate) fn new(
         bazel_client: Arc<dyn BazelClient>,
-        interner: Arc<PathInterner>,
         workspace: PathBuf,
         workspace_name: Option<String>,
         external_output_base: PathBuf,
@@ -215,36 +55,12 @@ impl DefaultFileLoader {
     ) -> Self {
         Self {
             bazel_client,
-            interner,
             workspace,
             workspace_name,
             external_output_base,
-            cached_load_results: Default::default(),
             fetch_repo_sender,
             bzlmod_enabled,
         }
-    }
-
-    fn make_cache_key(&self, repo_kind: &RepoKind, path: &str, from: FileId) -> String {
-        format!("{:?}-{:?}-{:?}", repo_kind, path, from.0)
-    }
-
-    fn read_cache_result(&self, repo_kind: &RepoKind, path: &str, from: FileId) -> Option<PathBuf> {
-        let key = self.make_cache_key(repo_kind, path, from);
-        self.cached_load_results
-            .get(&key)
-            .map(|path_buf| path_buf.clone())
-    }
-
-    fn record_cache_result(
-        &self,
-        repo_kind: &RepoKind,
-        path: &str,
-        from: FileId,
-        resolved_path: PathBuf,
-    ) {
-        let key = self.make_cache_key(repo_kind, path, from);
-        self.cached_load_results.insert(key, resolved_path);
     }
 }
 
@@ -254,12 +70,17 @@ struct ResolvedLabel {
 }
 
 impl DefaultFileLoader {
-    fn resolve_label(&self, label: &Label, from: FileId) -> anyhow::Result<Option<ResolvedLabel>> {
+    fn resolve_label(
+        &self,
+        db: &dyn Db,
+        label: &Label,
+        from: File,
+    ) -> anyhow::Result<Option<ResolvedLabel>> {
         let repo_kind = label.kind();
         let mut canonical_repo_res = None;
         let (root, package) = match &repo_kind {
             RepoKind::Apparent if self.bzlmod_enabled => {
-                let from_path = self.interner.lookup_by_file_id(from);
+                let from_path = from.path(db).to_path_buf();
                 let from_repo = try_opt!(self.repo_for_path(&from_path));
                 let canonical_repo = self
                     .bazel_client
@@ -299,7 +120,7 @@ impl DefaultFileLoader {
             }
             RepoKind::Current => {
                 // Find the Bazel workspace root.
-                let from_path = self.interner.lookup_by_file_id(from);
+                let from_path = from.path(db).to_path_buf();
                 match starpls_bazel::resolve_workspace(from_path)? {
                     Some(root) => root,
                     None => {
@@ -323,44 +144,36 @@ impl DefaultFileLoader {
         }))
     }
 
-    fn maybe_intern_file(
+    fn read_file(
         &self,
+        db: &dyn Db,
         path: PathBuf,
-        from: FileId,
+        dialect: Dialect,
+        info: Option<FileInfo>,
+        from: File,
         fetch_repo_on_err: Option<String>,
-    ) -> anyhow::Result<(FileId, Option<String>)> {
-        // If we've already interned this file, then simply return the file id.
-        let (file_id, contents) = match self.interner.lookup_by_path_buf(&path) {
-            Some(file_id) => (file_id, None),
-            None => {
-                let contents = match fs::read_to_string(&path) {
-                    Ok(contents) => contents,
-                    Err(err) => {
-                        if let Some(canonical_repo) = fetch_repo_on_err {
-                            if !self
-                                .external_output_base
-                                .join(&canonical_repo)
-                                .try_exists()
-                                .ok()
-                                .unwrap_or_default()
-                            {
-                                let _ = self.fetch_repo_sender.send(
-                                    Task::FetchExternalRepoRequest(FetchExternalRepoRequest {
-                                        file_id: from,
-                                        repo: canonical_repo,
-                                    }),
-                                );
-                            }
-                        }
-                        return Err(err.into());
+    ) -> anyhow::Result<File> {
+        match File::from_path(db, &path, dialect, info) {
+            Ok(file) => Ok(file),
+            Err(error) => {
+                if let Some(canonical_repo) = fetch_repo_on_err {
+                    if !self
+                        .external_output_base
+                        .join(&canonical_repo)
+                        .try_exists()
+                        .unwrap_or(false)
+                    {
+                        let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
+                            FetchExternalRepoRequest {
+                                file_id: from,
+                                repo: canonical_repo,
+                            },
+                        ));
                     }
-                };
-
-                (self.interner.intern_path(path), Some(contents))
+                }
+                Err(error)
             }
-        };
-
-        Ok((file_id, contents))
+        }
     }
 
     fn repo_for_path<'a>(&'a self, path: &'a Path) -> Option<&'a str> {
@@ -384,9 +197,10 @@ impl DefaultFileLoader {
 impl FileLoader for DefaultFileLoader {
     fn resolve_path(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<ResolvedPath>> {
         if dialect != Dialect::Bazel {
             return Ok(None);
@@ -398,7 +212,7 @@ impl FileLoader for DefaultFileLoader {
             Err(err) => return Err(anyhow!("error parsing label: {}", err.err)),
         };
 
-        let resolved_label = try_opt!(self.resolve_label(&label, from)?);
+        let resolved_label = try_opt!(self.resolve_label(db, &label, from)?);
         let res = if fs::metadata(&resolved_label.resolved_path)
             .ok()
             .map(|metadata| metadata.is_file())
@@ -422,14 +236,21 @@ impl FileLoader for DefaultFileLoader {
                 }));
             let path = parent.join(build_file);
 
-            // If we've already interned this file, then simply return the file id.
-            let (build_file, contents) =
-                self.maybe_intern_file(path, from, resolved_label.canonical_repo)?;
+            let build_file = self.read_file(
+                db,
+                path,
+                Dialect::Bazel,
+                Some(FileInfo::Bazel {
+                    api_context: APIContext::Build,
+                    is_external: false,
+                }),
+                from,
+                resolved_label.canonical_repo,
+            )?;
 
             ResolvedPath::BuildTarget {
                 build_file,
                 target: label.target().to_string(),
-                contents,
             }
         };
 
@@ -438,18 +259,24 @@ impl FileLoader for DefaultFileLoader {
 
     fn load_file(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
-    ) -> anyhow::Result<Option<LoadFileResult>> {
+        from: File,
+    ) -> anyhow::Result<Option<File>> {
         let (path, info, canonical_repo) = match dialect {
             Dialect::Standard => {
                 // Find the importing file's directory.
-                let mut from_path = self.interner.lookup_by_file_id(from);
+                let mut from_path = from.path(db).to_path_buf();
                 assert!(from_path.pop());
 
                 // Resolve the given path relative to the importing file's directory.
-                (from_path.join(path).canonicalize()?, None, None)
+                let candidate = from_path.join(path);
+                // Track missing paths before canonicalization can fail outside Salsa.
+                File::from_path(db, &candidate, dialect, None)?;
+                let candidate = starpls_common::system_path(&candidate)?;
+                let canonical = db.system().canonicalize_path(candidate)?;
+                (canonical.as_std_path().to_path_buf(), None, None)
             }
             Dialect::Bazel => {
                 // Parse the load path as a Bazel label.
@@ -463,17 +290,10 @@ impl FileLoader for DefaultFileLoader {
                     bail!("cannot load a non-bzl file");
                 }
 
-                let repo_kind = label.kind();
-                let (resolved_path, canonical_repo) = match self
-                    .read_cache_result(&repo_kind, path, from)
-                {
-                    Some(path) => (path, None),
-                    None => {
-                        let res = try_opt!(self.resolve_label(&label, from)?);
-                        self.record_cache_result(&repo_kind, path, from, res.resolved_path.clone());
-                        (res.resolved_path, res.canonical_repo)
-                    }
-                };
+                let ResolvedLabel {
+                    resolved_path,
+                    canonical_repo,
+                } = try_opt!(self.resolve_label(db, &label, from)?);
 
                 let is_external = !resolved_path.starts_with(&self.workspace);
                 (
@@ -487,22 +307,18 @@ impl FileLoader for DefaultFileLoader {
             }
         };
 
-        let (file_id, contents) = self.maybe_intern_file(path, from, canonical_repo)?;
-        Ok(Some(LoadFileResult {
-            file_id,
-            dialect,
-            info,
-            contents,
-        }))
+        let file = self.read_file(db, path, dialect, info, from, canonical_repo)?;
+        Ok(Some(file))
     }
 
     fn list_load_candidates(
         &self,
+        db: &dyn Db,
         path: &str,
         dialect: Dialect,
-        from: FileId,
+        from: File,
     ) -> anyhow::Result<Option<Vec<LoadItemCandidate>>> {
-        let from_path = self.interner.lookup_by_file_id(from);
+        let from_path = from.path(db).to_path_buf();
         match dialect {
             Dialect::Standard => {
                 let from_dir = from_path.parent().unwrap();
@@ -536,9 +352,8 @@ impl FileLoader for DefaultFileLoader {
             }
             Dialect::Bazel => {
                 // Determine the loading file's workspace root and package.
-                let (mut root, package) = try_opt!(starpls_bazel::resolve_workspace(
-                    self.interner.lookup_by_file_id(from),
-                )?);
+                let (mut root, package) =
+                    try_opt!(starpls_bazel::resolve_workspace(from.path(db),)?);
                 let (label, err) = match Label::parse(path) {
                     Ok(label) => (label, None),
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
@@ -653,8 +468,8 @@ impl FileLoader for DefaultFileLoader {
         }
     }
 
-    fn resolve_build_file(&self, file_id: FileId) -> Option<String> {
-        let path = self.interner.lookup_by_file_id(file_id);
+    fn resolve_build_file(&self, db: &dyn Db, file_id: File) -> Option<String> {
+        let path = file_id.path(db).to_path_buf();
         let path = path.strip_prefix(&self.workspace).ok()?;
         if matches!(
             &*path.file_name()?.to_string_lossy(),
@@ -777,4 +592,80 @@ pub(crate) fn dialect_and_api_context_for_workspace_path(
             }
         },
     })
+}
+
+#[cfg(test)]
+mod source_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use ruff_db::system::InMemorySystem;
+    use ruff_db::system::SystemPath;
+    use ruff_db::system::WritableSystem;
+    use starpls_bazel::client::BazelCLI;
+    use starpls_common::Dialect;
+    use starpls_ide::Analysis;
+    use starpls_ide::FilePosition;
+
+    use super::DefaultFileLoader;
+
+    #[test]
+    fn opening_a_relative_dependency_invalidates_failed_resolution() {
+        let disk = InMemorySystem::default();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = DefaultFileLoader::new(
+            Arc::new(BazelCLI::new("bazel")),
+            Default::default(),
+            None,
+            Default::default(),
+            sender,
+            false,
+        );
+        let mut analysis =
+            Analysis::with_system(Arc::new(loader), Default::default(), disk.clone());
+        let text = "load(\"dep.star\", \"value\")\nresult = value\n";
+        let main = analysis
+            .open_document(
+                Path::new("/main.star"),
+                Dialect::Standard,
+                None,
+                text.into(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(main).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with("Could not resolve module")),
+            "{diagnostics:?}"
+        );
+
+        disk.write_file(SystemPath::new("/dep.star"), "value = 1\n")
+            .unwrap();
+        analysis
+            .open_document(
+                Path::new("/dep.star"),
+                Dialect::Standard,
+                None,
+                "value = 42\n".into(),
+                1,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(main).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let hover = snapshot
+            .hover(FilePosition {
+                file_id: main,
+                pos: (text.rfind("value").unwrap() as u32).into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains("Literal[42]"),
+            "{}",
+            hover.contents.value
+        );
+    }
 }

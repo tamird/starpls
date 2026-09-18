@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ruff_db = { workspace = true }
 ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "cbff046555e11add566bc35a3b29ef8ecf8ebdb0" }
-dashmap = "5.5.3"
 id-arena = "2.2.1"
 salsa = { workspace = true }
 starpls_bazel = { path = "../starpls_bazel" }

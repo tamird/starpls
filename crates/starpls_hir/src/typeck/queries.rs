@@ -61,7 +61,26 @@ pub(crate) fn active_parameter(
     TyContext::new(db).resolve_call_expr_active_param(file, expr, argument)
 }
 
-#[salsa::tracked(returns(clone))]
 pub fn diagnostics(db: &dyn Db, file: File) -> Vec<Diagnostic> {
+    let File {
+        source,
+        dialect,
+        info,
+    } = file;
+    diagnostics_query(db, source, (dialect, info))
+}
+
+#[salsa::tracked(returns(clone))]
+fn diagnostics_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> Vec<Diagnostic> {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     TyContext::new(db).diagnostics_for_file(file)
 }
