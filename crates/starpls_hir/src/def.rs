@@ -12,7 +12,6 @@ use starpls_common::File;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
-use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::BinaryOp;
 use starpls_syntax::ast::UnaryOp;
 use starpls_syntax::ast::{self};
@@ -30,16 +29,12 @@ pub(crate) mod scope;
 mod tests;
 
 pub type ExprId = Id<Expr>;
-pub type ExprPtr = AstPtr<ast::Expression>;
 
 pub type StmtId = Id<Stmt>;
-pub type StmtPtr = AstPtr<ast::Statement>;
 
 pub type ParamId = Id<Param>;
-pub type ParamPtr = AstPtr<ast::Parameter>;
 
 pub type LoadItemId = Id<LoadItem>;
-pub type LoadItemPtr = AstPtr<ast::LoadItem>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Module {
@@ -67,13 +62,15 @@ pub(crate) struct ModuleSourceMap {
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
-    pub expr_map: FxHashMap<ExprPtr, ExprId>,
+    // Temporary correspondence for Rowan editor callers. Native consumers
+    // will use Ruff node indices; synthetic HIR retains source ranges.
+    pub expr_map: FxHashMap<TextRange, ExprId>,
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
-    pub stmt_map: FxHashMap<StmtPtr, StmtId>,
+    pub stmt_map: FxHashMap<TextRange, StmtId>,
     pub stmt_map_back: FxHashMap<StmtId, TextRange>,
-    pub param_map: FxHashMap<ParamPtr, ParamId>,
+    pub param_map: FxHashMap<TextRange, ParamId>,
     pub param_map_back: FxHashMap<ParamId, TextRange>,
-    pub load_item_map: FxHashMap<LoadItemPtr, LoadItemId>,
+    pub load_item_map: FxHashMap<TextRange, LoadItemId>,
     pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
 }
 

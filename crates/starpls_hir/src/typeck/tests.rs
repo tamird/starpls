@@ -5,10 +5,8 @@ use expect_test::expect;
 use expect_test::Expect;
 use itertools::Itertools;
 use starpls_bazel::APIContext;
-use starpls_common::parse;
 use starpls_common::Dialect;
 use starpls_common::FileInfo;
-use starpls_syntax::ast::AstNode;
 use starpls_test_util::FixtureType;
 
 use crate::display::DisplayWithDb;
@@ -128,14 +126,14 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
         0,
     )
     .unwrap();
-    let root = parse(&db, file).syntax();
+    let source = file.contents(&db);
     let source_map = source_map(&db, file);
     let mut res = String::new();
 
-    for (ptr, range) in source_map
-        .expr_map
-        .keys()
-        .map(|ptr| (ptr, ptr.syntax_node_ptr().text_range()))
+    for (expr, range) in source_map
+        .expr_map_back
+        .iter()
+        .map(|(expr, range)| (expr, *range))
         .sorted_by(|(_, lhs), (_, rhs)| {
             if lhs.contains_range(*rhs) {
                 Ordering::Greater
@@ -146,15 +144,13 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
             }
         })
     {
-        let expr = *source_map.expr_map.get(ptr).unwrap();
-        let ty = super::queries::infer_expr(&db, file, expr);
-        let node = ptr.to_node(&root);
+        let ty = super::queries::infer_expr(&db, file, *expr);
         writeln!(
             res,
             "{:?}..{:?} {:?}: {}",
             range.start(),
             range.end(),
-            node.syntax().text(),
+            &source[usize::from(range.start())..usize::from(range.end())],
             ty.display(&db)
         )
         .unwrap();

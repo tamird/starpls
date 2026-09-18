@@ -10,7 +10,6 @@ use starpls_common::File;
 use starpls_common::Severity;
 use starpls_intern::Interned;
 use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::AstToken;
 use starpls_syntax::ast::{self};
 use starpls_syntax::SyntaxNode;
@@ -23,12 +22,10 @@ use crate::def::CompClause;
 use crate::def::DictEntry;
 use crate::def::Expr;
 use crate::def::ExprId;
-use crate::def::ExprPtr;
 use crate::def::FunctionData;
 use crate::def::Literal;
 use crate::def::LoadItem;
 use crate::def::LoadItemId;
-use crate::def::LoadItemPtr;
 use crate::def::LoadStmt;
 use crate::def::LoadStmtData;
 use crate::def::Module;
@@ -36,10 +33,8 @@ use crate::def::ModuleSourceMap;
 use crate::def::Name;
 use crate::def::Param;
 use crate::def::ParamId;
-use crate::def::ParamPtr;
 use crate::def::Stmt;
 use crate::def::StmtId;
-use crate::def::StmtPtr;
 use crate::def::TypeCommentOwner;
 use crate::typeck::FunctionTypeRef;
 use crate::Db;
@@ -113,7 +108,7 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: ast::Statement) -> StmtId {
-        let ptr = AstPtr::new(&stmt);
+        let range = stmt.syntax().text_range();
         let type_comment = match &stmt {
             ast::Statement::Def(node) => node.suite().and_then(|suite| suite.type_comment()),
             ast::Statement::Assign(node) => node.type_comment(),
@@ -137,7 +132,7 @@ impl<'a> LoweringContext<'a> {
                     name,
                     ret_type_ref: spec.map(|spec| spec.1),
                     doc,
-                    range: ptr.syntax_node_ptr().text_range(),
+                    range,
                     params,
                 });
                 let stmt = self.alloc_stmt(
@@ -145,7 +140,7 @@ impl<'a> LoweringContext<'a> {
                         func: func.clone(),
                         stmts,
                     },
-                    ptr,
+                    range,
                     type_comment,
                 );
                 if let Some(range) = name_range {
@@ -214,7 +209,7 @@ impl<'a> LoweringContext<'a> {
                 Stmt::Expr { expr }
             }
         };
-        self.alloc_stmt(statement, ptr, type_comment)
+        self.alloc_stmt(statement, range, type_comment)
     }
 
     fn lower_expr_opt(&mut self, syntax: Option<ast::Expression>) -> ExprId {
@@ -233,7 +228,7 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_expr(&mut self, expr: ast::Expression) -> ExprId {
-        let ptr = AstPtr::new(&expr);
+        let range = expr.syntax().text_range();
         let expr = match expr {
             ast::Expression::Name(node) => {
                 let name = self.lower_name_ref_opt(Some(node));
@@ -271,7 +266,7 @@ impl<'a> LoweringContext<'a> {
                     name: Name::new_inline("lambda"),
                     ret_type_ref: None,
                     doc: None,
-                    range: ptr.syntax_node_ptr().text_range(),
+                    range,
                     params,
                 });
                 let body = self.lower_expr_opt(node.body());
@@ -342,7 +337,7 @@ impl<'a> LoweringContext<'a> {
                     }
                     _ => None,
                 });
-                let expr = self.alloc_expr(Expr::Call { callee, args }, ptr);
+                let expr = self.alloc_expr(Expr::Call { callee, args }, range);
                 if let Some(name) = impl_fn_name {
                     self.module.call_expr_with_impl_fn.insert(name, expr);
                 }
@@ -366,7 +361,7 @@ impl<'a> LoweringContext<'a> {
                 }
             }
         };
-        self.alloc_expr(expr, ptr)
+        self.alloc_expr(expr, range)
     }
 
     fn lower_params_opt(
@@ -412,7 +407,7 @@ impl<'a> LoweringContext<'a> {
             .flat_map(|params| params.parameters())
             .enumerate()
         {
-            let ptr = AstPtr::new(&param);
+            let range = param.syntax().text_range();
             let type_comment = param.type_comment();
             let comment_range = type_comment
                 .as_ref()
@@ -497,7 +492,7 @@ impl<'a> LoweringContext<'a> {
                 }
             };
 
-            let param = self.alloc_param(param, ptr);
+            let param = self.alloc_param(param, range);
             if let Some(range) = comment_range {
                 self.source_map
                     .type_comment_owners
@@ -614,7 +609,7 @@ impl<'a> LoweringContext<'a> {
     ) -> Box<[LoadItemId]> {
         load_items
             .map(|load_item| {
-                let ptr = AstPtr::new(&load_item);
+                let range = load_item.syntax().text_range();
                 let load_item = match load_item {
                     ast::LoadItem::Direct(item) => LoadItem::Direct {
                         name: self.lower_string_opt(item.name()),
@@ -629,7 +624,7 @@ impl<'a> LoweringContext<'a> {
                         }
                     }
                 };
-                self.alloc_load_item(load_item, ptr)
+                self.alloc_load_item(load_item, range)
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -704,7 +699,12 @@ impl<'a> LoweringContext<'a> {
         node.map(Self::lower_type).unwrap_or(TypeRef::Unknown)
     }
 
-    fn alloc_stmt(&mut self, stmt: Stmt, ptr: StmtPtr, type_comment: Option<TextRange>) -> StmtId {
+    fn alloc_stmt(
+        &mut self,
+        stmt: Stmt,
+        range: TextRange,
+        type_comment: Option<TextRange>,
+    ) -> StmtId {
         let Self {
             db: _,
             file: _,
@@ -739,14 +739,12 @@ impl<'a> LoweringContext<'a> {
                     .insert(source, AssignmentSource::Statement(id));
             }
         }
-        source_map.stmt_map.insert(ptr.clone(), id);
-        source_map
-            .stmt_map_back
-            .insert(id, ptr.syntax_node_ptr().text_range());
+        source_map.stmt_map.insert(range, id);
+        source_map.stmt_map_back.insert(id, range);
         id
     }
 
-    fn alloc_expr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
+    fn alloc_expr(&mut self, expr: Expr, range: TextRange) -> ExprId {
         let Self {
             db: _,
             file: _,
@@ -784,28 +782,33 @@ impl<'a> LoweringContext<'a> {
                 }
             }
         }
-        source_map.expr_map.insert(ptr.clone(), id);
-        source_map
-            .expr_map_back
-            .insert(id, ptr.syntax_node_ptr().text_range());
+        match source_map.expr_map.entry(range) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                panic!(
+                    "expressions {:?} and {id:?} share source range {:?}",
+                    entry.get(),
+                    entry.key()
+                );
+            }
+        }
+        source_map.expr_map_back.insert(id, range);
         id
     }
 
-    fn alloc_param(&mut self, param: Param, ptr: ParamPtr) -> ParamId {
+    fn alloc_param(&mut self, param: Param, range: TextRange) -> ParamId {
         let id = self.module.params.alloc(param);
-        self.source_map.param_map.insert(ptr.clone(), id);
-        self.source_map
-            .param_map_back
-            .insert(id, ptr.syntax_node_ptr().text_range());
+        self.source_map.param_map.insert(range, id);
+        self.source_map.param_map_back.insert(id, range);
         id
     }
 
-    fn alloc_load_item(&mut self, load_item: LoadItem, ptr: LoadItemPtr) -> LoadItemId {
+    fn alloc_load_item(&mut self, load_item: LoadItem, range: TextRange) -> LoadItemId {
         let id = self.module.load_items.alloc(load_item);
-        self.source_map.load_item_map.insert(ptr.clone(), id);
-        self.source_map
-            .load_item_map_back
-            .insert(id, ptr.syntax_node_ptr().text_range());
+        self.source_map.load_item_map.insert(range, id);
+        self.source_map.load_item_map_back.insert(id, range);
         id
     }
 

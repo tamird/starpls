@@ -237,3 +237,52 @@ def f():
         ),
     )
 }
+
+#[test]
+fn source_ranges_remain_distinct_during_edits() {
+    let mut db = TestDatabase::default();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Bazel,
+        Some(FileInfo::Bazel {
+            api_context: APIContext::Bzl,
+            is_external: false,
+        }),
+        String::new(),
+        0,
+    )
+    .unwrap();
+    for source in [
+        "x = ((a + b))\ny = a and b or c\nz = a < b < c\n",
+        "def f(x=(1+2), *, y=0, **kwargs):\n    # type: (int) -> int\n    return x\n",
+        "[x for (x,) in xs if x for y in ys if y]\n",
+        "load(\":defs.bzl\", alias=\"name\", \"other\")\nf(x, key=(y))\n",
+        "x = {\"😀\": lambda a: a}\nif x:\n    pass\nelif y:\n    z = 1\n",
+        "def broken()\nx = {\"k\": 1}\ny = 2\n",
+    ] {
+        let prefixes = source
+            .char_indices()
+            .map(|(offset, _)| source[..offset].to_owned());
+        let deletions = source.char_indices().map(|(offset, character)| {
+            let mut edited = source.to_owned();
+            edited.replace_range(offset..offset + character.len_utf8(), "");
+            edited
+        });
+        for input in std::iter::once(source.to_owned())
+            .chain(prefixes)
+            .chain(deletions)
+        {
+            starpls_common::update_file(&mut db, file, input.clone());
+            let map = crate::source_map(&db, file);
+            assert_eq!(map.expr_map.len(), map.expr_map_back.len(), "{input}");
+            assert_eq!(map.stmt_map.len(), map.stmt_map_back.len(), "{input}");
+            assert_eq!(map.param_map.len(), map.param_map_back.len(), "{input}");
+            assert_eq!(
+                map.load_item_map.len(),
+                map.load_item_map_back.len(),
+                "{input}"
+            );
+        }
+    }
+}
