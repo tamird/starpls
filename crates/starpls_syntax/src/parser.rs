@@ -9,7 +9,6 @@ use rowan::TextRange;
 use crate::type_comments::parse_type_list;
 use crate::type_comments::StrStep;
 use crate::type_comments::StrWithTokens;
-use crate::Module;
 use crate::StarlarkLanguage;
 use crate::SyntaxKind::*;
 use crate::SyntaxNode;
@@ -22,7 +21,7 @@ pub struct SyntaxError {
     pub range: TextRange,
 }
 
-/// The result of parsing a Starlark module and constructing a Rowan syntax tree.
+/// A parsed type-comment tree with ranges local to the comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseTree<T> {
     green: GreenNode,
@@ -48,26 +47,7 @@ impl<T: AstNode<Language = StarlarkLanguage>> ParseTree<T> {
     }
 }
 
-pub fn parse_module(input: &str, errors_sink: &mut dyn FnMut(SyntaxError)) -> ParseTree<Module> {
-    let parsed =
-        ruff_python_parser::parse_unchecked_source(input, ruff_python_ast::PySourceType::Python);
-    from_parsed_module(input, &parsed, errors_sink)
-}
-
-/// Applies Starlark validation and constructs the editor tree from a shared parse.
-///
-/// `input` must be the exact source text used to produce `parsed`.
-pub fn from_parsed_module(
-    input: &str,
-    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
-    errors_sink: &mut dyn FnMut(SyntaxError),
-) -> ParseTree<Module> {
-    crate::validate(input, parsed, errors_sink);
-    let comments = parse_type_comments(input, parsed.tokens(), errors_sink);
-    editor_tree(input, parsed, &comments)
-}
-
-pub(super) fn build_type_comment(
+fn build_type_comment(
     builder: &mut GreenNodeBuilder,
     text: &str,
     text_start: usize,
@@ -132,14 +112,4 @@ pub fn parse_type_comments(
             })
         })
         .collect()
-}
-
-/// Constructs the transitional editor tree from already validated syntax and
-/// parsed comments. Callers must use comments from the exact same source.
-pub fn editor_tree(
-    input: &str,
-    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
-    comments: &[TypeComment],
-) -> ParseTree<Module> {
-    ParseTree::new(crate::ruff::parse(input, parsed, comments))
 }

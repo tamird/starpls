@@ -1,0 +1,91 @@
+type comment 24..59:
+TYPE_COMMENT@0..35
+  TYPE_COMMENT_PREFIX@0..8 "# type: "
+  TYPE_COMMENT_BODY@8..35
+    PATH_TYPE@8..35
+      PATH_SEGMENT@8..11
+        IDENT@8..11 "api"
+      DOT@11..12 "."
+      PATH_SEGMENT@12..17
+        IDENT@12..17 "Value"
+      GENERIC_ARGUMENTS@17..35
+        OPEN_BRACK@17..18 "["
+        PATH_TYPE@18..34
+          PATH_SEGMENT@18..22
+            IDENT@18..22 "list"
+          GENERIC_ARGUMENTS@22..34
+            OPEN_BRACK@22..23 "["
+            UNION_TYPE@23..33
+              PATH_TYPE@23..26
+                PATH_SEGMENT@23..26
+                  IDENT@23..26 "int"
+              WHITESPACE@26..27 " "
+              BAR@27..28 "|"
+              WHITESPACE@28..29 " "
+              NONE_TYPE@29..33
+                NONE@29..33 "None"
+            CLOSE_BRACK@33..34 "]"
+        CLOSE_BRACK@34..35 "]"
+type comment 91..147:
+TYPE_COMMENT@0..56
+  TYPE_COMMENT_PREFIX@0..8 "# type: "
+  TYPE_COMMENT_BODY@8..56
+    FUNCTION_TYPE@8..56
+      OPEN_PAREN@8..9 "("
+      PARAMETER_TYPES@9..42
+        SIMPLE_PARAMETER_TYPE@9..12
+          PATH_TYPE@9..12
+            PATH_SEGMENT@9..12
+              IDENT@9..12 "int"
+        COMMA@12..13 ","
+        WHITESPACE@13..14 " "
+        ARGS_LIST_PARAMETER_TYPE@14..21
+          STAR@14..15 "*"
+          PATH_TYPE@15..21
+            PATH_SEGMENT@15..21
+              IDENT@15..21 "string"
+        COMMA@21..22 ","
+        WHITESPACE@22..23 " "
+        KWARGS_DICT_PARAMETER_TYPE@23..42
+          STAR_STAR@23..25 "**"
+          PATH_TYPE@25..42
+            PATH_SEGMENT@25..29
+              IDENT@25..29 "dict"
+            GENERIC_ARGUMENTS@29..42
+              OPEN_BRACK@29..30 "["
+              PATH_TYPE@30..36
+                PATH_SEGMENT@30..36
+                  IDENT@30..36 "string"
+              COMMA@36..37 ","
+              WHITESPACE@37..38 " "
+              PATH_TYPE@38..41
+                PATH_SEGMENT@38..41
+                  IDENT@38..41 "int"
+              CLOSE_BRACK@41..42 "]"
+      CLOSE_PAREN@42..43 ")"
+      WHITESPACE@43..44 " "
+      ARROW@44..46 "->"
+      WHITESPACE@46..47 " "
+      PATH_TYPE@47..56
+        PATH_SEGMENT@47..50
+          IDENT@47..50 "api"
+        DOT@50..51 "."
+        PATH_SEGMENT@51..56
+          IDENT@51..56 "Value"
+type comment 166..180:
+TYPE_COMMENT@0..14
+  TYPE_COMMENT_PREFIX@0..8 "# type: "
+  TYPE_COMMENT_BODY@8..14
+    IGNORE_TYPE@8..14
+      IGNORE@8..14 "ignore"
+type comment 187..202:
+TYPE_COMMENT@0..15
+  TYPE_COMMENT_PREFIX@0..8 "# type: "
+  TYPE_COMMENT_BODY@8..15
+    PATH_TYPE@8..11
+      PATH_SEGMENT@8..11
+        IDENT@8..11 "int"
+    WHITESPACE@11..12 " "
+    ERROR@12..15
+      DEF@12..15 "def"
+error 198..198: Unexpected token

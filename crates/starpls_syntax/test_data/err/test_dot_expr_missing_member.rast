@@ -1,7 +1,1 @@
-MODULE@0..2
-  DOT_EXPR@0..2
-    NAME_REF@0..1
-      IDENT@0..1 "a"
-    DOT@1..2 "."
-    NAME@2..2
 error 2..2: Expected an identifier

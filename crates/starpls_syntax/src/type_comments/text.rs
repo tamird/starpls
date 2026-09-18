@@ -48,7 +48,7 @@ impl<'a> StrWithTokens<'a> {
             token_kinds.push(if text == "ignore" {
                 SyntaxKind::IGNORE
             } else {
-                crate::ruff::token_kind(token, text)
+                token_kind(token, text)
             });
             token_start.push(start);
             end = u32::from(range.end());
@@ -188,5 +188,117 @@ impl Builder<'_, '_> {
         let text = self.str_with_tokens.token_text(self.pos);
         (self.sink)(StrStep::Token { kind, text });
         self.pos += 1;
+    }
+}
+
+fn token_kind(token: Token, text: &str) -> SyntaxKind {
+    use TokenKind as T;
+
+    use crate::SyntaxKind::*;
+    match token.kind() {
+        T::Identifier => {
+            if text == "load" {
+                LOAD
+            } else {
+                IDENT
+            }
+        }
+        T::Int => INT,
+        T::Float => FLOAT,
+        T::String => {
+            if token.unwrap_string_flags().is_byte_string() {
+                BYTES
+            } else {
+                STRING
+            }
+        }
+        T::Comment => COMMENT,
+        T::Newline => NEWLINE,
+        T::NonLogicalNewline => WHITESPACE,
+        T::Indent => WHITESPACE,
+        T::Dedent => WHITESPACE,
+        T::Lpar => OPEN_PAREN,
+        T::Rpar => CLOSE_PAREN,
+        T::Lsqb => OPEN_BRACK,
+        T::Rsqb => CLOSE_BRACK,
+        T::Lbrace => OPEN_BRACE,
+        T::Rbrace => CLOSE_BRACE,
+        T::Colon => COLON,
+        T::Comma => COMMA,
+        T::Semi => SEMI,
+        T::Plus => PLUS,
+        T::Minus => MINUS,
+        T::Star => STAR,
+        T::Slash => SLASH,
+        T::Vbar => BAR,
+        T::Amper => AMPERSAND,
+        T::Less => LT,
+        T::Greater => GT,
+        T::Equal => EQ,
+        T::Dot => DOT,
+        T::Percent => MOD,
+        T::EqEqual => EQ_EQ,
+        T::NotEqual => BANG_EQ,
+        T::LessEqual => LE,
+        T::GreaterEqual => GE,
+        T::Tilde => TILDE,
+        T::CircumFlex => CARET,
+        T::LeftShift => LT_LT,
+        T::RightShift => GT_GT,
+        T::DoubleStar => STAR_STAR,
+        T::PlusEqual => PLUS_EQ,
+        T::MinusEqual => MINUS_EQ,
+        T::StarEqual => STAR_EQ,
+        T::SlashEqual => SLASH_EQ,
+        T::PercentEqual => MOD_EQ,
+        T::AmperEqual => AMPERSAND_EQ,
+        T::VbarEqual => BAR_EQ,
+        T::CircumflexEqual => CARET_EQ,
+        T::LeftShiftEqual => LT_LT_EQ,
+        T::RightShiftEqual => GT_GT_EQ,
+        T::DoubleSlash => SLASH_SLASH,
+        T::DoubleSlashEqual => SLASH_SLASH_EQ,
+        T::Rarrow => ARROW,
+        T::Ellipsis => ELLIPSIS,
+        T::And => AND,
+        T::As => AS,
+        T::Assert => ASSERT,
+        T::Async => ASYNC,
+        T::Await => AWAIT,
+        T::Break => BREAK,
+        T::Class => CLASS,
+        T::Continue => CONTINUE,
+        T::Def => DEF,
+        T::Del => DEL,
+        T::Elif => ELIF,
+        T::Else => ELSE,
+        T::Except => EXCEPT,
+        T::False => FALSE,
+        T::Finally => FINALLY,
+        T::For => FOR,
+        T::From => FROM,
+        T::Global => GLOBAL,
+        T::If => IF,
+        T::Import => IMPORT,
+        T::In => IN,
+        T::Is => IS,
+        T::Lambda => LAMBDA,
+        T::None => NONE,
+        T::Nonlocal => NONLOCAL,
+        T::Not => NOT,
+        T::Or => OR,
+        T::Pass => PASS,
+        T::Raise => RAISE,
+        T::Return => RETURN,
+        T::True => TRUE,
+        T::Try => TRY,
+        T::While => WHILE,
+        T::With => WITH,
+        T::Yield => YIELD,
+        T::Case => IDENT,
+        T::Lazy => IDENT,
+        T::Match => IDENT,
+        T::Type => IDENT,
+        _ => ERROR,
     }
 }

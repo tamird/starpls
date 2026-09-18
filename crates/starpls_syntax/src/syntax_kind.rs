@@ -99,36 +99,6 @@ pub enum SyntaxKind {
     ARROW,
     ELLIPSIS,
 
-    // Expressions.
-    NAME,
-    NAME_REF,
-    LITERAL_EXPR,
-    IF_EXPR,
-    UNARY_EXPR,
-    BINARY_EXPR,
-    LAMBDA_EXPR,
-    LIST_EXPR,
-    LIST_COMP,
-    DICT_EXPR,
-    DICT_COMP,
-    TUPLE_EXPR,
-    PAREN_EXPR,
-    DOT_EXPR,
-    CALL_EXPR,
-    INDEX_EXPR,
-    SLICE_EXPR,
-
-    // Statements.
-    DEF_STMT,
-    IF_STMT,
-    FOR_STMT,
-    RETURN_STMT,
-    BREAK_STMT,
-    CONTINUE_STMT,
-    PASS_STMT,
-    ASSIGN_STMT,
-    LOAD_STMT,
-
     // Types.
     NONE_TYPE,
     UNION_TYPE,    // int | None
@@ -149,29 +119,6 @@ pub enum SyntaxKind {
     TYPE_COMMENT_PREFIX,
     TYPE_COMMENT_BODY,
     TYPE_LIST,
-
-    ARGUMENTS,
-    SIMPLE_ARGUMENT,        // f(x)
-    KEYWORD_ARGUMENT,       // f(kwarg=x)
-    UNPACKED_LIST_ARGUMENT, // f(*x)
-    UNPACKED_DICT_ARGUMENT, // f(**x)
-
-    PARAMETERS,
-    SIMPLE_PARAMETER,      // def f(x, y="default")
-    ARGS_LIST_PARAMETER,   // def f(*, *args)
-    KWARGS_DICT_PARAMETER, // def f(**kwargs)
-
-    SUITE,
-    LOOP_VARIABLES,
-    COMP_CLAUSE_FOR,
-    COMP_CLAUSE_IF,
-    DICT_ENTRY,
-
-    LOAD_MODULE,
-    DIRECT_LOAD_ITEM,
-    ALIASED_LOAD_ITEM,
-
-    MODULE,
 }
 
 #[macro_export]
@@ -269,7 +216,7 @@ impl SyntaxKind {
 impl From<u16> for SyntaxKind {
     #[inline]
     fn from(value: u16) -> Self {
-        assert!(value <= MODULE as u16);
+        assert!(value <= TYPE_LIST as u16);
         unsafe { std::mem::transmute(value) }
     }
 }

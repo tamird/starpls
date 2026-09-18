@@ -329,8 +329,7 @@ mod parse_tests {
                     let node = covering.node();
                     assert_eq!(node.range(), first);
                     assert_eq!(parsed.get_by_index(node.node_index().load()).range(), first);
-                    let tree = starpls_common::parse(&db, file);
-                    assert!(!tree.syntax().text_range().is_empty());
+                    assert!(starpls_common::syntax_info(&db, file).is_empty());
                 }
             })
             .unwrap()

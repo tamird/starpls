@@ -26,6 +26,7 @@ use starpls_syntax::source::string_value;
 use starpls_syntax::source::suite_range;
 use starpls_syntax::TypeComment;
 
+use crate::def::ops;
 use crate::def::Argument;
 use crate::def::AssignmentSource;
 use crate::def::CompClause;
@@ -320,7 +321,7 @@ impl<'a> LoweringContext<'a> {
                 Stmt::Assign {
                     lhs,
                     rhs,
-                    op: Some(ast::AssignOp::Normal),
+                    op: Some(ops::AssignOp::Normal),
                     type_ref,
                 }
             }
@@ -525,10 +526,10 @@ impl<'a> LoweringContext<'a> {
                 } = node;
                 let expr = self.lower_expr(operand, parent);
                 let op = match op {
-                    py::UnaryOp::Invert => ast::UnaryOp::Inv,
-                    py::UnaryOp::Not => ast::UnaryOp::Not,
-                    py::UnaryOp::UAdd => ast::UnaryOp::Arith(ast::UnaryArithOp::Add),
-                    py::UnaryOp::USub => ast::UnaryOp::Arith(ast::UnaryArithOp::Sub),
+                    py::UnaryOp::Invert => ops::UnaryOp::Inv,
+                    py::UnaryOp::Not => ops::UnaryOp::Not,
+                    py::UnaryOp::UAdd => ops::UnaryOp::Arith(ops::UnaryArithOp::Add),
+                    py::UnaryOp::USub => ops::UnaryOp::Arith(ops::UnaryArithOp::Sub),
                 };
                 Expr::Unary { expr, op: Some(op) }
             }
@@ -555,9 +556,9 @@ impl<'a> LoweringContext<'a> {
                     op,
                     values,
                 } = node;
-                let op = ast::BinaryOp::Logic(match op {
-                    py::BoolOp::And => ast::LogicOp::And,
-                    py::BoolOp::Or => ast::LogicOp::Or,
+                let op = ops::BinaryOp::Logic(match op {
+                    py::BoolOp::And => ops::LogicOp::And,
+                    py::BoolOp::Or => ops::LogicOp::Or,
                 });
                 return self.lower_chain(
                     values,
@@ -732,7 +733,7 @@ impl<'a> LoweringContext<'a> {
     fn lower_chain(
         &mut self,
         values: &[py::Expr],
-        ops: impl IntoIterator<Item = Option<ast::BinaryOp>>,
+        ops: impl IntoIterator<Item = Option<ops::BinaryOp>>,
         parent: AnyNodeRef<'_>,
     ) -> ExprId {
         let Some((first, rest)) = values.split_first() else {
@@ -1265,52 +1266,52 @@ impl<'a> LoweringContext<'a> {
     }
 }
 
-fn binary_op(op: py::Operator) -> Option<ast::BinaryOp> {
+fn binary_op(op: py::Operator) -> Option<ops::BinaryOp> {
     Some(match op {
-        py::Operator::Add => ast::BinaryOp::Arith(ast::ArithOp::Add),
-        py::Operator::Sub => ast::BinaryOp::Arith(ast::ArithOp::Sub),
-        py::Operator::Mult => ast::BinaryOp::Arith(ast::ArithOp::Mul),
-        py::Operator::Div => ast::BinaryOp::Arith(ast::ArithOp::Div),
-        py::Operator::FloorDiv => ast::BinaryOp::Arith(ast::ArithOp::Flr),
-        py::Operator::Mod => ast::BinaryOp::Arith(ast::ArithOp::Mod),
-        py::Operator::BitAnd => ast::BinaryOp::Bitwise(ast::BitwiseOp::And),
-        py::Operator::BitOr => ast::BinaryOp::Bitwise(ast::BitwiseOp::Or),
-        py::Operator::BitXor => ast::BinaryOp::Bitwise(ast::BitwiseOp::Xor),
-        py::Operator::LShift => ast::BinaryOp::Bitwise(ast::BitwiseOp::Shl),
-        py::Operator::RShift => ast::BinaryOp::Bitwise(ast::BitwiseOp::Shr),
+        py::Operator::Add => ops::BinaryOp::Arith(ops::ArithOp::Add),
+        py::Operator::Sub => ops::BinaryOp::Arith(ops::ArithOp::Sub),
+        py::Operator::Mult => ops::BinaryOp::Arith(ops::ArithOp::Mul),
+        py::Operator::Div => ops::BinaryOp::Arith(ops::ArithOp::Div),
+        py::Operator::FloorDiv => ops::BinaryOp::Arith(ops::ArithOp::Flr),
+        py::Operator::Mod => ops::BinaryOp::Arith(ops::ArithOp::Mod),
+        py::Operator::BitAnd => ops::BinaryOp::Bitwise(ops::BitwiseOp::And),
+        py::Operator::BitOr => ops::BinaryOp::Bitwise(ops::BitwiseOp::Or),
+        py::Operator::BitXor => ops::BinaryOp::Bitwise(ops::BitwiseOp::Xor),
+        py::Operator::LShift => ops::BinaryOp::Bitwise(ops::BitwiseOp::Shl),
+        py::Operator::RShift => ops::BinaryOp::Bitwise(ops::BitwiseOp::Shr),
         py::Operator::Pow => return None,
         py::Operator::MatMult => return None,
     })
 }
 
-fn assign_op(op: py::Operator) -> Option<ast::AssignOp> {
+fn assign_op(op: py::Operator) -> Option<ops::AssignOp> {
     Some(match op {
-        py::Operator::Add => ast::AssignOp::Arith(ast::ArithAssignOp::Add),
-        py::Operator::Sub => ast::AssignOp::Arith(ast::ArithAssignOp::Sub),
-        py::Operator::Mult => ast::AssignOp::Arith(ast::ArithAssignOp::Mul),
-        py::Operator::Div => ast::AssignOp::Arith(ast::ArithAssignOp::Div),
-        py::Operator::FloorDiv => ast::AssignOp::Arith(ast::ArithAssignOp::Flr),
-        py::Operator::Mod => ast::AssignOp::Arith(ast::ArithAssignOp::Mod),
-        py::Operator::BitAnd => ast::AssignOp::Bitwise(ast::BitwiseAssignOp::And),
-        py::Operator::BitOr => ast::AssignOp::Bitwise(ast::BitwiseAssignOp::Or),
-        py::Operator::BitXor => ast::AssignOp::Bitwise(ast::BitwiseAssignOp::Xor),
-        py::Operator::LShift => ast::AssignOp::Bitwise(ast::BitwiseAssignOp::Shl),
-        py::Operator::RShift => ast::AssignOp::Bitwise(ast::BitwiseAssignOp::Shr),
+        py::Operator::Add => ops::AssignOp::Arith(ops::ArithAssignOp::Add),
+        py::Operator::Sub => ops::AssignOp::Arith(ops::ArithAssignOp::Sub),
+        py::Operator::Mult => ops::AssignOp::Arith(ops::ArithAssignOp::Mul),
+        py::Operator::Div => ops::AssignOp::Arith(ops::ArithAssignOp::Div),
+        py::Operator::FloorDiv => ops::AssignOp::Arith(ops::ArithAssignOp::Flr),
+        py::Operator::Mod => ops::AssignOp::Arith(ops::ArithAssignOp::Mod),
+        py::Operator::BitAnd => ops::AssignOp::Bitwise(ops::BitwiseAssignOp::And),
+        py::Operator::BitOr => ops::AssignOp::Bitwise(ops::BitwiseAssignOp::Or),
+        py::Operator::BitXor => ops::AssignOp::Bitwise(ops::BitwiseAssignOp::Xor),
+        py::Operator::LShift => ops::AssignOp::Bitwise(ops::BitwiseAssignOp::Shl),
+        py::Operator::RShift => ops::AssignOp::Bitwise(ops::BitwiseAssignOp::Shr),
         py::Operator::Pow => return None,
         py::Operator::MatMult => return None,
     })
 }
 
-fn compare_op(op: py::CmpOp) -> Option<ast::BinaryOp> {
+fn compare_op(op: py::CmpOp) -> Option<ops::BinaryOp> {
     Some(match op {
-        py::CmpOp::Eq => ast::BinaryOp::Cmp(ast::CmpOp::Eq),
-        py::CmpOp::NotEq => ast::BinaryOp::Cmp(ast::CmpOp::Ne),
-        py::CmpOp::Lt => ast::BinaryOp::Cmp(ast::CmpOp::Lt),
-        py::CmpOp::LtE => ast::BinaryOp::Cmp(ast::CmpOp::Le),
-        py::CmpOp::Gt => ast::BinaryOp::Cmp(ast::CmpOp::Gt),
-        py::CmpOp::GtE => ast::BinaryOp::Cmp(ast::CmpOp::Ge),
-        py::CmpOp::In => ast::BinaryOp::MemberOp(ast::MemberOp::In),
-        py::CmpOp::NotIn => ast::BinaryOp::MemberOp(ast::MemberOp::NotIn),
+        py::CmpOp::Eq => ops::BinaryOp::Cmp(ops::CmpOp::Eq),
+        py::CmpOp::NotEq => ops::BinaryOp::Cmp(ops::CmpOp::Ne),
+        py::CmpOp::Lt => ops::BinaryOp::Cmp(ops::CmpOp::Lt),
+        py::CmpOp::LtE => ops::BinaryOp::Cmp(ops::CmpOp::Le),
+        py::CmpOp::Gt => ops::BinaryOp::Cmp(ops::CmpOp::Gt),
+        py::CmpOp::GtE => ops::BinaryOp::Cmp(ops::CmpOp::Ge),
+        py::CmpOp::In => ops::BinaryOp::MemberOp(ops::MemberOp::In),
+        py::CmpOp::NotIn => ops::BinaryOp::MemberOp(ops::MemberOp::NotIn),
         py::CmpOp::Is => return None,
         py::CmpOp::IsNot => return None,
     })

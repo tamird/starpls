@@ -12,16 +12,17 @@ use smol_str::SmolStr;
 use starpls_common::File;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
-use starpls_syntax::ast::AssignOp;
-use starpls_syntax::ast::BinaryOp;
-use starpls_syntax::ast::UnaryOp;
 use starpls_syntax::TextRange;
 
+use crate::def::ops::AssignOp;
+use crate::def::ops::BinaryOp;
+use crate::def::ops::UnaryOp;
 use crate::typeck::TypeRef;
 use crate::Db;
 
 pub(crate) mod codeflow;
 mod lower;
+pub(crate) mod ops;
 pub(crate) mod resolver;
 pub(crate) mod scope;
 

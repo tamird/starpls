@@ -4,9 +4,6 @@ use std::path::PathBuf;
 use ruff_source_file::LineIndex;
 use salsa::Accumulator;
 use starpls_bazel::APIContext;
-use starpls_syntax::editor_tree;
-use starpls_syntax::Module;
-use starpls_syntax::ParseTree;
 pub use system::DocumentStamp;
 pub use system::OpenDocument;
 pub use system::SourceSystem;
@@ -186,8 +183,6 @@ pub fn update_file(db: &mut dyn Db, file: File, contents: String) {
     open_document(db, &path, file.dialect, file.info, contents, 0).expect("known file path");
 }
 
-pub type Parse = ParseTree<Module>;
-
 /// The canonical Python-shaped parse. Starlark validation is applied separately.
 pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule {
     let file = ruff_db::PythonFile::new_with_source_type(
@@ -199,34 +194,7 @@ pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule 
     ruff_db::parsed::parsed_module(db, file)
 }
 
-pub fn parse(db: &dyn Db, file: File) -> &Parse {
-    let File {
-        source,
-        dialect,
-        info,
-    } = file;
-    parse_query(db, source, (dialect, info))
-}
-
-#[salsa::tracked(returns(ref))]
-fn parse_query(
-    db: &dyn Db,
-    source: ruff_db::files::File,
-    context: (Dialect, Option<FileInfo>),
-) -> Parse {
-    let (dialect, info) = context;
-    let file = File {
-        source,
-        dialect,
-        info,
-    };
-    let comments = syntax_info(db, file);
-    let contents = file.contents(db);
-    let parsed = parsed_module(db, file).load(db);
-    editor_tree(&contents, &parsed, comments)
-}
-
-/// Language validation and type comments independent of the module editor tree.
+/// Starlark validation and type comments for the canonical parsed revision.
 pub fn syntax_info(db: &dyn Db, file: File) -> &[starpls_syntax::TypeComment] {
     syntax_info_query(db, file.source, (file.dialect, file.info))
 }

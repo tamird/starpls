@@ -260,6 +260,9 @@ fn native_nodes_follow_recovered_syntax() {
         "load(\":defs.bzl\", alias=\"name\", \"other\")\nf(x, key=(y))\n",
         "x = {\"😀\": lambda a: a}\nif x:\n    pass\nelif y:\n    z = 1\n",
         "def broken()\nx = {\"k\": 1}\ny = 2\n",
+        "if x:\n    pass\nelif y:\n    pass\nelse:\n    pass\n",
+        "if x:\nelse:\n    pass\n",
+        "if x\nelse:\n    pass\n",
     ] {
         let prefixes = source
             .char_indices()
@@ -291,9 +294,7 @@ fn native_nodes_follow_recovered_syntax() {
 }
 
 #[test]
-fn native_declarations_preserve_editor_ranges() {
-    use starpls_syntax::ast::AstNode;
-    use starpls_syntax::ast::{self};
+fn native_declaration_ranges_include_trivia() {
     let source = "def f(x=(1+2), *, y=0):\n    if x:\n        pass\n    elif y:\n        pass\n    else:\n        pass\n        # trailing suite comment\n\nnext = f\n";
     let mut db = TestDatabase::default();
     let file = starpls_common::open_document(
@@ -306,35 +307,21 @@ fn native_declarations_preserve_editor_ranges() {
     )
     .unwrap();
     let map = crate::source_map(&db, file);
-    let tree = starpls_common::parse(&db, file).syntax();
-    for node in tree.descendants() {
-        if (node.kind() == starpls_syntax::SyntaxKind::IF_STMT
-            || node.parent().is_some_and(|parent| {
-                matches!(
-                    parent.kind(),
-                    starpls_syntax::SyntaxKind::MODULE | starpls_syntax::SyntaxKind::SUITE
-                )
-            }))
-            && ast::Statement::cast(node.clone()).is_some()
-        {
-            assert!(
-                map.stmt_map_back
-                    .values()
-                    .any(|range| *range == node.text_range()),
-                "{} at {:?}",
-                node,
-                node.text_range()
-            );
-        }
-        if ast::Parameter::cast(node.clone()).is_some() {
-            assert!(
-                map.param_map_back
-                    .values()
-                    .any(|range| *range == node.text_range()),
-                "{node}"
-            );
-        }
-    }
+    let module = crate::module(&db, file);
+    let function = module.top_level[0];
+    let range = map.stmt_map_back[&function];
+    assert_eq!(u32::from(range.start()), 0);
+    assert_eq!(
+        u32::from(range.end()) as usize,
+        source.find("next").unwrap()
+    );
+    let mut parameters = map.param_map_back.values().copied().collect::<Vec<_>>();
+    parameters.sort_by_key(|range| range.start());
+    let text = parameters
+        .iter()
+        .map(|range| &source[usize::from(range.start())..usize::from(range.end())])
+        .collect::<Vec<_>>();
+    assert_eq!(text, ["x=(1+2)", "*", "y=0"]);
 }
 
 #[test]
@@ -423,9 +410,8 @@ def f(
 
 #[test]
 fn native_operators_and_recovered_slots() {
-    use starpls_syntax::ast::AssignOp;
-    use starpls_syntax::ast::BitwiseAssignOp;
-
+    use crate::def::ops::AssignOp;
+    use crate::def::ops::BitwiseAssignOp;
     use crate::def::Expr;
     use crate::def::Stmt;
     let mut db = TestDatabase::default();
