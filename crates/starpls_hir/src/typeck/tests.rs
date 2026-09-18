@@ -13,12 +13,12 @@ use starpls_common::FileInfo;
 use starpls_syntax::ast::AstNode;
 use starpls_test_util::FixtureType;
 
+use crate::display::DisplayWithDb;
 use crate::source_map;
 use crate::test_database::TestDatabaseBuilder;
 use crate::typeck::assign_tys;
 use crate::typeck::Ty;
 use crate::typeck::TyKind;
-use crate::DisplayWithDb;
 use crate::InferenceOptions;
 
 fn check_infer(input: &str, expect: Expect) {

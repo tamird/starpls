@@ -89,21 +89,21 @@ enum CompletionRelevance {
     Builtin,
 }
 
-enum CompletionAnalysis {
-    Name(NameContext),
-    NameRef(NameRefContext),
+enum CompletionAnalysis<'a> {
+    Name(NameContext<'a>),
+    NameRef(NameRefContext<'a>),
     String(StringContext),
     Type,
 }
 
-enum NameContext {
+enum NameContext<'a> {
     Def,
-    Dot { receiver_ty: Type },
+    Dot { receiver_ty: Type<'a> },
 }
 
-struct NameRefContext {
-    names: FxHashMap<Name, ScopeDef>,
-    params: Vec<Param>,
+struct NameRefContext<'a> {
+    names: FxHashMap<Name, ScopeDef<'a>>,
+    params: Vec<Param<'a>>,
     is_in_def: bool,
     is_in_for: bool,
     is_lone_expr: bool,
@@ -129,8 +129,8 @@ enum StringContext {
     },
 }
 
-struct CompletionContext {
-    analysis: CompletionAnalysis,
+struct CompletionContext<'a> {
+    analysis: CompletionAnalysis<'a>,
 }
 
 pub(crate) fn completions(
@@ -154,11 +154,9 @@ pub(crate) fn completions(
             for name in params
                 .iter()
                 .filter(|param| {
-                    !param.is_args_list(db)
-                        && !param.is_kwargs_dict(db)
-                        && !param.is_positional_only()
+                    !param.is_args_list() && !param.is_kwargs_dict() && !param.is_positional_only()
                 })
-                .filter_map(|param| match param.name(db) {
+                .filter_map(|param| match param.name() {
                     Some(name) if !name.is_missing() => Some(name),
                     _ => None,
                 })
@@ -179,7 +177,7 @@ pub(crate) fn completions(
                         label: name.to_string(),
                         kind: match &def {
                             ScopeDef::Callable(_) => CompletionItemKind::Function,
-                            def if def.ty(db).is_callable() => CompletionItemKind::Function,
+                            def if def.ty().is_callable() => CompletionItemKind::Function,
                             // All the global values in the Bazel builtins are modules.
                             ScopeDef::Variable(it) if !it.is_user_defined() => {
                                 CompletionItemKind::Module
@@ -202,7 +200,7 @@ pub(crate) fn completions(
             }
         }
         CompletionAnalysis::Name(NameContext::Dot { receiver_ty }) => {
-            for (name, ty) in receiver_ty.fields(db) {
+            for (name, ty) in receiver_ty.fields() {
                 items.push(CompletionItem {
                     label: name.name().to_string(),
                     kind: if ty.is_callable() {
@@ -288,7 +286,7 @@ pub(crate) fn completions(
                             CompletionItemKind::Function
                         }
                         ScopeDef::Variable(it) if it.is_user_defined() => {
-                            if def.ty(db).is_callable() {
+                            if def.ty().is_callable() {
                                 CompletionItemKind::Function
                             } else {
                                 CompletionItemKind::Variable
@@ -443,9 +441,9 @@ fn maybe_str_context(file_id: FileId, root: &SyntaxNode, pos: TextSize) -> Optio
     None
 }
 
-impl CompletionContext {
+impl<'a> CompletionContext<'a> {
     fn new(
-        db: &dyn Db,
+        db: &'a dyn Db,
         FilePosition { file_id, pos }: FilePosition,
         trigger_character: Option<String>,
     ) -> Option<Self> {
@@ -509,9 +507,9 @@ impl CompletionContext {
                 .and_then(|expr| expr.callee())
                 .and_then(|expr| sema.type_of_expr(file, &expr))
                 .map(|ty| {
-                    ty.params(db)
+                    ty.params()
                         .into_iter()
-                        .filter_map(|(param, _)| match param.name(db) {
+                        .filter_map(|(param, _)| match param.name() {
                             Some(name)
                                 if keyword_args.iter().all(|kwarg| kwarg != name.as_str()) =>
                             {

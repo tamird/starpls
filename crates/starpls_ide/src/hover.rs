@@ -1,7 +1,6 @@
 use std::fmt::Write;
 
 use starpls_common::Db as _;
-use starpls_hir::DisplayWithDb;
 use starpls_hir::Semantics;
 use starpls_hir::Type;
 use starpls_syntax::ast::AstNode;
@@ -66,14 +65,14 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
     let parent = token.parent()?;
     if let Some(expr) = ast::NameRef::cast(parent.clone()) {
         let ty = sema.type_of_expr(file, &expr.clone().into())?;
-        return Some(format_for_name(db, expr.name()?.text(), &ty).into());
+        return Some(format_for_name(expr.name()?.text(), &ty).into());
     } else if let Some(name) = ast::Name::cast(parent.clone()) {
         let parent = name.syntax().parent()?;
         let name_token = name.name()?;
         let name_text = name_token.text();
         if let Some(expr) = ast::DotExpr::cast(parent.clone()) {
             let ty = sema.type_of_expr(file, &expr.expr()?)?;
-            let fields = ty.fields(db);
+            let fields = ty.fields();
             let (field, field_ty) = fields.into_iter().find_map(|(field, ty)| {
                 if field.name().as_str() == name_text {
                     Some((field, ty))
@@ -91,7 +90,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
                 text.push_str(name_text);
                 text.push_str(": ");
             }
-            write!(&mut text, "{}", field_ty.display(db)).unwrap();
+            write!(&mut text, "{}", field_ty).unwrap();
             text.push_str("\n```\n");
 
             let doc = field.doc();
@@ -104,7 +103,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
         } else if let Some(stmt) = ast::DefStmt::cast(parent.clone()) {
             let func = sema.callable_for_def(file, stmt)?;
             let mut text = String::from("```python\n(function) ");
-            write!(text, "{}\n```\n", func.ty().display(db)).ok()?;
+            write!(text, "{}\n```\n", func.ty()).ok()?;
             if let Some(doc) = func.doc() {
                 text.push_str(&unindent_doc(&doc));
                 text.push('\n');
@@ -117,14 +116,14 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
                 text,
                 "{}: {}\n```\n",
                 param
-                    .name(db)
+                    .name()
                     .as_ref()
                     .map(|name| name.as_str())
                     .unwrap_or(""),
-                ty.display(db)
+                ty
             )
             .ok()?;
-            if let Some(doc) = param.doc(db) {
+            if let Some(doc) = param.doc() {
                 text.push_str(&unindent_doc(&doc));
                 text.push('\n');
             }
@@ -137,8 +136,8 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
                 .and_then(|args| args.syntax().parent())
                 .and_then(ast::CallExpr::cast)?;
             let func = sema.resolve_call_expr(file, &call)?;
-            let (name, param, ty) = func.params(db).into_iter().find_map(|(param, ty)| {
-                let name = param.name(db)?;
+            let (name, param, ty) = func.params().into_iter().find_map(|(param, ty)| {
+                let name = param.name()?;
                 if name.as_str() == name_text {
                     Some((name, param, ty))
                 } else {
@@ -146,13 +145,9 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
                 }
             })?;
 
-            let mut text = format!(
-                "```python\n(parameter) {}: {}\n```\n",
-                name.as_str(),
-                ty.display(db),
-            );
+            let mut text = format!("```python\n(parameter) {}: {}\n```\n", name.as_str(), ty,);
 
-            if let Some(doc) = param.doc(db) {
+            if let Some(doc) = param.doc() {
                 if !doc.is_empty() {
                     text.push_str(&unindent_doc(&doc));
                     text.push('\n');
@@ -163,7 +158,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
     } else if let Some(segment) = ast::PathSegment::cast(parent.clone()) {
         let path_ty = ast::PathType::cast(segment.syntax().parent()?)?;
         let ty = sema.resolve_path_type(file, &path_ty)?;
-        let mut text = format!("```python\n(type) {}\n```\n", ty.display(db));
+        let mut text = format!("```python\n(type) {}\n```\n", ty);
         if let Some(doc) = ty.doc() {
             text.push_str(&unindent_doc(&doc));
             text.push('\n');
@@ -171,8 +166,8 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
         return Some(text.into());
     } else if let Some(load_item) = ast::LoadItem::cast(parent.clone()) {
         let load_item = sema.resolve_load_item(file, &load_item)?;
-        let def = sema.def_for_load_item(&load_item)?;
-        return Some(format_for_name(db, load_item.name(db).as_str(), &def.ty(db)).into());
+        let def = load_item.definition()?;
+        return Some(format_for_name(load_item.name().as_str(), &def.ty()).into());
     } else if let Some(load_module) = ast::LoadModule::cast(parent) {
         let load_stmt = ast::LoadStmt::cast(load_module.syntax().parent()?)?;
         let loaded_file = sema.resolve_load_stmt(file, &load_stmt)?;
@@ -188,7 +183,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
     None
 }
 
-fn format_for_name(db: &Database, name: &str, ty: &Type) -> String {
+fn format_for_name(name: &str, ty: &Type<'_>) -> String {
     let mut text = String::from("```python\n");
 
     // Handle special `def` formatting for function types.
@@ -200,7 +195,7 @@ fn format_for_name(db: &Database, name: &str, ty: &Type) -> String {
         text.push_str(": ");
     }
 
-    write!(&mut text, "{}", ty.display(db)).unwrap();
+    write!(&mut text, "{}", ty).unwrap();
     text.push_str("\n```\n");
 
     if let Some(doc) = ty.doc() {

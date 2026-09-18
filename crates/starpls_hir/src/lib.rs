@@ -42,14 +42,12 @@ use crate::def::ExprId;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
-pub use crate::display::DisplayWithDb;
-pub use crate::display::DisplayWithDbWrapper;
 pub use crate::test_database::Fixture;
 pub use crate::typeck::builtins::BuiltinDefs;
 pub use crate::typeck::queries::diagnostics as inference_diagnostics;
 pub use crate::typeck::Cancelled;
 pub use crate::typeck::InferenceOptions;
-pub use crate::typeck::Ty;
+pub(crate) use crate::typeck::Ty;
 use crate::typeck::TyKind;
 use crate::typeck::TypeRef;
 
@@ -127,38 +125,83 @@ pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Dia
 
 /// Semantic views for one database revision.
 ///
-/// Types and definitions returned by this API contain IDs into that revision's
-/// lowered modules. Use them only with this database, before changing its inputs.
-/// Editor requests turn these views into owned response data within their snapshot.
+/// Types and definitions borrow this database and use it for every lookup, so
+/// their revision-local IDs cannot survive an edit or be queried in another
+/// database. Editor requests convert these views into owned response data.
+///
+/// Materialize response data before editing the database:
+///
+/// ```no_run
+/// use starpls_common::File;
+/// use starpls_hir::{Db, Semantics};
+///
+/// fn inspect_then_edit(db: &mut dyn Db, file: File) -> String {
+///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
+///     let result = definition.ty().to_string();
+///     db.update_file(file.id(db), String::new());
+///     result
+/// }
+/// ```
+///
+/// Keeping a definition in use across an edit is rejected:
+///
+/// ```compile_fail,E0502
+/// use starpls_common::File;
+/// use starpls_hir::{Db, Semantics};
+///
+/// fn edit_then_inspect(db: &mut dyn Db, file: File) -> String {
+///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
+///     db.update_file(file.id(db), String::new());
+///     definition.ty().to_string()
+/// }
+/// ```
+#[derive(Clone, Copy)]
 pub struct Semantics<'a> {
     pub db: &'a dyn Db,
 }
+
+impl std::fmt::Debug for Semantics<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { db: _ } = self;
+        f.debug_struct("Semantics").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Semantics<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { db } = self;
+        let Self { db: other } = other;
+        std::ptr::addr_eq(*db, *other)
+    }
+}
+
+impl Eq for Semantics<'_> {}
 
 impl<'a> Semantics<'a> {
     pub fn new(db: &'a dyn Db) -> Self {
         Self { db }
     }
 
-    pub fn parse(&self, file: File) -> &Parse {
+    pub fn parse(&self, file: File) -> &'a Parse {
         parse(self.db, file)
     }
 
-    pub fn callable_for_def(&self, file: File, node: ast::DefStmt) -> Option<Callable> {
+    pub fn callable_for_def(&self, file: File, node: ast::DefStmt) -> Option<Callable<'a>> {
         let ptr = AstPtr::new(&ast::Statement::cast(node.syntax().clone())?);
         let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
         match &module(self.db, file)[*stmt] {
-            Stmt::Def { func, .. } => Some(
-                FunctionDef::Def {
+            Stmt::Def { func, .. } => Some(Callable::new(
+                *self,
+                CallableInner::HirDef(FunctionDef::Def {
                     func: func.clone(),
                     stmt: InFile { file, value: *stmt },
-                }
-                .into(),
-            ),
+                }),
+            )),
             _ => None,
         }
     }
 
-    pub fn resolve_path_type(&self, file: File, node: &ast::PathType) -> Option<Type> {
+    pub fn resolve_path_type(&self, file: File, node: &ast::PathType) -> Option<Type<'a>> {
         let usage = node
             .syntax()
             .ancestors()
@@ -190,30 +233,38 @@ impl<'a> Semantics<'a> {
             .flat_map(|segment| segment.value())
             .map(|token| Name::from_str(token.text()))
             .collect::<SmallVec<_>>();
-        Some(queries::resolve_type(self.db, TypeRef::Path(segments, None), usage).into())
+        Some(Type::new(
+            *self,
+            queries::resolve_type(self.db, TypeRef::Path(segments, None), usage),
+        ))
     }
 
-    pub fn resolve_call_expr(&self, file: File, expr: &ast::CallExpr) -> Option<Callable> {
+    pub fn resolve_call_expr(&self, file: File, expr: &ast::CallExpr) -> Option<Callable<'a>> {
         let ty = self.type_of_expr(file, &expr.callee()?)?;
         Some(match ty.ty.kind() {
-            TyKind::Function(def) => def.clone().into(),
-            TyKind::IntrinsicFunction(func, subst) => Callable(CallableInner::IntrinsicFunction(
-                func.clone(),
-                Some(subst.clone()),
-            )),
-            TyKind::BuiltinFunction(func) => func.clone().into(),
-            TyKind::Rule(rule) => Callable(CallableInner::Rule(rule.clone())),
-            TyKind::Provider(provider) => Callable(CallableInner::Provider(provider.clone())),
-            TyKind::ProviderRawConstructor(name, provider) => Callable(
+            TyKind::Function(def) => Callable::new(*self, CallableInner::HirDef(def.clone())),
+            TyKind::IntrinsicFunction(func, subst) => Callable::new(
+                *self,
+                CallableInner::IntrinsicFunction(func.clone(), Some(subst.clone())),
+            ),
+            TyKind::BuiltinFunction(func) => {
+                Callable::new(*self, CallableInner::BuiltinFunction(func.clone()))
+            }
+            TyKind::Rule(rule) => Callable::new(*self, CallableInner::Rule(rule.clone())),
+            TyKind::Provider(provider) => {
+                Callable::new(*self, CallableInner::Provider(provider.clone()))
+            }
+            TyKind::ProviderRawConstructor(name, provider) => Callable::new(
+                *self,
                 CallableInner::ProviderRawConstructor(name.clone(), provider.clone()),
             ),
-            TyKind::Tag(tag_class) => Callable(CallableInner::Tag(tag_class.clone())),
-            TyKind::Macro(makro) => Callable(CallableInner::Macro(makro.clone())),
+            TyKind::Tag(tag_class) => Callable::new(*self, CallableInner::Tag(tag_class.clone())),
+            TyKind::Macro(makro) => Callable::new(*self, CallableInner::Macro(makro.clone())),
             _ => return None,
         })
     }
 
-    pub fn resolve_def_stmt(&self, file: File, def_stmt: &ast::DefStmt) -> Option<Callable> {
+    pub fn resolve_def_stmt(&self, file: File, def_stmt: &ast::DefStmt) -> Option<Callable<'a>> {
         let module = module(self.db, file);
         let stmt = source_map(self.db, file)
             .stmt_map
@@ -221,19 +272,26 @@ impl<'a> Semantics<'a> {
         let Stmt::Def { ref func, .. } = module[*stmt] else {
             return None;
         };
-        Some(Callable(CallableInner::HirDef(FunctionDef::Def {
-            func: func.clone(),
-            stmt: InFile { file, value: *stmt },
-        })))
+        Some(Callable::new(
+            *self,
+            CallableInner::HirDef(FunctionDef::Def {
+                func: func.clone(),
+                stmt: InFile { file, value: *stmt },
+            }),
+        ))
     }
 
-    pub fn type_of_expr(&self, file: File, expr: &ast::Expression) -> Option<Type> {
+    pub fn type_of_expr(&self, file: File, expr: &ast::Expression) -> Option<Type<'a>> {
         let ptr = AstPtr::new(expr);
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
-        Some(queries::infer_expr(self.db, file, *expr).into())
+        Some(Type::new(*self, queries::infer_expr(self.db, file, *expr)))
     }
 
-    pub fn resolve_param(&self, file: File, param: &ast::Parameter) -> Option<(Param, Type)> {
+    pub fn resolve_param(
+        &self,
+        file: File,
+        param: &ast::Parameter,
+    ) -> Option<(Param<'a>, Type<'a>)> {
         let module = module(self.db, file);
         let param = source_map(self.db, file)
             .param_map
@@ -246,11 +304,14 @@ impl<'a> Semantics<'a> {
                 _ => None,
             })?;
         Some((
-            Param(ParamInner::Param {
-                func,
-                index: *index,
-            }),
-            queries::infer_param(self.db, file, *param).into(),
+            Param::new(
+                *self,
+                ParamInner::Param {
+                    func,
+                    index: *index,
+                },
+            ),
+            Type::new(*self, queries::infer_param(self.db, file, *param)),
         ))
     }
 
@@ -264,10 +325,11 @@ impl<'a> Semantics<'a> {
         queries::resolve_load_stmt(self.db, file, load_stmt)
     }
 
-    pub fn resolve_load_item(&self, file: File, load_item: &ast::LoadItem) -> Option<LoadItem> {
+    pub fn resolve_load_item(&self, file: File, load_item: &ast::LoadItem) -> Option<LoadItem<'a>> {
         let ptr = AstPtr::new(load_item);
         let load_item = source_map(self.db, file).load_item_map.get(&ptr)?;
         Some(LoadItem {
+            sema: *self,
             id: InFile {
                 file,
                 value: *load_item,
@@ -275,21 +337,30 @@ impl<'a> Semantics<'a> {
         })
     }
 
-    pub fn scope_for_module(&self, file: File) -> SemanticsScope<'_> {
+    pub fn scope_for_module(&self, file: File) -> SemanticsScope<'a> {
         let resolver = Resolver::new_for_module(self.db, file);
-        SemanticsScope { resolver }
+        SemanticsScope {
+            sema: *self,
+            resolver,
+        }
     }
 
-    pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope<'_>> {
+    pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope<'a>> {
         let ptr = AstPtr::new(expr);
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
         let resolver = Resolver::new_for_expr(self.db, file, *expr);
-        Some(SemanticsScope { resolver })
+        Some(SemanticsScope {
+            sema: *self,
+            resolver,
+        })
     }
 
-    pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope<'_> {
+    pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope<'a> {
         let resolver = Resolver::new_for_offset(self.db, file, offset);
-        SemanticsScope { resolver }
+        SemanticsScope {
+            sema: *self,
+            resolver,
+        }
     }
 
     pub fn resolve_call_expr_active_param(
@@ -302,44 +373,42 @@ impl<'a> Semantics<'a> {
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
         queries::active_parameter(self.db, file, *expr, active_arg)
     }
-
-    pub fn def_for_load_item(&self, load_item: &LoadItem) -> Option<ScopeDef> {
-        let load_stmt = load_item.load_stmt(self.db)?;
-        let loaded_file = self.resolve_load_stmt(load_item.id.file, &load_stmt)?;
-        self.scope_for_module(loaded_file)
-            .resolve_name(&load_item.name(self.db))
-            .into_iter()
-            .next()
-    }
 }
 
 pub struct SemanticsScope<'a> {
+    sema: Semantics<'a>,
     resolver: Resolver<'a>,
 }
 
-impl SemanticsScope<'_> {
-    pub fn names(&self) -> impl Iterator<Item = (Name, ScopeDef)> {
-        self.resolver
+impl<'a> SemanticsScope<'a> {
+    pub fn names(&self) -> impl Iterator<Item = (Name, ScopeDef<'a>)> + 'a {
+        let Self { sema, resolver } = self;
+        let sema = *sema;
+        resolver
             .names()
             .into_iter()
-            .map(|(name, def)| (name, def.into()))
+            .map(move |(name, def)| (name, ScopeDef::new(sema, def)))
     }
 
-    pub fn exports(&self) -> impl Iterator<Item = (Name, ScopeDef)> {
-        self.resolver
+    pub fn exports(&self) -> impl Iterator<Item = (Name, ScopeDef<'a>)> + 'a {
+        let Self { sema, resolver } = self;
+        let sema = *sema;
+        resolver
             .module_defs(true)
             .into_iter()
-            .map(|(name, def)| (name, def.into()))
+            .map(move |(name, def)| (name, ScopeDef::new(sema, def)))
     }
 
-    pub fn resolve_name(&self, name: &Name) -> Vec<ScopeDef> {
-        let mut defs: Vec<ScopeDef> = match self.resolver.resolve_name(name) {
-            Some((_, defs)) => defs.map(|def| def.def.clone().into()).collect(),
+    pub fn resolve_name(&self, name: &Name) -> Vec<ScopeDef<'a>> {
+        let mut defs: Vec<ScopeDef<'a>> = match self.resolver.resolve_name(name) {
+            Some((_, defs)) => defs
+                .map(|def| ScopeDef::new(self.sema, def.def.clone()))
+                .collect(),
             None => Vec::new(),
         };
         if defs.is_empty() {
             if let Some(def) = self.resolver.resolve_name_in_prelude_or_builtins(name) {
-                defs.push(def.into());
+                defs.push(ScopeDef::new(self.sema, def));
             }
         }
         defs
@@ -348,22 +417,29 @@ impl SemanticsScope<'_> {
 
 /// A type. Mostly serves as a public API for [`typeck::Ty`].
 #[derive(Clone, Debug)]
-pub struct Type {
+pub struct Type<'a> {
+    sema: Semantics<'a>,
     pub(crate) ty: Ty,
 }
 
-impl Type {
+impl<'a> Type<'a> {
+    fn new(sema: Semantics<'a>, ty: Ty) -> Self {
+        Self { sema, ty }
+    }
+
     pub fn is_function(&self) -> bool {
+        let Self { sema: _, ty } = self;
         matches!(
-            self.ty.kind(),
+            ty.kind(),
             TyKind::Function(_) | TyKind::BuiltinFunction(_) | TyKind::IntrinsicFunction(_, _)
         )
     }
 
     pub fn is_callable(&self) -> bool {
+        let Self { sema: _, ty } = self;
         self.is_function()
             || matches!(
-                self.ty.kind(),
+                ty.kind(),
                 TyKind::Rule(_)
                     | TyKind::Provider(_)
                     | TyKind::ProviderRawConstructor(_, _)
@@ -373,22 +449,29 @@ impl Type {
     }
 
     pub fn is_unknown(&self) -> bool {
-        self.ty.kind() == &TyKind::Unknown
+        let Self { sema: _, ty } = self;
+        ty.kind() == &TyKind::Unknown
     }
 
     pub fn is_user_defined_function(&self) -> bool {
-        matches!(self.ty.kind(), TyKind::Function(_))
+        let Self { sema: _, ty } = self;
+        matches!(ty.kind(), TyKind::Function(_))
     }
 
-    pub fn params(&self, db: &dyn Db) -> Vec<(Param, Type)> {
-        match self.ty.params(db) {
-            Some(params) => params.map(|(param, ty)| (param, ty.into())).collect(),
+    pub fn params(&self) -> Vec<(Param<'a>, Type<'a>)> {
+        let Self { sema, ty } = self;
+        let db = sema.db;
+        match ty.params(db) {
+            Some(params) => params
+                .map(|(param, ty)| (Param::new(*sema, param), Type::new(*sema, ty)))
+                .collect(),
             None => Vec::new(),
         }
     }
 
     pub fn doc(&self) -> Option<String> {
-        match self.ty.kind() {
+        let Self { sema: _, ty } = self;
+        match ty.kind() {
             TyKind::BuiltinFunction(func) => Some(func.doc.clone()),
             TyKind::BuiltinType(ty, _) => Some(ty.doc.clone()),
             TyKind::Function(def) => def.func().doc.as_ref().map(|doc| doc.to_string()),
@@ -405,19 +488,20 @@ impl Type {
         }
     }
 
-    pub fn fields(&self, db: &dyn Db) -> Vec<(Field, Type)> {
-        let fields = match self.ty.fields(db) {
+    pub fn fields(&self) -> Vec<(Field, Type<'a>)> {
+        let Self { sema, ty } = self;
+        let db = sema.db;
+        let fields = match ty.fields(db) {
             Some(fields) => fields,
             None => return Vec::new(),
         };
 
         let mut fields = fields
-            .map(|(name, ty)| (name, ty.into()))
+            .map(|(name, ty)| (name, Type::new(*sema, ty)))
             .collect::<Vec<_>>();
 
         // TODO(withered-magic): This ideally should be handled in `Ty::fields()` instead.
-        if let TyKind::Struct(Some(typeck::Struct::RuleAttributes { rule_kind, attrs })) =
-            self.ty.kind()
+        if let TyKind::Struct(Some(typeck::Struct::RuleAttributes { rule_kind, attrs })) = ty.kind()
         {
             fields.extend(attrs.attrs.iter().filter_map(|(name, attr)| {
                 attr.as_ref().map(|attr| {
@@ -426,7 +510,7 @@ impl Type {
                             name: name.clone(),
                             doc: attr.doc.as_ref().map(|doc| doc.as_ref().to_string()),
                         }),
-                        attr.resolved_ty(rule_kind).into(),
+                        Type::new(*sema, attr.resolved_ty(rule_kind)),
                     )
                 })
             }));
@@ -435,8 +519,10 @@ impl Type {
         fields
     }
 
-    pub fn provider_fields_source(&self, db: &dyn Db) -> Option<InFile<ast::DictExpr>> {
-        match self.ty.kind() {
+    pub fn provider_fields_source(&self) -> Option<InFile<ast::DictExpr>> {
+        let Self { sema, ty } = self;
+        let db = sema.db;
+        match ty.kind() {
             TyKind::Provider(provider) | TyKind::ProviderInstance(provider) => {
                 let dict_expr = match provider {
                     Provider::Builtin(_) => return None,
@@ -460,7 +546,8 @@ impl Type {
     }
 
     pub fn known_keys(&self) -> Option<Vec<String>> {
-        self.ty.known_keys().map(|known_keys| {
+        let Self { sema: _, ty } = self;
+        ty.known_keys().map(|known_keys| {
             known_keys
                 .iter()
                 .map(|(name, _)| name.as_ref().to_string())
@@ -468,24 +555,28 @@ impl Type {
         })
     }
 
-    pub fn dict_value_ty(&self) -> Option<Type> {
-        match self.ty.kind() {
-            TyKind::Dict(_, value_ty, _) => Some(value_ty.clone().into()),
+    pub fn dict_value_ty(&self) -> Option<Type<'a>> {
+        let Self { sema, ty } = self;
+        match ty.kind() {
+            TyKind::Dict(_, value_ty, _) => Some(Type::new(*sema, value_ty.clone())),
             _ => None,
         }
     }
 
-    pub fn variable_tuple_element_ty(&self) -> Option<Type> {
-        match self.ty.kind() {
-            TyKind::Tuple(Tuple::Variable(ty)) => Some(ty.clone().into()),
+    pub fn variable_tuple_element_ty(&self) -> Option<Type<'a>> {
+        let Self { sema, ty } = self;
+        match ty.kind() {
+            TyKind::Tuple(Tuple::Variable(ty)) => Some(Type::new(*sema, ty.clone())),
             _ => None,
         }
     }
 
-    pub fn try_as_inline_struct(&self) -> Option<Struct> {
-        match self.ty.kind() {
+    pub fn try_as_inline_struct(&self) -> Option<Struct<'a>> {
+        let Self { sema, ty } = self;
+        match ty.kind() {
             TyKind::Struct(strukt) => strukt.as_ref().and_then(|strukt| match strukt {
                 typeck::Struct::Inline { call_expr, .. } => Some(Struct {
+                    sema: *sema,
                     call_expr: *call_expr,
                 }),
                 _ => None,
@@ -495,46 +586,40 @@ impl Type {
     }
 }
 
-impl From<Ty> for Type {
-    fn from(ty: Ty) -> Self {
-        Self { ty }
-    }
-}
-
 /// A Bazel struct, created with the `struct()` function.
 #[derive(Clone, Debug)]
-pub struct Struct {
+pub struct Struct<'a> {
+    sema: Semantics<'a>,
     /// The `struct()` call that created this struct.
     call_expr: InFile<ExprId>,
 }
 
-impl Struct {
+impl<'a> Struct<'a> {
     /// Returns the AST node corresponding to the `struct()` call that created this struct.
-    pub fn call_expr(&self, db: &dyn Db) -> Option<InFile<ast::CallExpr>> {
-        let call_expr = source_map(db, self.call_expr.file)
-            .expr_map_back
-            .get(&self.call_expr.value)
-            .cloned()?
-            .cast::<ast::CallExpr>()?
-            .try_to_node(&parse(db, self.call_expr.file).syntax())?;
-        Some(InFile {
-            file: self.call_expr.file,
-            value: call_expr,
-        })
+    pub fn call_expr(&self) -> Option<InFile<ast::CallExpr>> {
+        let Self { sema, call_expr } = self;
+        let db = sema.db;
+        let InFile { file, value } = *call_expr;
+        let ptr = source_map(db, file).expr_map_back.get(&value)?;
+        let ptr = ptr.clone().cast::<ast::CallExpr>()?;
+        let value = ptr.try_to_node(&parse(db, file).syntax())?;
+        Some(InFile { file, value })
     }
 }
 
 /// A variable definition.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Variable {
+pub struct Variable<'a> {
+    sema: Semantics<'a>,
     expr: Option<InFile<ExprId>>,
 }
 
-impl Variable {
+impl<'a> Variable<'a> {
     /// Whether the variable is user-defined; `false` in the case of
     /// variables from e.g. Bazel builtins.
     pub fn is_user_defined(&self) -> bool {
-        self.expr.is_some()
+        let Self { sema: _, expr } = self;
+        expr.is_some()
     }
 }
 
@@ -542,11 +627,19 @@ impl Variable {
 /// The actual data is stored in [`CallableInner`], which wraps some
 /// crate-internal data types.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Callable(CallableInner);
+pub struct Callable<'a> {
+    sema: Semantics<'a>,
+    inner: CallableInner,
+}
 
-impl Callable {
+impl<'a> Callable<'a> {
+    fn new(sema: Semantics<'a>, inner: CallableInner) -> Self {
+        Self { sema, inner }
+    }
+
     pub fn name(&self) -> Name {
-        match self.0 {
+        let Self { sema: _, inner } = self;
+        match *inner {
             CallableInner::HirDef(ref def) => def.func().name.clone(),
             CallableInner::IntrinsicFunction(ref func, _) => func.name.clone(),
             CallableInner::BuiltinFunction(ref func) => func.name.clone(),
@@ -561,12 +654,14 @@ impl Callable {
         }
     }
 
-    pub fn params(&self, db: &dyn Db) -> Vec<(Param, Type)> {
-        self.ty().params(db)
+    pub fn params(&self) -> Vec<(Param<'a>, Type<'a>)> {
+        let Self { sema: _, inner: _ } = self;
+        self.ty().params()
     }
 
-    pub fn ty(&self) -> Type {
-        match self.0 {
+    pub fn ty(&self) -> Type<'a> {
+        let Self { sema, inner } = self;
+        let ty = match *inner {
             CallableInner::HirDef(ref def) => TyKind::Function(def.clone()).intern(),
             CallableInner::IntrinsicFunction(ref func, ref subst) => TyKind::IntrinsicFunction(
                 func.clone(),
@@ -585,20 +680,20 @@ impl Callable {
             }
             CallableInner::Tag(ref tag_class) => TyKind::Tag(tag_class.clone()).intern(),
             CallableInner::Macro(ref makro) => TyKind::Macro(makro.clone()).intern(),
-        }
-        .into()
+        };
+        Type::new(*sema, ty)
     }
 
-    pub fn ret_ty(&self, db: &dyn Db) -> Type {
-        self.ty()
-            .ty
-            .ret_ty(db)
-            .expect("expected return type")
-            .into()
+    pub fn ret_ty(&self) -> Type<'a> {
+        let Self { sema, inner: _ } = self;
+        let db = sema.db;
+        let ty = self.ty().ty.ret_ty(db).expect("expected return type");
+        Type::new(*sema, ty)
     }
 
     pub fn doc(&self) -> Option<String> {
-        match self.0 {
+        let Self { sema: _, inner } = self;
+        match *inner {
             CallableInner::HirDef(ref def) => def.func().doc.as_ref().map(|doc| doc.to_string()),
             CallableInner::BuiltinFunction(ref func) => Some(func.doc.clone()),
             CallableInner::IntrinsicFunction(ref func, _) => Some(func.doc.clone()),
@@ -620,30 +715,37 @@ impl Callable {
     }
 
     pub fn file(&self) -> Option<File> {
-        match self.0 {
+        let Self { sema: _, inner } = self;
+        match *inner {
             CallableInner::HirDef(ref def) => def.stmt().map(|stmt| stmt.file),
             _ => None,
         }
     }
 
     pub fn is_user_defined(&self) -> bool {
-        matches!(self.0, CallableInner::HirDef(_))
+        let Self { sema: _, inner } = self;
+        matches!(*inner, CallableInner::HirDef(_))
     }
 
     pub fn is_rule(&self) -> bool {
-        matches!(self.0, CallableInner::Rule(_))
+        let Self { sema: _, inner } = self;
+        matches!(*inner, CallableInner::Rule(_))
     }
 
     pub fn is_tag(&self) -> bool {
-        matches!(self.0, CallableInner::Tag(_))
+        let Self { sema: _, inner } = self;
+        matches!(*inner, CallableInner::Tag(_))
     }
 
     pub fn is_macro(&self) -> bool {
-        matches!(self.0, CallableInner::Macro(_))
+        let Self { sema: _, inner } = self;
+        matches!(*inner, CallableInner::Macro(_))
     }
 
-    pub fn rule_attrs_source(&self, db: &dyn Db) -> Option<InFile<ast::DictExpr>> {
-        let attrs_expr = match self.0 {
+    pub fn rule_attrs_source(&self) -> Option<InFile<ast::DictExpr>> {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        let attrs_expr = match *inner {
             CallableInner::Rule(ref rule) => rule.attrs.as_ref()?.expr?,
             _ => return None,
         };
@@ -658,18 +760,6 @@ impl Callable {
                     value: ptr.try_to_node(&parse(db, attrs_expr.file).syntax())?,
                 })
             })
-    }
-}
-
-impl From<FunctionDef> for Callable {
-    fn from(def: FunctionDef) -> Self {
-        Self(CallableInner::HirDef(def))
-    }
-}
-
-impl From<BuiltinFunction> for Callable {
-    fn from(func: BuiltinFunction) -> Self {
-        Self(CallableInner::BuiltinFunction(func))
     }
 }
 
@@ -706,7 +796,16 @@ enum CallableInner {
 /// The actual data is stored in [`ParamInner`], which wraps some
 /// crate-internal data types.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Param(pub(crate) ParamInner);
+pub struct Param<'a> {
+    sema: Semantics<'a>,
+    inner: ParamInner,
+}
+
+impl<'a> Param<'a> {
+    fn new(sema: Semantics<'a>, inner: ParamInner) -> Self {
+        Self { sema, inner }
+    }
+}
 
 /// Reperesents parameters for different types of callables.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -738,24 +837,39 @@ pub(crate) enum ParamInner {
 
 /// An item in a load statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadItem {
+pub struct LoadItem<'a> {
+    sema: Semantics<'a>,
     id: InFile<LoadItemId>,
 }
 
-impl LoadItem {
+impl<'a> LoadItem<'a> {
+    pub fn definition(&self) -> Option<ScopeDef<'a>> {
+        let Self { sema, id } = self;
+        let load_stmt = self.load_stmt()?;
+        let loaded_file = sema.resolve_load_stmt(id.file, &load_stmt)?;
+        sema.scope_for_module(loaded_file)
+            .resolve_name(&self.name())
+            .into_iter()
+            .next()
+    }
+
     /// Returns the AST node for the corresponding load statement.
-    pub fn load_stmt(&self, db: &dyn Db) -> Option<ast::LoadStmt> {
-        source_map(db, self.id.file)
+    pub fn load_stmt(&self) -> Option<ast::LoadStmt> {
+        let Self { sema, id } = self;
+        let db = sema.db;
+        source_map(db, id.file)
             .load_item_map_back
-            .get(&self.id.value)
-            .and_then(|ptr| ptr.try_to_node(&parse(db, self.id.file).syntax()))
+            .get(&id.value)
+            .and_then(|ptr| ptr.try_to_node(&parse(db, id.file).syntax()))
             .and_then(|node| node.syntax().parent())
             .and_then(ast::LoadStmt::cast)
     }
 
     /// The name of the item being loaded by the load statement.
-    pub fn name(&self, db: &dyn Db) -> Name {
-        match &module(db, self.id.file).load_items[self.id.value] {
+    pub fn name(&self) -> Name {
+        let Self { sema, id } = self;
+        let db = sema.db;
+        match &module(db, id.file).load_items[id.value] {
             def::LoadItem::Direct { name, .. } | def::LoadItem::Aliased { name, .. } => {
                 Name::from_str(name)
             }
@@ -766,35 +880,49 @@ impl LoadItem {
 /// Represents the different types of definition present within a scope.
 /// Mostly provides a nicer API for [`scope::ScopeDef`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ScopeDef {
+pub enum ScopeDef<'a> {
     /// A function definition.
-    Callable(Callable),
+    Callable(Callable<'a>),
 
     /// A variable definition.
-    Variable(Variable),
+    Variable(Variable<'a>),
 
     /// A parameter for a user-defined function.
-    Parameter(Param),
+    Parameter(Param<'a>),
 
     /// An item loaded by a `load` statement.
-    LoadItem(LoadItem),
+    LoadItem(LoadItem<'a>),
 }
 
-impl ScopeDef {
-    pub fn syntax_node_ptr(&self, db: &dyn Db) -> Option<InFile<SyntaxNodePtr>> {
+impl<'a> ScopeDef<'a> {
+    fn semantics(&self) -> Semantics<'a> {
         match self {
-            ScopeDef::Callable(Callable(CallableInner::HirDef(def))) => {
-                Some(def.func().syntax_node_ptr())
-            }
-            ScopeDef::Variable(Variable { expr: Some(expr) }) => source_map(db, expr.file)
+            Self::Callable(Callable { sema, inner: _ }) => *sema,
+            Self::Variable(Variable { sema, expr: _ }) => *sema,
+            Self::Parameter(Param { sema, inner: _ }) => *sema,
+            Self::LoadItem(LoadItem { sema, id: _ }) => *sema,
+        }
+    }
+
+    pub fn syntax_node_ptr(&self) -> Option<InFile<SyntaxNodePtr>> {
+        let db = self.semantics().db;
+        match self {
+            ScopeDef::Callable(Callable {
+                sema: _,
+                inner: CallableInner::HirDef(def),
+            }) => Some(def.func().syntax_node_ptr()),
+            ScopeDef::Variable(Variable {
+                sema: _,
+                expr: Some(expr),
+            }) => source_map(db, expr.file)
                 .expr_map_back
                 .get(&expr.value)
                 .map(|ptr| InFile {
                     file: expr.file,
                     value: ptr.syntax_node_ptr(),
                 }),
-            ScopeDef::Parameter(param) => param.syntax_node_ptr(db),
-            ScopeDef::LoadItem(LoadItem { id }) => source_map(db, id.file)
+            ScopeDef::Parameter(param) => param.syntax_node_ptr(),
+            ScopeDef::LoadItem(LoadItem { sema: _, id }) => source_map(db, id.file)
                 .load_item_map_back
                 .get(&id.value)
                 .map(|ptr| InFile {
@@ -805,16 +933,20 @@ impl ScopeDef {
         }
     }
 
-    pub fn ty(&self, db: &dyn Db) -> Type {
-        match self {
-            ScopeDef::Variable(Variable { expr: Some(expr) }) => {
-                queries::infer_expr(db, expr.file, expr.value)
-            }
+    pub fn ty(&self) -> Type<'a> {
+        let db = self.semantics().db;
+        let ty = match self {
+            ScopeDef::Variable(Variable {
+                sema: _,
+                expr: Some(expr),
+            }) => queries::infer_expr(db, expr.file, expr.value),
             ScopeDef::Callable(callable) => return callable.ty(),
-            ScopeDef::LoadItem(LoadItem { id }) => queries::infer_load_item(db, id.file, id.value),
+            ScopeDef::LoadItem(LoadItem { sema: _, id }) => {
+                queries::infer_load_item(db, id.file, id.value)
+            }
             _ => Ty::unknown(),
-        }
-        .into()
+        };
+        Type::new(self.semantics(), ty)
     }
 
     pub fn is_user_defined(&self) -> bool {
@@ -826,30 +958,38 @@ impl ScopeDef {
     }
 }
 
-impl From<scope::ScopeDef> for ScopeDef {
-    fn from(value: scope::ScopeDef) -> Self {
+impl<'a> ScopeDef<'a> {
+    fn new(sema: Semantics<'a>, value: scope::ScopeDef) -> Self {
         match value {
-            scope::ScopeDef::Function(it) => ScopeDef::Callable(it.into()),
-            scope::ScopeDef::IntrinsicFunction(it) => {
-                ScopeDef::Callable(Callable(CallableInner::IntrinsicFunction(it, None)))
+            scope::ScopeDef::Function(it) => {
+                ScopeDef::Callable(Callable::new(sema, CallableInner::HirDef(it)))
             }
-            scope::ScopeDef::BuiltinFunction(it) => ScopeDef::Callable(it.into()),
+            scope::ScopeDef::IntrinsicFunction(it) => ScopeDef::Callable(Callable::new(
+                sema,
+                CallableInner::IntrinsicFunction(it, None),
+            )),
+            scope::ScopeDef::BuiltinFunction(it) => {
+                ScopeDef::Callable(Callable::new(sema, CallableInner::BuiltinFunction(it)))
+            }
             scope::ScopeDef::Variable(it) => ScopeDef::Variable(Variable {
+                sema,
                 expr: Some(InFile {
                     file: it.file,
                     value: it.expr,
                 }),
             }),
             scope::ScopeDef::BuiltinVariable(type_ref) => match type_ref {
-                TypeRef::Provider(provider) => ScopeDef::Callable(Callable(
+                TypeRef::Provider(provider) => ScopeDef::Callable(Callable::new(
+                    sema,
                     CallableInner::Provider(Provider::Builtin(provider)),
                 )),
-                _ => ScopeDef::Variable(Variable { expr: None }),
+                _ => ScopeDef::Variable(Variable { sema, expr: None }),
             },
             scope::ScopeDef::Parameter(ParameterDef { func, index }) => {
-                ScopeDef::Parameter(Param(ParamInner::Param { func, index }))
+                ScopeDef::Parameter(Param::new(sema, ParamInner::Param { func, index }))
             }
             scope::ScopeDef::LoadItem(def) => ScopeDef::LoadItem(LoadItem {
+                sema,
                 id: InFile {
                     file: def.file,
                     value: def.load_item,

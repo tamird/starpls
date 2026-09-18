@@ -65,7 +65,7 @@ pub(crate) fn document_symbols(db: &Database, file_id: FileId) -> Option<Vec<Doc
     let mut symbols = scope
         .names()
         .filter_map(|(name, def)| {
-            let ptr = match def.syntax_node_ptr(db)? {
+            let ptr = match def.syntax_node_ptr()? {
                 InFile {
                     file: def_file,
                     value,

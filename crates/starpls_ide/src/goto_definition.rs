@@ -93,7 +93,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                         if skip_re_exports {
                             self.try_resolve_re_export(&load_item)
                         } else {
-                            let def = self.sema.def_for_load_item(&load_item)?;
+                            let def = load_item.definition()?;
                             self.def_to_location_link(def)
                         }
                     }
@@ -108,14 +108,14 @@ impl<'a> GotoDefinitionHandler<'a> {
     // might need to issue multiple "Go to Definition" commands to get to
     // the actual definition of a re-exported symbol.
     fn try_resolve_re_export(&self, load_item: &LoadItem) -> Option<LocationLink> {
-        let def = self.sema.def_for_load_item(load_item)?;
+        let def = load_item.definition()?;
         self.try_resolve_assign_from_load_item(&def)
             .and_then(|load_item| self.try_resolve_re_export(&load_item))
             .or_else(|| self.def_to_location_link(def))
     }
 
-    fn try_resolve_assign_from_load_item(&self, def: &ScopeDef) -> Option<LoadItem> {
-        let InFile { file, value: ptr } = def.syntax_node_ptr(self.sema.db)?;
+    fn try_resolve_assign_from_load_item(&self, def: &ScopeDef) -> Option<LoadItem<'a>> {
+        let InFile { file, value: ptr } = def.syntax_node_ptr()?;
         let syntax = ptr.try_to_node(&self.sema.parse(file).syntax())?;
         if !ast::NameRef::can_cast(syntax.kind()) {
             return None;
@@ -143,7 +143,7 @@ impl<'a> GotoDefinitionHandler<'a> {
 
         if let Some(strukt) = ty.try_as_inline_struct() {
             // Check for struct field definition.
-            let struct_call_expr = strukt.call_expr(self.sema.db)?;
+            let struct_call_expr = strukt.call_expr()?;
             struct_call_expr
                 .value
                 .arguments()
@@ -164,7 +164,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                     }
                     _ => None,
                 })
-        } else if let Some(provider_fields) = ty.provider_fields_source(self.sema.db) {
+        } else if let Some(provider_fields) = ty.provider_fields_source() {
             // Check for provider field definition. This only handles the case where the provider
             // fields are specified in a dictionary literal.
             self.find_name_in_dict_expr(provider_fields)
@@ -183,23 +183,20 @@ impl<'a> GotoDefinitionHandler<'a> {
         let callable = self.sema.resolve_call_expr(self.file, &call_expr)?;
 
         // If the callable is a rule, link to the dictionary where its attributes are declared.
-        if let Some(attrs_expr) = callable.rule_attrs_source(self.sema.db) {
+        if let Some(attrs_expr) = callable.rule_attrs_source() {
             return self.find_name_in_dict_expr(attrs_expr);
         }
 
-        let (param, _) = callable
-            .params(self.sema.db)
-            .into_iter()
-            .find(|(param, _)| {
-                param.name(self.sema.db).as_ref().map(|name| name.as_str())
-                    == arg
-                        .name()
-                        .and_then(|name| name.name())
-                        .as_ref()
-                        .map(|name| name.text())
-            })?;
+        let (param, _) = callable.params().into_iter().find(|(param, _)| {
+            param.name().as_ref().map(|name| name.as_str())
+                == arg
+                    .name()
+                    .and_then(|name| name.name())
+                    .as_ref()
+                    .map(|name| name.text())
+        })?;
 
-        let InFile { file, value: ptr } = param.syntax_node_ptr(self.sema.db)?;
+        let InFile { file, value: ptr } = param.syntax_node_ptr()?;
         let range = ptr.text_range();
         Some(vec![LocationLink::Local {
             origin_selection_range: None,
@@ -229,7 +226,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         if skip_re_exports {
             self.try_resolve_re_export(&load_item)
         } else {
-            let def = self.sema.def_for_load_item(&load_item)?;
+            let def = load_item.definition()?;
             self.def_to_location_link(def)
         }
         .map(|loc| vec![loc])
@@ -341,7 +338,7 @@ impl<'a> GotoDefinitionHandler<'a> {
     fn def_to_location_link(&self, def: ScopeDef) -> Option<LocationLink> {
         let location = match def {
             ScopeDef::Callable(_) => {
-                let InFile { file, value: ptr } = def.syntax_node_ptr(self.sema.db)?;
+                let InFile { file, value: ptr } = def.syntax_node_ptr()?;
                 let def_stmt = ptr
                     .try_to_node(&self.sema.parse(file).syntax())
                     .and_then(ast::DefStmt::cast)?;
@@ -354,7 +351,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                 }
             }
             _ => {
-                let InFile { file, value: ptr } = def.syntax_node_ptr(self.sema.db)?;
+                let InFile { file, value: ptr } = def.syntax_node_ptr()?;
                 let range = ptr.text_range();
                 LocationLink::Local {
                     origin_selection_range: None,

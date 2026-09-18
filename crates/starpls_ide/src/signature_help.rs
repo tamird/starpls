@@ -1,7 +1,6 @@
 use std::fmt::Write;
 
 use starpls_common::Db as _;
-use starpls_hir::DisplayWithDb;
 use starpls_hir::Semantics;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::Direction;
@@ -52,24 +51,24 @@ pub(crate) fn signature_help(
     // Find the argument node containing the current token.
     let expr = token.parent_ancestors().find_map(ast::CallExpr::cast)?;
     let func = sema.resolve_call_expr(file, &expr)?;
-    let params = func.params(db);
+    let params = func.params();
     let param_labels: Vec<String> = params
         .iter()
         .map(|(param, ty)| {
             let mut s = String::new();
-            if param.is_args_list(db) {
+            if param.is_args_list() {
                 s.push('*');
-            } else if param.is_kwargs_dict(db) {
+            } else if param.is_kwargs_dict() {
                 s.push_str("**");
             }
 
-            match param.name(db) {
+            match param.name() {
                 Some(name) if !name.is_missing() && !name.as_str().is_empty() => {
                     s.push_str(name.as_str());
 
-                    let ty = if param.is_args_list(db) {
+                    let ty = if param.is_args_list() {
                         ty.variable_tuple_element_ty()
-                    } else if param.is_kwargs_dict(db) {
+                    } else if param.is_kwargs_dict() {
                         ty.dict_value_ty()
                     } else {
                         ty.clone().into()
@@ -77,12 +76,12 @@ pub(crate) fn signature_help(
 
                     match ty {
                         Some(ty) if !ty.is_unknown() => {
-                            let _ = write!(&mut s, ": {}", ty.display(db));
+                            let _ = write!(&mut s, ": {}", ty);
                         }
                         _ => {}
                     }
 
-                    match param.default_value(db) {
+                    match param.default_value() {
                         Some(default_value) if !default_value.is_empty() => {
                             s.push_str(" = ");
                             s.push_str(&default_value);
@@ -117,7 +116,7 @@ pub(crate) fn signature_help(
     }
 
     label.push_str(") -> ");
-    let _ = write!(&mut label, "{}", func.ret_ty(db).display(db));
+    let _ = write!(&mut label, "{}", func.ret_ty());
 
     // Check if token's direct parent is an `Arguments` node. If so, that means we are at a ',', '(', or ')'.
     // The active parameter index is equal to the number of commas that we see to the left (including ourselves).
@@ -155,7 +154,7 @@ pub(crate) fn signature_help(
                     .zip(param_labels.into_iter())
                     .map(|((param, _), label)| ParameterInfo {
                         label,
-                        documentation: param.doc(db).map(|doc| unindent_doc(&doc)),
+                        documentation: param.doc().map(|doc| unindent_doc(&doc)),
                     })
                     .collect(),
             ),

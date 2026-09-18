@@ -83,13 +83,14 @@ impl DisplayWithDb for Ty {
     }
 }
 
-impl DisplayWithDb for Type {
-    fn fmt(&self, db: &dyn Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.ty.fmt(db, f)
-    }
-
-    fn fmt_alt(&self, db: &dyn Db, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.ty.fmt_alt(db, f)
+impl fmt::Display for Type<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Type { sema, ty } = self;
+        if f.alternate() {
+            ty.fmt_alt(sema.db, f)
+        } else {
+            ty.fmt(sema.db, f)
+        }
     }
 }
 
