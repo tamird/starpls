@@ -590,10 +590,10 @@ impl<'a> Type<'a> {
 
 fn expr_source_range(db: &dyn Db, expr: InFile<ExprId>) -> Option<InFile<TextRange>> {
     let InFile { file, value } = expr;
-    let ptr = source_map(db, file).expr_map_back.get(&value)?;
+    let range = source_map(db, file).expr_map_back.get(&value)?;
     Some(InFile {
         file,
-        value: ptr.syntax_node_ptr().text_range(),
+        value: *range,
     })
 }
 
@@ -964,7 +964,7 @@ impl<'a> ScopeDef<'a> {
                 let func = def.func();
                 Some(InFile {
                     file: func.file,
-                    value: func.ptr.text_range(),
+                    value: func.range,
                 })
             }
             Self::Variable(Variable { sema: _, def }) => {
@@ -983,10 +983,10 @@ impl<'a> ScopeDef<'a> {
             }
             Self::Parameter(param) => param.source_range(),
             Self::LoadItem(LoadItem { sema: _, id }) => {
-                let ptr = source_map(db, id.file).load_item_map_back.get(&id.value)?;
+                let range = source_map(db, id.file).load_item_map_back.get(&id.value)?;
                 Some(InFile {
                     file: id.file,
-                    value: ptr.syntax_node_ptr().text_range(),
+                    value: *range,
                 })
             }
         }

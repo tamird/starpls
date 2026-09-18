@@ -892,9 +892,9 @@ impl Param<'_> {
                 source_map(db, file)
                     .param_map_back
                     .get(&func.params[index])
-                    .map(|ptr| InFile {
+                    .map(|range| InFile {
                         file,
-                        value: ptr.syntax_node_ptr().text_range(),
+                        value: *range,
                     })
             }
             _ => None,

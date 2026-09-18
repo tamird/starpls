@@ -14,7 +14,6 @@ use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
 use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::BinaryOp;
-use starpls_syntax::ast::SyntaxNodePtr;
 use starpls_syntax::ast::UnaryOp;
 use starpls_syntax::ast::{self};
 use starpls_syntax::TextRange;
@@ -29,8 +28,6 @@ pub(crate) mod scope;
 
 #[cfg(test)]
 mod tests;
-
-pub type ModulePtr = AstPtr<ast::Module>;
 
 pub type ExprId = Id<Expr>;
 pub type ExprPtr = AstPtr<ast::Expression>;
@@ -66,17 +63,27 @@ pub(crate) enum AssignmentSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSourceMap {
-    pub root: ModulePtr,
+    pub root: TextRange,
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub expr_map: FxHashMap<ExprPtr, ExprId>,
-    pub expr_map_back: FxHashMap<ExprId, ExprPtr>,
+    pub expr_map_back: FxHashMap<ExprId, TextRange>,
     pub stmt_map: FxHashMap<StmtPtr, StmtId>,
-    pub stmt_map_back: FxHashMap<StmtId, StmtPtr>,
+    pub stmt_map_back: FxHashMap<StmtId, TextRange>,
     pub param_map: FxHashMap<ParamPtr, ParamId>,
-    pub param_map_back: FxHashMap<ParamId, ParamPtr>,
+    pub param_map_back: FxHashMap<ParamId, TextRange>,
     pub load_item_map: FxHashMap<LoadItemPtr, LoadItemId>,
-    pub load_item_map_back: FxHashMap<LoadItemId, LoadItemPtr>,
+    pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
+}
+
+impl ModuleSourceMap {
+    pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
+        match hir {
+            scope::ScopeHirId::Module => self.root,
+            scope::ScopeHirId::Expr(expr) => self.expr_map_back[&expr],
+            scope::ScopeHirId::Stmt(stmt) => self.stmt_map_back[&stmt],
+        }
+    }
 }
 
 impl Module {
@@ -378,7 +385,7 @@ pub type LoadStmt = Arc<LoadStmtData>;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct LoadStmtData {
     pub(crate) module: Box<str>,
-    pub(crate) ptr: SyntaxNodePtr,
+    pub(crate) range: TextRange,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,7 +495,7 @@ pub(crate) struct FunctionData {
     pub(crate) name: Name,
     pub(crate) ret_type_ref: Option<TypeRef>,
     pub(crate) doc: Option<Box<str>>,
-    pub(crate) ptr: SyntaxNodePtr,
+    pub(crate) range: TextRange,
     pub(crate) params: Box<[ParamId]>,
 }
 

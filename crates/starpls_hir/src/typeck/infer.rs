@@ -143,12 +143,10 @@ impl TyContext<'_> {
                     .stmt_map_back
                     .get(&unreachable_start)
                     .and_then(|start| {
-                        source_map.stmt_map_back.get(&unreachable_end).map(|end| {
-                            (
-                                start.syntax_node_ptr().text_range().start(),
-                                end.syntax_node_ptr().text_range().end(),
-                            )
-                        })
+                        source_map
+                            .stmt_map_back
+                            .get(&unreachable_end)
+                            .map(|end| (start.start(), end.end()))
                     })
             {
                 self.add_diagnostic_for_range(
@@ -1972,7 +1970,7 @@ impl TyContext<'_> {
         message: T,
     ) {
         let range = match source_map(self.db, file).expr_map_back.get(&expr) {
-            Some(ptr) => ptr.syntax_node_ptr().text_range(),
+            Some(range) => *range,
             None => return,
         };
         self.add_diagnostic_for_range(file, id, severity, range, tags, message);
@@ -2110,12 +2108,12 @@ impl TyContext<'_> {
         // TODO(withered-magic): This will eventually need to handle diagnostics
         // for other places that type comments can appear.
         for error in errors {
-            if let Some(ptr) = source_map(self.db, file).param_map_back.get(&param) {
+            if let Some(range) = source_map(self.db, file).param_map_back.get(&param) {
                 self.add_diagnostic_for_range(
                     file,
                     TYPE_CHECK,
                     Severity::Warning,
-                    ptr.syntax_node_ptr().text_range(),
+                    *range,
                     None,
                     error,
                 );
@@ -2136,11 +2134,11 @@ impl TyContext<'_> {
 
         let db = self.db;
         let range = || {
-            let ptr = source_map(db, file)
+            let range = source_map(db, file)
                 .load_item_map_back
                 .get(&load_item)
                 .unwrap();
-            ptr.syntax_node_ptr().text_range()
+            *range
         };
 
         let ty = match &module(db, file).load_items[load_item] {
@@ -2186,7 +2184,7 @@ impl TyContext<'_> {
                                     file,
                                     LOAD_ERROR,
                                     Severity::Warning,
-                                    load_stmt.ptr.text_range(),
+                                    load_stmt.range,
                                     None,
                                     message.clone(),
                                 )
@@ -2197,7 +2195,7 @@ impl TyContext<'_> {
                                 file,
                                 LOAD_ERROR,
                                 Severity::Warning,
-                                load_stmt.ptr.text_range(),
+                                load_stmt.range,
                                 None,
                                 message,
                             );
@@ -2262,7 +2260,7 @@ impl TyContext<'_> {
                     file,
                     LOAD_ERROR,
                     Severity::Warning,
-                    load_stmt.ptr.text_range(),
+                    load_stmt.range,
                     None,
                     format!("Could not resolve module \"{}\": {}", load_stmt.module, err),
                 );

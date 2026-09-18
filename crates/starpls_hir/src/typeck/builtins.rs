@@ -362,8 +362,8 @@ impl BuiltinFunctionData {
                                 }
                             }
                             "default" => {
-                                if let Some(ptr) = source_map(db, file).expr_map_back.get(expr) {
-                                    default_range = Some(ptr.syntax_node_ptr().text_range());
+                                if let Some(range) = source_map(db, file).expr_map_back.get(expr) {
+                                    default_range = Some(*range);
                                 }
                             }
                             _ => {}
