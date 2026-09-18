@@ -9,7 +9,6 @@ use rowan::TextRange;
 use crate::type_comments::parse_type_list;
 use crate::type_comments::StrStep;
 use crate::type_comments::StrWithTokens;
-use crate::LineIndex;
 use crate::Module;
 use crate::StarlarkLanguage;
 use crate::SyntaxKind::*;
@@ -84,8 +83,4 @@ pub(super) fn build_type_comment(
     });
 
     builder.finish_node();
-}
-
-pub fn line_index(input: &str) -> LineIndex {
-    LineIndex::new(input)
 }

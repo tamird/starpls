@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
 use anyhow::anyhow;
-use line_index::LineIndex;
-use line_index::WideEncoding;
-use line_index::WideLineCol;
+use ruff_source_file::OneIndexed;
+use ruff_source_file::PositionEncoding;
+use ruff_source_file::SourceLocation;
 use starpls_common::Diagnostic;
 use starpls_common::DiagnosticTag;
 use starpls_common::FileId;
 use starpls_common::Severity;
+use starpls_common::Source;
 use starpls_ide::DocumentSymbol;
 use starpls_ide::SymbolKind;
 use starpls_ide::SymbolTag;
@@ -23,10 +24,10 @@ pub(crate) fn path_buf_from_url(url: &lsp_types::Url) -> anyhow::Result<PathBuf>
 
 pub(crate) fn lsp_diagnostic_from_native(
     diagnostic: Diagnostic,
-    line_index: &LineIndex,
+    source: Source<'_>,
 ) -> Option<lsp_types::Diagnostic> {
     Some(lsp_types::Diagnostic {
-        range: lsp_range_from_text_range(diagnostic.range.range, line_index)?,
+        range: lsp_range_from_text_range(diagnostic.range.range, source)?,
         severity: Some(lsp_severity_from_native(diagnostic.severity)),
         code: None,
         code_description: None,
@@ -47,27 +48,56 @@ pub(crate) fn lsp_diagnostic_from_native(
 
 pub(crate) fn lsp_range_from_text_range(
     text_range: TextRange,
-    line_index: &LineIndex,
+    source: Source<'_>,
 ) -> Option<lsp_types::Range> {
-    let start = line_index.to_wide(WideEncoding::Utf16, line_index.line_col(text_range.start()))?;
-    let end = line_index.to_wide(WideEncoding::Utf16, line_index.line_col(text_range.end()))?;
-    Some(lsp_types::Range {
-        start: lsp_types::Position {
-            line: start.line,
-            character: start.col,
-        },
-        end: lsp_types::Position {
-            line: end.line,
-            character: end.col,
-        },
-    })
+    let start = lsp_position_from_offset(source, text_range.start())?;
+    let end = lsp_position_from_offset(source, text_range.end())?;
+    Some(lsp_types::Range { start, end })
 }
 
-fn wide_line_col_from_lsp_position(pos: lsp_types::Position) -> WideLineCol {
-    WideLineCol {
-        line: pos.line,
-        col: pos.character,
+fn lsp_position_from_offset(source: Source<'_>, offset: TextSize) -> Option<lsp_types::Position> {
+    if !source.text.is_char_boundary(usize::from(offset)) {
+        return None;
     }
+    let location = source.index.source_location(
+        u32::from(offset).into(),
+        source.text,
+        PositionEncoding::Utf16,
+    );
+    let line = u32::try_from(location.line.to_zero_indexed()).ok()?;
+    let character = u32::try_from(location.character_offset.to_zero_indexed()).ok()?;
+    Some(lsp_types::Position { line, character })
+}
+
+pub(crate) fn offset_from_lsp_position(
+    source: Source<'_>,
+    pos: lsp_types::Position,
+) -> Option<TextSize> {
+    if pos.line as usize >= source.index.line_count() {
+        return None;
+    }
+    let location = SourceLocation {
+        line: OneIndexed::from_zero_indexed(pos.line as usize),
+        character_offset: OneIndexed::from_zero_indexed(pos.character as usize),
+    };
+    let range = source.index.line_range(location.line, source.text);
+    let line = source.text[range].trim_end_matches(['\r', '\n']);
+    let length = u32::try_from(line.len()).ok()?;
+    let end = (u32::from(range.start()) + length).into();
+    // LSP clamps columns beyond the text of a line, excluding its newline.
+    let offset = source
+        .index
+        .offset(location, source.text, PositionEncoding::Utf16)
+        .min(end);
+    let actual = source
+        .index
+        .source_location(offset, source.text, PositionEncoding::Utf16);
+    // Ruff rounds positions inside a surrogate pair forward. Such a position
+    // cannot identify a byte boundary for an editor operation.
+    if actual.character_offset > location.character_offset {
+        return None;
+    }
+    Some(u32::from(offset).into())
 }
 
 pub(crate) fn text_size_from_lsp_position(
@@ -75,16 +105,10 @@ pub(crate) fn text_size_from_lsp_position(
     file_id: FileId,
     pos: lsp_types::Position,
 ) -> anyhow::Result<Option<TextSize>> {
-    let line_index = match snapshot.analysis_snapshot.line_index(file_id)? {
-        Some(line_index) => line_index,
-        None => return Ok(None),
+    let Some(source) = snapshot.analysis_snapshot.source(file_id)? else {
+        return Ok(None);
     };
-    let line_col =
-        match line_index.to_utf8(WideEncoding::Utf16, wide_line_col_from_lsp_position(pos)) {
-            Some(line_col) => line_col,
-            None => return Ok(None),
-        };
-    Ok(line_index.offset(line_col))
+    Ok(offset_from_lsp_position(source, pos))
 }
 
 fn lsp_severity_from_native(severity: Severity) -> lsp_types::DiagnosticSeverity {
@@ -106,7 +130,7 @@ pub(crate) fn lsp_document_symbol_from_native(
         selection_range,
         children,
     }: DocumentSymbol,
-    line_index: &LineIndex,
+    source: Source<'_>,
 ) -> Option<lsp_types::DocumentSymbol> {
     Some(lsp_types::DocumentSymbol {
         name,
@@ -146,14 +170,89 @@ pub(crate) fn lsp_document_symbol_from_native(
                 })
                 .collect()
         }),
-        range: lsp_range_from_text_range(range, line_index)?,
-        selection_range: lsp_range_from_text_range(selection_range, line_index)?,
+        range: lsp_range_from_text_range(range, source)?,
+        selection_range: lsp_range_from_text_range(selection_range, source)?,
         children: children.map(|children| {
             children
                 .into_iter()
-                .filter_map(|child| lsp_document_symbol_from_native(child, line_index))
+                .filter_map(|child| lsp_document_symbol_from_native(child, source))
                 .collect()
         }),
         deprecated: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::Position;
+    use ruff_source_file::LineIndex;
+    use starpls_common::Source;
+
+    use super::lsp_position_from_offset;
+    use super::offset_from_lsp_position;
+
+    #[test]
+    fn utf16_positions_preserve_bom_and_crlf() {
+        let text = "\u{feff}a😀\r\nβ\n";
+        let index = LineIndex::from_source_text(text);
+        let source = Source {
+            text,
+            index: &index,
+        };
+        for (offset, line, character) in [
+            (0, 0, 0),
+            (3, 0, 1),
+            (4, 0, 2),
+            (8, 0, 4),
+            (10, 1, 0),
+            (12, 1, 1),
+            (13, 2, 0),
+        ] {
+            let position = Position::new(line, character);
+            assert_eq!(
+                lsp_position_from_offset(source, offset.into()),
+                Some(position)
+            );
+            assert_eq!(
+                offset_from_lsp_position(source, position),
+                Some(offset.into())
+            );
+        }
+        assert_eq!(offset_from_lsp_position(source, Position::new(0, 3)), None);
+        assert_eq!(offset_from_lsp_position(source, Position::new(3, 0)), None);
+        assert_eq!(lsp_position_from_offset(source, 2.into()), None);
+        assert_eq!(lsp_position_from_offset(source, 14.into()), None);
+        assert_eq!(
+            offset_from_lsp_position(source, Position::new(0, 99)),
+            Some(8.into())
+        );
+        assert_eq!(
+            offset_from_lsp_position(source, Position::new(1, 99)),
+            Some(12.into())
+        );
+    }
+    #[test]
+    fn line_endings_use_the_parser_convention() {
+        for text in ["a\nb", "a\r\nb", "a\rb"] {
+            let index = LineIndex::from_source_text(text);
+            let source = Source {
+                text,
+                index: &index,
+            };
+            let offset = u32::try_from(text.find('b').unwrap()).unwrap();
+            let position = Position::new(1, 0);
+            assert_eq!(
+                lsp_position_from_offset(source, offset.into()),
+                Some(position)
+            );
+            assert_eq!(
+                offset_from_lsp_position(source, position),
+                Some(offset.into())
+            );
+            assert_eq!(
+                offset_from_lsp_position(source, Position::new(0, 99)),
+                Some(1.into())
+            );
+        }
+    }
 }

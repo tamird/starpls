@@ -369,7 +369,7 @@ fn collect_diagnostics(
     snapshot: &ServerSnapshot,
     file_id: FileId,
 ) -> Option<Vec<lsp_types::Diagnostic>> {
-    let line_index = snapshot.analysis_snapshot.line_index(file_id).ok()??;
+    let source = snapshot.analysis_snapshot.source(file_id).ok()??;
 
     // Get the diagnostics for the current path. If the operation was cancelled, simply continue to the next file.
     let diagnostics = snapshot.analysis_snapshot.diagnostics(file_id).ok()?;
@@ -378,7 +378,7 @@ fn collect_diagnostics(
     Some(
         diagnostics
             .into_iter()
-            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, line_index))
+            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, source))
             .collect::<Vec<_>>(),
     )
 }

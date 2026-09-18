@@ -16,6 +16,7 @@ use starpls_common::FileId;
 use starpls_common::FileInfo;
 use starpls_common::LoadItemCandidate;
 use starpls_common::ResolvedPath;
+use starpls_common::Source;
 use starpls_hir::BuiltinDefs;
 pub use starpls_hir::Cancelled;
 use starpls_hir::Db as _;
@@ -23,7 +24,6 @@ use starpls_hir::Db as _;
 use starpls_hir::Fixture;
 use starpls_hir::GlobalContext;
 pub use starpls_hir::InferenceOptions;
-use starpls_syntax::LineIndex;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 
@@ -48,10 +48,10 @@ mod document_symbols;
 mod find_references;
 mod goto_definition;
 mod hover;
-mod line_index;
 mod show_hir;
 mod show_syntax_tree;
 mod signature_help;
+mod source;
 mod util;
 
 pub type Cancellable<T> = Result<T, Cancelled>;
@@ -382,8 +382,8 @@ impl AnalysisSnapshot {
         self.query(|db| hover::hover(db, pos))
     }
 
-    pub fn line_index(&self, file_id: FileId) -> Cancellable<Option<&LineIndex>> {
-        self.query(move |db| line_index::line_index(db, file_id))
+    pub fn source(&self, file_id: FileId) -> Cancellable<Option<Source<'_>>> {
+        self.query(move |db| source::source(db, file_id))
     }
 
     pub fn show_hir(&self, file_id: FileId) -> Cancellable<Option<String>> {

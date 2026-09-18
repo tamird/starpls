@@ -1,59 +1,39 @@
 use std::ops::Range;
 
-use anyhow::format_err;
-use line_index::LineIndex;
-use line_index::WideEncoding;
-use line_index::WideLineCol;
+use ruff_source_file::LineIndex;
 use starpls_common::FileId;
+use starpls_common::Source;
 use starpls_ide::LocationLink;
 
 use crate::convert;
 use crate::server::ServerSnapshot;
 
-pub(crate) fn text_offset(
-    line_index: &LineIndex,
-    pos: lsp_types::Position,
-) -> anyhow::Result<usize> {
-    let line_col = line_index
-        .to_utf8(
-            WideEncoding::Utf16,
-            WideLineCol {
-                line: pos.line,
-                col: pos.character,
-            },
-        )
-        .ok_or_else(|| format_err!("error converting wide line col to utf-8"))?;
-    line_index
-        .offset(line_col)
-        .map(|offset| offset.into())
-        .ok_or_else(|| format_err!("invalid offset"))
-}
-
-pub(crate) fn text_range(
-    line_index: &LineIndex,
-    range: lsp_types::Range,
-) -> anyhow::Result<Range<usize>> {
-    let start = text_offset(line_index, range.start)?;
-    let end = text_offset(line_index, range.end)?;
-    Ok(start..end)
+fn text_range(source: Source<'_>, range: lsp_types::Range) -> Option<Range<usize>> {
+    let start = convert::offset_from_lsp_position(source, range.start)?;
+    let end = convert::offset_from_lsp_position(source, range.end)?;
+    (start <= end).then_some(usize::from(start)..usize::from(end))
 }
 
 pub(crate) fn apply_document_content_changes(
-    mut current_document_contents: String,
+    mut contents: String,
     content_changes: Vec<lsp_types::TextDocumentContentChangeEvent>,
 ) -> String {
-    let mut line_index = LineIndex::new(&current_document_contents);
     for change in content_changes {
-        let Some(pos_range) = change.range else {
-            continue;
-        };
-        if let Ok(range) = text_range(&line_index, pos_range) {
-            current_document_contents.replace_range(range.clone(), &change.text);
-            line_index = LineIndex::new(&current_document_contents);
+        match change.range {
+            Some(range) => {
+                let index = LineIndex::from_source_text(&contents);
+                let source = Source {
+                    text: &contents,
+                    index: &index,
+                };
+                if let Some(range) = text_range(source, range) {
+                    contents.replace_range(range, &change.text);
+                }
+            }
+            None => contents = change.text,
         }
     }
-
-    current_document_contents
+    contents
 }
 
 pub(crate) fn response_from_locations<T, U>(
@@ -65,12 +45,11 @@ where
     T: Iterator<Item = LocationLink>,
     U: From<Vec<lsp_types::Location>> + From<Vec<lsp_types::LocationLink>>,
 {
-    let source_line_index = match snapshot.analysis_snapshot.line_index(source_file_id) {
-        Ok(Some(source_line_index)) => source_line_index,
+    let source = match snapshot.analysis_snapshot.source(source_file_id) {
+        Ok(Some(source)) => source,
         _ => return Vec::<lsp_types::Location>::new().into(),
     };
 
-    // let get_line_index = |file_id| snapshot.analysis_snapshot.line_index(file_id);
     let to_lsp_location = |location: LocationLink| -> Option<lsp_types::Location> {
         let location = match location {
             LocationLink::Local {
@@ -78,11 +57,8 @@ where
                 target_file_id,
                 ..
             } => {
-                let target_line_index = snapshot
-                    .analysis_snapshot
-                    .line_index(target_file_id)
-                    .ok()??;
-                let range = convert::lsp_range_from_text_range(target_range, target_line_index);
+                let target = snapshot.analysis_snapshot.source(target_file_id).ok()??;
+                let range = convert::lsp_range_from_text_range(target_range, target);
                 lsp_types::Location {
                     uri: lsp_types::Url::from_file_path(
                         snapshot
@@ -111,15 +87,11 @@ where
                 target_file_id,
                 ..
             } => {
-                let target_line_index = snapshot
-                    .analysis_snapshot
-                    .line_index(target_file_id)
-                    .ok()??;
-                let range = convert::lsp_range_from_text_range(target_range, target_line_index);
+                let target = snapshot.analysis_snapshot.source(target_file_id).ok()??;
+                let range = convert::lsp_range_from_text_range(target_range, target);
                 lsp_types::LocationLink {
-                    origin_selection_range: origin_selection_range.and_then(|range| {
-                        convert::lsp_range_from_text_range(range, source_line_index)
-                    }),
+                    origin_selection_range: origin_selection_range
+                        .and_then(|range| convert::lsp_range_from_text_range(range, source)),
                     target_range: range?,
                     target_selection_range: range?,
                     target_uri: lsp_types::Url::from_file_path(
@@ -136,7 +108,7 @@ where
                 target_path,
             } => lsp_types::LocationLink {
                 origin_selection_range: origin_selection_range
-                    .and_then(|range| convert::lsp_range_from_text_range(range, source_line_index)),
+                    .and_then(|range| convert::lsp_range_from_text_range(range, source)),
                 target_range: Default::default(),
                 target_selection_range: Default::default(),
                 target_uri: lsp_types::Url::from_file_path(target_path).ok()?,
@@ -156,5 +128,60 @@ where
             .flat_map(to_lsp_location)
             .collect::<Vec<_>>()
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::Position;
+    use lsp_types::Range;
+    use lsp_types::TextDocumentContentChangeEvent;
+
+    use super::apply_document_content_changes;
+
+    fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            )),
+            range_length: None,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn edits_use_each_preceding_revision() {
+        let contents = apply_document_content_changes(
+            "a😀\r\nb\n".to_owned(),
+            vec![edit((0, 1), (0, 3), "xy\n"), edit((2, 0), (2, 1), "β")],
+        );
+        assert_eq!(contents, "axy\n\r\nβ\n");
+        let contents = apply_document_content_changes(
+            contents,
+            vec![
+                TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "😀".to_owned(),
+                },
+                edit((0, 0), (0, 2), "done"),
+            ],
+        );
+        assert_eq!(contents, "done");
+    }
+
+    #[test]
+    fn invalid_edits_preserve_contents() {
+        for change in [
+            edit((0, 1), (0, 2), "x"),
+            edit((0, 2), (0, 0), "x"),
+            edit((1, 0), (1, 0), "x"),
+        ] {
+            assert_eq!(
+                apply_document_content_changes("😀".to_owned(), vec![change]),
+                "😀"
+            );
+        }
     }
 }

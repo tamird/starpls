@@ -349,8 +349,12 @@ impl TyContext<'_> {
                 if diagnostic.range.file_id != file.id(self.db) {
                     return false;
                 }
-                let start_line = line_index.line_col(diagnostic.range.range.start()).line;
-                let end_line = line_index.line_col(diagnostic.range.range.end()).line;
+                let start_line = line_index
+                    .line_index(u32::from(diagnostic.range.range.start()).into())
+                    .to_zero_indexed() as u32;
+                let end_line = line_index
+                    .line_index(u32::from(diagnostic.range.range.end()).into())
+                    .to_zero_indexed() as u32;
                 (start_line..=end_line)
                     .all(|line| !module.type_ignore_comment_lines.contains(&line))
             })
