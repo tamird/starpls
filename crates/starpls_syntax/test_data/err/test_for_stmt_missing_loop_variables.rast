@@ -1,0 +1,8 @@
+MODULE@0..3
+  FOR_STMT@0..3
+    FOR@0..3 "for"
+    LOOP_VARIABLES@3..3
+      ERROR@3..3
+    ERROR@3..3
+    SUITE@3..3
+error 3..3: Expected an expression

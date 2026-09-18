@@ -2,17 +2,21 @@ pub use line_index::LineIndex;
 pub use rowan::TextRange;
 pub use rowan::TextSize;
 pub use rowan::TokenAtOffset;
-pub use starpls_parser::SyntaxKind;
-pub use starpls_parser::T;
 
 pub use crate::ast::Module;
 pub use crate::parser::line_index;
 pub use crate::parser::parse_module;
 pub use crate::parser::ParseTree;
 pub use crate::parser::SyntaxError;
+pub use crate::syntax_kind::SyntaxKind;
 
 pub mod ast;
+mod lexical;
 mod parser;
+mod ruff;
+mod syntax_kind;
+mod type_comments;
+mod unescape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StarlarkLanguage {}
@@ -33,3 +37,6 @@ pub type SyntaxNode = rowan::SyntaxNode<StarlarkLanguage>;
 pub type SyntaxToken = rowan::SyntaxToken<StarlarkLanguage>;
 pub type SyntaxElement = rowan::SyntaxElement<StarlarkLanguage>;
 pub type SyntaxNodeChildren = rowan::SyntaxNodeChildren<StarlarkLanguage>;
+
+#[cfg(test)]
+mod tests;

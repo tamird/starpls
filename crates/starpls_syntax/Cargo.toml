@@ -6,10 +6,17 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-starpls_lexer = { path = "../starpls_lexer" }
-starpls_parser = { path = "../starpls_parser" }
+drop_bomb = "0.1.5"
 rowan = "0.15.11"
 line-index = "0.1.0"
+ruff_python_parser = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
+stacker = { workspace = true }
 
 [build-dependencies]
 cc = "*"
+
+[dev-dependencies]
+runfiles = { path = "../../vendor/runfiles" }
+expect-test = "1.4.1"

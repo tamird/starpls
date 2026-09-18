@@ -1,0 +1,3 @@
+MODULE@0..8
+  CONTINUE_STMT@0..8
+    CONTINUE@0..8 "continue"

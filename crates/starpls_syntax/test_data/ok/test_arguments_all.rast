@@ -1,0 +1,30 @@
+MODULE@0..26
+  CALL_EXPR@0..26
+    NAME_REF@0..1
+      IDENT@0..1 "f"
+    ARGUMENTS@1..26
+      OPEN_PAREN@1..2 "("
+      SIMPLE_ARGUMENT@2..3
+        NAME_REF@2..3
+          IDENT@2..3 "x"
+      COMMA@3..4 ","
+      WHITESPACE@4..5 " "
+      UNPACKED_LIST_ARGUMENT@5..10
+        STAR@5..6 "*"
+        NAME_REF@6..10
+          IDENT@6..10 "args"
+      COMMA@10..11 ","
+      WHITESPACE@11..12 " "
+      KEYWORD_ARGUMENT@12..15
+        NAME@12..13
+          IDENT@12..13 "y"
+        EQ@13..14 "="
+        LITERAL_EXPR@14..15
+          INT@14..15 "1"
+      COMMA@15..16 ","
+      WHITESPACE@16..17 " "
+      UNPACKED_DICT_ARGUMENT@17..25
+        STAR_STAR@17..19 "**"
+        NAME_REF@19..25
+          IDENT@19..25 "kwargs"
+      CLOSE_PAREN@25..26 ")"

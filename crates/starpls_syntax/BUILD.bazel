@@ -1,13 +1,17 @@
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "starpls_syntax",
     srcs = glob(["src/**/*.rs"]),
-    deps = all_crate_deps() + [
-        "//crates/starpls_lexer",
-        "//crates/starpls_parser",
-    ],
+    deps = all_crate_deps(),
+)
+
+rust_test(
+    name = "starpls_syntax_test",
+    crate = ":starpls_syntax",
+    data = glob(["test_data/**"]),
+    deps = all_crate_deps(normal_dev = True) + ["//vendor/runfiles"],
 )

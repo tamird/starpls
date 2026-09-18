@@ -163,3 +163,45 @@ pub(crate) fn signature_help(
         }],
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Analysis;
+    use crate::FilePosition;
+
+    #[test]
+    fn keyword_only_after_multiplication_default() {
+        let (analysis, fixture) =
+            Analysis::from_single_file_fixture("def f(x=1*2, *, y=0): pass\nf(1, y=2$0)");
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let help = analysis
+            .snapshot()
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert_eq!(signature.active_parameter, Some(2));
+        let parameters = signature.parameters.as_ref().unwrap();
+        let [_, _, keyword_only] = parameters.as_slice() else {
+            panic!("{parameters:?}");
+        };
+        assert_eq!(keyword_only.label, "y");
+    }
+
+    #[test]
+    fn incomplete_call_after_comma() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture("def f(x, y): pass\nf(1, $0");
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let help = analysis
+            .snapshot()
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert_eq!(signature.active_parameter, Some(1));
+    }
+}
