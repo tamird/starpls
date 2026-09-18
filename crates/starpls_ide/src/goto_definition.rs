@@ -1,3 +1,4 @@
+use ruff_text_size::Ranged;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_hir::LoadItem;
@@ -16,7 +17,6 @@ use crate::Database;
 use crate::FilePosition;
 use crate::LocationLink;
 use crate::ResolvedPath;
-use crate::TextSize;
 
 struct GotoDefinitionHandler<'a> {
     sema: Semantics<'a>,
@@ -185,43 +185,16 @@ impl<'a> GotoDefinitionHandler<'a> {
                 build_file: build_file_id,
                 target,
             } => {
-                let build_file = build_file_id;
-                let parse = self.sema.parse(build_file).syntax();
-                let optional_call_expr =
-                    parse
-                        .children()
-                        .filter_map(ast::CallExpr::cast)
-                        .find(|expr| {
-                            expr.arguments()
-                                .into_iter()
-                                .flat_map(|args| args.arguments())
-                                .any(|arg| match arg {
-                                    ast::Argument::Keyword(arg) => {
-                                        arg.name()
-                                            .and_then(|name| name.name())
-                                            .map(|name| name.text() == "name")
-                                            .unwrap_or_default()
-                                            && arg
-                                                .expr()
-                                                .and_then(|expr| match expr {
-                                                    ast::Expression::Literal(expr) => Some(expr),
-                                                    _ => None,
-                                                })
-                                                .and_then(|expr| match expr.kind() {
-                                                    ast::LiteralKind::String(s) => {
-                                                        s.value().map(|value| *value == target)
-                                                    }
-                                                    _ => None,
-                                                })
-                                                .unwrap_or_default()
-                                    }
-                                    _ => false,
-                                })
-                        });
-                let range = match optional_call_expr {
-                    Some(call_expr) => call_expr.syntax().text_range(),
-                    None => TextRange::new(TextSize::new(0), TextSize::new(0)),
-                };
+                let source = build_file_id.contents(self.sema.db);
+                let parsed =
+                    starpls_common::parsed_module(self.sema.db, build_file_id).load(self.sema.db);
+                let range = crate::build_targets::calls(parsed.syntax(), parsed.tokens())
+                    .find(|call| {
+                        crate::build_targets::names(call, &source, parsed.tokens())
+                            .any(|name| *name == target)
+                    })
+                    .map(|call| crate::util::text_range(call.range()))
+                    .unwrap_or_default();
 
                 Some(vec![LocationLink::Local {
                     origin_selection_range: Some(self.token.text_range()),

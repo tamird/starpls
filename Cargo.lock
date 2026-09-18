@@ -2243,6 +2243,8 @@ dependencies = [
  "expect-test",
  "memchr",
  "ruff_db",
+ "ruff_python_ast",
+ "ruff_text_size",
  "rustc-hash 1.1.0",
  "salsa",
  "starpls_bazel",

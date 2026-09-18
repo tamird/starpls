@@ -42,6 +42,7 @@ pub use crate::signature_help::ParameterInfo;
 pub use crate::signature_help::SignatureHelp;
 pub use crate::signature_help::SignatureInfo;
 
+mod build_targets;
 mod completions;
 mod diagnostics;
 mod document_symbols;
