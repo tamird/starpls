@@ -135,48 +135,36 @@ pub(crate) fn navigation_token(
 #[cfg(test)]
 mod cursor_tests {
     use ruff_text_size::Ranged;
-    use starpls_syntax::T;
 
     #[test]
     fn native_selection_preserves_editor_boundaries() {
-        for source in [
-            "",
-            "x = f()\n",
-            "f()  ",
-            "def f():\n    pass\nx = f()\n",
-            "load(\":defs.bzl\", \"name\")\n",
-            "match = lazy.case\n",
-            "f(\n    name = 1,\n)\n",
-            "é = 1\r\n",
+        for (input, expected) in [
+            ("$0", None),
+            ("name$0(", Some("name")),
+            ("f()$0 ", Some(" ")),
+            ("f()$0", Some(")")),
+            ("def f():\n    pass\n$0name", Some("name")),
+            ("match$0 = 1", Some("match")),
+            ("load$0(\"defs\")", Some("load")),
+            ("name$0\r\n", Some("name")),
+            ("f(\"value\"$0,)", Some(",")),
+            ("f(\"value\"$0)", Some("\"value\"")),
+            ("é$0", Some("é")),
         ] {
-            let (analysis, fixture) = crate::Analysis::from_single_file_fixture(source);
-            let parsed =
-                starpls_common::parsed_module(&analysis.db, fixture.main_file()).load(&analysis.db);
-            let editor = starpls_common::parse(&analysis.db, fixture.main_file()).syntax();
-            for offset in source
-                .char_indices()
-                .map(|(offset, _)| offset)
-                .chain([source.len()])
-            {
-                let offset = u32::try_from(offset).unwrap();
-                let expected = super::pick_best_token(
-                    editor.token_at_offset(offset.into()),
-                    |kind| match kind {
-                        T![ident] => 2,
-                        T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
-                        kind if kind.is_trivia_token() => 0,
-                        _ => 1,
-                    },
-                )
-                .map(|token| token.text_range());
-                let actual = super::navigation_token(source, parsed.tokens(), offset.into())
-                    .map(|token| super::text_range(token.range()));
-                assert_eq!(actual, expected, "{source:?} at {offset}");
-            }
+            let (before, after) = input.split_once("$0").unwrap();
+            let source = format!("{before}{after}");
+            let offset = ruff_text_size::TextSize::of(before);
+            let parsed = ruff_python_parser::parse_unchecked_source(
+                &source,
+                ruff_python_ast::PySourceType::Python,
+            );
+            let actual = super::navigation_token(&source, parsed.tokens(), offset)
+                .map(|token| &source[token.range()]);
+            assert_eq!(actual, expected, "{input}");
             assert!(super::navigation_token(
-                source,
+                &source,
                 parsed.tokens(),
-                (u32::try_from(source.len()).unwrap() + 1).into()
+                ruff_text_size::TextSize::of(&source) + ruff_text_size::TextSize::new(1)
             )
             .is_none());
         }

@@ -547,3 +547,109 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod dialect_tests {
+    fn validate_source(source: &str, errors: &mut dyn FnMut(crate::SyntaxError)) {
+        let parsed = ruff_python_parser::parse_unchecked_source(
+            source,
+            ruff_python_ast::PySourceType::Python,
+        );
+        super::validate(source, &parsed, errors);
+    }
+
+    #[test]
+    fn starlark_load_grammar() {
+        let source = "load(\":defs.bzl\", alias=\"name\", \"other\")\n";
+        let mut errors = Vec::new();
+        validate_source(source, &mut |error| errors.push(error));
+        assert_eq!(errors, []);
+        for source in [
+            "f(alias=1, 2)",
+            "load(module=\":defs.bzl\")",
+            "load(\":defs.bzl\", **\"name\")",
+            "load((\":defs.bzl\"), \"name\")",
+            "load(\":defs\" \".bzl\", \"name\")",
+            "load(\":defs.bzl\", load=\"name\")",
+            "load(\":defs.bzl\", (alias)=\"name\")",
+            "f(load=1)",
+            "f((name)=1)",
+            "(load)(\":defs.bzl\", \"name\")",
+            "(load(\":defs.bzl\", \"name\"))",
+        ] {
+            let mut errors = Vec::new();
+            validate_source(source, &mut |error| errors.push(error));
+            assert!(!errors.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn reject_python_literal_extensions() {
+        for source in [
+            "x = 'a' 'b'",
+            "x = b'a' b'b'",
+            "x = 1_000",
+            "x = 0b10",
+            "x = u'x'",
+            "x = R'x'",
+            "x = B'x'",
+            "x = BR'x'",
+            "é = 1",
+            r#"x = "\z""#,
+            r#"x = "\xff""#,
+            r#"x = "\377""#,
+            "x = load",
+            "load = 1",
+            "obj.load",
+            "def load(): pass",
+        ] {
+            let mut errors = Vec::new();
+            validate_source(source, &mut |error| errors.push(error));
+            assert!(!errors.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn starlark_literal_values() {
+        for (source, expected) in [(r#"x = r"a\"b""#, "a\"b"), (r#"x = "\x7f""#, "\x7f")] {
+            let mut errors = Vec::new();
+            validate_source(source, &mut |error| errors.push(error));
+            assert_eq!(errors, [], "{source}");
+            assert_eq!(
+                crate::source::string_value(&source[4..])
+                    .unwrap()
+                    .0
+                    .as_ref(),
+                expected
+            );
+        }
+        let mut errors = Vec::new();
+        validate_source("x = b'é'", &mut |error| errors.push(error));
+        assert_eq!(errors, []);
+    }
+
+    #[test]
+    fn nested_ruff_expressions() {
+        for separator in [" + ", "."] {
+            let source = std::iter::repeat_n("x", 10_000)
+                .collect::<Vec<_>>()
+                .join(separator);
+            // Ruff's recursive AST drop also needs the larger stack.
+            stacker::grow(16 * 1024 * 1024, || {
+                validate_source(&source, &mut |error| panic!("{error:?}"));
+            });
+        }
+    }
+
+    #[test]
+    fn indentation_requires_spaces() {
+        let mut errors = Vec::new();
+        validate_source("if x:\n\tpass\n", &mut |error| errors.push(error));
+        assert!(errors
+            .iter()
+            .any(|error| error.message == "Starlark indentation must use spaces"));
+        for source in ["x = (\n\t1\n)\n", "x = '''\n\ttext\n'''\n"] {
+            validate_source(source, &mut |error| panic!("{source}: {error:?}"));
+        }
+    }
+}

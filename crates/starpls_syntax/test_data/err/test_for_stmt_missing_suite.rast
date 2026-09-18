@@ -1,15 +1,1 @@
-MODULE@0..11
-  FOR_STMT@0..11
-    FOR@0..3 "for"
-    WHITESPACE@3..4 " "
-    LOOP_VARIABLES@4..5
-      NAME_REF@4..5
-        IDENT@4..5 "x"
-    WHITESPACE@5..6 " "
-    IN@6..8 "in"
-    WHITESPACE@8..9 " "
-    NAME_REF@9..10
-      IDENT@9..10 "y"
-    COLON@10..11 ":"
-    SUITE@11..11
 error 11..11: Expected an indented block after `for` statement

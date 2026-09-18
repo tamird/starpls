@@ -1,7 +1,0 @@
-MODULE@0..3
-  DOT_EXPR@0..3
-    NAME_REF@0..1
-      IDENT@0..1 "a"
-    DOT@1..2 "."
-    NAME@2..3
-      IDENT@2..3 "b"

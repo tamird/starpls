@@ -10,10 +10,20 @@ use runfiles::find_runfiles_dir;
 
 fn check(input: &str, expected: ExpectFile) {
     let mut errors = Vec::new();
-    let tree = crate::parse_module(input, &mut |error| errors.push(error));
-    let syntax = tree.syntax();
-    assert_eq!(syntax.text().to_string(), input);
-    let mut buf = format!("{syntax:#?}");
+    let parsed =
+        ruff_python_parser::parse_unchecked_source(input, ruff_python_ast::PySourceType::Python);
+    crate::validate(input, &parsed, &mut |error| errors.push(error));
+    let comments =
+        crate::parse_type_comments(input, parsed.tokens(), &mut |error| errors.push(error));
+    let mut buf = String::new();
+    for comment in comments {
+        assert_eq!(
+            comment.parsed.syntax().text().to_string(),
+            &input[comment.range]
+        );
+        writeln!(buf, "type comment {:?}:", comment.range).unwrap();
+        write!(buf, "{:#?}", comment.parsed.syntax()).unwrap();
+    }
     for error in errors {
         writeln!(buf, "error {:?}: {}", error.range, error.message).unwrap();
     }
@@ -46,9 +56,16 @@ fn collect_test_cases(dir: &'static str) -> Result<Vec<TestCase>, Box<dyn error:
     // Check for a test filter.
     let filter = env::var("TEST_FILTER").ok();
 
-    let root = find_runfiles_dir()
-        .map(|dir| dir.join("_main/crates/starpls_syntax"))
-        .unwrap_or_else(|_| {
+    // Snapshot updates need the source directory: a new expected file written
+    // into runfiles would not be a symlink back to the checkout.
+    let root = env::var_os("CARGO_WORKSPACE_DIR")
+        .map(|dir| PathBuf::from(dir).join("crates/starpls_syntax"))
+        .or_else(|| {
+            find_runfiles_dir()
+                .ok()
+                .map(|dir| dir.join("_main/crates/starpls_syntax"))
+        })
+        .unwrap_or_else(|| {
             PathBuf::from(
                 env::var("CARGO_MANIFEST_DIR")
                     .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string()),

@@ -3,8 +3,6 @@
 use either::Either;
 use rustc_hash::FxHashMap;
 use starpls_common::File;
-use starpls_syntax::ast::BinaryOp;
-use starpls_syntax::ast::LogicOp;
 use ty_flow::bindings::Bindings;
 use ty_flow::bindings::FutureDefinitions;
 use ty_flow::bindings::PreviousDefinitions;
@@ -15,6 +13,8 @@ use ty_flow::reachability_constraints::ReachabilityConstraints;
 use ty_flow::reachability_constraints::ReachabilityConstraintsBuilder;
 use ty_flow::reachability_constraints::ScopedReachabilityConstraintId as Constraint;
 
+use crate::def::ops::BinaryOp;
+use crate::def::ops::LogicOp;
 use crate::def::scope::module_scopes;
 use crate::def::scope::ExecutionScopeId;
 use crate::def::scope::Scopes;

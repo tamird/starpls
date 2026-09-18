@@ -2,10 +2,6 @@ pub use rowan::TextRange;
 pub use rowan::TextSize;
 pub use rowan::TokenAtOffset;
 
-pub use crate::ast::Module;
-pub use crate::parser::editor_tree;
-pub use crate::parser::from_parsed_module;
-pub use crate::parser::parse_module;
 pub use crate::parser::parse_type_comments;
 pub use crate::parser::ParseTree;
 pub use crate::parser::SyntaxError;
@@ -17,7 +13,6 @@ pub use crate::validation::validate;
 pub mod ast;
 mod lexical;
 mod parser;
-mod ruff;
 pub mod source;
 mod syntax_kind;
 mod type_comments;
@@ -41,7 +36,6 @@ impl rowan::Language for StarlarkLanguage {
 
 pub type SyntaxNode = rowan::SyntaxNode<StarlarkLanguage>;
 pub type SyntaxToken = rowan::SyntaxToken<StarlarkLanguage>;
-pub type SyntaxElement = rowan::SyntaxElement<StarlarkLanguage>;
 pub type SyntaxNodeChildren = rowan::SyntaxNodeChildren<StarlarkLanguage>;
 
 #[cfg(test)]

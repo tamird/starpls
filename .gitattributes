@@ -3,3 +3,6 @@
 # Make sure .star files always have LF line endings, since the parser tests
 # are snapshot tests and therefore depend on the content being the same.
 *.star text eol=lf
+
+# Preserve the mixed line endings used to check global type-comment byte offsets.
+crates/starpls_syntax/test_data/err/type_comments.star -text
