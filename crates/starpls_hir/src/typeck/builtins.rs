@@ -44,11 +44,11 @@ use crate::typeck::Struct;
 use crate::typeck::TagClass;
 use crate::typeck::TagClassData;
 use crate::typeck::Tuple;
+use crate::typeck::TyContext;
 use crate::Db;
 use crate::ExprId;
 use crate::Name;
 use crate::Ty;
-use crate::TyContext;
 use crate::TyKind;
 use crate::TypeRef;
 

@@ -11,7 +11,7 @@ pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
         None => return Vec::new(),
     };
 
-    let diagnostics = db.gcx.with_tcx(db, |tcx| tcx.diagnostics_for_file(file));
+    let diagnostics = starpls_hir::inference_diagnostics(db, file);
 
     // Limit the amount of syntax errors we send, as this many syntax errors probably means something
     // is really wrong with the file being analyzed.

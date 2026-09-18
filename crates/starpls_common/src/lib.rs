@@ -63,8 +63,8 @@ pub enum ResolvedPath {
 
 /// The base Salsa database. Supports file-related operations, like getting/setting file contents.
 pub trait Db: salsa::DbWithJar<Jar> {
-    /// Creates a `File` in the database. This will overwrite the currently active
-    /// `File` for the given `FileId`, if it exists.
+    /// Creates a file or updates the existing input for this identity. Opening
+    /// a previously loaded file must preserve its importers' dependencies.
     fn create_file(
         &mut self,
         file_id: FileId,

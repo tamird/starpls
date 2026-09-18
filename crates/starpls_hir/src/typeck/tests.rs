@@ -18,7 +18,6 @@ use crate::test_database::TestDatabaseBuilder;
 use crate::typeck::assign_tys;
 use crate::typeck::Ty;
 use crate::typeck::TyKind;
-use crate::Db as _;
 use crate::DisplayWithDb;
 use crate::InferenceOptions;
 
@@ -148,7 +147,7 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
         })
     {
         let expr = *source_map.expr_map.get(ptr).unwrap();
-        let ty = db.gcx().with_tcx(&db, |tcx| tcx.infer_expr(file, expr));
+        let ty = super::queries::infer_expr(&db, file, expr);
         let node = ptr.to_node(&root);
         writeln!(
             res,
@@ -161,27 +160,7 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
         .unwrap();
     }
 
-    for (ptr, _) in source_map
-        .param_map
-        .keys()
-        .map(|ptr| (ptr, ptr.syntax_node_ptr().text_range()))
-        .sorted_by(|(_, lhs), (_, rhs)| {
-            if lhs.contains_range(*rhs) {
-                Ordering::Greater
-            } else if rhs.contains_range(*lhs) {
-                Ordering::Less
-            } else {
-                lhs.start().cmp(&rhs.start())
-            }
-        })
-    {
-        let param = *source_map.param_map.get(ptr).unwrap();
-        db.gcx().with_tcx(&db, |tcx| {
-            tcx.infer_param(file, param);
-        });
-    }
-
-    let diagnostics = db.gcx.with_tcx(&db, |tcx| tcx.diagnostics_for_file(file));
+    let diagnostics = super::queries::diagnostics(&db, file);
     if !diagnostics.is_empty() {
         res.push('\n');
         for diagnostic in diagnostics
@@ -2242,7 +2221,7 @@ def baz():
             307..308 "d": Unknown
             311..312 "e": Unknown
             314..315 "f": Unknown
-            310..316 "(e, f)": Unknown
+            310..316 "(e, f)": tuple[Unknown, Unknown]
             306..317 "(d, (e, f))": tuple[Unknown, Unknown]
             320..323 "123": Literal[123]
 

@@ -245,6 +245,10 @@ impl Server {
 
         drop(document_manager);
 
+        if !self.force_analysis_for_files.is_empty() {
+            change.invalidate_loads();
+        }
+
         // Apply the change to our analyzer. This will cancel any affected active Salsa operations.
         self.analysis.apply_change(change);
         if let Some(prelude_file) = prelude_file {

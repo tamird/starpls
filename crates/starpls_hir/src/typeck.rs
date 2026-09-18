@@ -1,12 +1,8 @@
 use std::fmt::Write;
 use std::iter;
-use std::panic::UnwindSafe;
-use std::panic::{self};
 use std::sync::Arc;
 
-use crossbeam::atomic::AtomicCell;
 use either::Either;
-use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use smallvec::smallvec;
@@ -51,6 +47,7 @@ use crate::ParamInner;
 
 mod call;
 mod infer;
+pub(crate) mod queries;
 
 #[cfg(test)]
 mod tests;
@@ -106,69 +103,13 @@ impl FileLoadItemId {
     }
 }
 
-#[derive(Debug)]
+pub use salsa::Cancelled;
 
-pub enum Cancelled {
-    Salsa(salsa::Cancelled),
-    Typecheck(TypecheckCancelled),
-}
-
-impl Cancelled {
-    pub fn catch<F, T>(f: F) -> Result<T, Cancelled>
-    where
-        F: FnOnce() -> T + UnwindSafe,
-    {
-        match panic::catch_unwind(f) {
-            Ok(t) => Ok(t),
-            Err(payload) => match payload.downcast::<salsa::Cancelled>() {
-                Ok(cancelled) => Err(Cancelled::Salsa(*cancelled)),
-                Err(payload) => match payload.downcast::<TypecheckCancelled>() {
-                    Ok(cancelled) => Err(Cancelled::Typecheck(*cancelled)),
-                    Err(payload) => panic::resume_unwind(payload),
-                },
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Cancelled::Salsa(err) => err.fmt(f),
-            Cancelled::Typecheck(err) => err.fmt(f),
-        }
-    }
-}
-
-#[derive(Debug)]
-
-pub struct TypecheckCancelled;
-
-impl TypecheckCancelled {
-    pub(crate) fn throw(self) -> ! {
-        std::panic::resume_unwind(Box::new(self))
-    }
-}
-
-impl std::fmt::Display for TypecheckCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("type inference cancelled")
-    }
-}
-
-impl std::error::Error for Cancelled {}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InferenceOptions {
     pub infer_ctx_attributes: bool,
     pub use_code_flow_analysis: bool,
     pub allow_unused_definitions: bool,
-}
-
-#[derive(Default)]
-struct SharedState {
-    cancelled: AtomicCell<bool>,
-    options: InferenceOptions,
 }
 
 /// A reference to a type in a source file.
@@ -439,7 +380,7 @@ impl Ty {
             TyKind::Function(def) => Params::Simple(def.func().params(db).iter().enumerate().map(
                 |(index, param)| {
                     let file = def.func().file(db);
-                    let ty = with_tcx(db, |tcx| tcx.infer_param(file, *param));
+                    let ty = queries::infer_param(db, file, *param);
                     let param = Param(ParamInner::Param {
                         func: def.func(),
                         index,
@@ -1681,49 +1622,6 @@ pub enum Protocol {
     Sequence(Ty),
 }
 
-#[derive(Default)]
-pub struct GlobalContext {
-    shared_state: Arc<SharedState>,
-    cx: Arc<Mutex<InferenceContext>>,
-}
-
-impl GlobalContext {
-    pub fn new(options: InferenceOptions) -> Self {
-        Self {
-            shared_state: Arc::new(SharedState {
-                options,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    pub fn cancel(&self) -> CancelGuard<'_> {
-        CancelGuard::new(self)
-    }
-
-    pub fn with_tcx<F, T>(&self, db: &dyn Db, mut f: F) -> T
-    where
-        F: FnMut(&mut TyContext) -> T + std::panic::UnwindSafe,
-    {
-        let mut cx = self.cx.lock();
-        let mut tcx = TyContext {
-            db,
-            cx: &mut cx,
-            intrinsics: intrinsic_types(db),
-            shared_state: Arc::clone(&self.shared_state),
-        };
-        f(&mut tcx)
-    }
-}
-
-pub(crate) fn with_tcx<F, T>(db: &dyn Db, f: F) -> T
-where
-    F: FnMut(&mut TyContext) -> T + std::panic::UnwindSafe,
-{
-    db.gcx().with_tcx(db, f)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CodeFlowCacheKey {
     file: File,
@@ -1732,7 +1630,7 @@ pub(crate) struct CodeFlowCacheKey {
     flow_node: FlowNodeId,
 }
 
-#[allow(unused)]
+/// Working state for one inference query, including its demand-driven imports.
 #[derive(Default)]
 pub(crate) struct InferenceContext {
     pub(crate) diagnostics: Vec<Diagnostic>,
@@ -1746,31 +1644,22 @@ pub(crate) struct InferenceContext {
     pub(crate) definition_is_used: FxHashMap<InFile<Either<ExprId, StmtId>>, bool>,
 }
 
-pub struct CancelGuard<'a> {
-    gcx: &'a GlobalContext,
-    cx: &'a Mutex<InferenceContext>,
-}
-
-impl<'a> CancelGuard<'a> {
-    fn new(gcx: &'a GlobalContext) -> Self {
-        gcx.shared_state.cancelled.store(true);
-        Self { gcx, cx: &gcx.cx }
-    }
-}
-
-impl Drop for CancelGuard<'_> {
-    fn drop(&mut self) {
-        let mut cx = self.cx.lock();
-        self.gcx.shared_state.cancelled.store(false);
-        *cx = Default::default();
-    }
-}
-
-pub struct TyContext<'a> {
+pub(crate) struct TyContext<'a> {
     db: &'a dyn Db,
-    cx: &'a mut InferenceContext,
+    cx: InferenceContext,
     intrinsics: Intrinsics,
-    shared_state: Arc<SharedState>,
+    options: &'a InferenceOptions,
+}
+
+impl<'a> TyContext<'a> {
+    fn new(db: &'a dyn Db) -> Self {
+        Self {
+            db,
+            cx: InferenceContext::default(),
+            intrinsics: intrinsic_types(db),
+            options: db.environment().options(db),
+        }
+    }
 }
 
 struct TypeRefResolver<'a, 'b> {
