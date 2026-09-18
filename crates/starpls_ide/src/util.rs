@@ -33,3 +33,11 @@ pub(crate) fn unindent_doc(doc: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Convert Ruff's byte range at the editor protocol boundary.
+pub(crate) fn text_range(range: ruff_text_size::TextRange) -> starpls_syntax::TextRange {
+    starpls_syntax::TextRange::new(
+        u32::from(range.start()).into(),
+        u32::from(range.end()).into(),
+    )
+}

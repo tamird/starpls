@@ -1,11 +1,10 @@
+use ruff_text_size::Ranged;
 use starpls_bazel::APIContext;
-use starpls_common::parse;
+use starpls_common::parsed_module;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::{self};
 use starpls_syntax::TextRange;
 
 use crate::Database;
@@ -94,40 +93,22 @@ pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<Docum
 }
 
 fn add_target_symbols(db: &Database, file: File, acc: &mut Vec<DocumentSymbol>) {
-    let root = parse(db, file).syntax();
-    let targets = root.children().filter_map(|child| {
-        let expr = ast::CallExpr::cast(child)?;
-        let range = expr.syntax().text_range();
-        let name = expr
-            .arguments()
-            .into_iter()
-            .flat_map(|args| args.arguments())
-            .find_map(|arg| match arg {
-                ast::Argument::Keyword(arg) => {
-                    if arg.name()?.name()?.text() != "name" {
-                        return None;
-                    }
-                    let lit = match arg.expr()? {
-                        ast::Expression::Literal(lit) => lit,
-                        _ => return None,
-                    };
-                    match lit.kind() {
-                        ast::LiteralKind::String(s) => s.value(),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            })?;
-        Some(DocumentSymbol {
-            name: format!(":{}", name),
-            detail: None,
-            kind: SymbolKind::Variable,
-            tags: None,
-            range,
-            selection_range: range,
-            children: None,
-        })
-    });
+    let source = file.contents(db);
+    let parsed = parsed_module(db, file).load(db);
+    let targets =
+        crate::build_targets::calls(parsed.syntax(), parsed.tokens()).filter_map(|call| {
+            let range = crate::util::text_range(call.range());
+            let name = crate::build_targets::names(call, &source, parsed.tokens()).next()?;
+            Some(DocumentSymbol {
+                name: format!(":{}", name),
+                detail: None,
+                kind: SymbolKind::Variable,
+                tags: None,
+                range,
+                selection_range: range,
+                children: None,
+            })
+        });
     acc.extend(targets);
 }
 
