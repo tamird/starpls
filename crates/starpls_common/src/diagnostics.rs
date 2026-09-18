@@ -1,34 +1,35 @@
+use ruff_db::diagnostic::Annotation;
+pub use ruff_db::diagnostic::Diagnostic;
+pub use ruff_db::diagnostic::DiagnosticId;
+use ruff_db::diagnostic::DiagnosticMessage;
+pub use ruff_db::diagnostic::DiagnosticTag;
+pub use ruff_db::diagnostic::Severity;
+use ruff_db::diagnostic::Span;
 use starpls_syntax::TextRange;
 
 use crate::File;
 
-/// An IDE diagnostic. This is the common data structure used to report errors to the user.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub message: String,
-    pub severity: Severity,
-    pub range: FileRange,
-    pub tags: Option<Vec<DiagnosticTag>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileRange {
-    pub file_id: File,
-    pub range: TextRange,
-}
-
-/// A severity level for diagnostic messages.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Severity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DiagnosticTag {
-    Unnecessary,
-    Deprecated,
+/// Creates a source diagnostic with the primary annotation used by the editor.
+pub fn diagnostic(
+    file: File,
+    id: DiagnosticId,
+    severity: Severity,
+    range: TextRange,
+    message: impl Into<String>,
+    tags: impl IntoIterator<Item = DiagnosticTag>,
+) -> Diagnostic {
+    let range = ruff_text_size::TextRange::new(
+        u32::from(range.start()).into(),
+        u32::from(range.end()).into(),
+    );
+    let mut annotation = Annotation::primary(Span::from(file.source).with_range(range));
+    for tag in tags {
+        annotation.push_tag(tag);
+    }
+    let message: String = message.into();
+    let mut diagnostic = Diagnostic::new(id, severity, DiagnosticMessage::from(message));
+    diagnostic.annotate(annotation);
+    diagnostic
 }
 
 #[salsa::accumulator]

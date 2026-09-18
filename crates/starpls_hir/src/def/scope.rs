@@ -6,10 +6,10 @@ use id_arena::Arena;
 use id_arena::Id;
 use rustc_hash::FxHashMap;
 use salsa::Accumulator;
-use starpls_common::Diagnostic;
+use starpls_common::diagnostic;
+use starpls_common::DiagnosticId;
 use starpls_common::Diagnostics;
 use starpls_common::File;
-use starpls_common::FileRange;
 use starpls_common::InFile;
 use starpls_common::Severity;
 
@@ -433,21 +433,19 @@ impl ScopeCollector<'_> {
                     self.record_expr_scope(expr, current);
                 }
                 Expr::Missing => {}
-                _ => Diagnostics(Diagnostic {
-                    message: "Expression is not assignable".to_string(),
-                    severity: Severity::Error,
-                    range: FileRange {
-                        file_id: self.file,
-                        range: self
-                            .source_map
-                            .expr_map_back
-                            .get(&expr)
-                            .expect("expected expr to exist in source map")
-                            .syntax_node_ptr()
-                            .text_range(),
-                    },
-                    tags: None,
-                })
+                _ => Diagnostics(diagnostic(
+                    self.file,
+                    DiagnosticId::InvalidSyntax,
+                    Severity::Error,
+                    self.source_map
+                        .expr_map_back
+                        .get(&expr)
+                        .expect("expected expr to exist in source map")
+                        .syntax_node_ptr()
+                        .text_range(),
+                    "Expression is not assignable",
+                    [],
+                ))
                 .accumulate(self.db),
             }
         } else {

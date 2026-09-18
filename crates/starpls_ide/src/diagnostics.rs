@@ -19,7 +19,6 @@ pub(crate) fn diagnostics(db: &Database, file_id: File) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-
     use crate::Analysis;
 
     #[test]
@@ -36,5 +35,80 @@ mod tests {
                 .unwrap();
             assert!(!diagnostics.is_empty(), "{source}");
         }
+    }
+    #[test]
+    fn type_ignore_only_suppresses_inference() {
+        for input in ["\"x\" + 1", "fail(msg = \"x\")"] {
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(input);
+            let file = fixture.main_file();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(!diagnostics.is_empty(), "{input}");
+            assert!(diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().is_lint()));
+            analysis.update_file(file, format!("{input} # type: ignore\n"));
+            assert!(analysis.snapshot().diagnostics(file).unwrap().is_empty());
+        }
+        let (analysis, fixture) = Analysis::from_single_file_fixture("1 = 2 # type: ignore\n");
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.is_invalid_syntax()));
+
+        let (analysis, fixture) =
+            Analysis::from_single_file_fixture("\"x\" + (\n  1 # type: ignore\n)\n");
+        assert!(analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn syntax_limit_does_not_limit_inference() {
+        let input = "if True: pass\n".repeat(129) + "unknown\n";
+        let (analysis, fixture) = Analysis::from_single_file_fixture(&input);
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.is_invalid_syntax())
+                .count(),
+            128
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.id().is_lint())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn renderer_uses_snapshot_source() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture("value = 1 # type: string\n");
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(fixture.main_file()).unwrap();
+        let rendered = snapshot
+            .render_diagnostics(
+                &diagnostics,
+                &ruff_db::diagnostic::DisplayDiagnosticConfig::new("starpls"),
+            )
+            .unwrap();
+        expect_test::expect![[r#"
+            error[type-check]: Expression of type "Literal[1]" cannot be assigned to variable of type "string"
+             --> main.bzl:1:9
+              |
+            1 | value = 1 # type: string
+              |         ^
+
+        "#]].assert_eq(&rendered);
     }
 }

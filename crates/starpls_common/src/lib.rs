@@ -11,10 +11,11 @@ pub use system::DocumentStamp;
 pub use system::OpenDocument;
 pub use system::SourceSystem;
 
+pub use crate::diagnostics::diagnostic;
 pub use crate::diagnostics::Diagnostic;
+pub use crate::diagnostics::DiagnosticId;
 pub use crate::diagnostics::DiagnosticTag;
 pub use crate::diagnostics::Diagnostics;
-pub use crate::diagnostics::FileRange;
 pub use crate::diagnostics::Severity;
 
 mod diagnostics;
@@ -221,28 +222,26 @@ fn parse_query(
     };
     let contents = file.contents(db);
     if let Some(error) = contents.read_error() {
-        Diagnostics(Diagnostic {
-            message: format!("cannot read {}: {error}", file.path(db).display()),
-            range: FileRange {
-                file_id: file,
-                range: Default::default(),
-            },
-            severity: Severity::Error,
-            tags: None,
-        })
+        Diagnostics(diagnostic(
+            file,
+            DiagnosticId::Io,
+            Severity::Error,
+            Default::default(),
+            format!("cannot read {}: {error}", file.path(db).display()),
+            [],
+        ))
         .accumulate(db);
     }
     let parsed = parsed_module(db, file).load(db);
     from_parsed_module(&contents, &parsed, &mut |err| {
-        Diagnostics(Diagnostic {
-            message: err.message,
-            range: FileRange {
-                file_id: file,
-                range: err.range,
-            },
-            severity: Severity::Error,
-            tags: None,
-        })
+        Diagnostics(diagnostic(
+            file,
+            DiagnosticId::InvalidSyntax,
+            Severity::Error,
+            err.range,
+            err.message,
+            [],
+        ))
         .accumulate(db)
     })
 }

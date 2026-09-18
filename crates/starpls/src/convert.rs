@@ -27,22 +27,30 @@ pub(crate) fn lsp_diagnostic_from_native(
     diagnostic: Diagnostic,
     source: &Source,
 ) -> Option<lsp_types::Diagnostic> {
+    let range = diagnostic.range()?;
+    let range = TextRange::new(
+        u32::from(range.start()).into(),
+        u32::from(range.end()).into(),
+    );
     Some(lsp_types::Diagnostic {
-        range: lsp_range_from_text_range(diagnostic.range.range, source)?,
-        severity: Some(lsp_severity_from_native(diagnostic.severity)),
+        range: lsp_range_from_text_range(range, source)?,
+        severity: Some(lsp_severity_from_native(diagnostic.severity())),
         code: None,
         code_description: None,
         source: Some("starpls".to_string()),
-        message: diagnostic.message,
+        message: diagnostic.headline_message().to_owned(),
         related_information: None,
-        tags: diagnostic.tags.map(|tags| {
-            tags.into_iter()
-                .map(|tag| match tag {
-                    DiagnosticTag::Unnecessary => lsp_types::DiagnosticTag::UNNECESSARY,
-                    DiagnosticTag::Deprecated => lsp_types::DiagnosticTag::DEPRECATED,
-                })
-                .collect()
-        }),
+        tags: diagnostic
+            .primary_tags()
+            .filter(|tags| !tags.is_empty())
+            .map(|tags| {
+                tags.iter()
+                    .map(|tag| match tag {
+                        DiagnosticTag::Unnecessary => lsp_types::DiagnosticTag::UNNECESSARY,
+                        DiagnosticTag::Deprecated => lsp_types::DiagnosticTag::DEPRECATED,
+                    })
+                    .collect()
+            }),
         data: None,
     })
 }
@@ -111,6 +119,7 @@ pub(crate) fn text_size_from_lsp_position(
 fn lsp_severity_from_native(severity: Severity) -> lsp_types::DiagnosticSeverity {
     match severity {
         Severity::Error => lsp_types::DiagnosticSeverity::ERROR,
+        Severity::Fatal => lsp_types::DiagnosticSeverity::ERROR,
         Severity::Warning => lsp_types::DiagnosticSeverity::WARNING,
         Severity::Info => lsp_types::DiagnosticSeverity::INFORMATION,
     }
@@ -186,6 +195,69 @@ mod tests {
 
     use super::lsp_position_from_offset;
     use super::offset_from_lsp_position;
+
+    #[test]
+    fn diagnostic_conversion_preserves_protocol_fields() {
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = crate::document::DefaultFileLoader::new(
+            std::sync::Arc::new(starpls_bazel::client::BazelCLI::new("bazel")),
+            Default::default(),
+            None,
+            Default::default(),
+            sender,
+            false,
+        );
+        let mut analysis = starpls_ide::Analysis::with_system(
+            std::sync::Arc::new(loader),
+            Default::default(),
+            ruff_db::system::InMemorySystem::default(),
+        );
+        let file = analysis
+            .open_document(
+                std::path::Path::new("main.star"),
+                starpls_common::Dialect::Standard,
+                None,
+                "😀x\n".into(),
+                0,
+            )
+            .unwrap();
+        let source = analysis.snapshot().source(file).unwrap();
+        for (severity, tag, severity_number, tag_number) in [
+            (starpls_common::Severity::Error, None, 1, None),
+            (
+                starpls_common::Severity::Warning,
+                Some(starpls_common::DiagnosticTag::Unnecessary),
+                2,
+                Some(1),
+            ),
+            (
+                starpls_common::Severity::Info,
+                Some(starpls_common::DiagnosticTag::Deprecated),
+                3,
+                Some(2),
+            ),
+        ] {
+            let diagnostic = starpls_common::diagnostic(
+                file,
+                starpls_common::DiagnosticId::lint("type-check"),
+                severity,
+                starpls_syntax::TextRange::new(4.into(), 5.into()),
+                "message",
+                tag,
+            );
+            let converted = super::lsp_diagnostic_from_native(diagnostic, &source).unwrap();
+            let mut expected = serde_json::json!({
+                "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 3}},
+                "severity": severity_number,
+                "source": "starpls",
+                "message": "message",
+            });
+            if let Some(tag) = tag_number {
+                expected["tags"] = serde_json::json!([tag]);
+            }
+            assert_eq!(serde_json::to_value(converted).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn utf16_positions_preserve_bom_and_crlf() {
