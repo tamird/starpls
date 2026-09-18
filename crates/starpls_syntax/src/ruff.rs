@@ -353,7 +353,7 @@ impl Adapter<'_> {
     fn bare_expr(&mut self, expr: &Expr) -> Node {
         let parent = AnyNodeRef::from(expr);
         let range = expr.range();
-        if !crate::validation::supports_expr(expr, self.tokens) {
+        if !crate::validation::supports_expr(expr.into(), self.tokens) {
             return self.unsupported(range);
         }
         match expr {

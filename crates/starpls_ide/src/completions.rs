@@ -2,7 +2,17 @@
 
 use std::collections::HashSet;
 
+use ruff_python_ast::find_node::covering_node;
+use ruff_python_ast::find_node::CoveringNode;
+use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::token::Tokens;
+use ruff_python_ast::AnyNodeRef;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ExprRef;
+use ruff_python_ast::ModModule;
+use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
+use starpls_common::parsed_module;
 use starpls_common::File;
 use starpls_common::LoadItemCandidateKind;
 use starpls_hir::Db;
@@ -11,22 +21,18 @@ use starpls_hir::Param;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
 use starpls_hir::Type;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::AstToken;
-use starpls_syntax::ast::{self};
-use starpls_syntax::parse_module;
-use starpls_syntax::SyntaxKind::*;
-use starpls_syntax::SyntaxNode;
+use starpls_syntax::source::expr_range;
+use starpls_syntax::source::string_value;
+use starpls_syntax::source::suite_range;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 
+use crate::selection::Selection;
+use crate::util::pick_source_token;
+use crate::util::CursorToken;
 use crate::FilePosition;
 
 const COMPLETION_MARKER: &str = "__STARPLS_COMPLETION_MARKER";
-
-const BUILTIN_TYPE_NAMES: &[&str] = &[
-    "NoneType", "bool", "int", "float", "string", "bytes", "list", "tuple", "dict", "range",
-];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompletionItem {
@@ -73,7 +79,6 @@ pub enum CompletionItemKind {
     Function,
     Field,
     Variable,
-    Class,
     Module,
     Keyword,
     File,
@@ -93,7 +98,6 @@ enum CompletionAnalysis<'a> {
     Name(NameContext<'a>),
     NameRef(NameRefContext<'a>),
     String(StringContext),
-    Type,
 }
 
 enum NameContext<'a> {
@@ -111,17 +115,19 @@ struct NameRefContext<'a> {
 }
 
 enum StringContext {
+    // A recognized string context must not fall through to marker completion
+    // when its module, dictionary keys, or decoded value are unavailable.
+    Unavailable,
     LoadModule {
         file_id: File,
-        text: ast::String,
+        text: Box<str>,
+        body_start: TextSize,
     },
     LoadItem {
-        file_id: File,
-        load_stmt: ast::LoadStmt,
+        loaded_file: File,
     },
     DictKey {
-        file_id: File,
-        lhs: ast::Expression,
+        keys: Vec<String>,
     },
     Label {
         file_id: File,
@@ -214,20 +220,11 @@ pub(crate) fn completions(
                 })
             }
         }
-        CompletionAnalysis::Type => {
-            for name in BUILTIN_TYPE_NAMES.iter() {
-                items.push(CompletionItem {
-                    label: name.to_string(),
-                    kind: CompletionItemKind::Class,
-                    mode: None,
-                    relevance: CompletionRelevance::VariableOrKeyword,
-                    filter_text: None,
-                })
-            }
-        }
-        CompletionAnalysis::String(StringContext::LoadModule { file_id, text }) => {
-            let (value, offset) = text.value_and_offset()?;
-            let token_start = text.syntax().text_range().start() + TextSize::from(offset);
+        CompletionAnalysis::String(StringContext::LoadModule {
+            file_id,
+            text: value,
+            body_start: token_start,
+        }) => {
             for candidate in db.list_load_candidates(&value, file_id).ok()?? {
                 let start = TextSize::from(
                     value
@@ -273,10 +270,9 @@ pub(crate) fn completions(
                 });
             }
         }
-        CompletionAnalysis::String(StringContext::LoadItem { file_id, load_stmt }) => {
+        CompletionAnalysis::String(StringContext::Unavailable) => return None,
+        CompletionAnalysis::String(StringContext::LoadItem { loaded_file }) => {
             let sema = Semantics::new(db);
-            let file = file_id;
-            let loaded_file = sema.resolve_syntax_load_stmt(file, &load_stmt)?;
             let scope = sema.scope_for_module(loaded_file);
             for (name, def) in scope.exports() {
                 items.push(CompletionItem {
@@ -300,12 +296,8 @@ pub(crate) fn completions(
                 });
             }
         }
-        CompletionAnalysis::String(StringContext::DictKey { file_id, lhs }) => {
-            let sema = Semantics::new(db);
-            let file = file_id;
-            let ty = sema.type_of_syntax_expr(file, &lhs)?;
-
-            for key in ty.known_keys()?.into_iter() {
+        CompletionAnalysis::String(StringContext::DictKey { keys }) => {
+            for key in keys {
                 items.push(CompletionItem {
                     label: key,
                     kind: CompletionItemKind::Constant,
@@ -411,157 +403,317 @@ fn add_keywords(items: &mut Vec<CompletionItem>, is_in_def: bool, is_in_for: boo
     }
 }
 
-fn maybe_str_context(file_id: File, root: &SyntaxNode, pos: TextSize) -> Option<StringContext> {
-    let token = root.token_at_offset(pos).right_biased()?;
-    let text = ast::String::cast(token.clone())?;
-    let parent = token.parent()?;
-
-    if ast::LoadModule::can_cast(parent.kind()) {
-        return Some(StringContext::LoadModule { file_id, text });
-    } else if ast::LoadItem::can_cast(parent.kind()) {
-        let load_stmt = ast::LoadStmt::cast(parent.parent()?)?;
-        return Some(StringContext::LoadItem { file_id, load_stmt });
-    } else if let Some(expr) = ast::LiteralExpr::cast(parent) {
-        if let Some(index_expr) = ast::IndexExpr::cast(expr.syntax().parent()?) {
-            if index_expr.index() == Some(ast::Expression::Literal(expr)) {
-                return Some(StringContext::DictKey {
-                    file_id,
-                    lhs: index_expr.lhs()?,
-                });
+fn string_context<'a>(
+    sema: &Semantics<'a>,
+    file: File,
+    module: &ModModule,
+    tokens: &Tokens,
+    source: &str,
+    pos: ruff_text_size::TextSize,
+) -> Option<StringContext> {
+    let CursorToken::Token(token) =
+        pick_source_token(tokens, pos, ruff_text_size::TextSize::of(source), |_| 0)?
+    else {
+        return None;
+    };
+    if token.kind() != TokenKind::String || token.unwrap_string_flags().is_byte_string() {
+        return None;
+    }
+    let node = covering_node(module.into(), token.range());
+    match crate::selection::classify(&node, token.range())? {
+        Selection::LoadModule(call) => {
+            if !sema.is_load_stmt(file, call) {
+                return None;
+            }
+            Some(match string_value(&source[token.range()]) {
+                Some((text, offset)) => StringContext::LoadModule {
+                    file_id: file,
+                    text,
+                    body_start: TextSize::from(u32::from(token.start())) + TextSize::from(offset),
+                },
+                None => StringContext::Unavailable,
+            })
+        }
+        Selection::LoadItem { call, item: _ } => Some(match sema.resolve_load_stmt(file, call) {
+            Some(loaded_file) => StringContext::LoadItem { loaded_file },
+            None => StringContext::Unavailable,
+        }),
+        Selection::String(expr) => {
+            if !sema.contains_expr(file, expr.into()) {
+                return None;
+            }
+            let parent = node
+                .ancestors()
+                .skip_while(|node| !matches!(node, AnyNodeRef::ExprStringLiteral(_)))
+                .nth(1);
+            if let Some(AnyNodeRef::ExprSubscript(index)) = parent {
+                if index.slice.range() == expr.range()
+                    && expr_range(&index.slice, index.into(), tokens) == expr.range()
+                {
+                    let keys = sema
+                        .type_of_expr(file, index.value.as_ref().into())
+                        .and_then(|ty| ty.known_keys());
+                    return Some(match keys {
+                        Some(keys) => StringContext::DictKey { keys },
+                        None => StringContext::Unavailable,
+                    });
+                }
+            }
+            let (text, _) = string_value(&source[token.range()])?;
+            if text.starts_with("//") || text.starts_with(':') {
+                Some(StringContext::Label {
+                    file_id: file,
+                    text,
+                })
+            } else {
+                None
             }
         }
+        _ => None,
+    }
+}
 
-        // Check if the current text is potentially a label.
-        let text = text.value()?;
-        if text.starts_with("//") || text.starts_with(':') {
-            return Some(StringContext::Label { file_id, text });
+/// Completion's marker is not lowered. Follow the source positions represented
+/// by Starlark syntax, excluding Python-only children of otherwise valid nodes.
+fn marker_is_starlark(node: &CoveringNode<'_>, tokens: &Tokens) -> bool {
+    for (child, parent) in node.ancestors().zip(node.ancestors().skip(1)) {
+        if let Some(expr) = child.as_expr_ref() {
+            let wrapper = match expr {
+                ExprRef::Starred(_) => matches!(parent, AnyNodeRef::Arguments(_)),
+                ExprRef::Slice(_) => matches!(parent, AnyNodeRef::ExprSubscript(_)),
+                _ => false,
+            };
+            if !wrapper && !starpls_syntax::supports_expr(expr, tokens) {
+                return false;
+            }
+        }
+        let represented = match parent {
+            AnyNodeRef::StmtFunctionDef(def) => match child {
+                AnyNodeRef::Identifier(_) => true,
+                AnyNodeRef::Parameters(_) => true,
+                _ => suite_range(tokens, &def.body, def.parameters.end(), def.end(), None)
+                    .is_some_and(|range| range.contains_range(child.range())),
+            },
+            AnyNodeRef::StmtIf(stmt) => {
+                child.range() == stmt.test.range()
+                    || matches!(child, AnyNodeRef::ElifElseClause(_))
+                    || suite_range(
+                        tokens,
+                        &stmt.body,
+                        stmt.test.end(),
+                        stmt.end(),
+                        stmt.elif_else_clauses.first().map(Ranged::start),
+                    )
+                    .is_some_and(|range| range.contains_range(child.range()))
+            }
+            AnyNodeRef::ElifElseClause(clause) => {
+                clause
+                    .test
+                    .as_ref()
+                    .is_some_and(|test| test.range() == child.range())
+                    || suite_range(
+                        tokens,
+                        &clause.body,
+                        clause.test.as_ref().map_or(clause.start(), Ranged::end),
+                        clause.end(),
+                        None,
+                    )
+                    .is_some_and(|range| range.contains_range(child.range()))
+            }
+            AnyNodeRef::StmtFor(stmt) => {
+                child.range() == stmt.target.range()
+                    || child.range() == stmt.iter.range()
+                    || (stmt.body.iter().any(|stmt| stmt.range() == child.range())
+                        && suite_range(tokens, &stmt.body, stmt.iter.end(), stmt.end(), None)
+                            .is_some())
+            }
+            AnyNodeRef::StmtAssign(_) => true,
+            AnyNodeRef::StmtAugAssign(_) => true,
+            AnyNodeRef::StmtReturn(_) => true,
+            AnyNodeRef::StmtExpr(stmt) => {
+                if let Expr::Call(call) = stmt.value.as_ref() {
+                    if matches!(call.func.as_ref(), Expr::Name(name) if name.id == "load") {
+                        let alias = call.arguments.keywords.iter().any(|keyword| {
+                            keyword
+                                .arg
+                                .as_ref()
+                                .is_some_and(|arg| arg.range() == node.node().range())
+                        });
+                        if !alias {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            AnyNodeRef::Parameter(param) => !param
+                .annotation
+                .as_ref()
+                .is_some_and(|annotation| annotation.range() == child.range()),
+            AnyNodeRef::ExprDict(dict) => !dict
+                .items
+                .iter()
+                .any(|item| item.key.is_none() && item.value.range() == child.range()),
+            _ => !parent.is_statement(),
+        };
+        if !represented {
+            return false;
         }
     }
+    true
+}
 
-    None
+/// Reconnect an unaffected receiver or callee from the marker parse. Node
+/// indices are local to each parse, so only the canonical result may be used
+/// for semantic queries. Matching both range and kind rejects recovery changes.
+fn original_expr<'a>(
+    module: &'a ModModule,
+    modified: &Expr,
+    insertion: ruff_text_size::TextSize,
+) -> Option<ExprRef<'a>> {
+    if modified.end() > insertion {
+        return None;
+    }
+    let node = covering_node(module.into(), modified.range());
+    let original = node.ancestors().find(|node| {
+        node.range() == modified.range() && node.kind() == AnyNodeRef::from(modified).kind()
+    })?;
+    original.as_expr_ref()
 }
 
 impl<'a> CompletionContext<'a> {
     fn new(
         db: &'a dyn Db,
-        FilePosition { file_id, pos }: FilePosition,
+        FilePosition { file_id: file, pos }: FilePosition,
         trigger_character: Option<String>,
     ) -> Option<Self> {
-        // Reparse the file with a dummy identifier inserted at the current offset.
         let sema = Semantics::new(db);
-        let file = file_id;
-        let parse = sema.parse(file);
-
-        if let Some(cx) = maybe_str_context(file_id, &parse.syntax(), pos) {
-            return Some(CompletionContext {
-                analysis: CompletionAnalysis::String(cx),
+        let parsed = parsed_module(db, file).load(db);
+        let source = file.contents(db);
+        let offset = u32::from(pos).into();
+        if let Some(context) = string_context(
+            &sema,
+            file,
+            parsed.syntax(),
+            parsed.tokens(),
+            &source,
+            offset,
+        ) {
+            return Some(Self {
+                analysis: CompletionAnalysis::String(context),
             });
         }
-
         if matches!(trigger_character.as_deref(), Some("/" | ":" | "@")) {
             return None;
         }
-
-        let mut text = parse.syntax().text().to_string();
-        let insert_pos: usize = pos.into();
-        if insert_pos > text.len() {
+        let mut text = source.to_string();
+        let insertion = usize::from(pos);
+        if !text.is_char_boundary(insertion) {
             return None;
         }
-        text.insert_str(insert_pos, COMPLETION_MARKER);
-        let modified_parse = parse_module(&text, &mut |_| {});
-
-        // Find the node in the modified parse tree corresponding to the original node.
-        let parent = modified_parse
-            .syntax()
-            .token_at_offset(pos)
-            .right_biased()?
-            .parent()?;
-
-        let analysis = if let Some(name_ref) = ast::NameRef::cast(parent.clone()) {
-            // TODO(withered-magic): There's probably a better way to traverse up the tree.
-            let args = name_ref
-                .syntax()
-                .parent()
-                .and_then(ast::SimpleArgument::cast)
-                .and_then(|arg| arg.syntax().parent())
-                .and_then(ast::Arguments::cast);
-
-            let keyword_args = args
-                .as_ref()
-                .map(|args| {
-                    args.arguments()
-                        .filter_map(|arg| match arg {
-                            ast::Argument::Keyword(kwarg) => kwarg
-                                .name()
-                                .and_then(|name| name.name())
-                                .map(|name| name.text().to_string()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(Vec::new);
-
-            let params = args
-                .and_then(|arg| arg.syntax().parent())
-                .and_then(ast::CallExpr::cast)
-                .and_then(|expr| expr.callee())
-                .and_then(|expr| sema.type_of_syntax_expr(file, &expr))
-                .map(|ty| {
-                    ty.params()
-                        .into_iter()
-                        .filter_map(|(param, _)| match param.name() {
-                            Some(name)
-                                if keyword_args.iter().all(|kwarg| kwarg != name.as_str()) =>
-                            {
-                                Some(param)
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(std::vec::Vec::new);
-
-            let scope = sema.scope_for_offset(file, pos);
-
-            let (is_in_def, is_in_for, is_loop_variable) =
-                parent.ancestors().map(|node| node.kind()).fold(
-                    (false, false, false),
-                    |(is_in_def, is_in_for, is_loop_variable), kind| {
-                        (
-                            is_in_def || kind == DEF_STMT,
-                            (is_in_for || (kind == FOR_STMT && !is_in_def)),
-                            (is_loop_variable || kind == LOOP_VARIABLES),
-                        )
-                    },
-                );
-
-            let is_lone_expr = parent
-                .parent()
-                .map(|node| matches!(node.kind(), MODULE | SUITE))
-                .unwrap_or(true);
-            CompletionAnalysis::NameRef(NameRefContext {
-                names: scope.names().collect(),
-                params,
-                is_in_def,
-                is_in_for,
-                is_lone_expr,
-                is_loop_variable,
-            })
-        } else if let Some(name) = ast::Name::cast(parent.clone()) {
-            let parent = name.syntax().parent()?;
-            CompletionAnalysis::Name(if let Some(expr) = ast::DotExpr::cast(parent) {
-                NameContext::Dot {
-                    receiver_ty: sema.type_of_syntax_expr(file, &expr.expr()?)?,
-                }
-            } else {
-                NameContext::Def
-            })
-        } else if ast::PathType::cast(parent).is_some() {
-            CompletionAnalysis::Type
-        } else {
+        text.insert_str(insertion, COMPLETION_MARKER);
+        let modified = ruff_python_parser::parse_unchecked_source(
+            &text,
+            ruff_python_ast::PySourceType::Python,
+        );
+        let CursorToken::Token(token) = pick_source_token(
+            modified.tokens(),
+            offset,
+            ruff_text_size::TextSize::of(&text),
+            |_| 0,
+        )?
+        else {
             return None;
         };
-
+        let node = covering_node(modified.syntax().into(), token.range());
+        if !marker_is_starlark(&node, modified.tokens()) {
+            return None;
+        }
+        let analysis = match node.node() {
+            AnyNodeRef::ExprName(name) => {
+                let call = match node.parent() {
+                    Some(AnyNodeRef::Arguments(args)) => {
+                        let direct = args.args.iter().any(|arg| {
+                            arg.range() == name.range()
+                                && expr_range(arg, args.into(), modified.tokens()) == name.range()
+                        });
+                        if direct {
+                            node.ancestors().find_map(|node| match node {
+                                AnyNodeRef::ExprCall(call) => Some(call),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let params = call
+                    .and_then(|call| {
+                        let callee = original_expr(parsed.syntax(), &call.func, offset)?;
+                        let ty = sema.type_of_expr(file, callee)?;
+                        Some(
+                            ty.params()
+                                .into_iter()
+                                .filter_map(|(param, _)| {
+                                    let name = param.name()?;
+                                    (!call.arguments.keywords.iter().any(|keyword| {
+                                        keyword
+                                            .arg
+                                            .as_ref()
+                                            .is_some_and(|arg| arg.as_str() == name.as_str())
+                                    }))
+                                    .then_some(param)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut is_in_def = false;
+                let mut is_in_for = false;
+                let mut is_loop_variable = false;
+                for ancestor in node.ancestors() {
+                    match ancestor {
+                        AnyNodeRef::StmtFunctionDef(_) => is_in_def = true,
+                        AnyNodeRef::StmtFor(stmt) => {
+                            is_in_for |= !is_in_def;
+                            is_loop_variable |= stmt.target.range().contains_range(name.range());
+                        }
+                        AnyNodeRef::Comprehension(comp) => {
+                            is_loop_variable |= comp.target.range().contains_range(name.range());
+                        }
+                        _ => {}
+                    }
+                }
+                let is_lone_expr = match node.parent() {
+                    Some(AnyNodeRef::StmtExpr(stmt)) => {
+                        expr_range(&stmt.value, stmt.into(), modified.tokens()) == name.range()
+                    }
+                    _ => false,
+                };
+                CompletionAnalysis::NameRef(NameRefContext {
+                    names: sema.scope_for_offset(file, pos).names().collect(),
+                    params,
+                    is_in_def,
+                    is_in_for,
+                    is_lone_expr,
+                    is_loop_variable,
+                })
+            }
+            AnyNodeRef::Identifier(_) => {
+                let context = match node.parent()? {
+                    AnyNodeRef::ExprAttribute(expr) => {
+                        let receiver = original_expr(parsed.syntax(), &expr.value, offset)?;
+                        NameContext::Dot {
+                            receiver_ty: sema.type_of_expr(file, receiver)?,
+                        }
+                    }
+                    _ => NameContext::Def,
+                };
+                CompletionAnalysis::Name(context)
+            }
+            _ => return None,
+        };
         Some(Self { analysis })
     }
 }
@@ -581,11 +733,200 @@ mod tests {
     use expect_test::expect;
     use expect_test::Expect;
     use starpls_hir::Db;
+    use starpls_syntax::TextSize;
 
     use crate::completions::CompletionRelevance;
     use crate::Analysis;
     use crate::CompletionItemKind;
     use crate::FilePosition;
+
+    #[test]
+    fn marker_argument_ownership() {
+        for (call, parameters) in [
+            ("f($0)", vec!["x=", "y="]),
+            ("(f)($0)", vec!["x=", "y="]),
+            ("f(0, $0)", vec!["x=", "y="]),
+            ("f($0, y=1)", vec!["x="]),
+            ("f(($0))", vec![]),
+            ("f(x=$0)", vec![]),
+            ("f(*$0)", vec![]),
+            ("f(**$0)", vec![]),
+        ] {
+            let source = format!("def f(x, y): pass\n{call}");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            let mut actual = items
+                .iter()
+                .filter(|item| item.relevance == CompletionRelevance::Parameter)
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, parameters, "{call}");
+            assert!(items.iter().any(|item| item.label == "f"), "{call}");
+        }
+    }
+
+    #[test]
+    fn original_receiver_follows_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        let file_id = fixture.main_file();
+        for (prefix, field) in [("", "first"), ("other = [1, 2]\n", "second"), ("", "first")] {
+            let source = format!("{prefix}obj = struct({field}=1)\n(obj).");
+            let pos = TextSize::try_from(source.len()).unwrap();
+            analysis.update_file(file_id, source);
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                [field]
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_keys_do_not_require_valid_strings() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"d = {"known": 1}
+d["\x$0"]"#,
+        );
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let items = analysis
+            .snapshot()
+            .completions(FilePosition { file_id, pos }, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["known"]
+        );
+    }
+
+    #[test]
+    fn marker_excludes_ignored_source() {
+        for source in [
+            "class C:\n    $0",
+            "class C:\n    load(\"m\", al$0ias=\"x\")",
+            "load(\"m\", f(al$0ias=\"x\"))",
+            "d=1\nd[$0\"foo\"]",
+            "def f(x: $0): pass",
+            "def f() -> $0: pass",
+            "1 ** $0",
+            "{**$0}",
+            "def f()\n    $0",
+            "for x in []:\n    pass\nelse:\n    $0",
+            "# comment $0",
+            "# type: $0",
+            "load($0)",
+        ] {
+            let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let result = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap();
+            assert!(result.is_none(), "{source}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn marker_preserves_names_and_keyword_contexts() {
+        for (source, names, statements, flow) in [
+            ("$0", true, true, vec![]),
+            ("($0)", true, false, vec![]),
+            ("xs[$0:]", true, false, vec![]),
+            ("for $0 in []: pass", false, false, vec![]),
+            ("[x for $0 in []]", false, false, vec![]),
+            ("def f($0): pass", false, false, vec![]),
+            (
+                "def f():\n    for x in []:\n        $0",
+                true,
+                true,
+                vec!["break", "continue", "return"],
+            ),
+            (
+                "for x in []:\n    def f():\n        $0",
+                true,
+                true,
+                vec!["return"],
+            ),
+        ] {
+            let source = format!("known = 1\n{source}");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            let labels = items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(labels.contains(&"known"), names, "{source}");
+            assert_eq!(labels.contains(&"def"), statements, "{source}");
+            for keyword in ["break", "continue", "return"] {
+                assert_eq!(
+                    labels.contains(&keyword),
+                    flow.contains(&keyword),
+                    "{source}: {keyword}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn load_strings_complete_public_definitions() {
+        for (input, expected) in [
+            ("load(\"defs.bzl\", \"$0\")", Some(vec!["f", "value"])),
+            (
+                "load(\"defs.bzl\", alias = \"$0\")",
+                Some(vec!["f", "value"]),
+            ),
+            (r#"load("defs.bzl", "\x$0")"#, Some(vec!["f", "value"])),
+            (r#"load("defs.bzl", f("$0"))"#, Some(vec!["f", "value"])),
+            ("load(\"defs.bzl\", al$0ias = \"value\")", Some(vec![])),
+            ("load(\"defs.bzl\", \"value\"$0,)", None),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+            fixture.add_file(&mut analysis.db, "other.bzl", "imported = 1\n");
+            fixture.add_file(
+                &mut analysis.db,
+                "defs.bzl",
+                "load(\"other.bzl\", \"imported\")\nvalue = 1\n_private = 1\ndef f(): pass\n",
+            );
+            fixture.add_file(&mut analysis.db, "main.bzl", input);
+            loader.add_files_from_fixture(&fixture);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap();
+            let labels = items.as_ref().map(|items| {
+                let mut labels = items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>();
+                labels.sort_unstable();
+                labels
+            });
+            assert_eq!(labels, expected, "{input}");
+        }
+    }
 
     fn check_completions(fixture: &str, expect: Expect) {
         check_completions_with_options(fixture, false, expect);

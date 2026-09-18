@@ -69,9 +69,7 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
             function_names: Default::default(),
             keyword_names: Default::default(),
             type_comment_owners: Default::default(),
-            expr_map: Default::default(),
             expr_map_back: Default::default(),
-            stmt_map: Default::default(),
             stmt_map_back: Default::default(),
             param_map_back: Default::default(),
             load_item_map_back: Default::default(),
@@ -470,7 +468,7 @@ impl<'a> LoweringContext<'a> {
     fn lower_bare_expr(&mut self, expr: &py::Expr) -> ExprId {
         let parent = expr.into();
         let range = expr.range();
-        if !starpls_syntax::supports_expr(expr, self.tokens) {
+        if !starpls_syntax::supports_expr(expr.into(), self.tokens) {
             return self.lower_expr_missing();
         }
         let lowered = match expr {
@@ -897,7 +895,7 @@ impl<'a> LoweringContext<'a> {
             let py::Stmt::Expr(stmt) = stmt else {
                 return None;
             };
-            if !starpls_syntax::supports_expr(&stmt.value, self.tokens)
+            if !starpls_syntax::supports_expr(stmt.value.as_ref().into(), self.tokens)
                 || expr_range(&stmt.value, stmt.into(), self.tokens) != stmt.value.range()
             {
                 return None;
@@ -1189,7 +1187,6 @@ impl<'a> LoweringContext<'a> {
                     .insert(source, AssignmentSource::Statement(id));
             }
         }
-        source_map.stmt_map.insert(range, id);
         source_map.stmt_map_back.insert(id, range);
         id
     }
@@ -1233,18 +1230,6 @@ impl<'a> LoweringContext<'a> {
                         );
                     }
                 }
-            }
-        }
-        match source_map.expr_map.entry(range) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(id);
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                panic!(
-                    "expressions {:?} and {id:?} share source range {:?}",
-                    entry.get(),
-                    entry.key()
-                );
             }
         }
         source_map.expr_map_back.insert(id, range);

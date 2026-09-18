@@ -67,7 +67,7 @@ impl GotoDefinitionHandler<'_> {
                 target_selection_range: Default::default(),
                 target_file_id: sema.resolve_load_stmt(*file, call)?,
             }]),
-            Selection::LoadItem(item) => {
+            Selection::LoadItem { call: _, item } => {
                 let item = sema.resolve_load_item(*file, item)?;
                 self.load_item_location(&item)
                     .map(|location| vec![location])

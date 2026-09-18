@@ -184,7 +184,6 @@ pub(crate) fn completion(
                         CompletionItemKind::Function => lsp_types::CompletionItemKind::FUNCTION,
                         CompletionItemKind::Field => lsp_types::CompletionItemKind::FIELD,
                         CompletionItemKind::Variable => lsp_types::CompletionItemKind::VARIABLE,
-                        CompletionItemKind::Class => lsp_types::CompletionItemKind::CLASS,
                         CompletionItemKind::Module => lsp_types::CompletionItemKind::MODULE,
                         CompletionItemKind::Keyword => lsp_types::CompletionItemKind::KEYWORD,
                         CompletionItemKind::File => lsp_types::CompletionItemKind::FILE,
