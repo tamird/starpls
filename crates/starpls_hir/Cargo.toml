@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 ruff_db = { workspace = true }
-ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "cbff046555e11add566bc35a3b29ef8ecf8ebdb0" }
+ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
 id-arena = "2.2.1"
 salsa = { workspace = true }
 starpls_bazel = { path = "../starpls_bazel" }
@@ -22,5 +22,7 @@ either = "1.10.0"
 anyhow = "1.0.81"
 
 [dev-dependencies]
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
 expect-test = "1.4.1"
 itertools = "0.12.1"

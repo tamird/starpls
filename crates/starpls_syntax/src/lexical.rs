@@ -39,7 +39,7 @@ pub(super) fn validate(source: &str, tokens: &Tokens, errors: &mut dyn FnMut(Syn
             | TokenKind::Comment
             | TokenKind::Dedent
             | TokenKind::EndOfFile => {}
-            TokenKind::Name => {
+            TokenKind::Identifier => {
                 line_start = false;
                 if !text.is_ascii() {
                     error(errors, token.range(), "Starlark identifiers must be ASCII");

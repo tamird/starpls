@@ -15,8 +15,8 @@ use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::ArgOrKeyword;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
-use ruff_python_parser::parse_unchecked_source;
 use ruff_python_parser::ParseErrorType;
+use ruff_python_parser::Parsed;
 use ruff_python_parser::UnsupportedSyntaxErrorKind;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -51,8 +51,11 @@ impl Node {
     }
 }
 
-pub(super) fn parse(source: &str, errors: &mut dyn FnMut(SyntaxError)) -> GreenNode {
-    let parsed = parse_unchecked_source(source, py::PySourceType::Python);
+pub(super) fn parse(
+    source: &str,
+    parsed: &Parsed<py::ModModule>,
+    errors: &mut dyn FnMut(SyntaxError),
+) -> GreenNode {
     crate::lexical::validate(source, parsed.tokens(), errors);
     let mut adapter = Adapter {
         tokens: parsed.tokens(),
@@ -952,7 +955,7 @@ impl Writer<'_, '_> {
 pub(super) fn token_kind(token: Token, text: &str) -> SyntaxKind {
     use TokenKind as T;
     match token.kind() {
-        T::Name => {
+        T::Identifier => {
             if text == "load" {
                 LOAD
             } else {

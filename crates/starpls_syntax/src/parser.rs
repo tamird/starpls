@@ -49,7 +49,20 @@ impl<T: AstNode<Language = StarlarkLanguage>> ParseTree<T> {
 }
 
 pub fn parse_module(input: &str, errors_sink: &mut dyn FnMut(SyntaxError)) -> ParseTree<Module> {
-    ParseTree::new(crate::ruff::parse(input, errors_sink))
+    let parsed =
+        ruff_python_parser::parse_unchecked_source(input, ruff_python_ast::PySourceType::Python);
+    from_parsed_module(input, &parsed, errors_sink)
+}
+
+/// Applies Starlark validation and constructs the editor tree from a shared parse.
+///
+/// `input` must be the exact source text used to produce `parsed`.
+pub fn from_parsed_module(
+    input: &str,
+    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+    errors_sink: &mut dyn FnMut(SyntaxError),
+) -> ParseTree<Module> {
+    ParseTree::new(crate::ruff::parse(input, parsed, errors_sink))
 }
 
 pub(super) fn build_type_comment(
