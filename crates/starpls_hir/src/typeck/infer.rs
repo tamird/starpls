@@ -811,7 +811,10 @@ impl TyContext<'_> {
                                     {
                                         if *deprecated {
                                             let source_map = source_map(self.db, file);
-                                            if let Some(range) = source_map.keyword_names.get(&expr)
+                                            if let Some(range) =
+                                                source_map.keyword_names.get(&expr).filter(|_| {
+                                                    source_map.expr_map_back.contains_key(&expr)
+                                                })
                                             {
                                                 self.add_diagnostic_for_range(
                                                     file,

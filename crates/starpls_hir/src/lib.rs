@@ -20,7 +20,7 @@ use starpls_common::Parse;
 use starpls_syntax::ast;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::AstPtr;
-use starpls_syntax::ast::SyntaxNodePtr;
+use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 use starpls_syntax::T;
 use typeck::builtins::BuiltinFunction;
@@ -37,7 +37,11 @@ use typeck::TagClass;
 use typeck::TagParam;
 use typeck::Tuple;
 
+use crate::def::Argument;
+use crate::def::AssignmentSource;
+use crate::def::Expr;
 use crate::def::ExprId;
+use crate::def::Literal;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
@@ -518,27 +522,40 @@ impl<'a> Type<'a> {
         fields
     }
 
-    pub fn provider_fields_source(&self) -> Option<InFile<ast::DictExpr>> {
+    /// The original declaration of a struct or provider field, when known.
+    pub fn field_definition(&self, name: &str) -> Option<InFile<TextRange>> {
         let Self { sema, ty } = self;
-        let db = sema.db;
         match ty.kind() {
-            TyKind::Provider(provider) | TyKind::ProviderInstance(provider) => {
-                let dict_expr = match provider {
-                    Provider::Builtin(_) => return None,
-                    Provider::Custom(provider) => {
-                        provider.fields.as_ref().and_then(|fields| fields.expr)?
-                    }
+            TyKind::Struct(strukt) => {
+                let typeck::Struct::Inline {
+                    fields: _,
+                    call_expr,
+                } = strukt.as_ref()?
+                else {
+                    return None;
                 };
-                source_map(db, dict_expr.file)
-                    .expr_map_back
-                    .get(&dict_expr.value)
-                    .and_then(|ptr| ptr.clone().cast::<ast::DictExpr>())
-                    .and_then(|ptr| {
-                        Some(InFile {
-                            file: dict_expr.file,
-                            value: ptr.try_to_node(&parse(db, dict_expr.file).syntax())?,
-                        })
-                    })
+                let InFile { file, value } = *call_expr;
+                let Expr::Call { callee: _, args } = &module(sema.db, file)[value] else {
+                    return None;
+                };
+                args.iter().find_map(|arg| {
+                    let Argument::Keyword {
+                        name: keyword,
+                        expr,
+                    } = arg
+                    else {
+                        return None;
+                    };
+                    if keyword.as_str() != name {
+                        return None;
+                    }
+                    let range = *source_map(sema.db, file).keyword_names.get(expr)?;
+                    Some(InFile { file, value: range })
+                })
+            }
+            TyKind::Provider(provider) => provider_field_definition(sema.db, provider, name),
+            TyKind::ProviderInstance(provider) => {
+                provider_field_definition(sema.db, provider, name)
             }
             _ => None,
         }
@@ -569,56 +586,99 @@ impl<'a> Type<'a> {
             _ => None,
         }
     }
+}
 
-    pub fn try_as_inline_struct(&self) -> Option<Struct<'a>> {
-        let Self { sema, ty } = self;
-        match ty.kind() {
-            TyKind::Struct(strukt) => strukt.as_ref().and_then(|strukt| match strukt {
-                typeck::Struct::Inline { call_expr, .. } => Some(Struct {
-                    sema: *sema,
-                    call_expr: *call_expr,
-                }),
-                _ => None,
-            }),
-            _ => None,
+fn expr_source_range(db: &dyn Db, expr: InFile<ExprId>) -> Option<InFile<TextRange>> {
+    let InFile { file, value } = expr;
+    let ptr = source_map(db, file).expr_map_back.get(&value)?;
+    Some(InFile {
+        file,
+        value: ptr.syntax_node_ptr().text_range(),
+    })
+}
+
+fn provider_field_definition(
+    db: &dyn Db,
+    provider: &Provider,
+    name: &str,
+) -> Option<InFile<TextRange>> {
+    let expr = match provider {
+        Provider::Builtin(_) => return None,
+        Provider::Custom(provider) => provider.fields.as_ref()?.expr?,
+    };
+    dict_key_definition(db, expr, name)
+}
+
+fn dict_key_definition(db: &dyn Db, expr: InFile<ExprId>, name: &str) -> Option<InFile<TextRange>> {
+    let InFile { file, value } = expr;
+    let module = module(db, file);
+    let Expr::Dict { entries } = &module[value] else {
+        return None;
+    };
+    entries.iter().find_map(|def::DictEntry { key, value: _ }| {
+        let Expr::Literal { literal } = &module[*key] else {
+            return None;
+        };
+        let Literal::String(key_name) = literal else {
+            return None;
+        };
+        if key_name.as_ref() != name {
+            return None;
         }
-    }
-}
-
-/// A Bazel struct, created with the `struct()` function.
-#[derive(Clone, Debug)]
-pub struct Struct<'a> {
-    sema: Semantics<'a>,
-    /// The `struct()` call that created this struct.
-    call_expr: InFile<ExprId>,
-}
-
-impl<'a> Struct<'a> {
-    /// Returns the AST node corresponding to the `struct()` call that created this struct.
-    pub fn call_expr(&self) -> Option<InFile<ast::CallExpr>> {
-        let Self { sema, call_expr } = self;
-        let db = sema.db;
-        let InFile { file, value } = *call_expr;
-        let ptr = source_map(db, file).expr_map_back.get(&value)?;
-        let ptr = ptr.clone().cast::<ast::CallExpr>()?;
-        let value = ptr.try_to_node(&parse(db, file).syntax())?;
-        Some(InFile { file, value })
-    }
+        expr_source_range(db, InFile { file, value: *key })
+    })
 }
 
 /// A variable definition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Variable<'a> {
     sema: Semantics<'a>,
-    expr: Option<InFile<ExprId>>,
+    def: Option<scope::VariableDef>,
 }
 
 impl<'a> Variable<'a> {
     /// Whether the variable is user-defined; `false` in the case of
     /// variables from e.g. Bazel builtins.
     pub fn is_user_defined(&self) -> bool {
-        let Self { sema: _, expr } = self;
-        expr.is_some()
+        let Self { sema: _, def } = self;
+        def.is_some()
+    }
+
+    /// The load item directly assigned to this variable, if any.
+    pub fn re_export(&self) -> Option<LoadItem<'a>> {
+        let Self { sema, def } = self;
+        let scope::VariableDef { file, expr, source } = def.as_ref()?;
+        let source = (*source)?;
+        let module = module(sema.db, *file);
+        let AssignmentSource::Statement(stmt) = module.assignment_sources.get(&source)? else {
+            return None;
+        };
+        let Stmt::Assign {
+            lhs,
+            rhs,
+            op: _,
+            type_ref: _,
+        } = &module[*stmt]
+        else {
+            return None;
+        };
+        if lhs != expr {
+            return None;
+        }
+        let Expr::Name { name } = &module[*rhs] else {
+            return None;
+        };
+        let scope = SemanticsScope {
+            sema: *sema,
+            resolver: Resolver::new_for_expr(sema.db, *file, *rhs),
+        };
+        scope
+            .resolve_name(name)
+            .into_iter()
+            .find_map(|def| match def {
+                ScopeDef::LoadItem(item) => Some(item),
+                _ => None,
+            })
     }
 }
 
@@ -741,24 +801,19 @@ impl<'a> Callable<'a> {
         matches!(*inner, CallableInner::Macro(_))
     }
 
-    pub fn rule_attrs_source(&self) -> Option<InFile<ast::DictExpr>> {
+    /// The declaration associated with a named argument at a call site.
+    pub fn keyword_definition(&self, name: &str) -> Option<InFile<TextRange>> {
         let Self { sema, inner } = self;
-        let db = sema.db;
-        let attrs_expr = match *inner {
-            CallableInner::Rule(ref rule) => rule.attrs.as_ref()?.expr?,
-            _ => return None,
-        };
-
-        source_map(db, attrs_expr.file)
-            .expr_map_back
-            .get(&attrs_expr.value)
-            .and_then(|ptr| ptr.clone().cast::<ast::DictExpr>())
-            .and_then(|ptr| {
-                Some(InFile {
-                    file: attrs_expr.file,
-                    value: ptr.try_to_node(&parse(db, attrs_expr.file).syntax())?,
-                })
-            })
+        if let CallableInner::Rule(rule) = inner {
+            if let Some(expr) = rule.attrs.as_ref().and_then(|attrs| attrs.expr) {
+                return dict_key_definition(sema.db, expr, name);
+            }
+        }
+        let (param, _) = self
+            .params()
+            .into_iter()
+            .find(|(param, _)| param.name().as_ref().map(Name::as_str) == Some(name))?;
+        param.source_range()
     }
 }
 
@@ -844,24 +899,19 @@ pub struct LoadItem<'a> {
 impl<'a> LoadItem<'a> {
     pub fn definition(&self) -> Option<ScopeDef<'a>> {
         let Self { sema, id } = self;
-        let load_stmt = self.load_stmt()?;
-        let loaded_file = sema.resolve_load_stmt(id.file, &load_stmt)?;
+        let load_stmt = match &module(sema.db, id.file).load_items[id.value] {
+            def::LoadItem::Direct { name: _, load_stmt } => load_stmt,
+            def::LoadItem::Aliased {
+                alias: _,
+                name: _,
+                load_stmt,
+            } => load_stmt,
+        };
+        let loaded_file = queries::resolve_load_stmt(sema.db, id.file, load_stmt.clone())?;
         sema.scope_for_module(loaded_file)
             .resolve_name(&self.name())
             .into_iter()
             .next()
-    }
-
-    /// Returns the AST node for the corresponding load statement.
-    pub fn load_stmt(&self) -> Option<ast::LoadStmt> {
-        let Self { sema, id } = self;
-        let db = sema.db;
-        source_map(db, id.file)
-            .load_item_map_back
-            .get(&id.value)
-            .and_then(|ptr| ptr.try_to_node(&parse(db, id.file).syntax()))
-            .and_then(|node| node.syntax().parent())
-            .and_then(ast::LoadStmt::cast)
     }
 
     /// The name of the item being loaded by the load statement.
@@ -897,48 +947,79 @@ impl<'a> ScopeDef<'a> {
     fn semantics(&self) -> Semantics<'a> {
         match self {
             Self::Callable(Callable { sema, inner: _ }) => *sema,
-            Self::Variable(Variable { sema, expr: _ }) => *sema,
+            Self::Variable(Variable { sema, def: _ }) => *sema,
             Self::Parameter(Param { sema, inner: _ }) => *sema,
             Self::LoadItem(LoadItem { sema, id: _ }) => *sema,
         }
     }
 
-    pub fn syntax_node_ptr(&self) -> Option<InFile<SyntaxNodePtr>> {
+    /// The full source range of the definition, including a function's body.
+    pub fn source_range(&self) -> Option<InFile<TextRange>> {
         let db = self.semantics().db;
         match self {
-            ScopeDef::Callable(Callable {
-                sema: _,
-                inner: CallableInner::HirDef(def),
-            }) => Some(def.func().syntax_node_ptr()),
-            ScopeDef::Variable(Variable {
-                sema: _,
-                expr: Some(expr),
-            }) => source_map(db, expr.file)
-                .expr_map_back
-                .get(&expr.value)
-                .map(|ptr| InFile {
-                    file: expr.file,
-                    value: ptr.syntax_node_ptr(),
-                }),
-            ScopeDef::Parameter(param) => param.syntax_node_ptr(),
-            ScopeDef::LoadItem(LoadItem { sema: _, id }) => source_map(db, id.file)
-                .load_item_map_back
-                .get(&id.value)
-                .map(|ptr| InFile {
+            Self::Callable(Callable { sema: _, inner }) => {
+                let CallableInner::HirDef(def) = inner else {
+                    return None;
+                };
+                let func = def.func();
+                Some(InFile {
+                    file: func.file,
+                    value: func.ptr.text_range(),
+                })
+            }
+            Self::Variable(Variable { sema: _, def }) => {
+                let scope::VariableDef {
+                    file,
+                    expr,
+                    source: _,
+                } = def.as_ref()?;
+                expr_source_range(
+                    db,
+                    InFile {
+                        file: *file,
+                        value: *expr,
+                    },
+                )
+            }
+            Self::Parameter(param) => param.source_range(),
+            Self::LoadItem(LoadItem { sema: _, id }) => {
+                let ptr = source_map(db, id.file).load_item_map_back.get(&id.value)?;
+                Some(InFile {
                     file: id.file,
-                    value: ptr.syntax_node_ptr(),
-                }),
-            _ => None,
+                    value: ptr.syntax_node_ptr().text_range(),
+                })
+            }
         }
+    }
+
+    /// The navigation target: a function's name or another definition's range.
+    pub fn definition_range(&self) -> Option<InFile<TextRange>> {
+        if let Self::Callable(Callable { sema, inner }) = self {
+            let CallableInner::HirDef(def) = inner else {
+                return None;
+            };
+            let InFile { file, value } = def.stmt()?;
+            let range = *source_map(sema.db, file).function_names.get(&value)?;
+            return Some(InFile { file, value: range });
+        }
+        self.source_range()
     }
 
     pub fn ty(&self) -> Type<'a> {
         let db = self.semantics().db;
         let ty = match self {
-            ScopeDef::Variable(Variable {
-                sema: _,
-                expr: Some(expr),
-            }) => queries::infer_expr(db, expr.file, expr.value),
+            ScopeDef::Variable(Variable { sema: _, def }) => {
+                if let Some(scope::VariableDef {
+                    file,
+                    expr,
+                    source: _,
+                }) = def
+                {
+                    queries::infer_expr(db, *file, *expr)
+                } else {
+                    Ty::unknown()
+                }
+            }
             ScopeDef::Callable(callable) => return callable.ty(),
             ScopeDef::LoadItem(LoadItem { sema: _, id }) => {
                 queries::infer_load_item(db, id.file, id.value)
@@ -972,17 +1053,14 @@ impl<'a> ScopeDef<'a> {
             }
             scope::ScopeDef::Variable(it) => ScopeDef::Variable(Variable {
                 sema,
-                expr: Some(InFile {
-                    file: it.file,
-                    value: it.expr,
-                }),
+                def: Some(it),
             }),
             scope::ScopeDef::BuiltinVariable(type_ref) => match type_ref {
                 TypeRef::Provider(provider) => ScopeDef::Callable(Callable::new(
                     sema,
                     CallableInner::Provider(Provider::Builtin(provider)),
                 )),
-                _ => ScopeDef::Variable(Variable { sema, expr: None }),
+                _ => ScopeDef::Variable(Variable { sema, def: None }),
             },
             scope::ScopeDef::Parameter(ParameterDef { func, index }) => {
                 ScopeDef::Parameter(Param::new(sema, ParamInner::Param { func, index }))

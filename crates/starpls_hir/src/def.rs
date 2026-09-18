@@ -9,7 +9,6 @@ use id_arena::Id;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use starpls_common::File;
-use starpls_common::InFile;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
@@ -491,15 +490,6 @@ pub(crate) struct FunctionData {
     pub(crate) doc: Option<Box<str>>,
     pub(crate) ptr: SyntaxNodePtr,
     pub(crate) params: Box<[ParamId]>,
-}
-
-impl FunctionData {
-    pub(crate) fn syntax_node_ptr(&self) -> InFile<SyntaxNodePtr> {
-        InFile {
-            file: self.file,
-            value: self.ptr,
-        }
-    }
 }
 
 impl_internable!(FunctionData);

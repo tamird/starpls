@@ -168,6 +168,40 @@ mod tests {
     use crate::FilePosition;
 
     #[test]
+    fn imported_rule_default_follows_source_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");
+        fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "load(\"defs.bzl\", \"r\")\nr(fo$0o = \"\")",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        for default in ["\"é\"", "(\"日本語\")", "\"é\""] {
+            analysis.update_file(
+                dependency,
+                format!("r = rule(attrs = {{\"foo\": attr.string(default = {default})}})"),
+            );
+            let help = analysis
+                .snapshot()
+                .signature_help(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("{help:?}");
+            };
+            let parameters = signature.parameters.as_ref().unwrap();
+            let parameter = parameters
+                .iter()
+                .find(|param| param.label.starts_with("foo:"))
+                .unwrap();
+            assert_eq!(parameter.label, format!("foo: string = {default}"));
+        }
+    }
+
+    #[test]
     fn keyword_only_after_multiplication_default() {
         let (analysis, fixture) =
             Analysis::from_single_file_fixture("def f(x=1*2, *, y=0): pass\nf(1, y=2$0)");

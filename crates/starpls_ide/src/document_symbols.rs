@@ -63,15 +63,13 @@ pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<Docum
     let mut symbols = scope
         .names()
         .filter_map(|(name, def)| {
-            let ptr = match def.syntax_node_ptr()? {
-                InFile {
-                    file: def_file,
-                    value,
-                } if file == def_file => value,
-                _ => return None,
-            };
-
-            let range = ptr.text_range();
+            let InFile {
+                file: def_file,
+                value: range,
+            } = def.source_range()?;
+            if file != def_file {
+                return None;
+            }
             Some(DocumentSymbol {
                 name: name.as_str().to_string(),
                 detail: None,
