@@ -19,6 +19,7 @@ use starpls_syntax::SyntaxToken;
 use starpls_syntax::TextRange;
 
 use crate::def::Argument;
+use crate::def::AssignmentSource;
 use crate::def::CompClause;
 use crate::def::DictEntry;
 use crate::def::Expr;
@@ -56,6 +57,8 @@ pub(super) fn lower_module(
         module: Default::default(),
         source_map: ModuleSourceMap {
             root,
+            function_names: Default::default(),
+            keyword_names: Default::default(),
             expr_map: Default::default(),
             expr_map_back: Default::default(),
             stmt_map: Default::default(),
@@ -112,6 +115,7 @@ impl<'a> LoweringContext<'a> {
         let ptr = AstPtr::new(&stmt);
         let statement = match stmt {
             ast::Statement::Def(node) => {
+                let name_range = node.name().map(|name| name.syntax().text_range());
                 let name = self.lower_name_opt(node.name());
                 let spec = self.lower_func_type_opt(node.spec());
                 let doc = node.doc().and_then(|doc| doc.value());
@@ -136,6 +140,9 @@ impl<'a> LoweringContext<'a> {
                     },
                     ptr,
                 );
+                if let Some(range) = name_range {
+                    self.source_map.function_names.insert(stmt, range);
+                }
                 for (i, param) in func.params.iter().enumerate() {
                     self.module.param_to_def_stmt.insert(*param, (stmt, i));
                 }
@@ -493,8 +500,14 @@ impl<'a> LoweringContext<'a> {
                     Argument::Simple { expr }
                 }
                 ast::Argument::Keyword(arg) => {
+                    let name_range = arg.name().map(|name| name.syntax().text_range());
                     let name = self.lower_name_opt(arg.name());
                     let expr = self.lower_expr_opt(arg.expr());
+                    if let Some(range) = name_range {
+                        if self.source_map.expr_map_back.contains_key(&expr) {
+                            self.source_map.keyword_names.insert(expr, range);
+                        }
+                    }
                     Argument::Keyword { name, expr }
                 }
                 ast::Argument::UnpackedList(arg) => {
@@ -676,16 +689,80 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn alloc_stmt(&mut self, stmt: Stmt, ptr: StmtPtr) -> StmtId {
-        let id = self.module.stmts.alloc(stmt);
-        self.source_map.stmt_map.insert(ptr.clone(), id);
-        self.source_map.stmt_map_back.insert(id, ptr);
+        let Self {
+            db: _,
+            file: _,
+            module,
+            source_map,
+        } = self;
+        let id = module.stmts.alloc(stmt);
+        let source = match &module.stmts[id] {
+            Stmt::Assign {
+                lhs: _,
+                rhs,
+                op: _,
+                type_ref: _,
+            } => Some(*rhs),
+            Stmt::For {
+                iterable,
+                targets: _,
+                stmts: _,
+            } => Some(*iterable),
+            _ => None,
+        };
+        if let Some(source) = source {
+            // Synthetic missing expressions had no syntax parent to infer from.
+            if source_map.expr_map_back.contains_key(&source) {
+                module
+                    .assignment_sources
+                    .insert(source, AssignmentSource::Statement(id));
+            }
+        }
+        source_map.stmt_map.insert(ptr.clone(), id);
+        source_map.stmt_map_back.insert(id, ptr);
         id
     }
 
     fn alloc_expr(&mut self, expr: Expr, ptr: ExprPtr) -> ExprId {
-        let id = self.module.exprs.alloc(expr);
-        self.source_map.expr_map.insert(ptr.clone(), id);
-        self.source_map.expr_map_back.insert(id, ptr);
+        let Self {
+            db: _,
+            file: _,
+            module,
+            source_map,
+        } = self;
+        let id = module.exprs.alloc(expr);
+        let clauses = match &module.exprs[id] {
+            Expr::ListComp {
+                expr: _,
+                comp_clauses,
+            } => Some(comp_clauses),
+            Expr::DictComp {
+                entry: _,
+                comp_clauses,
+            } => Some(comp_clauses),
+            _ => None,
+        };
+        if let Some(clauses) = clauses {
+            for (clause, comp_clause) in clauses.iter().enumerate() {
+                if let CompClause::For {
+                    iterable,
+                    targets: _,
+                } = comp_clause
+                {
+                    if source_map.expr_map_back.contains_key(iterable) {
+                        module.assignment_sources.insert(
+                            *iterable,
+                            AssignmentSource::Comprehension {
+                                expression: id,
+                                clause,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        source_map.expr_map.insert(ptr.clone(), id);
+        source_map.expr_map_back.insert(id, ptr);
         id
     }
 

@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use either::Either;
 use starpls_common::line_index;
-use starpls_common::parse;
 use starpls_common::Diagnostic;
 use starpls_common::DiagnosticTag;
 use starpls_common::File;
@@ -10,13 +9,10 @@ use starpls_common::FileRange;
 use starpls_common::InFile;
 use starpls_common::Severity;
 use starpls_syntax::ast::ArithOp;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::BinaryOp;
 use starpls_syntax::ast::BitwiseOp;
 use starpls_syntax::ast::LogicOp;
 use starpls_syntax::ast::UnaryOp;
-use starpls_syntax::ast::{self};
 use starpls_syntax::TextRange;
 use ty_flow::reachability_constraints::ScopedReachabilityConstraintId as Constraint;
 
@@ -35,6 +31,8 @@ use crate::def::scope::ScopeDef;
 use crate::def::scope::ScopeHirId;
 use crate::def::scope::VariableDef;
 use crate::def::Argument;
+use crate::def::AssignmentSource;
+use crate::def::CompClause;
 use crate::def::Expr;
 use crate::def::ExprId;
 use crate::def::Literal;
@@ -291,17 +289,12 @@ impl TyContext<'_> {
                         return None;
                     }
 
-                    let ptr = source_map(tcx.db, file).stmt_map_back.get(&stmt)?;
-                    let node = ptr
-                        .syntax_node_ptr()
-                        .try_to_node(&parse(tcx.db, file).syntax())?;
-                    let def_stmt = ast::DefStmt::cast(node)?;
-                    let name_node = def_stmt.name()?;
+                    let range = *source_map(tcx.db, file).function_names.get(&stmt)?;
 
                     tcx.add_diagnostic_for_range(
                         file,
                         Severity::Warning,
-                        name_node.syntax().text_range(),
+                        range,
                         Some(vec![DiagnosticTag::Unnecessary]),
                         format!("\"{}\" is not accessed", name.as_str()),
                     );
@@ -790,22 +783,12 @@ impl TyContext<'_> {
                                     {
                                         if *deprecated {
                                             let source_map = source_map(self.db, file);
-                                            let arg_name_node = source_map
-                                                .expr_map_back
-                                                .get(&expr)
-                                                .and_then(|arg_value_ptr| {
-                                                    arg_value_ptr
-                                                        .syntax_node_ptr()
-                                                        .try_to_node(&parse(self.db, file).syntax())
-                                                })
-                                                .and_then(|arg_value_node| arg_value_node.parent())
-                                                .and_then(ast::KeywordArgument::cast)
-                                                .and_then(|keyword_arg| keyword_arg.name());
-                                            if let Some(arg_name_node) = arg_name_node {
+                                            if let Some(range) = source_map.keyword_names.get(&expr)
+                                            {
                                                 self.add_diagnostic_for_range(
                                                     file,
                                                     Severity::Info,
-                                                    arg_name_node.syntax().text_range(),
+                                                    *range,
                                                     Some(vec![DiagnosticTag::Deprecated]),
                                                     format!(
                                                         "Argument \"{}\" is deprecated",
@@ -1344,19 +1327,11 @@ impl TyContext<'_> {
         expected_ty: Option<Ty>,
         execution_scope: ExecutionScopeId,
     ) {
-        // Find the parent assignment node. This can be either an assignment statement (`x = 0`), a `for` statement (`for x in 1, 2, 3`), or
-        // a for comp clause in a list/dict comprehension (`[x + 1 for x in [1, 2, 3]]`).
         let db = self.db;
-        let source_map = source_map(db, file);
-        let source_ptr = match source_map.expr_map_back.get(&source) {
-            Some(ptr) => ptr,
-            _ => return,
+        let module = module(db, file);
+        let Some(owner) = module.assignment_sources.get(&source) else {
+            return;
         };
-        let parent = source_ptr
-            .to_node(&parse(db, file).syntax())
-            .syntax()
-            .parent()
-            .unwrap();
 
         // Convert "Unbound" to "Unknown" in assignments to avoid confusion.
         let mut source_ty = self.infer_expr(file, source);
@@ -1364,42 +1339,37 @@ impl TyContext<'_> {
             source_ty = self.unknown_ty();
         }
 
-        // Handle standard assigments, e.g. `x, y = 1, 2`.
-        if let Some(node) = ast::AssignStmt::cast(parent.clone()) {
-            let ptr = AstPtr::new(&ast::Statement::Assign(node.clone()));
-            let stmt = *source_map.stmt_map.get(&ptr).unwrap();
-            let expected_ty = expected_ty.or_else(|| {
-                match &module(db, file)[stmt] {
-                    Stmt::Assign { type_ref, .. } => type_ref.as_ref().and_then(|type_ref| {
-                        let (expected_ty, errors) =
-                            resolve_type_ref(self, &type_ref.0, Some(InFile { file, value: stmt }));
-                        if errors.is_empty() {
-                            Some(expected_ty)
-                        } else {
-                            // Add TypeRef resolution errors.
-                            for error in errors.iter() {
-                                self.add_diagnostic_for_range(
-                                    file,
-                                    Severity::Error,
-                                    type_ref.1,
-                                    None,
-                                    error,
-                                );
-                            }
-                            None
+        if let AssignmentSource::Statement(stmt) = *owner {
+            if let Stmt::Assign {
+                lhs,
+                rhs: _,
+                op: _,
+                type_ref,
+            } = &module[stmt]
+            {
+                let expected_ty = expected_ty.or_else(|| {
+                    let (type_ref, range) = type_ref.as_ref()?;
+                    let (expected_ty, errors) =
+                        resolve_type_ref(self, type_ref, Some(InFile { file, value: stmt }));
+                    if errors.is_empty() {
+                        Some(expected_ty)
+                    } else {
+                        for error in errors {
+                            self.add_diagnostic_for_range(
+                                file,
+                                Severity::Error,
+                                *range,
+                                None,
+                                error,
+                            );
                         }
-                    }),
-                    _ => None,
-                }
-            });
-
-            if let Some(lhs) = node.lhs() {
-                let lhs_ptr = AstPtr::new(&lhs);
-                let expr = source_map.expr_map.get(&lhs_ptr).unwrap();
+                        None
+                    }
+                });
                 self.assign_expr_source_ty(
                     file,
                     source,
-                    *expr,
+                    *lhs,
                     source_ty,
                     expected_ty,
                     execution_scope,
@@ -1408,21 +1378,39 @@ impl TyContext<'_> {
             }
         }
 
-        // Handle assignments in "for" statements and comphrehensions.
-        // e.g. `for x in 1, 2, 3` or `[x*y for x in range(5) for y in range(5)]`
-        let targets = ast::ForStmt::cast(parent.clone())
-            .and_then(|stmt| stmt.targets())
-            .or_else(|| {
-                ast::CompClauseFor::cast(parent).and_then(|comp_clause| comp_clause.targets())
-            });
-
-        let targets = match targets {
-            Some(targets) => targets
-                .exprs()
-                .map(|expr| source_map.expr_map.get(&AstPtr::new(&expr)).unwrap())
-                .copied()
-                .collect::<Vec<_>>(),
-            None => return,
+        let targets = match *owner {
+            AssignmentSource::Statement(stmt) => {
+                let Stmt::For {
+                    iterable: _,
+                    targets,
+                    stmts: _,
+                } = &module[stmt]
+                else {
+                    unreachable!("assignment source must belong to an assignment or loop");
+                };
+                targets
+            }
+            AssignmentSource::Comprehension { expression, clause } => {
+                let clauses = match &module[expression] {
+                    Expr::ListComp {
+                        expr: _,
+                        comp_clauses,
+                    } => comp_clauses,
+                    Expr::DictComp {
+                        entry: _,
+                        comp_clauses,
+                    } => comp_clauses,
+                    _ => unreachable!("comprehension source must belong to a comprehension"),
+                };
+                let CompClause::For {
+                    iterable: _,
+                    targets,
+                } = &clauses[clause]
+                else {
+                    unreachable!("assignment source must belong to a for clause");
+                };
+                targets
+            }
         };
 
         let sub_ty = match source_ty.kind() {
@@ -1452,7 +1440,7 @@ impl TyContext<'_> {
         if targets.len() == 1 {
             self.assign_expr_source_ty(file, targets[0], targets[0], sub_ty, None, execution_scope);
         } else {
-            self.assign_exprs_source_ty(file, source, &targets, sub_ty, execution_scope);
+            self.assign_exprs_source_ty(file, source, targets, sub_ty, execution_scope);
         }
     }
 

@@ -54,12 +54,22 @@ pub(crate) struct Module {
     pub(crate) top_level: Box<[StmtId]>,
     pub(crate) type_ignore_comment_lines: HashSet<u32>,
     pub(crate) call_expr_with_impl_fn: FxHashMap<Name, ExprId>,
+    pub(crate) assignment_sources: FxHashMap<ExprId, AssignmentSource>,
     pub(crate) param_to_def_stmt: FxHashMap<ParamId, (StmtId, usize)>,
+}
+
+/// The HIR construct that consumes an assignment's source expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssignmentSource {
+    Statement(StmtId),
+    Comprehension { expression: ExprId, clause: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSourceMap {
     pub root: ModulePtr,
+    pub function_names: FxHashMap<StmtId, TextRange>,
+    pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub expr_map: FxHashMap<ExprPtr, ExprId>,
     pub expr_map_back: FxHashMap<ExprId, ExprPtr>,
     pub stmt_map: FxHashMap<StmtPtr, StmtId>,
