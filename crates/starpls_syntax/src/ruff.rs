@@ -15,9 +15,7 @@ use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::ArgOrKeyword;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
-use ruff_python_parser::ParseErrorType;
 use ruff_python_parser::Parsed;
-use ruff_python_parser::UnsupportedSyntaxErrorKind;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
@@ -56,11 +54,9 @@ pub(super) fn parse(
     parsed: &Parsed<py::ModModule>,
     errors: &mut dyn FnMut(SyntaxError),
 ) -> GreenNode {
-    crate::lexical::validate(source, parsed.tokens(), errors);
+    crate::validation::validate(source, parsed, errors);
     let mut adapter = Adapter {
         tokens: parsed.tokens(),
-        errors,
-        loads: Vec::new(),
     };
     let children = parsed
         .syntax()
@@ -69,36 +65,6 @@ pub(super) fn parse(
         .map(|stmt| adapter.statement(stmt))
         .collect();
     let root = Node::new(MODULE, TextRange::up_to(TextSize::of(source)), children);
-    for error in parsed.unsupported_syntax_errors() {
-        // Other entries concern Python versions, not the Starlark grammar.
-        if error.kind == UnsupportedSyntaxErrorKind::ParenthesizedKeywordArgumentName {
-            adapter.error(
-                error.range(),
-                "Keyword argument names cannot be parenthesized",
-            );
-        }
-    }
-    for error in parsed.errors() {
-        // Starlark load items can interleave aliases and direct imports. The
-        // load adapter validates their grammar before admitting this exception.
-        if error.error == ParseErrorType::PositionalAfterKeywordArgument
-            && adapter
-                .loads
-                .iter()
-                .any(|range| range.contains_range(error.range()))
-        {
-            continue;
-        }
-        // Starlark bytes permit literal UTF-8. Their escapes were validated
-        // above using the Starlark decoder.
-        if matches!(
-            error.error,
-            ParseErrorType::Lexical(ruff_python_parser::LexicalErrorType::InvalidByteLiteral)
-        ) {
-            continue;
-        }
-        adapter.error(error.range(), error.error.to_string());
-    }
     let mut builder = GreenNodeBuilder::new();
     let mut writer = Writer {
         source,
@@ -113,23 +79,10 @@ pub(super) fn parse(
 
 struct Adapter<'a> {
     tokens: &'a Tokens,
-    errors: &'a mut dyn FnMut(SyntaxError),
-    loads: Vec<TextRange>,
 }
 
 impl Adapter<'_> {
-    fn error(&mut self, range: TextRange, message: impl Into<String>) {
-        (self.errors)(SyntaxError {
-            message: message.into(),
-            range: rowan::TextRange::new(
-                u32::from(range.start()).into(),
-                u32::from(range.end()).into(),
-            ),
-        });
-    }
-
-    fn unsupported(&mut self, range: TextRange) -> Node {
-        self.error(range, "This syntax is not supported in Starlark");
+    fn unsupported(&self, range: TextRange) -> Node {
         Node::leaf(ERROR, range)
     }
 
@@ -144,27 +97,14 @@ impl Adapter<'_> {
                 let py::StmtFunctionDef {
                     node_index: _,
                     range,
-                    is_async,
-                    decorator_list,
+                    is_async: _,
+                    decorator_list: _,
                     name,
-                    type_params,
+                    type_params: _,
                     parameters,
-                    returns,
+                    returns: _,
                     body,
                 } = def;
-                if *is_async
-                    || !decorator_list.is_empty()
-                    || type_params.is_some()
-                    || returns.is_some()
-                {
-                    self.error(
-                        *range,
-                        "Function annotations and decorators are not supported in Starlark",
-                    );
-                }
-                if name.as_str() == "load" {
-                    self.error(name.range(), "load is a reserved word");
-                }
                 let name = Node::leaf(NAME, name.range());
                 let params = self.parameters(parameters);
                 let suite = self.suite(body, parameters.end(), range.end(), None);
@@ -191,18 +131,12 @@ impl Adapter<'_> {
                 let py::StmtFor {
                     node_index: _,
                     range,
-                    is_async,
+                    is_async: _,
                     target,
                     iter,
                     body,
-                    orelse,
+                    orelse: _,
                 } = stmt;
-                if *is_async || !orelse.is_empty() {
-                    self.error(
-                        *range,
-                        "Async loops and for-else are not supported in Starlark",
-                    );
-                }
                 let target = self.loop_variables(target, parent);
                 let iterable = self.expr(iter, parent);
                 let suite = self.suite(body, iter.end(), range.end(), None);
@@ -215,9 +149,6 @@ impl Adapter<'_> {
                     targets,
                     value,
                 } = stmt;
-                if targets.len() != 1 {
-                    self.error(*range, "Chained assignment is not supported in Starlark");
-                }
                 let mut children = targets
                     .iter()
                     .map(|target| self.expr(target, parent))
@@ -230,12 +161,9 @@ impl Adapter<'_> {
                     node_index: _,
                     range,
                     target,
-                    op,
+                    op: _,
                     value,
                 } = stmt;
-                if matches!(op, py::Operator::Pow | py::Operator::MatMult) {
-                    self.error(*range, "Unsupported Starlark assignment operator");
-                }
                 let target = self.expr(target, parent);
                 let value = self.expr(value, parent);
                 Node::new(ASSIGN_STMT, *range, vec![target, value])
@@ -261,23 +189,6 @@ impl Adapter<'_> {
                 if let Expr::Call(call) = value.as_ref() {
                     if let Expr::Name(name) = call.func.as_ref() {
                         if name.id == "load" {
-                            if parentheses_iterator(
-                                value.as_ref().into(),
-                                Some(parent),
-                                self.tokens,
-                            )
-                            .next()
-                            .is_some()
-                                || parentheses_iterator(
-                                    call.func.as_ref().into(),
-                                    Some(call.into()),
-                                    self.tokens,
-                                )
-                                .next()
-                                .is_some()
-                            {
-                                self.error(stmt.range(), "load must be a bare statement");
-                            }
                             return self.load(call);
                         }
                     }
@@ -381,24 +292,7 @@ impl Adapter<'_> {
 
     fn load(&mut self, call: &py::ExprCall) -> Node {
         let mut children = Vec::new();
-        let mut valid = true;
         for (index, argument) in call.arguments.iter_source_order().enumerate() {
-            let value = argument.value();
-            let tokens = self.tokens.in_range(value.range());
-            let literal = match tokens {
-                [token] => token.kind() == TokenKind::String,
-                _ => false,
-            } && parentheses_iterator(
-                value.into(),
-                Some((&call.arguments).into()),
-                self.tokens,
-            )
-            .next()
-            .is_none();
-            if !matches!(value, Expr::StringLiteral(_)) || !literal {
-                self.error(value.range(), "Expected a string in load statement");
-                valid = false;
-            }
             let node = match argument {
                 ArgOrKeyword::Arg(expr) => Node::leaf(
                     if index == 0 {
@@ -409,23 +303,11 @@ impl Adapter<'_> {
                     expr.range(),
                 ),
                 ArgOrKeyword::Keyword(keyword) => {
-                    if index == 0 || keyword.arg.is_none() {
-                        self.error(
-                            keyword.range(),
-                            "Expected a module string followed by load items",
-                        );
-                        valid = false;
-                    }
                     let names = keyword.arg.iter().map(|name| self.name(name)).collect();
                     Node::new(ALIASED_LOAD_ITEM, keyword.range(), names)
                 }
             };
             children.push(node);
-        }
-        if children.is_empty() {
-            self.error(call.range(), "Expected module name");
-        } else if valid {
-            self.loads.push(call.range());
         }
         Node::new(LOAD_STMT, call.range(), children)
     }
@@ -434,18 +316,12 @@ impl Adapter<'_> {
         let py::Parameters {
             node_index: _,
             range,
-            posonlyargs,
+            posonlyargs: _,
             args,
             vararg,
             kwonlyargs,
             kwarg,
         } = parameters;
-        if !posonlyargs.is_empty() {
-            self.error(
-                *range,
-                "Positional-only parameters are not supported in Starlark",
-            );
-        }
         let mut children = Vec::new();
         for parameter in parameters.iter_source_order() {
             let node = match parameter {
@@ -513,21 +389,12 @@ impl Adapter<'_> {
             range: _,
             node_index: _,
             name,
-            annotation,
+            annotation: _,
         } = param;
-        if let Some(annotation) = annotation {
-            self.error(
-                annotation.range(),
-                "Type annotations are not supported in Starlark",
-            );
-        }
         self.name(name)
     }
 
     fn name(&mut self, name: &py::Identifier) -> Node {
-        if name.as_str() == "load" {
-            self.error(name.range(), "load is a reserved word");
-        }
         Node::leaf(NAME, name.range())
     }
 
@@ -549,44 +416,24 @@ impl Adapter<'_> {
     fn bare_expr(&mut self, expr: &Expr) -> Node {
         let parent = AnyNodeRef::from(expr);
         let range = expr.range();
+        if !crate::validation::supports_expr(expr, self.tokens) {
+            return self.unsupported(range);
+        }
         match expr {
             Expr::Name(name) => {
-                if name.id == "load" {
-                    return self.unsupported(range);
-                }
                 Node::leaf(if name.id.is_empty() { ERROR } else { NAME_REF }, range)
             }
-            Expr::NumberLiteral(number) => {
-                if number.value.is_complex() {
-                    return self.unsupported(range);
-                }
-                Node::leaf(LITERAL_EXPR, range)
-            }
+            Expr::NumberLiteral(_) => Node::leaf(LITERAL_EXPR, range),
             Expr::BooleanLiteral(_) | Expr::NoneLiteral(_) => Node::leaf(LITERAL_EXPR, range),
-            Expr::StringLiteral(_) | Expr::BytesLiteral(_) => {
-                if self
-                    .tokens
-                    .in_range(range)
-                    .iter()
-                    .filter(|token| token.kind() == TokenKind::String)
-                    .count()
-                    != 1
-                {
-                    return self.unsupported(range);
-                }
-                Node::leaf(LITERAL_EXPR, range)
-            }
+            Expr::StringLiteral(_) | Expr::BytesLiteral(_) => Node::leaf(LITERAL_EXPR, range),
             Expr::BinOp(expr) => {
                 let py::ExprBinOp {
                     node_index: _,
                     range,
                     left,
-                    op,
+                    op: _,
                     right,
                 } = expr;
-                if matches!(op, py::Operator::Pow | py::Operator::MatMult) {
-                    return self.unsupported(*range);
-                }
                 let left = self.expr(left, parent);
                 let right = self.expr(right, parent);
                 Node::new(BINARY_EXPR, *range, vec![left, right])
@@ -597,14 +444,8 @@ impl Adapter<'_> {
                     node_index: _,
                     range,
                     operands,
-                    ops,
+                    ops: _,
                 } = expr;
-                if ops
-                    .iter()
-                    .any(|op| matches!(op, py::CmpOp::Is | py::CmpOp::IsNot))
-                {
-                    return self.unsupported(*range);
-                }
                 self.binary_chain(operands, parent, *range)
             }
             Expr::UnaryOp(expr) => {
@@ -723,9 +564,6 @@ impl Adapter<'_> {
                     ctx: _,
                 } = expr;
                 let value = self.expr(value, parent);
-                if attr.as_str() == "load" {
-                    self.error(attr.range(), "load is a reserved word");
-                }
                 let name = Node::leaf(NAME, attr.range());
                 Node::new(DOT_EXPR, *range, vec![value, name])
             }
@@ -842,11 +680,8 @@ impl Adapter<'_> {
                 target,
                 iter,
                 ifs,
-                is_async,
+                is_async: _,
             } = generator;
-            if *is_async {
-                self.error(*range, "Async comprehensions are not supported in Starlark");
-            }
             let parent = generator.into();
             let target = self.loop_variables(target, parent);
             let iterable = self.expr(iter, parent);
