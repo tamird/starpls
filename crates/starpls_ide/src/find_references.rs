@@ -128,15 +128,14 @@ pub(crate) fn find_references(
         }
 
         (name, defs)
-    } else if let Some(node) = ast::Name::cast(node) {
+    } else {
+        let node = ast::Name::cast(node)?;
         let def_stmt = ast::DefStmt::cast(node.syntax().parent()?)?;
         let callable = sema.resolve_def_stmt(file, &def_stmt)?;
         (
             Name::from_ast_name(node),
             vec![ScopeDef::Callable(callable)],
         )
-    } else {
-        return None;
     };
 
     Some(
@@ -173,7 +172,7 @@ mod tests {
             .into_iter()
             .map(|location| (location.file_id, location.range))
             .collect::<Vec<_>>();
-        actual_locations.sort_by_key(|(_, range)| (range.start()));
+        actual_locations.sort_by_key(|(_, range)| range.start());
         actual_locations.sort_by_key(|(file_id, _)| *file_id);
 
         assert_eq!(fixture.selected_ranges, actual_locations);
