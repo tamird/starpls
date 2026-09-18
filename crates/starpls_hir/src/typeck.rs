@@ -371,16 +371,16 @@ impl Ty {
     pub(crate) fn params<'a>(
         &'a self,
         db: &'a dyn Db,
-    ) -> Option<impl Iterator<Item = (Param, Ty)> + 'a> {
+    ) -> Option<impl Iterator<Item = (ParamInner, Ty)> + 'a> {
         Some(match self.kind() {
             TyKind::Function(def) => {
                 Params::Simple(def.func().params.iter().enumerate().map(|(index, param)| {
                     let file = def.func().file;
                     let ty = queries::infer_param(db, file, *param);
-                    let param = Param(ParamInner::Param {
+                    let param = ParamInner::Param {
                         func: def.func().clone(),
                         index,
-                    });
+                    };
                     (param, ty)
                 }))
             }
@@ -390,10 +390,10 @@ impl Ty {
                         .ty()
                         .unwrap_or_else(Ty::unknown)
                         .substitute(&subst.args);
-                    let param = Param(ParamInner::IntrinsicParam {
+                    let param = ParamInner::IntrinsicParam {
                         parent: func.clone(),
                         index,
-                    });
+                    };
                     (param, ty)
                 }))
             }
@@ -407,10 +407,10 @@ impl Ty {
                         }
                         BuiltinFunctionParam::KwargsDict { .. } => Ty::dict(Ty::string(), ty, None),
                     };
-                    let param = Param(ParamInner::BuiltinParam {
+                    let param = ParamInner::BuiltinParam {
                         parent: func.clone(),
                         index,
-                    });
+                    };
                     (param, ty)
                 }))
             }
@@ -424,7 +424,7 @@ impl Ty {
                 .enumerate()
                 .map(|(index, (_, attr))| {
                     (
-                        Param(RuleParam::BuiltinKeyword(kind.clone(), index).into()),
+                        RuleParam::BuiltinKeyword(kind.clone(), index).into(),
                         attr.expected_ty(),
                     )
                 });
@@ -441,13 +441,11 @@ impl Ty {
                                     attrs.attrs.iter().filter_map(|(name, attr)| {
                                         attr.as_ref().map(|attr| {
                                             (
-                                                Param(
-                                                    RuleParam::Keyword {
-                                                        name: name.clone(),
-                                                        attr: attr.clone(),
-                                                    }
-                                                    .into(),
-                                                ),
+                                                RuleParam::Keyword {
+                                                    name: name.clone(),
+                                                    attr: attr.clone(),
+                                                }
+                                                .into(),
                                                 attr.expected_ty(),
                                             )
                                         })
@@ -458,7 +456,7 @@ impl Ty {
                         )
                         .chain(common_attrs)
                         .chain(iter::once((
-                            Param(RuleParam::Kwargs.into()),
+                            RuleParam::Kwargs.into(),
                             TyKind::Dict(Ty::string(), Ty::any(), None).intern(),
                         ))),
                 )
@@ -469,10 +467,10 @@ impl Ty {
                         ProviderParams::Builtin(builtin_provider.params.iter().enumerate().map(
                             |(index, param)| {
                                 (
-                                    Param(ParamInner::ProviderParam {
+                                    ParamInner::ProviderParam {
                                         provider: provider.clone(),
                                         index,
-                                    }),
+                                    },
                                     resolve_builtin_type_ref_opt(db, param.type_ref()),
                                 )
                             },
@@ -482,10 +480,10 @@ impl Ty {
                         ProviderParams::Custom(custom_provider.fields.iter().flat_map(|fields| {
                             fields.fields.iter().enumerate().map(|(index, _)| {
                                 (
-                                    Param(ParamInner::ProviderParam {
+                                    ParamInner::ProviderParam {
                                         provider: provider.clone(),
                                         index,
-                                    }),
+                                    },
                                     Ty::unknown(),
                                 )
                             })
@@ -500,18 +498,16 @@ impl Ty {
                     .flat_map(|attrs| attrs.iter())
                     .map(|data| {
                         (
-                            Param(
-                                TagParam::Keyword {
-                                    name: data.name.clone(),
-                                    attr: data.attr.clone(),
-                                }
-                                .into(),
-                            ),
+                            TagParam::Keyword {
+                                name: data.name.clone(),
+                                attr: data.attr.clone(),
+                            }
+                            .into(),
                             data.attr.expected_ty(),
                         )
                     })
                     .chain(iter::once((
-                        Param(TagParam::Kwargs.into()),
+                        TagParam::Kwargs.into(),
                         TyKind::Dict(Ty::string(), Ty::any(), None).intern(),
                     ))),
             ),
@@ -523,13 +519,11 @@ impl Ty {
                         attrs.attrs.iter().filter_map(|(name, attr)| {
                             attr.as_ref().map(|attr| {
                                 (
-                                    Param(
-                                        RuleParam::Keyword {
-                                            name: name.clone(),
-                                            attr: attr.clone(),
-                                        }
-                                        .into(),
-                                    ),
+                                    RuleParam::Keyword {
+                                        name: name.clone(),
+                                        attr: attr.clone(),
+                                    }
+                                    .into(),
                                     attr.expected_ty(),
                                 )
                             })
@@ -741,9 +735,11 @@ impl From<TagParam> for ParamInner {
     }
 }
 
-impl Param {
-    pub fn name(&self, db: &dyn Db) -> Option<Name> {
-        match self.0 {
+impl Param<'_> {
+    pub fn name(&self) -> Option<Name> {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        match *inner {
             ParamInner::Param { ref func, index } => {
                 let module = module(db, func.file);
                 Some(module[func.params[index]].name().clone())
@@ -793,8 +789,10 @@ impl Param {
         }
     }
 
-    pub fn doc(&self, db: &dyn Db) -> Option<String> {
-        Some(match &self.0 {
+    pub fn doc(&self) -> Option<String> {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        Some(match inner {
             ParamInner::Param { ref func, index } => {
                 let module = module(db, func.file);
                 return module[func.params[*index]].doc().map(|doc| doc.to_string());
@@ -834,8 +832,10 @@ impl Param {
         })
     }
 
-    pub fn is_args_list(&self, db: &dyn Db) -> bool {
-        match self.0 {
+    pub fn is_args_list(&self) -> bool {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        match *inner {
             // TODO(withered-magic): Handle lambda parameters.
             ParamInner::Param { ref func, index } => {
                 let module = module(db, func.file);
@@ -852,8 +852,10 @@ impl Param {
         }
     }
 
-    pub fn is_kwargs_dict(&self, db: &dyn Db) -> bool {
-        match self.0 {
+    pub fn is_kwargs_dict(&self) -> bool {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        match *inner {
             // TODO(withered-magic): Handle lambda parameters.
             ParamInner::Param { ref func, index } => {
                 let module = module(db, func.file);
@@ -881,8 +883,10 @@ impl Param {
         }
     }
 
-    pub fn syntax_node_ptr(&self, db: &dyn Db) -> Option<InFile<SyntaxNodePtr>> {
-        match self.0 {
+    pub fn syntax_node_ptr(&self) -> Option<InFile<SyntaxNodePtr>> {
+        let Self { sema, inner } = self;
+        let db = sema.db;
+        match *inner {
             ParamInner::Param { ref func, index } => {
                 let file = func.file;
                 source_map(db, file)
@@ -898,7 +902,8 @@ impl Param {
     }
 
     pub fn is_positional_only(&self) -> bool {
-        match self.0 {
+        let Self { sema: _, inner } = self;
+        match *inner {
             ParamInner::IntrinsicParam { ref parent, index } => matches!(
                 parent.params[index],
                 IntrinsicFunctionParam::Positional { .. }
@@ -907,9 +912,11 @@ impl Param {
         }
     }
 
-    pub fn default_value(&self, db: &dyn Db) -> Option<String> {
+    pub fn default_value(&self) -> Option<String> {
+        let Self { sema, inner } = self;
+        let db = sema.db;
         let common = common_attributes_query(db);
-        let attr = match &self.0 {
+        let attr = match inner {
             ParamInner::BuiltinParam { ref parent, index } => match &parent.params[*index] {
                 BuiltinFunctionParam::Simple { default_value, .. } => return default_value.clone(),
                 _ => return None,
@@ -942,10 +949,10 @@ enum ProviderParams<I1, I2> {
 
 impl<I1, I2> Iterator for ProviderParams<I1, I2>
 where
-    I1: Iterator<Item = (Param, Ty)>,
-    I2: Iterator<Item = (Param, Ty)>,
+    I1: Iterator<Item = (ParamInner, Ty)>,
+    I2: Iterator<Item = (ParamInner, Ty)>,
 {
-    type Item = (Param, Ty);
+    type Item = (ParamInner, Ty);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -967,16 +974,16 @@ enum Params<I1, I2, I3, I4, I5, I6, I7, I8> {
 
 impl<I1, I2, I3, I4, I5, I6, I7, I8> Iterator for Params<I1, I2, I3, I4, I5, I6, I7, I8>
 where
-    I1: Iterator<Item = (Param, Ty)>,
-    I2: Iterator<Item = (Param, Ty)>,
-    I3: Iterator<Item = (Param, Ty)>,
-    I4: Iterator<Item = (Param, Ty)>,
-    I5: Iterator<Item = (Param, Ty)>,
-    I6: Iterator<Item = (Param, Ty)>,
-    I7: Iterator<Item = (Param, Ty)>,
-    I8: Iterator<Item = (Param, Ty)>,
+    I1: Iterator<Item = (ParamInner, Ty)>,
+    I2: Iterator<Item = (ParamInner, Ty)>,
+    I3: Iterator<Item = (ParamInner, Ty)>,
+    I4: Iterator<Item = (ParamInner, Ty)>,
+    I5: Iterator<Item = (ParamInner, Ty)>,
+    I6: Iterator<Item = (ParamInner, Ty)>,
+    I7: Iterator<Item = (ParamInner, Ty)>,
+    I8: Iterator<Item = (ParamInner, Ty)>,
 {
-    type Item = (Param, Ty);
+    type Item = (ParamInner, Ty);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {

@@ -19,7 +19,7 @@ struct FindReferencesHandler<'a> {
     sema: &'a Semantics<'a>,
     file: File,
     name: Name,
-    defs: Vec<ScopeDef>,
+    defs: Vec<ScopeDef<'a>>,
     locations: Vec<Location>,
 }
 

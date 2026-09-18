@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -25,4 +25,9 @@ rust_test(
     },
     crate = ":starpls_hir",
     deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "starpls_hir_doc_test",
+    crate = ":starpls_hir",
 )
