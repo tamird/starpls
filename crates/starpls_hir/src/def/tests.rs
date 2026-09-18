@@ -49,7 +49,7 @@ fn check_scope_full(fixture: &str, expected: &[&str], prelude: Option<&str>) {
     // Filter out intrinsic function names as well as the hardcoded `BUILD.bazel` and `.bzl`
     // builtins, which are always added when `APIContext::Build` is the current API context.
     let names_to_filter = intrinsic_functions(&test_db)
-        .functions(&test_db)
+        .functions
         .keys()
         .map(|name| name.to_string())
         .chain(

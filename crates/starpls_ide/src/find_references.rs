@@ -38,7 +38,7 @@ impl<'a> FindReferencesHandler<'a> {
             let Some(parent) = self
                 .sema
                 .parse(self.file)
-                .syntax(self.sema.db)
+                .syntax()
                 .token_at_offset(offset)
                 .find(|token| token.text() == self.name.as_str())
                 .and_then(|token| token.parent())
@@ -102,7 +102,7 @@ pub(crate) fn find_references(
     let sema = Semantics::new(db);
     let file = db.get_file(file_id)?;
     let parse = sema.parse(file);
-    let token = pick_best_token(parse.syntax(db).token_at_offset(pos), |kind| match kind {
+    let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
         T![ident] => 2,
         T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
         kind if kind.is_trivia_token() => 0,

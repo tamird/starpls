@@ -18,3 +18,4 @@ ruff_python_parser = "=0.0.14"
 ruff_text_size = "=0.0.14"
 ruff_source_file = "=0.0.14"
 stacker = "0.1.25"
+salsa = { version = "=0.28.2", default-features = false, features = ["macros", "inventory", "accumulator"] }

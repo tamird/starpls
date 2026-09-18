@@ -98,7 +98,7 @@ pub(crate) fn document_symbols(db: &Database, file_id: FileId) -> Option<Vec<Doc
 }
 
 fn add_target_symbols(db: &Database, file: File, acc: &mut Vec<DocumentSymbol>) {
-    let root = parse(db, file).syntax(db);
+    let root = parse(db, file).syntax();
     let targets = root.children().filter_map(|child| {
         let expr = ast::CallExpr::cast(child)?;
         let range = expr.syntax().text_range();

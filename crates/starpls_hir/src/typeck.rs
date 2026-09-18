@@ -19,7 +19,6 @@ use ty_flow::reachability_constraints::ScopedReachabilityConstraintId;
 
 use crate::def::scope::FunctionDef;
 use crate::def::ExprId;
-use crate::def::InternedString;
 use crate::def::LoadItemId;
 use crate::def::LoadStmt;
 use crate::def::Param as HirDefParam;
@@ -33,7 +32,6 @@ use crate::typeck::builtins::BuiltinFunction;
 use crate::typeck::builtins::BuiltinFunctionParam;
 use crate::typeck::builtins::BuiltinProvider;
 use crate::typeck::builtins::BuiltinType;
-use crate::typeck::intrinsics::intrinsic_field_types;
 use crate::typeck::intrinsics::intrinsic_types;
 use crate::typeck::intrinsics::IntrinsicClass;
 use crate::typeck::intrinsics::IntrinsicFunction;
@@ -78,7 +76,7 @@ impl FileParamId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileLoadStmt {
     pub(crate) file: File,
     pub(crate) load_stmt: LoadStmt,
@@ -203,12 +201,12 @@ impl Ty {
     ) -> Option<impl Iterator<Item = (Field, Ty)> + 'a> {
         let kind = self.kind();
         if let Some(class) = kind.builtin_class(db) {
-            return Some(Fields::Intrinsic(self.intrinsic_class_fields(db, class)));
+            return Some(Fields::Intrinsic(self.intrinsic_class_fields(class)));
         }
 
         let fields = match kind {
             TyKind::BuiltinType(ty, data) => Fields::Builtin(
-                ty.fields(db)
+                ty.fields
                     .iter()
                     .enumerate()
                     .map(move |(index, field)| {
@@ -227,13 +225,16 @@ impl Ty {
                             }
                             _ => resolved,
                         };
-                        let field = Field(FieldInner::BuiltinField { parent: *ty, index });
+                        let field = Field(FieldInner::BuiltinField {
+                            parent: ty.clone(),
+                            index,
+                        });
                         (field, resolved)
                     })
-                    .chain(ty.methods(db).iter().map(|func| {
+                    .chain(ty.methods.iter().map(|func| {
                         (
-                            Field(FieldInner::BuiltinMethod { func: *func }),
-                            TyKind::BuiltinFunction(*func).intern(),
+                            Field(FieldInner::BuiltinMethod { func: func.clone() }),
+                            TyKind::BuiltinFunction(func.clone()).intern(),
                         )
                     })),
             ),
@@ -273,7 +274,7 @@ impl Ty {
             ),
             TyKind::ProviderInstance(provider) => Fields::Provider(match provider {
                 Provider::Builtin(builtin_provier) => {
-                    ProviderFields::Builtin(builtin_provier.fields(db).iter().enumerate().map(
+                    ProviderFields::Builtin(builtin_provier.fields.iter().enumerate().map(
                         |(index, field)| {
                             (
                                 Field(FieldInner::ProviderField {
@@ -321,7 +322,7 @@ impl Ty {
             ),
             TyKind::Target => {
                 let label_ty = builtin_types(db, Dialect::Bazel)
-                    .types(db)
+                    .types
                     .get("Label")
                     .cloned()
                     .unwrap_or_else(Ty::unknown);
@@ -341,16 +342,8 @@ impl Ty {
 
     fn intrinsic_class_fields<'a>(
         &'a self,
-        db: &'a dyn Db,
         class: IntrinsicClass,
     ) -> impl Iterator<Item = (Field, Ty)> + 'a {
-        let fields = (0..class.fields(db).len()).map(move |index| {
-            Field(FieldInner::IntrinsicField {
-                parent: class,
-                index,
-            })
-        });
-
         // Build the substitution for lists and dicts.
         let mut subst = Substitution::new();
         match self.kind() {
@@ -364,11 +357,15 @@ impl Ty {
             _ => {}
         }
 
-        let types = intrinsic_field_types(db, class)
-            .field_tys(db)
-            .iter()
-            .map(move |binders| binders.substitute(&subst));
-        fields.zip(types)
+        (0..class.fields.len()).map(move |index| {
+            let binders = Binders::new(class.num_vars, class.fields[index].ty.clone());
+            let ty = binders.substitute(&subst);
+            let field = Field(FieldInner::IntrinsicField {
+                parent: class.clone(),
+                index,
+            });
+            (field, ty)
+        })
     }
 
     pub(crate) fn params<'a>(
@@ -376,32 +373,32 @@ impl Ty {
         db: &'a dyn Db,
     ) -> Option<impl Iterator<Item = (Param, Ty)> + 'a> {
         Some(match self.kind() {
-            TyKind::Function(def) => Params::Simple(def.func().params(db).iter().enumerate().map(
-                |(index, param)| {
-                    let file = def.func().file(db);
+            TyKind::Function(def) => {
+                Params::Simple(def.func().params.iter().enumerate().map(|(index, param)| {
+                    let file = def.func().file;
                     let ty = queries::infer_param(db, file, *param);
                     let param = Param(ParamInner::Param {
-                        func: def.func(),
+                        func: def.func().clone(),
                         index,
                     });
                     (param, ty)
-                },
-            )),
+                }))
+            }
             TyKind::IntrinsicFunction(func, subst) => {
-                Params::Intrinsic(func.params(db).iter().enumerate().map(|(index, param)| {
+                Params::Intrinsic(func.params.iter().enumerate().map(|(index, param)| {
                     let ty = param
                         .ty()
                         .unwrap_or_else(Ty::unknown)
                         .substitute(&subst.args);
                     let param = Param(ParamInner::IntrinsicParam {
-                        parent: *func,
+                        parent: func.clone(),
                         index,
                     });
                     (param, ty)
                 }))
             }
             TyKind::BuiltinFunction(func) => {
-                Params::Builtin(func.params(db).iter().enumerate().map(|(index, param)| {
+                Params::Builtin(func.params.iter().enumerate().map(|(index, param)| {
                     let ty = resolve_builtin_type_ref_opt(db, param.type_ref());
                     let ty = match param {
                         BuiltinFunctionParam::Simple { .. } => ty,
@@ -411,7 +408,7 @@ impl Ty {
                         BuiltinFunctionParam::KwargsDict { .. } => Ty::dict(Ty::string(), ty, None),
                     };
                     let param = Param(ParamInner::BuiltinParam {
-                        parent: *func,
+                        parent: func.clone(),
                         index,
                     });
                     (param, ty)
@@ -420,8 +417,8 @@ impl Ty {
             TyKind::Rule(Rule { attrs, kind, .. }) => {
                 let common = common_attributes_query(db);
                 let mut common_attrs = match kind {
-                    RuleKind::Build => common.build(db),
-                    RuleKind::Repository => common.repository(db),
+                    RuleKind::Build => &common.build,
+                    RuleKind::Repository => &common.repository,
                 }
                 .iter()
                 .enumerate()
@@ -469,7 +466,7 @@ impl Ty {
             TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
                 Params::Provider(match provider {
                     Provider::Builtin(builtin_provider) => {
-                        ProviderParams::Builtin(builtin_provider.params(db).iter().enumerate().map(
+                        ProviderParams::Builtin(builtin_provider.params.iter().enumerate().map(
                             |(index, param)| {
                                 (
                                     Param(ParamInner::ProviderParam {
@@ -547,9 +544,11 @@ impl Ty {
 
     pub(crate) fn ret_ty(&self, db: &dyn Db) -> Option<Ty> {
         Some(match self.kind() {
-            TyKind::Function(def) => resolve_builtin_type_ref_opt(db, def.func().ret_type_ref(db)),
-            TyKind::IntrinsicFunction(func, subst) => func.ret_ty(db).substitute(&subst.args),
-            TyKind::BuiltinFunction(func) => resolve_builtin_type_ref(db, func.ret_type_ref(db)).0,
+            TyKind::Function(def) => {
+                resolve_builtin_type_ref_opt(db, def.func().ret_type_ref.clone())
+            }
+            TyKind::IntrinsicFunction(func, subst) => func.ret_ty.substitute(&subst.args),
+            TyKind::BuiltinFunction(func) => resolve_builtin_type_ref(db, &func.ret_type_ref).0,
             TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
                 TyKind::ProviderInstance(provider.clone()).intern()
             }
@@ -669,14 +668,14 @@ impl Ty {
                 lit.as_ref().cloned(),
             ),
             TyKind::IntrinsicFunction(data, subst) => {
-                TyKind::IntrinsicFunction(*data, subst.substitute(args)).intern()
+                TyKind::IntrinsicFunction(data.clone(), subst.substitute(args)).intern()
             }
             TyKind::BoundVar(index) => args[*index].clone(),
             _ => self.clone(),
         }
     }
 
-    pub(crate) fn known_keys(&self) -> Option<&[(InternedString, Ty)]> {
+    pub(crate) fn known_keys(&self) -> Option<&[(Arc<str>, Ty)]> {
         match self.kind() {
             TyKind::Dict(_, _, known_keys) => known_keys.as_ref().map(|lit| &*lit.known_keys),
             _ => None,
@@ -745,12 +744,12 @@ impl From<TagParam> for ParamInner {
 impl Param {
     pub fn name(&self, db: &dyn Db) -> Option<Name> {
         match self.0 {
-            ParamInner::Param { func, index } => {
-                let module = module(db, func.file(db));
-                Some(module[func.params(db)[index]].name().clone())
+            ParamInner::Param { ref func, index } => {
+                let module = module(db, func.file);
+                Some(module[func.params[index]].name().clone())
             }
-            ParamInner::IntrinsicParam { parent, index } => {
-                let param = &parent.params(db)[index];
+            ParamInner::IntrinsicParam { ref parent, index } => {
+                let param = &parent.params[index];
 
                 param.name().cloned().or_else(|| {
                     Some(match param {
@@ -763,7 +762,7 @@ impl Param {
                     })
                 })
             }
-            ParamInner::BuiltinParam { parent, index } => match &parent.params(db)[index] {
+            ParamInner::BuiltinParam { ref parent, index } => match &parent.params[index] {
                 BuiltinFunctionParam::Simple { name, .. }
                 | BuiltinFunctionParam::ArgsList { name, .. }
                 | BuiltinFunctionParam::KwargsDict { name, .. } => Some(name.clone()),
@@ -771,7 +770,7 @@ impl Param {
             ParamInner::RuleParam(RuleParam::Keyword { ref name, .. }) => Some(name.clone()),
             ParamInner::RuleParam(RuleParam::BuiltinKeyword(ref kind, index)) => Some(
                 common_attributes_query(db)
-                    .get(db, kind.clone(), index)
+                    .get(kind.clone(), index)
                     .0
                     .clone(),
             ),
@@ -780,7 +779,7 @@ impl Param {
                 ref provider,
                 index,
             } => Some(match provider {
-                Provider::Builtin(provider) => provider.params(db)[index].name(),
+                Provider::Builtin(provider) => provider.params[index].name(),
                 Provider::Custom(provider) => provider
                     .fields
                     .as_ref()
@@ -796,29 +795,27 @@ impl Param {
 
     pub fn doc(&self, db: &dyn Db) -> Option<String> {
         Some(match &self.0 {
-            ParamInner::Param { func, index } => {
-                let module = module(db, func.file(db));
-                return module[func.params(db)[*index]]
-                    .doc()
-                    .map(|doc| doc.to_string());
+            ParamInner::Param { ref func, index } => {
+                let module = module(db, func.file);
+                return module[func.params[*index]].doc().map(|doc| doc.to_string());
             }
-            ParamInner::BuiltinParam { parent, index } => {
-                parent.params(db)[*index].doc().to_string()
+            ParamInner::BuiltinParam { ref parent, index } => {
+                parent.params[*index].doc().to_string()
             }
             ParamInner::IntrinsicParam { .. } => return None,
             ParamInner::RuleParam(RuleParam::Keyword { attr, .. }) => {
-                return attr.doc.map(|doc| doc.value(db).to_string())
+                return attr.doc.as_ref().map(|doc| doc.as_ref().to_string())
             }
             ParamInner::RuleParam(RuleParam::BuiltinKeyword(kind, index)) => {
                 return common_attributes_query(db)
-                    .get(db, kind.clone(), *index)
+                    .get(kind.clone(), *index)
                     .1
                     .doc
                     .as_ref()
-                    .map(|doc| doc.value(db).to_string())
+                    .map(|doc| doc.as_ref().to_string())
             }
             ParamInner::ProviderParam { provider, index } => match provider {
-                Provider::Builtin(provider) => provider.params(db)[*index].doc().to_string(),
+                Provider::Builtin(provider) => provider.params[*index].doc().to_string(),
                 Provider::Custom(provider) => {
                     return provider
                         .fields
@@ -831,7 +828,7 @@ impl Param {
                 }
             },
             ParamInner::TagParam(TagParam::Keyword { attr, .. }) => {
-                return attr.doc.map(|doc| doc.value(db).to_string())
+                return attr.doc.as_ref().map(|doc| doc.as_ref().to_string())
             }
             _ => return None,
         })
@@ -840,18 +837,17 @@ impl Param {
     pub fn is_args_list(&self, db: &dyn Db) -> bool {
         match self.0 {
             // TODO(withered-magic): Handle lambda parameters.
-            ParamInner::Param { func, index } => {
-                let module = module(db, func.file(db));
-                matches!(module[func.params(db)[index]], HirDefParam::ArgsList { .. })
+            ParamInner::Param { ref func, index } => {
+                let module = module(db, func.file);
+                matches!(module[func.params[index]], HirDefParam::ArgsList { .. })
             }
-            ParamInner::IntrinsicParam { parent, index } => matches!(
-                parent.params(db)[index],
+            ParamInner::IntrinsicParam { ref parent, index } => matches!(
+                parent.params[index],
                 IntrinsicFunctionParam::ArgsList { .. }
             ),
-            ParamInner::BuiltinParam { parent, index } => matches!(
-                parent.params(db)[index],
-                BuiltinFunctionParam::ArgsList { .. }
-            ),
+            ParamInner::BuiltinParam { ref parent, index } => {
+                matches!(parent.params[index], BuiltinFunctionParam::ArgsList { .. })
+            }
             _ => false,
         }
     }
@@ -859,18 +855,15 @@ impl Param {
     pub fn is_kwargs_dict(&self, db: &dyn Db) -> bool {
         match self.0 {
             // TODO(withered-magic): Handle lambda parameters.
-            ParamInner::Param { func, index } => {
-                let module = module(db, func.file(db));
-                matches!(
-                    module[func.params(db)[index]],
-                    HirDefParam::KwargsDict { .. }
-                )
+            ParamInner::Param { ref func, index } => {
+                let module = module(db, func.file);
+                matches!(module[func.params[index]], HirDefParam::KwargsDict { .. })
             }
-            ParamInner::IntrinsicParam { parent, index } => {
-                matches!(parent.params(db)[index], IntrinsicFunctionParam::KwargsDict)
+            ParamInner::IntrinsicParam { ref parent, index } => {
+                matches!(parent.params[index], IntrinsicFunctionParam::KwargsDict)
             }
-            ParamInner::BuiltinParam { parent, index } => matches!(
-                parent.params(db)[index],
+            ParamInner::BuiltinParam { ref parent, index } => matches!(
+                parent.params[index],
                 BuiltinFunctionParam::KwargsDict { .. }
             ),
             ParamInner::RuleParam(RuleParam::Kwargs) => true,
@@ -880,7 +873,7 @@ impl Param {
                 index,
             } => {
                 matches!(
-                    provider.params(db)[index],
+                    provider.params[index],
                     BuiltinFunctionParam::KwargsDict { .. }
                 )
             }
@@ -890,11 +883,11 @@ impl Param {
 
     pub fn syntax_node_ptr(&self, db: &dyn Db) -> Option<InFile<SyntaxNodePtr>> {
         match self.0 {
-            ParamInner::Param { func, index } => {
-                let file = func.file(db);
+            ParamInner::Param { ref func, index } => {
+                let file = func.file;
                 source_map(db, file)
                     .param_map_back
-                    .get(&func.params(db)[index])
+                    .get(&func.params[index])
                     .map(|ptr| InFile {
                         file,
                         value: ptr.syntax_node_ptr(),
@@ -904,10 +897,10 @@ impl Param {
         }
     }
 
-    pub fn is_positional_only(&self, db: &dyn Db) -> bool {
+    pub fn is_positional_only(&self) -> bool {
         match self.0 {
-            ParamInner::IntrinsicParam { parent, index } => matches!(
-                parent.params(db)[index],
+            ParamInner::IntrinsicParam { ref parent, index } => matches!(
+                parent.params[index],
                 IntrinsicFunctionParam::Positional { .. }
             ),
             _ => false,
@@ -917,13 +910,13 @@ impl Param {
     pub fn default_value(&self, db: &dyn Db) -> Option<String> {
         let common = common_attributes_query(db);
         let attr = match &self.0 {
-            ParamInner::BuiltinParam { parent, index } => match &parent.params(db)[*index] {
+            ParamInner::BuiltinParam { ref parent, index } => match &parent.params[*index] {
                 BuiltinFunctionParam::Simple { default_value, .. } => return default_value.clone(),
                 _ => return None,
             },
             ParamInner::RuleParam(RuleParam::Keyword { attr, .. }) => attr,
             ParamInner::RuleParam(RuleParam::BuiltinKeyword(kind, index)) => {
-                common.get(db, kind.clone(), *index).1
+                common.get(kind.clone(), *index).1
             }
             _ => return None,
         };
@@ -933,10 +926,10 @@ impl Param {
                 Either::Left(ptr) => ptr
                     .value
                     .to_owned()
-                    .try_to_node(&parse(db, ptr.file).syntax(db))?
+                    .try_to_node(&parse(db, ptr.file).syntax())?
                     .text()
                     .to_string(),
-                Either::Right(s) => s.value(db).to_string(),
+                Either::Right(s) => s.as_ref().to_string(),
             })
         })
     }
@@ -1001,17 +994,17 @@ where
 pub struct Field(pub(crate) FieldInner);
 
 impl Field {
-    pub fn name(&self, db: &dyn Db) -> Name {
+    pub fn name(&self) -> Name {
         match self.0 {
-            FieldInner::BuiltinField { parent, index } => parent.fields(db)[index].name.clone(),
-            FieldInner::BuiltinMethod { func } => func.name(db),
-            FieldInner::IntrinsicField { parent, index } => parent.fields(db)[index].name.clone(),
+            FieldInner::BuiltinField { ref parent, index } => parent.fields[index].name.clone(),
+            FieldInner::BuiltinMethod { ref func } => func.name.clone(),
+            FieldInner::IntrinsicField { ref parent, index } => parent.fields[index].name.clone(),
             FieldInner::StructField { ref name, .. } => name.clone(),
             FieldInner::ProviderField {
                 ref provider,
                 index,
             } => match provider {
-                Provider::Builtin(provider) => provider.fields(db)[index].name.clone(),
+                Provider::Builtin(provider) => provider.fields[index].name.clone(),
                 Provider::Custom(provider) => provider
                     .fields
                     .as_ref()
@@ -1033,17 +1026,17 @@ impl Field {
         }
     }
 
-    pub fn doc(&self, db: &dyn Db) -> String {
+    pub fn doc(&self) -> String {
         match self.0 {
-            FieldInner::BuiltinField { parent, index } => parent.fields(db)[index].doc.clone(),
-            FieldInner::BuiltinMethod { func } => func.doc(db).clone(),
-            FieldInner::IntrinsicField { parent, index } => parent.fields(db)[index].doc.clone(),
+            FieldInner::BuiltinField { ref parent, index } => parent.fields[index].doc.clone(),
+            FieldInner::BuiltinMethod { ref func } => func.doc.clone(),
+            FieldInner::IntrinsicField { ref parent, index } => parent.fields[index].doc.clone(),
             FieldInner::StructField { ref doc, .. } => doc.as_ref().cloned().unwrap_or_default(),
             FieldInner::ProviderField {
                 ref provider,
                 index,
             } => match provider {
-                Provider::Builtin(provider) => provider.fields(db)[index].doc.clone(),
+                Provider::Builtin(provider) => provider.fields[index].doc.clone(),
                 Provider::Custom(provider) => provider
                     .fields
                     .as_ref()
@@ -1064,7 +1057,7 @@ impl Field {
                 .tag_class
                 .doc
                 .as_ref()
-                .map(|doc| doc.value(db).to_string())
+                .map(|doc| doc.as_ref().to_string())
                 .unwrap_or_default(),
             FieldInner::StaticField { doc, .. } => doc.unwrap_or_default().to_string(),
         }
@@ -1193,7 +1186,7 @@ pub(crate) enum TyKind {
     Float,
 
     /// A UTF-8 encoded string.
-    String(Option<InternedString>),
+    String(Option<Arc<str>>),
 
     /// The individual characters of a UTF-8 encoded string.
     StringElems,
@@ -1309,17 +1302,17 @@ pub enum AttributeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Attribute {
     pub kind: AttributeKind,
-    pub doc: Option<InternedString>,
+    pub doc: Option<Arc<str>>,
     pub mandatory: bool,
-    pub default_value: Option<Either<InFile<SyntaxNodePtr>, InternedString>>,
+    pub default_value: Option<Either<InFile<SyntaxNodePtr>, Arc<str>>>,
 }
 
 impl Attribute {
     pub fn new(
         kind: AttributeKind,
-        doc: Option<InternedString>,
+        doc: Option<Arc<str>>,
         mandatory: bool,
-        default_value: Option<Either<InFile<SyntaxNodePtr>, InternedString>>,
+        default_value: Option<Either<InFile<SyntaxNodePtr>, Arc<str>>>,
     ) -> Self {
         Self {
             kind,
@@ -1406,8 +1399,8 @@ impl Rule {
         // This chaining is done to put the `name` attribute first.
         let common = common_attributes_query(db);
         let mut common_attrs = match self.kind {
-            RuleKind::Build => common.build(db),
-            RuleKind::Repository => common.repository(db),
+            RuleKind::Build => &common.build,
+            RuleKind::Repository => &common.repository,
         }
         .iter()
         .map(|(ref name, ref attr)| (name, attr));
@@ -1440,7 +1433,7 @@ pub(crate) struct CustomProviderFields {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CustomProvider {
     pub(crate) name: Option<Name>,
-    pub(crate) doc: Option<InternedString>,
+    pub(crate) doc: Option<Arc<str>>,
     pub(crate) fields: Option<CustomProviderFields>,
 }
 
@@ -1451,17 +1444,17 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
-    pub(crate) fn name<'a>(&'a self, db: &'a dyn Db) -> Option<&'a Name> {
+    pub(crate) fn name(&self) -> Option<&Name> {
         match self {
-            Provider::Builtin(provider) => Some(provider.name(db)),
+            Provider::Builtin(provider) => Some(&provider.name),
             Provider::Custom(provider) => provider.name.as_ref(),
         }
     }
 
-    pub(crate) fn doc(&self, db: &dyn Db) -> Option<String> {
+    pub(crate) fn doc(&self) -> Option<String> {
         match self {
-            Provider::Builtin(provider) => Some(provider.doc(db).clone()),
-            Provider::Custom(provider) => provider.doc.map(|doc| doc.value(db).to_string()),
+            Provider::Builtin(provider) => Some(provider.doc.clone()),
+            Provider::Custom(provider) => provider.doc.as_ref().map(|doc| doc.as_ref().to_string()),
         }
     }
 }
@@ -1502,7 +1495,7 @@ pub(crate) struct AttributeData {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TagClass {
     pub(crate) attrs: Option<Box<[AttributeData]>>,
-    pub(crate) doc: Option<InternedString>,
+    pub(crate) doc: Option<Arc<str>>,
 }
 
 impl TyKind {
@@ -1513,10 +1506,10 @@ impl TyKind {
     pub fn builtin_class(&self, db: &dyn Db) -> Option<IntrinsicClass> {
         let intrinsics = intrinsic_types(db);
         Some(match self {
-            TyKind::String(_) => intrinsics.string_base_class(db),
-            TyKind::Bytes => intrinsics.bytes_base_class(db),
-            TyKind::List(_) => intrinsics.list_base_class(db),
-            TyKind::Dict(_, _, _) => intrinsics.dict_base_class(db),
+            TyKind::String(_) => intrinsics.string_base_class.clone(),
+            TyKind::Bytes => intrinsics.bytes_base_class.clone(),
+            TyKind::List(_) => intrinsics.list_base_class.clone(),
+            TyKind::Dict(_, _, _) => intrinsics.dict_base_class.clone(),
             _ => return None,
         })
     }
@@ -1527,7 +1520,7 @@ impl TyKind {
 pub(crate) struct Macro {
     /// Attributes defined in the `attrs` argument to the `macro()` function.
     pub(crate) attrs: Option<Arc<RuleAttributes>>,
-    pub(crate) doc: Option<InternedString>,
+    pub(crate) doc: Option<Arc<str>>,
 }
 
 impl Macro {
@@ -1567,7 +1560,7 @@ pub(crate) struct ProviderField {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DictLiteral {
     pub(crate) expr: Option<InFile<ExprId>>,
-    pub(crate) known_keys: Box<[(InternedString, Ty)]>,
+    pub(crate) known_keys: Box<[(Arc<str>, Ty)]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1638,7 +1631,7 @@ pub(crate) struct InferenceContext {
 pub(crate) struct TyContext<'a> {
     db: &'a dyn Db,
     cx: InferenceContext,
-    intrinsics: Intrinsics,
+    intrinsics: &'a Intrinsics,
     options: &'a InferenceOptions,
 }
 
@@ -1666,7 +1659,7 @@ impl<'a, 'b> TypeRefResolver<'a, 'b> {
     }
 
     fn resolve_type_ref_inner(&mut self, type_ref: &TypeRef) -> Ty {
-        let types = intrinsic_types(self.db).types(self.db);
+        let types = &intrinsic_types(self.db).types;
         // TODO(withered-magic): Need to resolve based on the dialect, but unclear how
         // to get that information from things like the `DisplayWithDb` impl for `TyKind`.
         match type_ref {
@@ -1676,7 +1669,9 @@ impl<'a, 'b> TypeRefResolver<'a, 'b> {
                 args.iter()
                     .map(|type_ref| self.resolve_type_ref_inner(type_ref)),
             ),
-            TypeRef::Provider(provider) => TyKind::Provider(Provider::Builtin(*provider)).intern(),
+            TypeRef::Provider(provider) => {
+                TyKind::Provider(Provider::Builtin(provider.clone())).intern()
+            }
             TypeRef::Ellipsis => {
                 // We handle ellipsis types only while processing tuples above, any other occurrences of
                 // ellipsis types are invalid.
@@ -1700,7 +1695,7 @@ impl<'a, 'b> TypeRefResolver<'a, 'b> {
         loop {
             ty = ty
                 .fields(db)
-                .and_then(|mut fields| fields.find(|(field, _ty)| field.name(db).eq(next)))
+                .and_then(|mut fields| fields.find(|(field, _ty)| field.name().eq(next)))
                 .map(|(_field, ty)| ty.clone())?;
             next = match segments.next() {
                 Some(next) => next,
@@ -1718,7 +1713,7 @@ impl<'a, 'b> TypeRefResolver<'a, 'b> {
         mut segments: impl Iterator<Item = &'c Name>,
         args: &Option<Box<[TypeRef]>>,
     ) -> Ty {
-        let types = intrinsic_types(self.db).types(self.db);
+        let types = &intrinsic_types(self.db).types;
         let builtin_types = builtin_types(self.db, Dialect::Bazel);
         let name = match segments.next() {
             Some(name) => name,
@@ -1796,7 +1791,7 @@ impl<'a, 'b> TypeRefResolver<'a, 'b> {
                 }
                 None => TyKind::Tuple(Tuple::Variable(Ty::unknown())).intern(),
             },
-            name => match builtin_types.types(self.db).get(name).cloned() {
+            name => match builtin_types.types.get(name).cloned() {
                 Some(ty) => ty,
                 None => {
                     self.errors.push(format!("Unknown type \"{}\"", name));
@@ -1878,7 +1873,7 @@ pub(crate) fn resolve_builtin_type_ref_opt(db: &dyn Db, type_ref: Option<TypeRef
 }
 
 // TODO(withered-magic): This function currently assumes that all types are covariant in their arguments.
-pub(crate) fn assign_tys(db: &dyn Db, source: &Ty, target: &Ty) -> bool {
+pub(crate) fn assign_tys(source: &Ty, target: &Ty) -> bool {
     use Protocol::*;
 
     // Assignments involving "Any", "Unknown", or "Unbound" at the top-level
@@ -1889,36 +1884,34 @@ pub(crate) fn assign_tys(db: &dyn Db, source: &Ty, target: &Ty) -> bool {
             TyKind::List(source),
             TyKind::List(target) | TyKind::Protocol(Iterable(target) | Sequence(target)),
         )
-        | (TyKind::Protocol(Sequence(source)), TyKind::List(target)) => {
-            assign_tys(db, source, target)
-        }
+        | (TyKind::Protocol(Sequence(source)), TyKind::List(target)) => assign_tys(source, target),
         (
             TyKind::Tuple(tuple),
             TyKind::Protocol(Iterable(target) | Sequence(target))
             | TyKind::Tuple(Tuple::Variable(target)),
         ) => match tuple {
-            Tuple::Simple(sources) => sources.iter().all(|source| assign_tys(db, source, target)),
-            Tuple::Variable(source) => assign_tys(db, source, target),
+            Tuple::Simple(sources) => sources.iter().all(|source| assign_tys(source, target)),
+            Tuple::Variable(source) => assign_tys(source, target),
         },
         (TyKind::Tuple(Tuple::Simple(sources)), TyKind::Tuple(Tuple::Simple(targets))) => {
             sources.len() == targets.len()
                 && sources
                     .iter()
                     .zip(targets.iter())
-                    .all(|(source, target)| assign_tys(db, source, target))
+                    .all(|(source, target)| assign_tys(source, target))
         }
         (TyKind::Protocol(source), TyKind::Protocol(target)) => match &(source, target) {
             (Iterable(source), Iterable(target))
             | (Sequence(source), Sequence(target))
-            | (Sequence(source), Iterable(target)) => assign_tys(db, source, target),
+            | (Sequence(source), Iterable(target)) => assign_tys(source, target),
             _ => false,
         },
         (TyKind::Dict(key_source, value_source, _), TyKind::Dict(key_target, value_target, _)) => {
-            assign_tys(db, key_source, key_target) && assign_tys(db, value_source, value_target)
+            assign_tys(key_source, key_target) && assign_tys(value_source, value_target)
         }
         (TyKind::String(_), TyKind::BuiltinType(ty, _))
         | (TyKind::BuiltinType(ty, _), TyKind::String(_))
-            if ty.name(db).as_str() == "Label" =>
+            if ty.name.as_str() == "Label" =>
         {
             true
         }
@@ -1929,13 +1922,13 @@ pub(crate) fn assign_tys(db: &dyn Db, source: &Ty, target: &Ty) -> bool {
             source_tys.iter().all(|source_ty| {
                 target_tys
                     .iter()
-                    .any(|target_ty| assign_tys(db, source_ty, target_ty))
+                    .any(|target_ty| assign_tys(source_ty, target_ty))
             })
         }
         // TODO(withered-magic): The logic below also temporarily allows assignments like `int | None` to `int`. Fix
         // this once we support type guards.
-        (_, TyKind::Union(tys)) => tys.iter().any(|target| assign_tys(db, source, target)),
-        (TyKind::Union(tys), _) => tys.iter().any(|source| assign_tys(db, source, target)),
+        (_, TyKind::Union(tys)) => tys.iter().any(|target| assign_tys(source, target)),
+        (TyKind::Union(tys), _) => tys.iter().any(|source| assign_tys(source, target)),
         (TyKind::BuiltinType(source, _), TyKind::BuiltinType(target, _)) => source == target,
         (TyKind::String(_), TyKind::String(_))
         | (TyKind::Attribute(_), TyKind::Attribute(_))

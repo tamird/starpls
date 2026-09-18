@@ -156,7 +156,7 @@ pub(crate) fn completions(
                 .filter(|param| {
                     !param.is_args_list(db)
                         && !param.is_kwargs_dict(db)
-                        && !param.is_positional_only(db)
+                        && !param.is_positional_only()
                 })
                 .filter_map(|param| match param.name(db) {
                     Some(name) if !name.is_missing() => Some(name),
@@ -204,7 +204,7 @@ pub(crate) fn completions(
         CompletionAnalysis::Name(NameContext::Dot { receiver_ty }) => {
             for (name, ty) in receiver_ty.fields(db) {
                 items.push(CompletionItem {
-                    label: name.name(db).to_string(),
+                    label: name.name().to_string(),
                     kind: if ty.is_callable() {
                         CompletionItemKind::Function
                     } else {
@@ -307,7 +307,7 @@ pub(crate) fn completions(
             let file = db.get_file(file_id)?;
             let ty = sema.type_of_expr(file, &lhs)?;
 
-            for key in ty.known_keys(db)?.into_iter() {
+            for key in ty.known_keys()?.into_iter() {
                 items.push(CompletionItem {
                     label: key,
                     kind: CompletionItemKind::Constant,
@@ -454,7 +454,7 @@ impl CompletionContext {
         let file = db.get_file(file_id)?;
         let parse = sema.parse(file);
 
-        if let Some(cx) = maybe_str_context(file_id, &parse.syntax(db), pos) {
+        if let Some(cx) = maybe_str_context(file_id, &parse.syntax(), pos) {
             return Some(CompletionContext {
                 analysis: CompletionAnalysis::String(cx),
             });
@@ -464,7 +464,7 @@ impl CompletionContext {
             return None;
         }
 
-        let mut text = parse.syntax(db).text().to_string();
+        let mut text = parse.syntax().text().to_string();
         let insert_pos: usize = pos.into();
         if insert_pos > text.len() {
             return None;

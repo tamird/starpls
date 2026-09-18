@@ -19,13 +19,14 @@ use starpls_common::parse;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
+use starpls_intern::impl_internable;
+use starpls_intern::Interned;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::{self};
 
 use crate::def::resolver::Export;
 use crate::def::resolver::Resolver;
 use crate::def::Argument;
-use crate::def::InternedString;
 use crate::source_map;
 use crate::typeck::Attribute;
 use crate::typeck::AttributeData;
@@ -54,44 +55,36 @@ use crate::TypeRef;
 
 const DEFAULT_DOC: &str = "See the [Bazel Build Encyclopedia](https://bazel.build/reference/be/overview) for more details.";
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BuiltinTypes {
-    #[return_ref]
     pub(crate) types: FxHashMap<String, Ty>,
 }
 
-#[salsa::tracked]
-pub(crate) struct BuiltinType {
+pub(crate) type BuiltinType = Interned<BuiltinTypeData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BuiltinTypeData {
     pub(crate) name: Name,
-    #[return_ref]
     pub(crate) fields: Vec<BuiltinField>,
-    #[return_ref]
     pub(crate) methods: Vec<BuiltinFunction>,
-    #[return_ref]
     pub(crate) doc: String,
     pub(crate) indexable_by: Option<(TypeRef, TypeRef)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BuiltinField {
     pub(crate) name: Name,
     pub(crate) type_ref: TypeRef,
     pub(crate) doc: String,
 }
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BuiltinGlobals {
-    #[return_ref]
     pub(crate) bzl_globals: APIGlobals,
-    #[return_ref]
     pub(crate) bzlmod_globals: APIGlobals,
-    #[return_ref]
     pub(crate) repo_globals: APIGlobals,
-    #[return_ref]
     pub(crate) workspace_globals: APIGlobals,
-    #[return_ref]
     pub(crate) cquery_globals: APIGlobals,
-    #[return_ref]
     pub(crate) vendor_globals: APIGlobals,
 }
 
@@ -102,13 +95,13 @@ pub(crate) struct APIGlobals {
 }
 
 impl APIGlobals {
-    fn from_values<'a, I>(db: &dyn Db, providers: BuiltinProviders, values: I) -> Self
+    fn from_values<'a, I>(providers: &BuiltinProviders, values: I) -> Self
     where
         I: Iterator<Item = &'a Value>,
     {
         let mut functions = FxHashMap::default();
         let mut variables = FxHashMap::default();
-        let providers = providers.providers(db);
+        let providers = &providers.providers;
 
         for value in values {
             // Skip deny-listed globals, which are handled directly by the
@@ -119,12 +112,12 @@ impl APIGlobals {
 
             match (providers.get(value.name.as_str()), &value.callable) {
                 (Some(provider), _) => {
-                    variables.insert(value.name.clone(), TypeRef::Provider(*provider));
+                    variables.insert(value.name.clone(), TypeRef::Provider(provider.clone()));
                 }
                 (None, Some(callable)) => {
                     functions.insert(
                         value.name.clone(),
-                        builtin_function(db, &value.name, callable, &value.doc, None),
+                        builtin_function(&value.name, callable, &value.doc, None),
                     );
                 }
                 (None, None) => {
@@ -140,20 +133,18 @@ impl APIGlobals {
     }
 }
 
-#[salsa::tracked]
-pub(crate) struct BuiltinFunction {
+pub(crate) type BuiltinFunction = Interned<BuiltinFunctionData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BuiltinFunctionData {
     pub(crate) name: Name,
-    #[return_ref]
     pub(crate) parent_type: Option<String>,
-    #[return_ref]
     pub(crate) params: Vec<BuiltinFunctionParam>,
-    #[return_ref]
     pub(crate) ret_type_ref: TypeRef,
-    #[return_ref]
     pub(crate) doc: String,
 }
 
-impl BuiltinFunction {
+impl BuiltinFunctionData {
     pub(crate) fn maybe_unique_ret_type<'a, I>(
         &'a self,
         tcx: &'a mut TyContext,
@@ -167,7 +158,7 @@ impl BuiltinFunction {
         let resolve_load_like = |db: &dyn Db, args: &mut I| {
             let mut next_string_arg = || {
                 args.next().and_then(|(arg, ty)| match (arg, ty.kind()) {
-                    (Argument::Simple { .. }, TyKind::String(Some(s))) => Some(s.value(db)),
+                    (Argument::Simple { .. }, TyKind::String(Some(s))) => Some(s.as_ref()),
                     _ => None,
                 })
             };
@@ -188,12 +179,7 @@ impl BuiltinFunction {
         };
 
         let db = tcx.db;
-        let ret_kind = match (
-            self.parent_type(db)
-                .as_ref()
-                .map(|parent_type| parent_type.as_str()),
-            self.name(db).as_str(),
-        ) {
+        let ret_kind = match (self.parent_type.as_deref(), self.name.as_str()) {
             (None, "struct") => {
                 let fields = args
                     .filter_map(|(arg, ty)| match arg {
@@ -219,7 +205,7 @@ impl BuiltinFunction {
                         match name.as_str() {
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(*s);
+                                    doc = Some(s.clone());
                                 }
                             }
                             "fields" => {
@@ -230,13 +216,13 @@ impl BuiltinFunction {
                                             .known_keys
                                             .iter()
                                             .flat_map(|(key, value)| {
-                                                let name = &key.value(db);
+                                                let name = &key.as_ref();
                                                 if !name.is_empty() {
                                                     Some(ProviderField {
-                                                        name: Name::from_str(key.value(db)),
+                                                        name: Name::from_str(key.as_ref()),
                                                         doc: match value.kind() {
                                                             TyKind::String(Some(s)) => Some(
-                                                                s.value(db)
+                                                                s.as_ref()
                                                                     .to_string()
                                                                     .into_boxed_str(),
                                                             ),
@@ -262,7 +248,7 @@ impl BuiltinFunction {
                 let lhs = source_map(db, file)
                     .expr_map_back
                     .get(&call_expr)
-                    .and_then(|ptr| ptr.try_to_node(&parse(db, file).syntax(db)))
+                    .and_then(|ptr| ptr.try_to_node(&parse(db, file).syntax()))
                     .and_then(|expr| expr.syntax().parent())
                     .and_then(ast::AssignStmt::cast)
                     .and_then(|assign_stmt| assign_stmt.lhs());
@@ -336,12 +322,12 @@ impl BuiltinFunction {
                         match name.as_str() {
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(*s);
+                                    doc = Some(s.clone());
                                 }
                             }
                             "attrs" => {
                                 if let TyKind::Dict(_, _, Some(lit)) = ty.kind() {
-                                    attrs = Some(attrs_from_dict_literal(db, lit, false))
+                                    attrs = Some(attrs_from_dict_literal(lit, false))
                                 }
                             }
                             _ => {}
@@ -355,13 +341,13 @@ impl BuiltinFunction {
                     } else {
                         RuleKind::Repository
                     },
-                    doc: doc.map(|doc| doc.value(db).clone()),
+                    doc: doc.map(|doc| doc.as_ref().into()),
                     attrs: attrs.map(Arc::new),
                 })
             }
 
             (Some("attr"), attr) => {
-                let mut doc: Option<InternedString> = None;
+                let mut doc: Option<Arc<str>> = None;
                 let mut mandatory = false;
                 let mut default_ptr = None;
                 for (arg, ty) in args {
@@ -369,7 +355,7 @@ impl BuiltinFunction {
                         match name.as_str() {
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(*s);
+                                    doc = Some(s.clone());
                                 }
                             }
                             "mandatory" => {
@@ -429,7 +415,7 @@ impl BuiltinFunction {
                                             .filter_map(|(name, ty)| match ty.kind() {
                                                 TyKind::Attribute(Some(attr)) => {
                                                     Some(AttributeData {
-                                                        name: Name::from_str(name.value(db)),
+                                                        name: Name::from_str(name.as_ref()),
                                                         attr: attr.clone(),
                                                     })
                                                 }
@@ -442,7 +428,7 @@ impl BuiltinFunction {
                             }
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(*s);
+                                    doc = Some(s.clone());
                                 }
                             }
                             _ => {}
@@ -461,7 +447,7 @@ impl BuiltinFunction {
                         match name.as_str() {
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(s.value(db).clone());
+                                    doc = Some(s.as_ref().into());
                                 }
                             }
                             "tag_classes" => {
@@ -475,7 +461,7 @@ impl BuiltinFunction {
                                         .iter()
                                         .filter_map(|(name, ty)| match ty.kind() {
                                             TyKind::TagClass(tag_class) => Some(TagClassData {
-                                                name: Name::from_str(name.value(db)),
+                                                name: Name::from_str(name.as_ref()),
                                                 tag_class: tag_class.clone(),
                                             }),
                                             _ => None,
@@ -500,12 +486,12 @@ impl BuiltinFunction {
                         match name.as_str() {
                             "doc" => {
                                 if let TyKind::String(Some(s)) = ty.kind() {
-                                    doc = Some(*s);
+                                    doc = Some(s.clone());
                                 }
                             }
                             "attrs" => {
                                 if let TyKind::Dict(_, _, Some(lit)) = ty.kind() {
-                                    attrs = Some(Arc::new(attrs_from_dict_literal(db, lit, true)))
+                                    attrs = Some(Arc::new(attrs_from_dict_literal(lit, true)))
                                 }
                             }
                             _ => {}
@@ -599,33 +585,30 @@ impl BuiltinFunctionParam {
     }
 }
 
-#[salsa::tracked]
-pub(crate) struct BuiltinProvider {
-    #[return_ref]
+pub(crate) type BuiltinProvider = Interned<BuiltinProviderData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BuiltinProviderData {
     pub(crate) name: Name,
-    #[return_ref]
     pub(crate) params: Vec<BuiltinFunctionParam>,
-    #[return_ref]
     pub(crate) fields: Vec<BuiltinField>,
-    #[return_ref]
     pub(crate) doc: String,
 }
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BuiltinProviders {
-    #[return_ref]
     pub(crate) providers: FxHashMap<String, BuiltinProvider>,
 }
 
-#[salsa::input]
+#[salsa::input(debug)]
 pub struct BuiltinDefs {
-    #[return_ref]
+    #[returns(ref)]
     pub builtins: Builtins,
-    #[return_ref]
+    #[returns(ref)]
     pub rules: Builtins,
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(ref))]
 pub(crate) fn builtin_providers_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinProviders {
     // Collect all known provider types.
     let builtins = defs.builtins(db);
@@ -645,33 +628,32 @@ pub(crate) fn builtin_providers_query(db: &dyn Db, defs: BuiltinDefs) -> Builtin
         if let Some(ty) = known_provider_tys.get(value.name.as_str()) {
             providers.insert(
                 ty.name.clone(),
-                builtin_provider(db, ty, value.callable.as_ref()),
+                builtin_provider(ty, value.callable.as_ref()),
             );
         }
     }
 
     for (name, ty) in &known_provider_tys {
         if !providers.contains_key(name.as_str()) {
-            providers.insert(ty.name.clone(), builtin_provider(db, ty, None));
+            providers.insert(ty.name.clone(), builtin_provider(ty, None));
         }
     }
 
-    BuiltinProviders::new(db, providers)
+    BuiltinProviders { providers }
 }
 
-pub(crate) fn builtin_globals(db: &dyn Db, dialect: Dialect) -> BuiltinGlobals {
+pub(crate) fn builtin_globals(db: &dyn Db, dialect: Dialect) -> &BuiltinGlobals {
     let defs = db.get_builtin_defs(&dialect);
     builtin_globals_query(db, defs)
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(ref))]
 pub(crate) fn builtin_globals_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinGlobals {
     let builtins = defs.builtins(db);
     let rules = defs.rules(db);
     let providers = builtin_providers_query(db, defs);
 
     let bzl_globals = APIGlobals::from_values(
-        db,
         providers,
         env::make_bzl_builtins()
             .global
@@ -680,49 +662,44 @@ pub(crate) fn builtin_globals_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinGl
             .chain(builtins.global.iter())
             .chain(rules.global.iter()),
     );
-    let bzlmod_globals = APIGlobals::from_values(
-        db,
-        providers,
-        env::make_module_bazel_builtins().global.iter(),
-    );
-    let repo_globals =
-        APIGlobals::from_values(db, providers, env::make_repo_builtins().global.iter());
+    let bzlmod_globals =
+        APIGlobals::from_values(providers, env::make_module_bazel_builtins().global.iter());
+    let repo_globals = APIGlobals::from_values(providers, env::make_repo_builtins().global.iter());
     let workspace_globals =
-        APIGlobals::from_values(db, providers, env::make_workspace_builtins().global.iter());
+        APIGlobals::from_values(providers, env::make_workspace_builtins().global.iter());
     let cquery_globals =
-        APIGlobals::from_values(db, providers, env::make_cquery_builtins().global.iter());
+        APIGlobals::from_values(providers, env::make_cquery_builtins().global.iter());
     let vendor_globals =
-        APIGlobals::from_values(db, providers, env::make_vendor_builtins().global.iter());
+        APIGlobals::from_values(providers, env::make_vendor_builtins().global.iter());
 
-    BuiltinGlobals::new(
-        db,
+    BuiltinGlobals {
         bzl_globals,
         bzlmod_globals,
         repo_globals,
         workspace_globals,
         cquery_globals,
         vendor_globals,
-    )
+    }
 }
 
-pub(crate) fn builtin_types(db: &dyn Db, dialect: Dialect) -> BuiltinTypes {
+pub(crate) fn builtin_types(db: &dyn Db, dialect: Dialect) -> &BuiltinTypes {
     let defs = db.get_builtin_defs(&dialect);
     builtin_types_query(db, defs)
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(ref))]
 pub(crate) fn builtin_types_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinTypes {
     let mut types = FxHashMap::default();
     let builtins = defs.builtins(db);
     let rules = defs.rules(db);
     let mut missing_module_members = env::make_missing_module_members();
-    let providers = builtin_providers_query(db, defs).providers(db);
+    let providers = &builtin_providers_query(db, defs).providers;
 
     // Add all builtin providers.
     types.extend(providers.iter().map(|(name, provider)| {
         (
             name.clone(),
-            TyKind::ProviderInstance(Provider::Builtin(*provider)).intern(),
+            TyKind::ProviderInstance(Provider::Builtin(provider.clone())).intern(),
         )
     }));
 
@@ -760,7 +737,6 @@ pub(crate) fn builtin_types_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinType
 
                     seen_methods.insert(rule.name.as_str());
                     methods.push(builtin_function(
-                        db,
                         &rule.name,
                         callable,
                         &rule.doc,
@@ -782,14 +758,13 @@ pub(crate) fn builtin_types_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinType
                     match providers.get(field.name.as_str()) {
                         Some(provider) => {
                             fields.push(BuiltinField {
-                                name: provider.name(db).clone(),
-                                type_ref: TypeRef::Provider(*provider),
+                                name: provider.name.clone(),
+                                type_ref: TypeRef::Provider(provider.clone()),
                                 doc: normalize_doc_text(&field.doc),
                             });
                         }
                         None => {
                             methods.push(builtin_function(
-                                db,
                                 &field.name,
                                 callable,
                                 &field.doc,
@@ -800,7 +775,7 @@ pub(crate) fn builtin_types_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinType
                 }
             } else {
                 let type_ref = match providers.get(field.name.as_str()) {
-                    Some(provider) => TypeRef::Provider(*provider),
+                    Some(provider) => TypeRef::Provider(provider.clone()),
                     None => maybe_field_type_ref_override(&type_.name, &field.name)
                         .unwrap_or_else(|| parse_type_ref(&field.r#type)),
                 };
@@ -828,25 +803,23 @@ pub(crate) fn builtin_types_query(db: &dyn Db, defs: BuiltinDefs) -> BuiltinType
         types.insert(
             type_.name.clone(),
             TyKind::BuiltinType(
-                BuiltinType::new(
-                    db,
-                    Name::from_str(&type_.name),
+                Interned::new(BuiltinTypeData {
+                    name: Name::from_str(&type_.name),
                     fields,
                     methods,
-                    normalize_doc_text(&type_.doc),
+                    doc: normalize_doc_text(&type_.doc),
                     indexable_by,
-                ),
+                }),
                 None,
             )
             .intern(),
         );
     }
 
-    BuiltinTypes::new(db, types)
+    BuiltinTypes { types }
 }
 
 fn builtin_function(
-    db: &dyn Db,
     name: &str,
     callable: &Callable,
     doc: &str,
@@ -859,18 +832,17 @@ fn builtin_function(
         _ => callable.return_type.as_str(),
     };
 
-    BuiltinFunction::new(
-        db,
-        Name::from_str(name),
-        parent_name.map(|parent_name| parent_name.to_string()),
-        callable.param.iter().map(builtin_param).collect(),
-        parse_type_ref(ret_type_ref),
-        if doc.is_empty() {
+    Interned::new(BuiltinFunctionData {
+        name: Name::from_str(name),
+        parent_type: parent_name.map(|parent_name| parent_name.to_string()),
+        params: callable.param.iter().map(builtin_param).collect(),
+        ret_type_ref: parse_type_ref(ret_type_ref),
+        doc: if doc.is_empty() {
             DEFAULT_DOC.to_string()
         } else {
             normalize_doc_text(doc)
         },
-    )
+    })
 }
 
 fn builtin_param(param: &Param) -> BuiltinFunctionParam {
@@ -903,7 +875,7 @@ fn builtin_param(param: &Param) -> BuiltinFunctionParam {
     }
 }
 
-fn builtin_provider(db: &dyn Db, ty: &Type, callable: Option<&Callable>) -> BuiltinProvider {
+fn builtin_provider(ty: &Type, callable: Option<&Callable>) -> BuiltinProvider {
     let params = match callable {
         Some(callable) => callable.param.iter().map(builtin_param).collect(),
         None => ty
@@ -931,40 +903,32 @@ fn builtin_provider(db: &dyn Db, ty: &Type, callable: Option<&Callable>) -> Buil
             doc: normalize_doc_text(&field.doc),
         })
         .collect();
-    BuiltinProvider::new(
-        db,
-        Name::from_str(&ty.name),
+    Interned::new(BuiltinProviderData {
+        name: Name::from_str(&ty.name),
         params,
-        provider_fields,
-        normalize_doc_text(&ty.doc),
-    )
+        fields: provider_fields,
+        doc: normalize_doc_text(&ty.doc),
+    })
 }
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CommonAttributes {
-    #[return_ref]
     pub(crate) build: Vec<(Name, Attribute)>,
-    #[return_ref]
     pub(crate) repository: Vec<(Name, Attribute)>,
 }
 
 impl CommonAttributes {
-    pub(crate) fn get<'a>(
-        &'a self,
-        db: &'a dyn Db,
-        kind: RuleKind,
-        index: usize,
-    ) -> (&'a Name, &'a Attribute) {
+    pub(crate) fn get(&self, kind: RuleKind, index: usize) -> (&Name, &Attribute) {
         let (ref name, ref attr) = match kind {
-            RuleKind::Build => self.build(db),
-            RuleKind::Repository => self.repository(db),
+            RuleKind::Build => &self.build,
+            RuleKind::Repository => &self.repository,
         }[index];
         (name, attr)
     }
 }
 
-#[salsa::tracked]
-pub(crate) fn common_attributes_query(db: &dyn Db) -> CommonAttributes {
+#[salsa::tracked(returns(ref))]
+pub(crate) fn common_attributes_query(_db: &dyn Db) -> CommonAttributes {
     let map_attrs = |attrs: Vec<attr::Attribute>| {
         attrs
             .into_iter()
@@ -989,13 +953,11 @@ pub(crate) fn common_attributes_query(db: &dyn Db) -> CommonAttributes {
                             attr::AttributeKind::StringListDict => StringListDict,
                             attr::AttributeKind::StringKeyedLabelDict => StringKeyedLabelDict,
                         },
-                        doc: Some(InternedString::new(
-                            db,
+                        doc: Some(Arc::<str>::from(
                             normalize_doc_text(&attr.doc).into_boxed_str(),
                         )),
                         mandatory: attr.is_mandatory,
-                        default_value: Some(Either::Right(InternedString::new(
-                            db,
+                        default_value: Some(Either::Right(Arc::<str>::from(
                             attr.default_value.into_boxed_str(),
                         ))),
                     },
@@ -1005,7 +967,10 @@ pub(crate) fn common_attributes_query(db: &dyn Db) -> CommonAttributes {
     };
 
     let common = attr::make_common_attributes();
-    CommonAttributes::new(db, map_attrs(common.build), map_attrs(common.repository))
+    CommonAttributes {
+        build: map_attrs(common.build),
+        repository: map_attrs(common.repository),
+    }
 }
 
 /// Normalizes text from the generated Bazel documentation.
@@ -1136,16 +1101,16 @@ fn maybe_field_type_ref_override(typ: &str, field: &str) -> Option<TypeRef> {
     Some(type_ref)
 }
 
-fn attrs_from_dict_literal(db: &dyn Db, lit: &DictLiteral, allow_none: bool) -> RuleAttributes {
+fn attrs_from_dict_literal(lit: &DictLiteral, allow_none: bool) -> RuleAttributes {
     RuleAttributes {
         attrs: lit
             .known_keys
             .iter()
             .filter_map(|(name, ty)| match ty.kind() {
                 TyKind::Attribute(Some(attr)) => {
-                    Some((Name::from_str(name.value(db)), Some(attr.clone())))
+                    Some((Name::from_str(name.as_ref()), Some(attr.clone())))
                 }
-                TyKind::None if allow_none => Some((Name::from_str(name.value(db)), None)),
+                TyKind::None if allow_none => Some((Name::from_str(name.as_ref()), None)),
                 _ => None,
             })
             .collect::<Vec<_>>(),
@@ -1167,3 +1132,5 @@ mod tests {
         )
     }
 }
+
+impl_internable!(BuiltinTypeData, BuiltinFunctionData, BuiltinProviderData);

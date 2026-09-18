@@ -1,7 +1,5 @@
 //! Starlark control flow, with reaching bindings and constraint algebra supplied by Ty.
 
-use std::sync::Arc;
-
 use either::Either;
 use rustc_hash::FxHashMap;
 use starpls_common::File;
@@ -394,20 +392,14 @@ impl Builder<'_> {
     }
 }
 
-#[salsa::tracked]
-pub(crate) struct FlowIndexResult {
-    #[return_ref]
-    pub(crate) index: Arc<FlowIndex>,
-}
-
-#[salsa::tracked]
-pub(crate) fn flow_index(db: &dyn Db, file: File) -> FlowIndexResult {
+#[salsa::tracked(returns(ref))]
+pub(crate) fn flow_index(db: &dyn Db, file: File) -> FlowIndex {
     let info = lower(db, file);
     let scopes = module_scopes(db, file);
-    let module = info.module(db);
+    let module = &info.module;
     let mut builder = Builder {
         module,
-        scopes: scopes.scopes(db),
+        scopes,
         state: State::default(),
         uses: FxHashMap::default(),
         statements: FxHashMap::default(),
@@ -417,5 +409,5 @@ pub(crate) fn flow_index(db: &dyn Db, file: File) -> FlowIndexResult {
         narrowing: NarrowingConstraintsBuilder::default(),
     };
     builder.statements(&module.top_level);
-    FlowIndexResult::new(db, Arc::new(builder.finish()))
+    builder.finish()
 }

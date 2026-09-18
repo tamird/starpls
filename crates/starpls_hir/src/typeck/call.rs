@@ -250,11 +250,11 @@ impl Slots {
         }
     }
 
-    pub(crate) fn from_provider(db: &dyn Db, provider: &Provider) -> Self {
+    pub(crate) fn from_provider(provider: &Provider) -> Self {
         Self {
             slots: match provider {
                 Provider::Builtin(provider) => provider
-                    .params(db)
+                    .params
                     .iter()
                     .map(|param| match param {
                         BuiltinFunctionParam::Simple { name, .. } => Slot::Keyword {

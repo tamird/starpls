@@ -58,62 +58,19 @@ mod display;
 mod test_database;
 mod typeck;
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ModuleInfo {
-    pub file: File,
-    #[return_ref]
-    pub module: Module,
-    #[return_ref]
-    pub source_map: ModuleSourceMap,
+    pub(crate) file: File,
+    pub(crate) module: Module,
+    pub(crate) source_map: ModuleSourceMap,
 }
-
-#[salsa::jar(db = Db)]
-pub struct Jar(
-    Environment,
-    queries::infer_expr,
-    queries::infer_param,
-    queries::infer_load_item,
-    queries::resolve_load_stmt,
-    queries::resolve_type_query,
-    queries::active_parameter,
-    queries::diagnostics,
-    lower,
-    ModuleInfo,
-    def::Function,
-    def::LoadStmt,
-    def::InternedString,
-    def::flow::FlowIndexResult,
-    def::flow::flow_index,
-    def::scope::ModuleScopes,
-    def::scope::module_scopes,
-    def::scope::module_scopes_query,
-    typeck::builtins::BuiltinDefs,
-    typeck::builtins::BuiltinFunction,
-    typeck::builtins::BuiltinGlobals,
-    typeck::builtins::BuiltinProvider,
-    typeck::builtins::BuiltinProviders,
-    typeck::builtins::BuiltinType,
-    typeck::builtins::BuiltinTypes,
-    typeck::builtins::builtin_globals_query,
-    typeck::builtins::builtin_providers_query,
-    typeck::builtins::builtin_types_query,
-    typeck::builtins::CommonAttributes,
-    typeck::builtins::common_attributes_query,
-    typeck::intrinsics::Intrinsics,
-    typeck::intrinsics::IntrinsicClass,
-    typeck::intrinsics::IntrinsicFieldTypes,
-    typeck::intrinsics::IntrinsicFunction,
-    typeck::intrinsics::IntrinsicFunctions,
-    typeck::intrinsics::intrinsic_types,
-    typeck::intrinsics::intrinsic_field_types,
-    typeck::intrinsics::intrinsic_functions,
-);
 
 /// Documentation for the `Target` type defined by Bazel.
 /// TODO(withered-magic): Find a better place to put this.
 const TARGET_DOC: &str = "The BUILD target for a dependency. Appears in the fields of `ctx.attr` corresponding to dependency attributes (`label` or `label_list`).";
 
-pub trait Db: salsa::DbWithJar<Jar> + starpls_common::Db {
+#[salsa::db]
+pub trait Db: starpls_common::Db {
     fn environment(&self) -> Environment;
 
     fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins);
@@ -128,14 +85,19 @@ pub trait Db: salsa::DbWithJar<Jar> + starpls_common::Db {
 
 /// Inputs shared by semantic queries. Input identities remain stable when the
 /// host changes configuration or discovers previously unavailable modules.
-#[salsa::input]
+#[salsa::input(debug)]
 pub struct Environment {
-    #[return_ref]
+    #[returns(ref)]
     pub options: InferenceOptions,
+    #[returns(clone)]
     pub standard_builtins: BuiltinDefs,
+    #[returns(clone)]
     pub bazel_builtins: BuiltinDefs,
+    #[returns(clone)]
     pub prelude_file: Option<FileId>,
+    #[returns(clone)]
     pub all_workspace_targets: Arc<Vec<String>>,
+    #[returns(clone)]
     pub load_revision: u64,
 }
 
@@ -157,10 +119,17 @@ impl Environment {
 /// Return the diagnostics accumulated by Salsa queries on the given file.
 /// This does not include diagnostics from type inference, which are reported
 /// by [`inference_diagnostics`] instead.
-pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> {
-    module_scopes::accumulated::<Diagnostics>(db, file).into_iter()
+pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> + '_ {
+    module_scopes::accumulated::<Diagnostics>(db, file)
+        .into_iter()
+        .map(|diagnostic| diagnostic.0.clone())
 }
 
+/// Semantic views for one database revision.
+///
+/// Types and definitions returned by this API contain IDs into that revision's
+/// lowered modules. Use them only with this database, before changing its inputs.
+/// Editor requests turn these views into owned response data within their snapshot.
 pub struct Semantics<'a> {
     pub db: &'a dyn Db,
 }
@@ -170,7 +139,7 @@ impl<'a> Semantics<'a> {
         Self { db }
     }
 
-    pub fn parse(&self, file: File) -> Parse {
+    pub fn parse(&self, file: File) -> &Parse {
         parse(self.db, file)
     }
 
@@ -180,7 +149,7 @@ impl<'a> Semantics<'a> {
         match &module(self.db, file)[*stmt] {
             Stmt::Def { func, .. } => Some(
                 FunctionDef::Def {
-                    func: *func,
+                    func: func.clone(),
                     stmt: InFile { file, value: *stmt },
                 }
                 .into(),
@@ -228,10 +197,11 @@ impl<'a> Semantics<'a> {
         let ty = self.type_of_expr(file, &expr.callee()?)?;
         Some(match ty.ty.kind() {
             TyKind::Function(def) => def.clone().into(),
-            TyKind::IntrinsicFunction(func, subst) => {
-                Callable(CallableInner::IntrinsicFunction(*func, Some(subst.clone())))
-            }
-            TyKind::BuiltinFunction(func) => (*func).into(),
+            TyKind::IntrinsicFunction(func, subst) => Callable(CallableInner::IntrinsicFunction(
+                func.clone(),
+                Some(subst.clone()),
+            )),
+            TyKind::BuiltinFunction(func) => func.clone().into(),
             TyKind::Rule(rule) => Callable(CallableInner::Rule(rule.clone())),
             TyKind::Provider(provider) => Callable(CallableInner::Provider(provider.clone())),
             TyKind::ProviderRawConstructor(name, provider) => Callable(
@@ -248,11 +218,11 @@ impl<'a> Semantics<'a> {
         let stmt = source_map(self.db, file)
             .stmt_map
             .get(&AstPtr::new(&ast::Statement::Def(def_stmt.clone())))?;
-        let Stmt::Def { func, .. } = module[*stmt] else {
+        let Stmt::Def { ref func, .. } = module[*stmt] else {
             return None;
         };
         Some(Callable(CallableInner::HirDef(FunctionDef::Def {
-            func,
+            func: func.clone(),
             stmt: InFile { file, value: *stmt },
         })))
     }
@@ -272,7 +242,7 @@ impl<'a> Semantics<'a> {
             .param_to_def_stmt
             .get(param)
             .and_then(|(stmt, index)| match module[*stmt] {
-                Stmt::Def { func, .. } => Some((func, index)),
+                Stmt::Def { ref func, .. } => Some((func.clone(), index)),
                 _ => None,
             })?;
         Some((
@@ -288,7 +258,7 @@ impl<'a> Semantics<'a> {
         let ptr = AstPtr::new(&ast::Statement::Load(load_stmt.clone()));
         let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
         let load_stmt = match module(self.db, file)[*stmt] {
-            Stmt::Load { load_stmt, .. } => load_stmt,
+            Stmt::Load { ref load_stmt, .. } => load_stmt.clone(),
             _ => return None,
         };
         queries::resolve_load_stmt(self.db, file, load_stmt)
@@ -417,20 +387,20 @@ impl Type {
         }
     }
 
-    pub fn doc(&self, db: &dyn Db) -> Option<String> {
+    pub fn doc(&self) -> Option<String> {
         match self.ty.kind() {
-            TyKind::BuiltinFunction(func) => Some(func.doc(db).clone()),
-            TyKind::BuiltinType(ty, _) => Some(ty.doc(db).clone()),
-            TyKind::Function(def) => def.func().doc(db).map(|doc| doc.to_string()),
-            TyKind::IntrinsicFunction(func, _) => Some(func.doc(db).clone()),
+            TyKind::BuiltinFunction(func) => Some(func.doc.clone()),
+            TyKind::BuiltinType(ty, _) => Some(ty.doc.clone()),
+            TyKind::Function(def) => def.func().doc.as_ref().map(|doc| doc.to_string()),
+            TyKind::IntrinsicFunction(func, _) => Some(func.doc.clone()),
             TyKind::Rule(rule) => rule.doc.as_ref().map(Box::to_string),
-            TyKind::Provider(provider) | TyKind::ProviderInstance(provider) => provider.doc(db),
+            TyKind::Provider(provider) | TyKind::ProviderInstance(provider) => provider.doc(),
             TyKind::ModuleExtension(module_extension)
             | TyKind::ModuleExtensionProxy(module_extension) => {
                 module_extension.doc.as_ref().map(Box::to_string)
             }
             TyKind::Target => Some(TARGET_DOC.into()),
-            TyKind::Macro(makro) => makro.doc.map(|doc| doc.value(db).to_string()),
+            TyKind::Macro(makro) => makro.doc.as_ref().map(|doc| doc.as_ref().to_string()),
             _ => None,
         }
     }
@@ -454,7 +424,7 @@ impl Type {
                     (
                         Field(FieldInner::StructField {
                             name: name.clone(),
-                            doc: attr.doc.as_ref().map(|doc| doc.value(db).to_string()),
+                            doc: attr.doc.as_ref().map(|doc| doc.as_ref().to_string()),
                         }),
                         attr.resolved_ty(rule_kind).into(),
                     )
@@ -481,7 +451,7 @@ impl Type {
                     .and_then(|ptr| {
                         Some(InFile {
                             file: dict_expr.file,
-                            value: ptr.try_to_node(&parse(db, dict_expr.file).syntax(db))?,
+                            value: ptr.try_to_node(&parse(db, dict_expr.file).syntax())?,
                         })
                     })
             }
@@ -489,11 +459,11 @@ impl Type {
         }
     }
 
-    pub fn known_keys(&self, db: &dyn Db) -> Option<Vec<String>> {
+    pub fn known_keys(&self) -> Option<Vec<String>> {
         self.ty.known_keys().map(|known_keys| {
             known_keys
                 .iter()
-                .map(|(name, _)| name.value(db).to_string())
+                .map(|(name, _)| name.as_ref().to_string())
                 .collect()
         })
     }
@@ -546,7 +516,7 @@ impl Struct {
             .get(&self.call_expr.value)
             .cloned()?
             .cast::<ast::CallExpr>()?
-            .try_to_node(&parse(db, self.call_expr.file).syntax(db))?;
+            .try_to_node(&parse(db, self.call_expr.file).syntax())?;
         Some(InFile {
             file: self.call_expr.file,
             value: call_expr,
@@ -575,14 +545,14 @@ impl Variable {
 pub struct Callable(CallableInner);
 
 impl Callable {
-    pub fn name(&self, db: &dyn Db) -> Name {
+    pub fn name(&self) -> Name {
         match self.0 {
-            CallableInner::HirDef(ref def) => def.func().name(db),
-            CallableInner::IntrinsicFunction(func, _) => func.name(db),
-            CallableInner::BuiltinFunction(func) => func.name(db),
+            CallableInner::HirDef(ref def) => def.func().name.clone(),
+            CallableInner::IntrinsicFunction(ref func, _) => func.name.clone(),
+            CallableInner::BuiltinFunction(ref func) => func.name.clone(),
             CallableInner::Rule(_) => Name::new_inline("rule"),
             CallableInner::Provider(ref provider) => provider
-                .name(db)
+                .name()
                 .cloned()
                 .unwrap_or_else(|| Name::new_inline("provider")),
             CallableInner::ProviderRawConstructor(ref name, _) => name.clone(),
@@ -592,20 +562,22 @@ impl Callable {
     }
 
     pub fn params(&self, db: &dyn Db) -> Vec<(Param, Type)> {
-        self.ty(db).params(db)
+        self.ty().params(db)
     }
 
-    pub fn ty(&self, db: &dyn Db) -> Type {
+    pub fn ty(&self) -> Type {
         match self.0 {
             CallableInner::HirDef(ref def) => TyKind::Function(def.clone()).intern(),
-            CallableInner::IntrinsicFunction(func, ref subst) => TyKind::IntrinsicFunction(
-                func,
+            CallableInner::IntrinsicFunction(ref func, ref subst) => TyKind::IntrinsicFunction(
+                func.clone(),
                 subst
                     .clone()
-                    .unwrap_or_else(|| Substitution::new_identity(func.num_vars(db))),
+                    .unwrap_or_else(|| Substitution::new_identity(func.num_vars)),
             )
             .intern(),
-            CallableInner::BuiltinFunction(func) => TyKind::BuiltinFunction(func).intern(),
+            CallableInner::BuiltinFunction(ref func) => {
+                TyKind::BuiltinFunction(func.clone()).intern()
+            }
             CallableInner::Rule(ref rule) => TyKind::Rule(rule.clone()).intern(),
             CallableInner::Provider(ref provider) => TyKind::Provider(provider.clone()).intern(),
             CallableInner::ProviderRawConstructor(ref name, ref provider) => {
@@ -618,29 +590,31 @@ impl Callable {
     }
 
     pub fn ret_ty(&self, db: &dyn Db) -> Type {
-        self.ty(db)
+        self.ty()
             .ty
             .ret_ty(db)
             .expect("expected return type")
             .into()
     }
 
-    pub fn doc(&self, db: &dyn Db) -> Option<String> {
+    pub fn doc(&self) -> Option<String> {
         match self.0 {
-            CallableInner::HirDef(ref def) => def.func().doc(db).map(|doc| doc.to_string()),
-            CallableInner::BuiltinFunction(func) => Some(func.doc(db).clone()),
-            CallableInner::IntrinsicFunction(func, _) => Some(func.doc(db).clone()),
+            CallableInner::HirDef(ref def) => def.func().doc.as_ref().map(|doc| doc.to_string()),
+            CallableInner::BuiltinFunction(ref func) => Some(func.doc.clone()),
+            CallableInner::IntrinsicFunction(ref func, _) => Some(func.doc.clone()),
             CallableInner::Rule(ref rule) => rule.doc.as_ref().map(Box::to_string),
             CallableInner::Provider(ref provider)
             | CallableInner::ProviderRawConstructor(_, ref provider) => match provider {
-                Provider::Builtin(provider) => Some(provider.doc(db).clone()),
-                Provider::Custom(provider) => provider.doc.map(|doc| doc.value(db).to_string()),
+                Provider::Builtin(provider) => Some(provider.doc.clone()),
+                Provider::Custom(provider) => {
+                    provider.doc.as_ref().map(|doc| doc.as_ref().to_string())
+                }
             },
             CallableInner::Tag(ref tag_class) => {
-                tag_class.doc.as_ref().map(|doc| doc.value(db).to_string())
+                tag_class.doc.as_ref().map(|doc| doc.as_ref().to_string())
             }
             CallableInner::Macro(ref makro) => {
-                makro.doc.as_ref().map(|doc| doc.value(db).to_string())
+                makro.doc.as_ref().map(|doc| doc.as_ref().to_string())
             }
         }
     }
@@ -681,7 +655,7 @@ impl Callable {
             .and_then(|ptr| {
                 Some(InFile {
                     file: attrs_expr.file,
-                    value: ptr.try_to_node(&parse(db, attrs_expr.file).syntax(db))?,
+                    value: ptr.try_to_node(&parse(db, attrs_expr.file).syntax())?,
                 })
             })
     }
@@ -774,7 +748,7 @@ impl LoadItem {
         source_map(db, self.id.file)
             .load_item_map_back
             .get(&self.id.value)
-            .and_then(|ptr| ptr.try_to_node(&parse(db, self.id.file).syntax(db)))
+            .and_then(|ptr| ptr.try_to_node(&parse(db, self.id.file).syntax()))
             .and_then(|node| node.syntax().parent())
             .and_then(ast::LoadStmt::cast)
     }
@@ -810,7 +784,7 @@ impl ScopeDef {
     pub fn syntax_node_ptr(&self, db: &dyn Db) -> Option<InFile<SyntaxNodePtr>> {
         match self {
             ScopeDef::Callable(Callable(CallableInner::HirDef(def))) => {
-                Some(def.func().syntax_node_ptr(db))
+                Some(def.func().syntax_node_ptr())
             }
             ScopeDef::Variable(Variable { expr: Some(expr) }) => source_map(db, expr.file)
                 .expr_map_back
@@ -836,7 +810,7 @@ impl ScopeDef {
             ScopeDef::Variable(Variable { expr: Some(expr) }) => {
                 queries::infer_expr(db, expr.file, expr.value)
             }
-            ScopeDef::Callable(callable) => return callable.ty(db),
+            ScopeDef::Callable(callable) => return callable.ty(),
             ScopeDef::LoadItem(LoadItem { id }) => queries::infer_load_item(db, id.file, id.value),
             _ => Ty::unknown(),
         }
@@ -885,19 +859,23 @@ impl From<scope::ScopeDef> for ScopeDef {
     }
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(ref))]
 pub(crate) fn lower(db: &dyn Db, file: File) -> ModuleInfo {
     let parse = parse(db, file);
-    let (module, source_map) = Module::new_with_source_map(db, file, parse.tree(db));
-    ModuleInfo::new(db, file, module, source_map)
+    let (module, source_map) = Module::new_with_source_map(db, file, parse.tree());
+    ModuleInfo {
+        file,
+        module,
+        source_map,
+    }
 }
 
 /// Shortcut to immediately access a `lower` query's `Module`.
 pub(crate) fn module(db: &dyn Db, file: File) -> &Module {
-    lower(db, file).module(db)
+    &lower(db, file).module
 }
 
 /// Shortcut to immediately access a `lower` query's `ModuleSourceMap`.
 pub(crate) fn source_map(db: &dyn Db, file: File) -> &ModuleSourceMap {
-    lower(db, file).source_map(db)
+    &lower(db, file).source_map
 }

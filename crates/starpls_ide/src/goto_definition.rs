@@ -35,7 +35,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         let sema = Semantics::new(db);
         let file = db.get_file(file_id)?;
         let parse = sema.parse(file);
-        let token = pick_best_token(parse.syntax(db).token_at_offset(pos), |kind| match kind {
+        let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
             T![ident] => 2,
             T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
             kind if kind.is_trivia_token() => 0,
@@ -116,7 +116,7 @@ impl<'a> GotoDefinitionHandler<'a> {
 
     fn try_resolve_assign_from_load_item(&self, def: &ScopeDef) -> Option<LoadItem> {
         let InFile { file, value: ptr } = def.syntax_node_ptr(self.sema.db)?;
-        let syntax = ptr.try_to_node(&self.sema.parse(file).syntax(self.sema.db))?;
+        let syntax = ptr.try_to_node(&self.sema.parse(file).syntax())?;
         if !ast::NameRef::can_cast(syntax.kind()) {
             return None;
         }
@@ -263,7 +263,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                 ..
             } => {
                 let build_file = self.sema.db.get_file(build_file_id)?;
-                let parse = self.sema.parse(build_file).syntax(self.sema.db);
+                let parse = self.sema.parse(build_file).syntax();
                 let optional_call_expr =
                     parse
                         .children()
@@ -343,7 +343,7 @@ impl<'a> GotoDefinitionHandler<'a> {
             ScopeDef::Callable(_) => {
                 let InFile { file, value: ptr } = def.syntax_node_ptr(self.sema.db)?;
                 let def_stmt = ptr
-                    .try_to_node(&self.sema.parse(file).syntax(self.sema.db))
+                    .try_to_node(&self.sema.parse(file).syntax())
                     .and_then(ast::DefStmt::cast)?;
                 let range = def_stmt.name()?.syntax().text_range();
                 LocationLink::Local {

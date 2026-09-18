@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use smallvec::smallvec;
+use starpls_intern::impl_internable;
+use starpls_intern::Interned;
 
 use crate::def::Argument;
-use crate::def::InternedString;
-use crate::typeck::Binders;
 use crate::typeck::DictLiteral;
 use crate::typeck::Substitution;
 use crate::typeck::Tuple as TupleVariants;
@@ -15,12 +15,9 @@ use crate::typeck::{self};
 use crate::Db;
 use crate::Name;
 
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Intrinsics {
-    #[return_ref]
     pub(crate) types: IntrinsicTypes,
-
-    // Base classes for types with fields/methods.
     pub(crate) string_base_class: IntrinsicClass,
     pub(crate) bytes_base_class: IntrinsicClass,
     pub(crate) list_base_class: IntrinsicClass,
@@ -63,19 +60,20 @@ impl Default for IntrinsicTypes {
     }
 }
 
-#[salsa::tracked]
-pub(crate) struct IntrinsicClass {
+pub(crate) type IntrinsicClass = Interned<IntrinsicClassData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct IntrinsicClassData {
     pub(crate) name: Name,
     pub(crate) num_vars: usize,
-    #[return_ref]
     pub(crate) fields: Vec<IntrinsicField>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct IntrinsicField {
     pub(crate) name: Name,
     pub(crate) doc: String,
-    ty: Ty,
+    pub(crate) ty: Ty,
 }
 
 impl IntrinsicField {
@@ -88,55 +86,37 @@ impl IntrinsicField {
     }
 }
 
-#[salsa::tracked]
-pub(crate) struct IntrinsicFieldTypes {
-    #[return_ref]
-    pub(crate) field_tys: Vec<Binders>,
-}
-
-#[salsa::tracked]
-pub(crate) fn intrinsic_field_types(db: &dyn Db, class: IntrinsicClass) -> IntrinsicFieldTypes {
-    let field_tys = class
-        .fields(db)
-        .iter()
-        .map(|field| Binders::new(class.num_vars(db), field.ty.clone()))
-        .collect();
-    IntrinsicFieldTypes::new(db, field_tys)
-}
-
-#[salsa::tracked]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct IntrinsicFunctions {
-    #[return_ref]
-    pub functions: FxHashMap<Name, IntrinsicFunction>,
+    pub(crate) functions: FxHashMap<Name, IntrinsicFunction>,
 }
 
-#[salsa::tracked]
-pub(crate) struct IntrinsicFunction {
-    pub name: Name,
-    #[return_ref]
-    pub doc: String,
-    pub num_vars: usize,
-    #[return_ref]
-    pub params: Vec<IntrinsicFunctionParam>,
-    pub ret_ty: Ty,
-    is_dict_constructor: bool,
+pub(crate) type IntrinsicFunction = Interned<IntrinsicFunctionData>;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct IntrinsicFunctionData {
+    pub(crate) name: Name,
+    pub(crate) doc: String,
+    pub(crate) num_vars: usize,
+    pub(crate) params: Vec<IntrinsicFunctionParam>,
+    pub(crate) ret_ty: Ty,
+    pub(crate) is_dict_constructor: bool,
 }
 
-impl IntrinsicFunction {
-    pub(crate) fn maybe_unique_ret_type<'a, I>(&'a self, db: &'a dyn Db, args: I) -> Option<Ty>
+impl IntrinsicFunctionData {
+    pub(crate) fn maybe_unique_ret_type<'a, I>(&'a self, args: I) -> Option<Ty>
     where
         I: Iterator<Item = (&'a Argument, &'a Ty)>,
     {
-        if !self.is_dict_constructor(db) {
+        if !self.is_dict_constructor {
             return None;
         }
 
         let known_keys = args
             .filter_map(|(arg, ty)| match arg {
-                Argument::Keyword { name, .. } => Some((
-                    InternedString::new(db, name.as_str().to_string().into_boxed_str()),
-                    ty.clone(),
-                )),
+                Argument::Keyword { name, .. } => {
+                    Some((Arc::<str>::from(name.as_str()), ty.clone()))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -217,8 +197,8 @@ impl IntrinsicFunctionParam {
     }
 }
 
-#[salsa::tracked]
-pub(crate) fn intrinsic_functions(db: &dyn Db) -> IntrinsicFunctions {
+#[salsa::tracked(returns(ref))]
+pub(crate) fn intrinsic_functions(_db: &dyn Db) -> IntrinsicFunctions {
     // TODO(withered-magic): Many of these signatures are wrong
     // since the implementation of Starlark's type system is still
     // heavily WIP. For example, for the `list` intrinsic, we need to
@@ -233,7 +213,7 @@ pub(crate) fn intrinsic_functions(db: &dyn Db) -> IntrinsicFunctions {
     let mut add_function = |name, doc, params, ret_ty| {
         functions.insert(
             Name::new_inline(name),
-            function(db, name, doc, params, 0, ret_ty),
+            function(name, doc, params, 0, ret_ty),
         );
     };
 
@@ -386,11 +366,7 @@ fail("oops", 1, False)		# "fail: oops 1 False"
             },
             Keyword {
                 name: Name::new_inline("sep"),
-                ty: TyKind::String(Some(InternedString::new(
-                    db,
-                    " ".to_string().into_boxed_str(),
-                )))
-                .intern(),
+                ty: TyKind::String(Some(Arc::<str>::from(" "))).intern(),
                 deprecated: false,
             },
             ArgsList { ty: Any.intern() },
@@ -778,31 +754,28 @@ zip(range(10), ["a", "b", "c"])         # [(0, "a"), (1, "b"), (2, "c")]
         List(Any.intern()),
     );
 
-    IntrinsicFunctions::new(db, functions)
+    IntrinsicFunctions { functions }
 }
 
-#[salsa::tracked]
-pub(crate) fn intrinsic_types(db: &dyn Db) -> Intrinsics {
-    Intrinsics::new(
-        db,
-        Default::default(),
-        make_string_base_class(db),
-        make_bytes_base_class(db),
-        make_list_base_class(db),
-        make_dict_base_class(db),
-    )
+#[salsa::tracked(returns(ref))]
+pub(crate) fn intrinsic_types(_db: &dyn Db) -> Intrinsics {
+    Intrinsics {
+        types: Default::default(),
+        string_base_class: make_string_base_class(),
+        bytes_base_class: make_bytes_base_class(),
+        list_base_class: make_list_base_class(),
+        dict_base_class: make_dict_base_class(),
+    }
 }
 
-fn make_string_base_class(db: &dyn Db) -> IntrinsicClass {
+fn make_string_base_class() -> IntrinsicClass {
     use IntrinsicFunctionParam::*;
     use TyKind::*;
-    IntrinsicClass::new(
-        db,
-        crate::Name::new_inline("string"),
-        0,
-        vec![
+    Interned::new(IntrinsicClassData {
+        name: crate::Name::new_inline("string"),
+        num_vars: 0,
+        fields: vec![
             function_field(
-                db,
                 "capitalize",
                 r#"`S.capitalize()` returns a copy of string S, where the first character (if any)
 is converted to uppercase; all other characters are converted to lowercase.
@@ -816,7 +789,6 @@ is converted to uppercase; all other characters are converted to lowercase.
                 0,
             ),
             function_field(
-                db,
                 "count",
                 r#"`S.count(sub[, start[, end]])` returns the number of occurrences of
 `sub` within the string S, or, if the optional substring indices
@@ -837,7 +809,6 @@ They are interpreted according to Starlark's [indexing conventions](#indexing).
                 0,
             ),
             function_field(
-                db,
                 "elems",
                 r#"`S.elems()` returns an opaque iterable value containing successive
 1-element substrings of S.
@@ -854,7 +825,6 @@ list("Hello, 123".elems())	# ["H", "e", "l", "l", "o", ",", " ", "1", "2", "3"]
                 0,
             ),
             function_field(
-                db,
                 "endswith",
                 r#"`S.endswith(suffix[, start[, end]])` reports whether the string
 `S[start:end]` has the specified suffix.
@@ -881,7 +851,6 @@ function reports whether any one of them is a suffix.
                 0,
             ),
             function_field(
-                db,
                 "find",
                 r#"`S.find(sub[, start[, end]])` returns the index of the first
 occurrence of the substring `sub` within S.
@@ -908,7 +877,6 @@ If no occurrence is found, `found` returns -1.
             ),
             // TODO(withered-magic): Handle *args and **kwargs for format().
             function_field(
-                db,
                 "format",
                 r#"`S.format(*args, **kwargs)` returns a version of the format string S
 in which bracketed portions `{...}` are replaced
@@ -943,7 +911,6 @@ the explicit and implicit forms may not be mixed.
                 0,
             ),
             function_field(
-                db,
                 "index",
                 r#"`S.index(sub[, start[, end]])` returns the index of the first
 occurrence of the substring `sub` within S, like `S.find`, except
@@ -964,7 +931,6 @@ that if the substring is not found, the operation fails.
                 0,
             ),
             function_field(
-                db,
                 "isalnum",
                 r#"`S.isalnum()` reports whether the string S is non-empty and consists only
 Unicode letters and digits.
@@ -979,7 +945,6 @@ Unicode letters and digits.
                 0,
             ),
             function_field(
-                db,
                 "isalpha",
                 r#"`S.isalpha()` reports whether the string S is non-empty and consists only of Unicode letters.
 
@@ -994,7 +959,6 @@ Unicode letters and digits.
                 0,
             ),
             function_field(
-                db,
                 "isdigit",
                 r#"`S.isdigit()` reports whether the string S is non-empty and consists only of Unicode digits.
 
@@ -1009,7 +973,6 @@ Unicode letters and digits.
                 0,
             ),
             function_field(
-                db,
                 "islower",
                 r#"`S.islower()` reports whether the string S contains at least one cased Unicode
 letter, and all such letters are lowercase.
@@ -1025,7 +988,6 @@ letter, and all such letters are lowercase.
                 0,
             ),
             function_field(
-                db,
                 "isspace",
                 r#"`S.isspace()` reports whether the string S is non-empty and consists only of Unicode spaces.
 
@@ -1040,7 +1002,6 @@ letter, and all such letters are lowercase.
                 0,
             ),
             function_field(
-                db,
                 "istitle",
                 r#"`S.istitle()` reports whether the string S contains at least one cased Unicode
 letter, and all such letters that begin a word are in title case.
@@ -1057,7 +1018,6 @@ letter, and all such letters that begin a word are in title case.
                 0,
             ),
             function_field(
-                db,
                 "isupper",
                 r#"`S.isupper()` reports whether the string S contains at least one cased Unicode
 letter, and all such letters are uppercase.
@@ -1073,7 +1033,6 @@ letter, and all such letters are uppercase.
                 0,
             ),
             function_field(
-                db,
                 "join",
                 r#"`S.join(iterable)` returns the string formed by concatenating each
 element of its argument, with a copy of the string S between
@@ -1090,7 +1049,6 @@ are strings.
                 0,
             ),
             function_field(
-                db,
                 "lower",
                 r#"`S.lower()` returns a copy of the string S with letters converted to lowercase.
 
@@ -1103,7 +1061,6 @@ are strings.
                 0,
             ),
             function_field(
-                db,
                 "lstrip",
                 r#"`S.lstrip([cutset])` returns a copy of the string S with leading whitespace removed.
 
@@ -1120,7 +1077,6 @@ alternative set of Unicode code points to remove.
                 0,
             ),
             function_field(
-                db,
                 "partition",
                 r#"`S.partition(x)` splits string S into three parts and returns them as
 a tuple: the portion before the first occurrence of string `x`, `x` itself,
@@ -1142,7 +1098,6 @@ If S does not contain `x`, `partition` returns `(S, "", "")`.
                 0,
             ),
             function_field(
-                db,
                 "removeprefix",
                 r#"`S.removeprefix(x)` removes the prefix `x` from the string S at most once,
 and returns the rest of the string.
@@ -1161,7 +1116,6 @@ If the prefix string is not found then it returns the original string.
                 0,
             ),
             function_field(
-                db,
                 "removesuffix",
                 r#"`S.removesuffix(x)` removes the suffix `x` from the string S at most once,
 and returns the rest of the string.
@@ -1180,7 +1134,6 @@ If the suffix string is not found then it returns the original string.
                 0,
             ),
             function_field(
-                db,
                 "replace",
                 r#"`S.replace(old, new[, count])` returns a copy of string S with all
 occurrences of substring `old` replaced by `new`. If the optional
@@ -1201,7 +1154,6 @@ specifies a maximum number of occurrences to replace.
                 0,
             ),
             function_field(
-                db,
                 "rfind",
                 r#"`S.rfind(sub[, start[, end]])` returns the index of the substring `sub` within
 S, like `S.find`, except that `rfind` returns the index of the substring's
@@ -1222,7 +1174,6 @@ _last_ occurrence.
                 0,
             ),
             function_field(
-                db,
                 "rindex",
                 r#"`S.rindex(sub[, start[, end]])` returns the index of the substring `sub` within
 S, like `S.index`, except that `rindex` returns the index of the substring's
@@ -1243,7 +1194,6 @@ _last_ occurrence.
                 0,
             ),
             function_field(
-                db,
                 "rpartition",
                 r#"`S.rpartition(x)` is like `partition`, but splits `S` at the last occurrence of `x`.
 
@@ -1260,7 +1210,6 @@ _last_ occurrence.
                 0,
             ),
             function_field(
-                db,
                 "rsplit",
                 r#"`S.rsplit([sep[, maxsplit]])` splits a string into substrings like `S.split`,
 except that when a maximum number of splits is specified, `rsplit` chooses the
@@ -1280,7 +1229,6 @@ rightmost splits.
                 0,
             ),
             function_field(
-                db,
                 "rstrip",
                 r#"`S.rstrip([cutset])` returns a copy of the string S with trailing whitespace removed.
 
@@ -1297,7 +1245,6 @@ alternative set of Unicode code points to remove.
                 0,
             ),
             function_field(
-                db,
                 "split",
                 r#"`S.split([sep [, maxsplit]])` returns the list of substrings of S,
 splitting at occurrences of the delimiter string `sep`.
@@ -1333,7 +1280,6 @@ If `maxsplit` is given and non-negative, it specifies a maximum number of splits
                 0,
             ),
             function_field(
-                db,
                 "splitlines",
                 r#"`S.splitlines([keepends])` returns a list whose elements are the
 successive lines of S, that is, the strings formed by splitting S at
@@ -1355,7 +1301,6 @@ the final element does not necessarily end with a line terminator.
                 0,
             ),
             function_field(
-                db,
                 "startswith",
                 r#"`S.startswith(prefix[, start[, end]])` reports whether the string
 `S[start:end]` has the specified prefix.
@@ -1387,7 +1332,6 @@ function reports whether any one of them is a prefix.
                 0,
             ),
             function_field(
-                db,
                 "strip",
                 r#"`S.strip([cutset])` returns a copy of the string S with leading and trailing whitespace removed.
 
@@ -1405,7 +1349,6 @@ and trailing Unicode code points contained in `cutset`.
                 0,
             ),
             function_field(
-                db,
                 "title",
                 r#"`S.title()` returns a copy of the string S with letters converted to titlecase.
 
@@ -1420,7 +1363,6 @@ Letters are converted to uppercase at the start of words, lowercase elsewhere.
                 0,
             ),
             function_field(
-                db,
                 "upper",
                 r#"
 `S.upper()` returns a copy of the string S with letters converted to uppercase.
@@ -1434,17 +1376,15 @@ Letters are converted to uppercase at the start of words, lowercase elsewhere.
                 0,
             ),
         ],
-    )
+    })
 }
 
-fn make_bytes_base_class(db: &dyn Db) -> IntrinsicClass {
+fn make_bytes_base_class() -> IntrinsicClass {
     use TyKind::*;
-    IntrinsicClass::new(
-        db,
-        crate::Name::new_inline("bytes"),
-        0,
-        vec![function_field(
-            db,
+    Interned::new(IntrinsicClassData {
+        name: crate::Name::new_inline("bytes"),
+        num_vars: 0,
+        fields: vec![function_field(
             "elems",
             r#"`b.elems()` returns an opaque iterable value containing successive int elements of b.
 Its type is `"bytes.elems"`, and its string representation is of the form `b"...".elems()`.
@@ -1472,18 +1412,16 @@ print(x)                                # {}
             BytesElems,
             0,
         )],
-    )
+    })
 }
 
-fn make_list_base_class(db: &dyn Db) -> IntrinsicClass {
+fn make_list_base_class() -> IntrinsicClass {
     use TyKind::*;
-    IntrinsicClass::new(
-        db,
-        crate::Name::new_inline("list"),
-        1,
-        vec![
+    Interned::new(IntrinsicClassData {
+        name: crate::Name::new_inline("list"),
+        num_vars: 1,
+        fields: vec![
             function_field(
-                db,
                 "append",
                 r#"`append` fails if the list is frozen or has active iterators.
 
@@ -1500,7 +1438,6 @@ x                                       # [1, 2, 3]
                 1,
             ),
             function_field(
-                db,
                 "clear",
                 r#"`L.clear()` removes all the elements of the list L and returns `None`.
 It fails if the list is frozen or if there are active iterators.
@@ -1516,7 +1453,6 @@ x                                       # []
                 1,
             ),
             function_field(
-                db,
                 "extend",
                 r#"`L.extend(x)` appends the elements of `x`, which must be iterable, to
 the list L, and returns `None`.
@@ -1542,7 +1478,6 @@ y                                       # [1, 2, 1, 2]
                 1,
             ),
             function_field(
-                db,
                 "index",
                 r#"`L.index(x[, start[, end]])` finds `x` within the list L and returns its index.
 
@@ -1572,7 +1507,6 @@ x.index("a", -2)                        # 5 (bananA)
                 1,
             ),
             function_field(
-                db,
                 "insert",
                 r#"`L.insert(i, x)` inserts the value `x` in the list L at index `i`, moving
 higher-numbered elements along by one.  It returns `None`.
@@ -1595,7 +1529,6 @@ x                                       # ["a", "b", "c", "d", "e"]
                 1,
             ),
             function_field(
-                db,
                 "pop",
                 r#"`L.pop([index])` removes and returns the last element of the list L, or,
 if the optional index is provided, at that index.
@@ -1615,7 +1548,6 @@ x                                       # [1]
                 1,
             ),
             function_field(
-                db,
                 "remove",
                 r#"`L.remove(x)` removes the first occurrence of the value `x` from the list L, and returns `None`.
 
@@ -1633,19 +1565,17 @@ x.remove(2)                             # error: element not found
                 1,
             ),
         ],
-    )
+    })
 }
 
-fn make_dict_base_class(db: &dyn Db) -> IntrinsicClass {
+fn make_dict_base_class() -> IntrinsicClass {
     use IntrinsicFunctionParam::*;
     use TyKind::*;
-    IntrinsicClass::new(
-        db,
-        crate::Name::new_inline("dict"),
-        2,
-        vec![
+    Interned::new(IntrinsicClassData {
+        name: crate::Name::new_inline("dict"),
+        num_vars: 2,
+        fields: vec![
             function_field(
-                db,
                 "clear",
                 r#"`D.clear()` removes all the entries of dictionary D and returns `None`.
 It fails if the dictionary is frozen or if there are active iterators.
@@ -1661,7 +1591,6 @@ print(x)                                # {}
                 2,
             ),
             function_field(
-                db,
                 "get",
                 r#"`D.get(key[, default])` returns the dictionary value corresponding to the given key.
 If the dictionary contains no such value, `get` returns `None`, or the
@@ -1681,7 +1610,6 @@ x.get("three", 0)                       # 0
                 2,
             ),
             function_field(
-                db,
                 "items",
                 r#"`D.items()` returns a new list of key/value pairs, one per element in
 dictionary D, in the same order as they would be returned by a `for` loop.
@@ -1702,7 +1630,6 @@ x.items()                               # [("one", 1), ("two", 2)]
                 2,
             ),
             function_field(
-                db,
                 "keys",
                 r#"`D.keys()` returns a new list containing the keys of dictionary D, in the
 same order as they would be returned by a `for` loop.
@@ -1717,7 +1644,6 @@ x.keys()                               # ["one", "two"]
                 2,
             ),
             function_field(
-                db,
                 "pop",
                 r#"`D.pop(key[, default])` returns the value corresponding to the specified
 key, and removes it from the dictionary.  If the dictionary contains no
@@ -1739,7 +1665,6 @@ x.pop("four")                           # error: missing key
                 2,
             ),
             function_field(
-                db,
                 "popitem",
                 r#"`D.popitem()` returns the first key/value pair, removing it from the dictionary.
 
@@ -1760,7 +1685,6 @@ x.popitem()                             # error: empty dict
                 2,
             ),
             function_field(
-                db,
                 "setdefault",
                 r#"`D.setdefault(key[, default])` returns the dictionary value corresponding to the given key.
 If the dictionary contains no such value, `setdefault`, like `get`,
@@ -1785,7 +1709,6 @@ x                                       # {"one": 1, "two": 2, "three": 3, "four
                 2,
             ),
             function_field(
-                db,
                 "update",
                 r#"`D.update([pairs][, name=value[, ...])` makes a sequence of key/value
 insertions into dictionary D, then returns `None.`
@@ -1829,7 +1752,6 @@ x                                       # {"a": 1, "b": "2", "c": 3, "d": 4, "e"
                 2,
             ),
             function_field(
-                db,
                 "values",
                 r#"`D.values()` returns a new list containing the dictionary's values, in the
 same order as they would be returned by a `for` loop over the
@@ -1845,30 +1767,27 @@ x.values()                              # [1, 2]
                 2,
             ),
         ],
-    )
+    })
 }
 
 fn function(
-    db: &dyn Db,
     name: &'static str,
     doc: &'static str,
     params: Vec<IntrinsicFunctionParam>,
     num_vars: usize,
     ret_ty: TyKind,
 ) -> IntrinsicFunction {
-    IntrinsicFunction::new(
-        db,
-        Name::new_inline(name),
-        doc.to_string(),
+    Interned::new(IntrinsicFunctionData {
+        name: Name::new_inline(name),
+        doc: doc.to_string(),
         num_vars,
         params,
-        ret_ty.intern(),
-        name == "dict",
-    )
+        ret_ty: ret_ty.intern(),
+        is_dict_constructor: name == "dict",
+    })
 }
 
 fn function_field(
-    db: &dyn Db,
     name: &'static str,
     doc: &'static str,
     params: Vec<IntrinsicFunctionParam>,
@@ -1879,7 +1798,7 @@ fn function_field(
         name,
         doc,
         TyKind::IntrinsicFunction(
-            function(db, name, doc, params, num_vars, ret_ty),
+            function(name, doc, params, num_vars, ret_ty),
             Substitution::new_identity(num_vars),
         )
         .intern(),
@@ -1911,3 +1830,5 @@ fn non_literal_bool() -> TyKind {
 fn non_literal_int() -> TyKind {
     TyKind::Int(None)
 }
+
+impl_internable!(IntrinsicClassData, IntrinsicFunctionData);

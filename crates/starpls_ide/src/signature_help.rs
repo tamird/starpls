@@ -41,7 +41,7 @@ pub(crate) fn signature_help(
     let sema = Semantics::new(db);
     let file = db.get_file(file_id)?;
     let parse = sema.parse(file);
-    let token = pick_best_token(parse.syntax(db).token_at_offset(pos), |kind| match kind {
+    let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
         // '(', ')', and ',' are typically the main tokens in a call expression that are not part of
         // one of the arguments.
         T!['('] | T![')'] | T![,] => 0,
@@ -101,7 +101,7 @@ pub(crate) fn signature_help(
     // TODO(withered-magic): Some of this logic is duplicated from the `DisplayWithDb` implementation on `TyKind`.
     let mut label = String::new();
     label.push_str("def ");
-    label.push_str(func.name(db).as_str());
+    label.push_str(func.name().as_str());
     label.push('(');
 
     let is_rule_or_tag = func.is_rule() || func.is_tag() || func.is_macro();
@@ -148,7 +148,7 @@ pub(crate) fn signature_help(
     Some(SignatureHelp {
         signatures: vec![SignatureInfo {
             label,
-            documentation: func.doc(db).map(|doc| unindent_doc(&doc)),
+            documentation: func.doc().map(|doc| unindent_doc(&doc)),
             parameters: Some(
                 params
                     .into_iter()

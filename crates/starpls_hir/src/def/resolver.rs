@@ -137,9 +137,9 @@ impl<'a> Resolver<'a> {
         // Otherwise, check the builtins scope.
         def.or_else(|| {
             intrinsic_functions(self.db)
-                .functions(self.db)
+                .functions
                 .get(name)
-                .copied()
+                .cloned()
                 .map(ScopeDef::IntrinsicFunction)
         })
         .or_else(|| self.resolve_name_in_builtin_globals(name))
@@ -152,7 +152,7 @@ impl<'a> Resolver<'a> {
             api_globals
                 .functions
                 .get(name.as_str())
-                .copied()
+                .cloned()
                 .map(ScopeDef::BuiltinFunction)
                 .or_else(|| {
                     api_globals
@@ -164,14 +164,14 @@ impl<'a> Resolver<'a> {
         };
 
         if api_context == APIContext::Repo {
-            return resolve_in_api_globals(globals.repo_globals(self.db));
+            return resolve_in_api_globals(&globals.repo_globals);
         }
         if api_context == APIContext::Cquery {
-            return resolve_in_api_globals(globals.cquery_globals(self.db));
+            return resolve_in_api_globals(&globals.cquery_globals);
         }
-        resolve_in_api_globals(globals.bzl_globals(self.db)).or_else(|| match api_context {
-            APIContext::Module => resolve_in_api_globals(globals.bzlmod_globals(self.db)),
-            APIContext::Workspace => resolve_in_api_globals(globals.workspace_globals(self.db)),
+        resolve_in_api_globals(&globals.bzl_globals).or_else(|| match api_context {
+            APIContext::Module => resolve_in_api_globals(&globals.bzlmod_globals),
+            APIContext::Workspace => resolve_in_api_globals(&globals.workspace_globals),
             _ => None,
         })
     }
@@ -183,8 +183,8 @@ impl<'a> Resolver<'a> {
         let mut names = self.module_names();
 
         // Add names from Starlark intrinsics.
-        for (key, func) in intrinsic_functions(self.db).functions(self.db).iter() {
-            names.insert(key.clone(), ScopeDef::IntrinsicFunction(*func));
+        for (key, func) in intrinsic_functions(self.db).functions.iter() {
+            names.insert(key.clone(), ScopeDef::IntrinsicFunction(func.clone()));
         }
 
         let api_context = match self.file.api_context(self.db) {
@@ -219,7 +219,10 @@ impl<'a> Resolver<'a> {
         // Add names from builtins, taking the current Bazel API context into account.
         let mut add_builtins = |api_globals: &APIGlobals| {
             for (name, func) in api_globals.functions.iter() {
-                names.insert(Name::from_str(name), ScopeDef::BuiltinFunction(*func));
+                names.insert(
+                    Name::from_str(name),
+                    ScopeDef::BuiltinFunction(func.clone()),
+                );
             }
             for (name, type_ref) in api_globals.variables.iter() {
                 names.insert(
@@ -230,16 +233,16 @@ impl<'a> Resolver<'a> {
         };
 
         if api_context == APIContext::Repo {
-            add_builtins(builtin_globals.repo_globals(self.db));
+            add_builtins(&builtin_globals.repo_globals);
         } else if api_context == APIContext::Cquery {
-            add_builtins(builtin_globals.cquery_globals(self.db));
+            add_builtins(&builtin_globals.cquery_globals);
         } else if api_context == APIContext::Vendor {
-            add_builtins(builtin_globals.vendor_globals(self.db));
+            add_builtins(&builtin_globals.vendor_globals);
         } else {
-            add_builtins(builtin_globals.bzl_globals(self.db));
+            add_builtins(&builtin_globals.bzl_globals);
             match api_context {
-                APIContext::Module => add_builtins(builtin_globals.bzlmod_globals(self.db)),
-                APIContext::Workspace => add_builtins(builtin_globals.workspace_globals(self.db)),
+                APIContext::Module => add_builtins(&builtin_globals.bzlmod_globals),
+                APIContext::Workspace => add_builtins(&builtin_globals.workspace_globals),
                 _ => {}
             }
         }
@@ -283,13 +286,13 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn new_for_module(db: &'a dyn Db, file: File) -> Self {
-        let scopes = module_scopes(db, file).scopes(db);
+        let scopes = module_scopes(db, file);
         let scope = scopes.scope_for_hir_id(ScopeHirId::Module);
         Self::from_parts(db, file, scopes, scope)
     }
 
     pub(crate) fn new_for_expr(db: &'a dyn Db, file: File, expr: ExprId) -> Self {
-        let scopes = module_scopes(db, file).scopes(db);
+        let scopes = module_scopes(db, file);
         let scope = scopes.scope_for_hir_id(expr);
         Self::from_parts(db, file, scopes, scope)
     }
@@ -299,13 +302,13 @@ impl<'a> Resolver<'a> {
         file: File,
         hir: impl Into<ScopeHirId>,
     ) -> Self {
-        let scopes = module_scopes(db, file).scopes(db);
+        let scopes = module_scopes(db, file);
         let scope = scopes.scope_for_hir_execution_scope(hir);
         Self::from_parts(db, file, scopes, scope)
     }
 
     pub(crate) fn new_for_offset(db: &'a dyn Db, file: File, offset: TextSize) -> Self {
-        let scopes = module_scopes(db, file).scopes(db);
+        let scopes = module_scopes(db, file);
         let source_map = source_map(db, file);
         let scope = scopes
             .scopes_by_hir_id
