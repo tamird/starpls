@@ -8,6 +8,9 @@ use def::scope::ParameterDef;
 use def::Function;
 use def::LoadItemId;
 use def::Stmt;
+use ruff_python_ast::ExprRef;
+use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::StmtFunctionDef;
 use smallvec::SmallVec;
 use starpls_bazel::Builtins;
 use starpls_common::parse;
@@ -188,21 +191,6 @@ impl<'a> Semantics<'a> {
         parse(self.db, file)
     }
 
-    pub fn callable_for_def(&self, file: File, node: ast::DefStmt) -> Option<Callable<'a>> {
-        let range = node.syntax().text_range();
-        let stmt = source_map(self.db, file).stmt_map.get(&range)?;
-        match &module(self.db, file)[*stmt] {
-            Stmt::Def { func, .. } => Some(Callable::new(
-                *self,
-                CallableInner::HirDef(FunctionDef::Def {
-                    func: func.clone(),
-                    stmt: InFile { file, value: *stmt },
-                }),
-            )),
-            _ => None,
-        }
-    }
-
     pub fn resolve_path_type(&self, file: File, node: &ast::PathType) -> Option<Type<'a>> {
         let usage = node
             .syntax()
@@ -256,19 +244,32 @@ impl<'a> Semantics<'a> {
         })
     }
 
-    pub fn resolve_def_stmt(&self, file: File, def_stmt: &ast::DefStmt) -> Option<Callable<'a>> {
-        let module = module(self.db, file);
-        let stmt = source_map(self.db, file)
+    /// Resolve a definition from the canonical parsed revision of `file`.
+    pub fn resolve_def_stmt(&self, file: File, node: &StmtFunctionDef) -> Option<Callable<'a>> {
+        let stmt = *source_map(self.db, file)
+            .stmt_nodes
+            .get(&node.node_index().load())?;
+        self.callable_for_stmt(file, stmt)
+    }
+
+    /// Temporary entry point for editor consumers still using Rowan.
+    pub fn resolve_syntax_def_stmt(&self, file: File, node: &ast::DefStmt) -> Option<Callable<'a>> {
+        let stmt = *source_map(self.db, file)
             .stmt_map
-            .get(&def_stmt.syntax().text_range())?;
-        let Stmt::Def { ref func, .. } = module[*stmt] else {
+            .get(&node.syntax().text_range())?;
+        self.callable_for_stmt(file, stmt)
+    }
+
+    fn callable_for_stmt(&self, file: File, stmt: def::StmtId) -> Option<Callable<'a>> {
+        let Self { db } = self;
+        let Stmt::Def { func, stmts: _ } = &module(*db, file)[stmt] else {
             return None;
         };
         Some(Callable::new(
             *self,
             CallableInner::HirDef(FunctionDef::Def {
                 func: func.clone(),
-                stmt: InFile { file, value: *stmt },
+                stmt: InFile { file, value: stmt },
             }),
         ))
     }
@@ -337,14 +338,32 @@ impl<'a> Semantics<'a> {
         }
     }
 
-    pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope<'a>> {
-        let range = expr.syntax().text_range();
-        let expr = source_map(self.db, file).expr_map.get(&range)?;
-        let resolver = Resolver::new_for_expr(self.db, file, *expr);
-        Some(SemanticsScope {
+    /// Resolve an expression from the canonical parsed revision of `file`.
+    pub fn scope_for_expr(&self, file: File, expr: ExprRef<'_>) -> Option<SemanticsScope<'a>> {
+        let expr = *source_map(self.db, file)
+            .expr_nodes
+            .get(&expr.node_index().load())?;
+        Some(self.scope_for_hir_expr(file, expr))
+    }
+
+    /// Temporary entry point for editor consumers still using Rowan.
+    pub fn scope_for_syntax_expr(
+        &self,
+        file: File,
+        expr: &ast::Expression,
+    ) -> Option<SemanticsScope<'a>> {
+        let expr = *source_map(self.db, file)
+            .expr_map
+            .get(&expr.syntax().text_range())?;
+        Some(self.scope_for_hir_expr(file, expr))
+    }
+
+    fn scope_for_hir_expr(&self, file: File, expr: ExprId) -> SemanticsScope<'a> {
+        let Self { db } = self;
+        SemanticsScope {
             sema: *self,
-            resolver,
-        })
+            resolver: Resolver::new_for_expr(*db, file, expr),
+        }
     }
 
     pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope<'a> {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use either::Either;
 use id_arena::Arena;
 use id_arena::Id;
+use ruff_python_ast::NodeIndex;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use starpls_common::File;
@@ -59,6 +60,8 @@ pub(crate) enum AssignmentSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSourceMap {
     pub root: TextRange,
+    pub expr_nodes: FxHashMap<NodeIndex, ExprId>,
+    pub stmt_nodes: FxHashMap<NodeIndex, StmtId>,
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
@@ -85,6 +88,8 @@ impl ModuleSourceMap {
     pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
         let Self {
             root,
+            expr_nodes: _,
+            stmt_nodes: _,
             function_names: _,
             keyword_names: _,
             type_comment_owners: _,
@@ -477,6 +482,12 @@ impl Name {
 
     fn new(repr: SmolStr) -> Self {
         Self(repr)
+    }
+}
+
+impl From<&str> for Name {
+    fn from(name: &str) -> Self {
+        Self::from_str(name)
     }
 }
 

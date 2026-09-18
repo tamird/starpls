@@ -7,6 +7,7 @@ use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::ArgOrKeyword;
+use ruff_python_ast::HasNodeIndex;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
@@ -61,6 +62,8 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
         module: Default::default(),
         source_map: ModuleSourceMap {
             root: source_range(TextRange::up_to(TextSize::of(&*source))),
+            expr_nodes: Default::default(),
+            stmt_nodes: Default::default(),
             function_names: Default::default(),
             keyword_names: Default::default(),
             type_comment_owners: Default::default(),
@@ -160,7 +163,13 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: &py::Stmt) -> Option<StmtId> {
-        stacker::maybe_grow(32 * 1024, 1024 * 1024, || self.lower_stmt_inner(stmt))
+        stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+            let id = self.lower_stmt_inner(stmt)?;
+            self.source_map
+                .stmt_nodes
+                .insert(stmt.node_index().load(), id);
+            Some(id)
+        })
     }
 
     fn lower_stmt_inner(&mut self, stmt: &py::Stmt) -> Option<StmtId> {
@@ -444,6 +453,11 @@ impl<'a> LoweringContext<'a> {
     fn lower_expr(&mut self, expr: &py::Expr, parent: AnyNodeRef<'_>) -> ExprId {
         stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
             let mut id = self.lower_bare_expr(expr);
+            if !matches!(self.module.exprs[id], Expr::Missing) {
+                self.source_map
+                    .expr_nodes
+                    .insert(expr.node_index().load(), id);
+            }
             for range in parentheses_iterator(expr.into(), Some(parent), self.tokens)
                 .take_while(|range| range.start() >= parent.start())
             {
