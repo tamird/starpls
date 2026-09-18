@@ -1992,7 +1992,7 @@ impl TyContext<'_> {
                         )
                         .intern(),
                     ),
-                    _ => None,
+                    _ => Some(ty.clone()),
                 }
             }
             _ => None,

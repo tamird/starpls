@@ -1660,6 +1660,72 @@ my_rule = repository_rule(
 }
 
 #[test]
+fn test_rule_context_without_known_attributes() {
+    for (rule, context, method) in [
+        ("rule", "ctx", "runfiles"),
+        ("repository_rule", "repository_ctx", "download"),
+    ] {
+        for attrs in ["", ", attrs = None", ", attrs = get_attrs()"] {
+            let mut builder = TestDatabaseBuilder::default();
+            builder.add_function("rule");
+            builder.add_type(FixtureType::new(
+                context,
+                vec![("attr", "struct")],
+                vec![method],
+            ));
+            builder.set_inference_options(InferenceOptions {
+                infer_ctx_attributes: true,
+                use_code_flow_analysis: true,
+                allow_unused_definitions: true,
+            });
+            let mut db = builder.build();
+            let input = format!(
+                "def get_attrs():\n    return {{}}\n\
+                 def _impl(ctx):\n    ctx.{method}()\n    ctx.attr.custom\n\
+                 my_rule = {rule}(implementation = _impl{attrs})\n"
+            );
+            let file = starpls_common::open_document(
+                &mut db,
+                std::path::Path::new("main.bzl"),
+                Dialect::Bazel,
+                Some(FileInfo::Bazel {
+                    api_context: APIContext::Bzl,
+                    is_external: false,
+                }),
+                input.clone(),
+                0,
+            )
+            .unwrap();
+            let map = source_map(&db, file);
+            for (text, expected) in [
+                ("ctx".to_string(), context.to_string()),
+                (
+                    format!("ctx.{method}"),
+                    format!("def {method}(*args, **kwargs) -> Unknown"),
+                ),
+                ("ctx.attr.custom".to_string(), "Unknown".to_string()),
+            ] {
+                let expr = map
+                    .expr_map_back
+                    .iter()
+                    .find_map(|(expr, range)| {
+                        (input[usize::from(range.start())..usize::from(range.end())] == text)
+                            .then_some(*expr)
+                    })
+                    .unwrap();
+                let ty = super::queries::infer_expr(&db, file, expr);
+                assert_eq!(
+                    ty.display(&db).to_string(),
+                    expected,
+                    "{rule}{attrs}: {text}"
+                );
+            }
+            assert!(super::queries::diagnostics(&db, file).is_empty());
+        }
+    }
+}
+
+#[test]
 fn test_infer_ctx_attrs_disabled() {
     check_infer(
         r#"
