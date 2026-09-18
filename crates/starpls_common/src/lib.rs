@@ -1,10 +1,9 @@
 use std::fmt::Debug;
 use std::path::PathBuf;
 
+use ruff_source_file::LineIndex;
 use starpls_bazel::APIContext;
-use starpls_syntax::line_index as syntax_line_index;
 use starpls_syntax::parse_module;
-use starpls_syntax::LineIndex;
 use starpls_syntax::Module;
 use starpls_syntax::ParseTree;
 use starpls_syntax::SyntaxNode;
@@ -175,12 +174,26 @@ struct LineIndexResult {
 
 #[salsa::tracked]
 fn line_index_query(db: &dyn Db, file: File) -> LineIndexResult {
-    let line_index = syntax_line_index(file.contents(db));
+    let line_index = LineIndex::from_source_text(file.contents(db));
     LineIndexResult::new(db, line_index)
 }
 
 pub fn line_index(db: &dyn Db, file: File) -> &LineIndex {
     line_index_query(db, file).inner(db)
+}
+
+/// Text and its index borrowed from the same file revision.
+#[derive(Clone, Copy)]
+pub struct Source<'a> {
+    pub text: &'a str,
+    pub index: &'a LineIndex,
+}
+
+pub fn source(db: &dyn Db, file: File) -> Source<'_> {
+    Source {
+        text: file.contents(db),
+        index: line_index(db, file),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

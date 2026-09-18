@@ -1,10 +1,8 @@
-pub use line_index::LineIndex;
 pub use rowan::TextRange;
 pub use rowan::TextSize;
 pub use rowan::TokenAtOffset;
 
 pub use crate::ast::Module;
-pub use crate::parser::line_index;
 pub use crate::parser::parse_module;
 pub use crate::parser::ParseTree;
 pub use crate::parser::SyntaxError;

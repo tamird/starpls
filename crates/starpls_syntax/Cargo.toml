@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 drop_bomb = "0.1.5"
 rowan = "0.15.11"
-line-index = "0.1.0"
 ruff_python_parser = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_text_size = { workspace = true }

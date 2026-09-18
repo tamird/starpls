@@ -959,16 +959,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "line-index"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67d61795376ae2683928c218fda7d7d7db136fd38c06b7552904667f0d55580a"
-dependencies = [
- "nohash-hasher",
- "text-size",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1090,12 +1080,6 @@ name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
-
-[[package]]
-name = "nohash-hasher"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "object"
@@ -1864,12 +1848,12 @@ dependencies = [
  "dashmap",
  "env_logger",
  "indexmap 2.14.2",
- "line-index",
  "log",
  "lsp-server",
  "lsp-types",
  "parking_lot",
  "rayon",
+ "ruff_source_file",
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
@@ -1902,6 +1886,7 @@ name = "starpls_common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ruff_source_file",
  "salsa-2022",
  "starpls_bazel",
  "starpls_syntax",
@@ -1965,7 +1950,6 @@ dependencies = [
  "cc",
  "drop_bomb",
  "expect-test",
- "line-index",
  "rowan",
  "ruff_python_ast",
  "ruff_python_parser",

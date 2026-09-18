@@ -76,7 +76,11 @@ impl<'a> LoweringContext<'a> {
         let line_index = line_index(self.db, self.file);
         self.module.type_ignore_comment_lines = syntax
             .type_ignore_comment_positions()
-            .map(|pos| line_index.line_col(pos).line)
+            .map(|pos| {
+                line_index
+                    .line_index(u32::from(pos).into())
+                    .to_zero_indexed() as u32
+            })
             .collect();
 
         let mut top_level = Vec::new();

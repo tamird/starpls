@@ -93,7 +93,7 @@ pub(crate) fn find_references(
 ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
     let path = path_buf_from_url(&params.text_document_position.text_document.uri)?;
     let file_id = try_opt!(snapshot.document_manager.read().lookup_by_path_buf(&path));
-    let line_index = try_opt!(snapshot.analysis_snapshot.line_index(file_id)?);
+    let source = try_opt!(snapshot.analysis_snapshot.source(file_id)?);
     let pos = try_opt!(convert::text_size_from_lsp_position(
         snapshot,
         file_id,
@@ -106,7 +106,7 @@ pub(crate) fn find_references(
         .into_iter()
         .filter_map(|location| {
             Some(lsp_types::Location {
-                range: convert::lsp_range_from_text_range(location.range, line_index)?,
+                range: convert::lsp_range_from_text_range(location.range, source)?,
                 uri: lsp_types::Url::from_file_path(
                     snapshot
                         .document_manager
@@ -126,7 +126,7 @@ pub(crate) fn completion(
 ) -> anyhow::Result<Option<lsp_types::CompletionResponse>> {
     let path = path_buf_from_url(&params.text_document_position.text_document.uri)?;
     let file_id = try_opt!(snapshot.document_manager.read().lookup_by_path_buf(&path));
-    let line_index = try_opt!(snapshot.analysis_snapshot.line_index(file_id)?);
+    let source = try_opt!(snapshot.analysis_snapshot.source(file_id)?);
     let pos = try_opt!(convert::text_size_from_lsp_position(
         snapshot,
         file_id,
@@ -153,7 +153,7 @@ pub(crate) fn completion(
                                 Edit::TextEdit(edit) => {
                                     lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
                                         range: convert::lsp_range_from_text_range(
-                                            edit.range, line_index,
+                                            edit.range, source,
                                         )?,
                                         new_text: edit.new_text,
                                     })
@@ -166,11 +166,11 @@ pub(crate) fn completion(
                                             new_text: edit.new_text,
                                             insert: convert::lsp_range_from_text_range(
                                                 edit.insert,
-                                                line_index,
+                                                source,
                                             )?,
                                             replace: convert::lsp_range_from_text_range(
                                                 edit.replace,
-                                                line_index,
+                                                source,
                                             )?,
                                         },
                                     )
@@ -274,14 +274,14 @@ pub(crate) fn document_symbols(
 ) -> anyhow::Result<Option<lsp_types::DocumentSymbolResponse>> {
     let path = path_buf_from_url(&params.text_document.uri)?;
     let file_id = try_opt!(snapshot.document_manager.read().lookup_by_path_buf(&path));
-    let line_index = try_opt!(snapshot.analysis_snapshot.line_index(file_id)?);
+    let source = try_opt!(snapshot.analysis_snapshot.source(file_id)?);
     Ok(snapshot
         .analysis_snapshot
         .document_symbols(file_id)?
         .map(|symbols| {
             symbols
                 .into_iter()
-                .filter_map(|symbol| convert::lsp_document_symbol_from_native(symbol, line_index))
+                .filter_map(|symbol| convert::lsp_document_symbol_from_native(symbol, source))
                 .collect::<Vec<_>>()
                 .into()
         }))
