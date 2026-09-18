@@ -108,68 +108,20 @@ impl<'a> GotoDefinitionHandler<'a> {
     // the actual definition of a re-exported symbol.
     fn try_resolve_re_export(&self, load_item: &LoadItem) -> Option<LocationLink> {
         let def = load_item.definition()?;
-        self.try_resolve_assign_from_load_item(&def)
-            .and_then(|load_item| self.try_resolve_re_export(&load_item))
-            .or_else(|| self.def_to_location_link(def))
-    }
-
-    fn try_resolve_assign_from_load_item(&self, def: &ScopeDef) -> Option<LoadItem<'a>> {
-        let InFile { file, value: ptr } = def.syntax_node_ptr()?;
-        let syntax = ptr.try_to_node(&self.sema.parse(file).syntax())?;
-        if !ast::NameRef::can_cast(syntax.kind()) {
-            return None;
+        if let ScopeDef::Variable(variable) = &def {
+            if let Some(item) = variable.re_export() {
+                if let Some(location) = self.try_resolve_re_export(&item) {
+                    return Some(location);
+                }
+            }
         }
-        let assign_stmt = ast::AssignStmt::cast(syntax.parent()?)?;
-        let name_ref = match assign_stmt.rhs()? {
-            ast::Expression::Name(name_ref) => name_ref,
-            _ => return None,
-        };
-        let name = Name::from_ast_name_ref(name_ref.clone());
-        let scope = self
-            .sema
-            .scope_for_expr(file, &ast::Expression::cast(name_ref.syntax().clone())?)?;
-        scope
-            .resolve_name(&name)
-            .into_iter()
-            .find_map(|def| match def {
-                ScopeDef::LoadItem(load_item) => Some(load_item),
-                _ => None,
-            })
+        self.def_to_location_link(def)
     }
 
     fn handle_dot_expr(&self, dot_expr: ast::DotExpr) -> Option<Vec<LocationLink>> {
         let ty = self.sema.type_of_expr(self.file, &dot_expr.expr()?)?;
-
-        if let Some(strukt) = ty.try_as_inline_struct() {
-            // Check for struct field definition.
-            let struct_call_expr = strukt.call_expr()?;
-            struct_call_expr
-                .value
-                .arguments()
-                .into_iter()
-                .flat_map(|args| args.arguments())
-                .find_map(|arg| match arg {
-                    ast::Argument::Keyword(kwarg) => {
-                        let name = kwarg.name()?;
-                        (name.name()?.text() == self.token.text()).then(|| {
-                            let range = name.syntax().text_range();
-                            vec![LocationLink::Local {
-                                origin_selection_range: None,
-                                target_range: range,
-                                target_selection_range: range,
-                                target_file_id: struct_call_expr.file,
-                            }]
-                        })
-                    }
-                    _ => None,
-                })
-        } else if let Some(provider_fields) = ty.provider_fields_source() {
-            // Check for provider field definition. This only handles the case where the provider
-            // fields are specified in a dictionary literal.
-            self.find_name_in_dict_expr(provider_fields)
-        } else {
-            None
-        }
+        let source = ty.field_definition(self.token.text())?;
+        Some(vec![location_link(source)])
     }
 
     fn handle_keyword_argument(&self, arg: ast::KeywordArgument) -> Option<Vec<LocationLink>> {
@@ -180,29 +132,9 @@ impl<'a> GotoDefinitionHandler<'a> {
             .and_then(|args| args.syntax().parent())
             .and_then(ast::CallExpr::cast)?;
         let callable = self.sema.resolve_call_expr(self.file, &call_expr)?;
-
-        // If the callable is a rule, link to the dictionary where its attributes are declared.
-        if let Some(attrs_expr) = callable.rule_attrs_source() {
-            return self.find_name_in_dict_expr(attrs_expr);
-        }
-
-        let (param, _) = callable.params().into_iter().find(|(param, _)| {
-            param.name().as_ref().map(|name| name.as_str())
-                == arg
-                    .name()
-                    .and_then(|name| name.name())
-                    .as_ref()
-                    .map(|name| name.text())
-        })?;
-
-        let InFile { file, value: ptr } = param.syntax_node_ptr()?;
-        let range = ptr.text_range();
-        Some(vec![LocationLink::Local {
-            origin_selection_range: None,
-            target_range: range,
-            target_selection_range: range,
-            target_file_id: file,
-        }])
+        let name = arg.name()?.name()?;
+        let source = callable.keyword_definition(name.text())?;
+        Some(vec![location_link(source)])
     }
 
     fn handle_load_module(&self, load_module: ast::LoadModule) -> Option<Vec<LocationLink>> {
@@ -301,61 +233,17 @@ impl<'a> GotoDefinitionHandler<'a> {
         }
     }
 
-    fn find_name_in_dict_expr(
-        &self,
-        dict_expr: InFile<ast::DictExpr>,
-    ) -> Option<Vec<LocationLink>> {
-        dict_expr.value.entries().find_map(|entry| {
-            entry
-                .key()
-                .as_ref()
-                .and_then(|entry| match entry {
-                    ast::Expression::Literal(lit) => Some((lit.syntax(), lit.kind())),
-                    _ => None,
-                })
-                .and_then(|(syntax, kind)| match kind {
-                    ast::LiteralKind::String(s)
-                        if s.value().as_deref() == Some(self.token.text()) =>
-                    {
-                        Some(vec![LocationLink::Local {
-                            origin_selection_range: None,
-                            target_range: syntax.text_range(),
-                            target_selection_range: syntax.text_range(),
-                            target_file_id: dict_expr.file,
-                        }])
-                    }
-                    _ => None,
-                })
-        })
-    }
-
     fn def_to_location_link(&self, def: ScopeDef) -> Option<LocationLink> {
-        let location = match def {
-            ScopeDef::Callable(_) => {
-                let InFile { file, value: ptr } = def.syntax_node_ptr()?;
-                let def_stmt = ptr
-                    .try_to_node(&self.sema.parse(file).syntax())
-                    .and_then(ast::DefStmt::cast)?;
-                let range = def_stmt.name()?.syntax().text_range();
-                LocationLink::Local {
-                    origin_selection_range: None,
-                    target_range: range,
-                    target_selection_range: range,
-                    target_file_id: file,
-                }
-            }
-            _ => {
-                let InFile { file, value: ptr } = def.syntax_node_ptr()?;
-                let range = ptr.text_range();
-                LocationLink::Local {
-                    origin_selection_range: None,
-                    target_range: range,
-                    target_selection_range: range,
-                    target_file_id: file,
-                }
-            }
-        };
-        Some(location)
+        Some(location_link(def.definition_range()?))
+    }
+}
+
+fn location_link(InFile { file, value: range }: InFile<TextRange>) -> LocationLink {
+    LocationLink::Local {
+        origin_selection_range: None,
+        target_range: range,
+        target_selection_range: range,
+        target_file_id: file,
     }
 }
 
@@ -531,6 +419,94 @@ info = GoInfo(foo = 123)
 info.fo$0o
 "#,
         )
+    }
+
+    #[test]
+    fn test_imported_field_origins() {
+        for (definition, usage) in [
+            (
+                "value = struct(foo = 1, foo = 2)\n               #^^\n",
+                "alias.fo$0o",
+            ),
+            (
+                r#"value = provider(fields = {
+    "\x66oo": "first",
+    #^^^^^^^
+    "foo": "second",
+})
+"#,
+                "alias().fo$0o",
+            ),
+            (
+                r#"value = rule(attrs = {
+    "foo": None,
+    #^^^^
+    "foo": attr.string(),
+})
+"#,
+                "alias(fo$0o = 1)",
+            ),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            fixture.add_file(&mut analysis.db, "//:defs.bzl", definition);
+            fixture.add_file(
+                &mut analysis.db,
+                "//:main.bzl",
+                &format!("load(\"//:defs.bzl\", alias = \"value\")\n{usage}"),
+            );
+            loader.add_files_from_fixture(&fixture);
+            check_goto_definition_from_fixture(analysis, fixture, false);
+        }
+    }
+
+    #[test]
+    fn test_incomplete_struct_field() {
+        check_goto_definition(
+            r#"
+s = struct(foo = )
+           #^^
+s.fo$0o
+"#,
+        );
+    }
+
+    #[test]
+    fn test_parameter_range_includes_default() {
+        check_goto_definition(
+            r#"
+def f(abc = 123):
+      #^^^^^^^^
+    pass
+f(ab$0c = 0)
+"#,
+        );
+    }
+
+    #[test]
+    fn test_re_export_assignment_shapes() {
+        for (definition, declaration) in [
+            ("foo = 1", "foo = (_foo)\n#^^"),
+            ("foo = 1", "(foo) = _foo\n #^^"),
+            ("foo = 1", "foo, other = _foo\n#^^"),
+            ("foo = 1\n#^^", "_foo = 0\nfoo = _foo"),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            fixture.add_file(&mut analysis.db, "//:defs.bzl", definition);
+            fixture.add_file(
+                &mut analysis.db,
+                "//:middle.bzl",
+                &format!("load(\"//:defs.bzl\", _foo = \"foo\")\n{declaration}"),
+            );
+            fixture.add_file(
+                &mut analysis.db,
+                "//:main.bzl",
+                "load(\"//:middle.bzl\", \"foo\")\nf$0oo",
+            );
+            loader.add_files_from_fixture(&fixture);
+            check_goto_definition_from_fixture(analysis, fixture, true);
+        }
     }
 
     #[test]

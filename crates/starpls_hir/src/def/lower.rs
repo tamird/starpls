@@ -504,9 +504,7 @@ impl<'a> LoweringContext<'a> {
                     let name = self.lower_name_opt(arg.name());
                     let expr = self.lower_expr_opt(arg.expr());
                     if let Some(range) = name_range {
-                        if self.source_map.expr_map_back.contains_key(&expr) {
-                            self.source_map.keyword_names.insert(expr, range);
-                        }
+                        self.source_map.keyword_names.insert(expr, range);
                     }
                     Argument::Keyword { name, expr }
                 }

@@ -7,14 +7,13 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use smallvec::smallvec;
 use smallvec::SmallVec;
-use starpls_common::parse;
 use starpls_common::Diagnostic;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
-use starpls_syntax::ast::SyntaxNodePtr;
+use starpls_syntax::TextRange;
 use ty_flow::reachability_constraints::ScopedReachabilityConstraintId;
 
 use crate::def::scope::FunctionDef;
@@ -883,7 +882,7 @@ impl Param<'_> {
         }
     }
 
-    pub fn syntax_node_ptr(&self) -> Option<InFile<SyntaxNodePtr>> {
+    pub fn source_range(&self) -> Option<InFile<TextRange>> {
         let Self { sema, inner } = self;
         let db = sema.db;
         match *inner {
@@ -894,7 +893,7 @@ impl Param<'_> {
                     .get(&func.params[index])
                     .map(|ptr| InFile {
                         file,
-                        value: ptr.syntax_node_ptr(),
+                        value: ptr.syntax_node_ptr().text_range(),
                     })
             }
             _ => None,
@@ -928,16 +927,12 @@ impl Param<'_> {
             _ => return None,
         };
 
-        attr.default_value.as_ref().and_then(|e| {
-            Some(match e {
-                Either::Left(ptr) => ptr
-                    .value
-                    .to_owned()
-                    .try_to_node(&parse(db, ptr.file).syntax())?
-                    .text()
-                    .to_string(),
-                Either::Right(s) => s.as_ref().to_string(),
-            })
+        attr.default_value.as_ref().map(|e| match e {
+            Either::Left(InFile { file, value: range }) => {
+                let source = file.contents(db);
+                source[usize::from(range.start())..usize::from(range.end())].to_owned()
+            }
+            Either::Right(s) => s.as_ref().to_string(),
         })
     }
 }
@@ -1311,7 +1306,7 @@ pub struct Attribute {
     pub kind: AttributeKind,
     pub doc: Option<Arc<str>>,
     pub mandatory: bool,
-    pub default_value: Option<Either<InFile<SyntaxNodePtr>, Arc<str>>>,
+    pub default_value: Option<Either<InFile<TextRange>, Arc<str>>>,
 }
 
 impl Attribute {
@@ -1319,7 +1314,7 @@ impl Attribute {
         kind: AttributeKind,
         doc: Option<Arc<str>>,
         mandatory: bool,
-        default_value: Option<Either<InFile<SyntaxNodePtr>, Arc<str>>>,
+        default_value: Option<Either<InFile<TextRange>, Arc<str>>>,
     ) -> Self {
         Self {
             kind,

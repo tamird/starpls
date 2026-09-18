@@ -347,7 +347,7 @@ impl BuiltinFunctionData {
             (Some("attr"), attr) => {
                 let mut doc: Option<Arc<str>> = None;
                 let mut mandatory = false;
-                let mut default_ptr = None;
+                let mut default_range = None;
                 for (arg, ty) in args {
                     if let Argument::Keyword { name, expr } = arg {
                         match name.as_str() {
@@ -363,7 +363,7 @@ impl BuiltinFunctionData {
                             }
                             "default" => {
                                 if let Some(ptr) = source_map(db, file).expr_map_back.get(expr) {
-                                    default_ptr = Some(ptr.syntax_node_ptr());
+                                    default_range = Some(ptr.syntax_node_ptr().text_range());
                                 }
                             }
                             _ => {}
@@ -390,7 +390,7 @@ impl BuiltinFunctionData {
                     },
                     doc,
                     mandatory,
-                    default_ptr.map(|text_range| {
+                    default_range.map(|text_range| {
                         Either::Left(InFile {
                             file,
                             value: text_range,
