@@ -230,6 +230,36 @@ mod tests {
     }
 
     #[test]
+    fn type_comments_resolve_in_their_declaration_context() {
+        for (body, expected) in [
+            ("def f(x, # type: P$0\n): pass", "P"),
+            ("def f():\n    if True:\n        x = P() # type: P$0", "P"),
+            ("def f():\n    Q = provider()\n    x = Q() # type: Q$0", "Q"),
+            ("def f(): # type: () -> P$0\n    pass", "P"),
+            ("x = 0; # type: P$0", "Unknown"),
+            (
+                "def f():\n    \"doc\"\n    # type: () -> P$0\n    pass",
+                "Unknown",
+            ),
+            ("def f(x=(\n    1 # type: P$0\n)): pass", "Unknown"),
+        ] {
+            let input = format!("P = provider()\n{body}\n");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&input);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let hover = analysis
+                .snapshot()
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                hover.contents.value,
+                format!("```python\n(type) {expected}\n```\n"),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn check_variable() {
         check_hover(
             r#"

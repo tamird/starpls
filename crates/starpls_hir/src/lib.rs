@@ -22,7 +22,6 @@ use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::AstPtr;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
-use starpls_syntax::T;
 use typeck::builtins::BuiltinFunction;
 use typeck::intrinsics::IntrinsicFunction;
 use typeck::queries;
@@ -45,6 +44,7 @@ use crate::def::Literal;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
+use crate::def::TypeCommentOwner;
 pub use crate::test_database::Fixture;
 pub use crate::typeck::builtins::BuiltinDefs;
 pub use crate::typeck::queries::diagnostics as inference_diagnostics;
@@ -209,27 +209,17 @@ impl<'a> Semantics<'a> {
             .syntax()
             .ancestors()
             .find_map(ast::TypeComment::cast)
-            .and_then(|type_comment| {
-                let parent = type_comment.syntax().parent()?;
-                let ptr = if ast::Suite::can_cast(parent.kind()) {
-                    let grandparent = parent.parent()?;
-                    if ast::DefStmt::can_cast(grandparent.kind()) {
-                        AstPtr::new(&ast::Statement::cast(grandparent)?)
-                    } else {
-                        return None;
+            .and_then(|comment| {
+                let owner = source_map(self.db, file)
+                    .type_comment_owners
+                    .get(&comment.syntax().text_range())?;
+                let value = match owner {
+                    TypeCommentOwner::Statement(stmt) => *stmt,
+                    TypeCommentOwner::Parameter(param) => {
+                        module(self.db, file).param_to_def_stmt.get(param)?.0
                     }
-                } else {
-                    let assign_stmt = type_comment
-                        .syntax()
-                        .siblings_with_tokens(ast::Direction::Prev)
-                        .take_while(|el| !matches!(el.kind(), T!['\n'] | T![;]))
-                        .filter_map(|el| el.into_node())
-                        .find_map(ast::AssignStmt::cast)?;
-                    AstPtr::new(&ast::Statement::Assign(assign_stmt))
                 };
-
-                let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
-                Some(InFile { file, value: *stmt })
+                Some(InFile { file, value })
             });
         let segments = node
             .segments()

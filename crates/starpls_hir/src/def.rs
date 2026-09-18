@@ -66,6 +66,7 @@ pub(crate) struct ModuleSourceMap {
     pub root: TextRange,
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
+    pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
     pub expr_map: FxHashMap<ExprPtr, ExprId>,
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
     pub stmt_map: FxHashMap<StmtPtr, StmtId>,
@@ -74,6 +75,13 @@ pub(crate) struct ModuleSourceMap {
     pub param_map_back: FxHashMap<ParamId, TextRange>,
     pub load_item_map: FxHashMap<LoadItemPtr, LoadItemId>,
     pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
+}
+
+/// The HIR declaration whose type is described by a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypeCommentOwner {
+    Statement(StmtId),
+    Parameter(ParamId),
 }
 
 impl ModuleSourceMap {
