@@ -786,6 +786,49 @@ info = DataInfo(foo = "foo", bar = "bar")
 }
 
 #[test]
+fn test_parenthesized_provider_is_anonymous() {
+    check_infer(
+        "Direct = provider()\nParenthesized = (provider())\nNested = [provider()]\n",
+        expect![[r#"
+            0..6 "Direct": Provider[Direct]
+            9..17 "provider": def provider(*args, **kwargs) -> Unknown
+            9..19 "provider()": Provider[Direct]
+            20..33 "Parenthesized": Provider[_]
+            37..45 "provider": def provider(*args, **kwargs) -> Unknown
+            37..47 "provider()": Provider[_]
+            36..48 "(provider())": Provider[_]
+            49..55 "Nested": list[Provider[_]]
+            59..67 "provider": def provider(*args, **kwargs) -> Unknown
+            59..69 "provider()": Provider[_]
+            58..70 "[provider()]": list[Provider[_]]
+        "#]],
+    );
+}
+
+#[test]
+fn test_incomplete_assignment_sources() {
+    for enabled in [false, true] {
+        check_infer_with_options(
+            "value = # type: string\nfor item in :\n    item\nvalues = [element for element in ]\n",
+            expect![[r#"
+            0..5 "value": Unknown
+            27..31 "item": Unknown
+            41..45 "item": Unknown
+            46..52 "values": list[Unknown]
+            56..63 "element": Unknown
+            68..75 "element": Unknown
+            55..80 "[element for element in ]": list[Unknown]
+        "#]],
+            InferenceOptions {
+                use_code_flow_analysis: enabled,
+                allow_unused_definitions: true,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+#[test]
 fn test_provider_constructor() {
     check_infer(
         r#"

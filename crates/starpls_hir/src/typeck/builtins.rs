@@ -15,18 +15,19 @@ use starpls_bazel::Builtins;
 use starpls_bazel::BUILTINS_TYPES_DENY_LIST;
 use starpls_bazel::BUILTINS_VALUES_DENY_LIST;
 use starpls_bazel::KNOWN_PROVIDER_TYPES;
-use starpls_common::parse;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::{self};
 
 use crate::def::resolver::Export;
 use crate::def::resolver::Resolver;
 use crate::def::Argument;
+use crate::def::AssignmentSource;
+use crate::def::Expr;
+use crate::def::Stmt;
+use crate::module;
 use crate::source_map;
 use crate::typeck::Attribute;
 use crate::typeck::AttributeData;
@@ -245,36 +246,40 @@ impl BuiltinFunctionData {
                     }
                 }
 
-                let lhs = source_map(db, file)
-                    .expr_map_back
+                let module = module(db, file);
+                let lhs = module
+                    .assignment_sources
                     .get(&call_expr)
-                    .and_then(|ptr| ptr.try_to_node(&parse(db, file).syntax()))
-                    .and_then(|expr| expr.syntax().parent())
-                    .and_then(ast::AssignStmt::cast)
-                    .and_then(|assign_stmt| assign_stmt.lhs());
-
-                let extract_name = |expr: ast::Expression| {
-                    match expr {
-                        ast::Expression::Name(name_ref) => Some(name_ref),
-                        _ => None,
-                    }
-                    .and_then(|name_ref| name_ref.name())
-                    .as_ref()
-                    .and_then(|name| {
-                        let text = name.text();
-                        if !text.is_empty() {
-                            Some(Name::from_str(text))
-                        } else {
-                            None
+                    .and_then(|source| {
+                        let AssignmentSource::Statement(stmt) = *source else {
+                            return None;
+                        };
+                        match module[stmt] {
+                            Stmt::Assign {
+                                lhs,
+                                rhs: _,
+                                op: _,
+                                type_ref: _,
+                            } => Some(lhs),
+                            _ => None,
                         }
-                    })
+                    });
+                let extract_name = |expr| match &module[expr] {
+                    Expr::Name { name } => {
+                        if name.is_missing() || name.as_str().is_empty() {
+                            None
+                        } else {
+                            Some(name.clone())
+                        }
+                    }
+                    _ => None,
                 };
 
                 if has_init {
                     let (provider_name, ctor_name) = lhs
-                        .and_then(|lhs| match lhs {
-                            ast::Expression::Tuple(tuple_expr) => {
-                                let mut elements = tuple_expr.elements();
+                        .and_then(|lhs| match &module[lhs] {
+                            Expr::Tuple { exprs } => {
+                                let mut elements = exprs.iter().copied();
                                 let provider_name = elements.next().and_then(extract_name);
                                 let ctor_name = elements.next().and_then(extract_name);
                                 Some((provider_name, ctor_name))
@@ -298,14 +303,7 @@ impl BuiltinFunctionData {
                         .intern(),
                     ]))
                 } else {
-                    let name = lhs
-                        .and_then(|lhs| match lhs {
-                            ast::Expression::Name(name_ref) => Some(name_ref),
-                            _ => None,
-                        })
-                        .and_then(|name_ref| name_ref.name())
-                        .as_ref()
-                        .map(|name| Name::from_str(name.text()));
+                    let name = lhs.and_then(extract_name);
                     TyKind::Provider(Provider::Custom(Arc::new(CustomProvider {
                         name,
                         doc,
