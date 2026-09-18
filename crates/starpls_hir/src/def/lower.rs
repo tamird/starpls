@@ -40,6 +40,7 @@ use crate::def::ParamPtr;
 use crate::def::Stmt;
 use crate::def::StmtId;
 use crate::def::StmtPtr;
+use crate::def::TypeCommentOwner;
 use crate::typeck::FunctionTypeRef;
 use crate::Db;
 use crate::TypeRef;
@@ -58,6 +59,7 @@ pub(super) fn lower_module(
             root,
             function_names: Default::default(),
             keyword_names: Default::default(),
+            type_comment_owners: Default::default(),
             expr_map: Default::default(),
             expr_map_back: Default::default(),
             stmt_map: Default::default(),
@@ -112,6 +114,12 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_stmt(&mut self, stmt: ast::Statement) -> StmtId {
         let ptr = AstPtr::new(&stmt);
+        let type_comment = match &stmt {
+            ast::Statement::Def(node) => node.suite().and_then(|suite| suite.type_comment()),
+            ast::Statement::Assign(node) => node.type_comment(),
+            _ => None,
+        }
+        .map(|comment| comment.syntax().text_range());
         let statement = match stmt {
             ast::Statement::Def(node) => {
                 let name_range = node.name().map(|name| name.syntax().text_range());
@@ -138,6 +146,7 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                     },
                     ptr,
+                    type_comment,
                 );
                 if let Some(range) = name_range {
                     self.source_map.function_names.insert(stmt, range);
@@ -205,7 +214,7 @@ impl<'a> LoweringContext<'a> {
                 Stmt::Expr { expr }
             }
         };
-        self.alloc_stmt(statement, ptr)
+        self.alloc_stmt(statement, ptr, type_comment)
     }
 
     fn lower_expr_opt(&mut self, syntax: Option<ast::Expression>) -> ExprId {
@@ -404,8 +413,12 @@ impl<'a> LoweringContext<'a> {
             .enumerate()
         {
             let ptr = AstPtr::new(&param);
+            let type_comment = param.type_comment();
+            let comment_range = type_comment
+                .as_ref()
+                .map(|comment| comment.syntax().text_range());
             let type_ref = self
-                .lower_type_comment_opt(param.type_comment())
+                .lower_type_comment_opt(type_comment)
                 .map(|res| res.0)
                 .or(spec_type_refs.get(i).cloned());
             let param = match param {
@@ -484,7 +497,13 @@ impl<'a> LoweringContext<'a> {
                 }
             };
 
-            params.push(self.alloc_param(param, ptr));
+            let param = self.alloc_param(param, ptr);
+            if let Some(range) = comment_range {
+                self.source_map
+                    .type_comment_owners
+                    .insert(range, TypeCommentOwner::Parameter(param));
+            }
+            params.push(param);
         }
         params.into_boxed_slice()
     }
@@ -685,7 +704,7 @@ impl<'a> LoweringContext<'a> {
         node.map(Self::lower_type).unwrap_or(TypeRef::Unknown)
     }
 
-    fn alloc_stmt(&mut self, stmt: Stmt, ptr: StmtPtr) -> StmtId {
+    fn alloc_stmt(&mut self, stmt: Stmt, ptr: StmtPtr, type_comment: Option<TextRange>) -> StmtId {
         let Self {
             db: _,
             file: _,
@@ -693,6 +712,11 @@ impl<'a> LoweringContext<'a> {
             source_map,
         } = self;
         let id = module.stmts.alloc(stmt);
+        if let Some(range) = type_comment {
+            source_map
+                .type_comment_owners
+                .insert(range, TypeCommentOwner::Statement(id));
+        }
         let source = match &module.stmts[id] {
             Stmt::Assign {
                 lhs: _,
