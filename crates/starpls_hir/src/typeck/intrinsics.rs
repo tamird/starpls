@@ -104,10 +104,32 @@ pub(crate) struct IntrinsicFunctionData {
 }
 
 impl IntrinsicFunctionData {
-    pub(crate) fn maybe_unique_ret_type<'a, I>(&'a self, args: I) -> Option<Ty>
+    pub(crate) fn maybe_unique_ret_type<'a, I>(&'a self, mut args: I) -> Option<Ty>
     where
         I: Iterator<Item = (&'a Argument, &'a Ty)>,
     {
+        if self.name.as_str() == "type" {
+            let (Argument::Simple { expr: _ }, ty) = args.next()? else {
+                return None;
+            };
+            if args.next().is_some() {
+                return None;
+            }
+            let name = match ty.kind() {
+                TyKind::None => "NoneType",
+                TyKind::Bool(_) => "bool",
+                TyKind::Int(_) => "int",
+                TyKind::Float => "float",
+                TyKind::String(_) => "string",
+                TyKind::Bytes => "bytes",
+                TyKind::List(_) => "list",
+                TyKind::Tuple(_) => "tuple",
+                TyKind::Dict(_, _, _) => "dict",
+                TyKind::Range => "range",
+                _ => return None,
+            };
+            return Some(TyKind::String(Some(Arc::from(name))).intern());
+        }
         if !self.is_dict_constructor {
             return None;
         }

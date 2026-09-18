@@ -44,6 +44,82 @@ fn check_infer_with_unused_definitions(input: &str, expect: Expect) {
     check_infer_with_options(input, expect, Default::default())
 }
 
+fn check_expr_types(builder: TestDatabaseBuilder, input: &str, expected: &[(&str, &str)]) {
+    let mut db = builder.build();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Bazel,
+        Some(FileInfo::Bazel {
+            api_context: APIContext::Bzl,
+            is_external: false,
+        }),
+        input.to_string(),
+        0,
+    )
+    .unwrap();
+    let map = source_map(&db, file);
+    for (text, expected) in expected {
+        let expr = map
+            .expr_map_back
+            .iter()
+            .find_map(|(expr, range)| {
+                (&input[usize::from(range.start())..usize::from(range.end())] == *text)
+                    .then_some(*expr)
+            })
+            .unwrap();
+        let ty = super::queries::infer_expr(&db, file, expr);
+        assert_eq!(ty.display(&db).to_string(), *expected, "{input}: {text}");
+    }
+    let diagnostics = super::queries::diagnostics(&db, file);
+    assert!(diagnostics.is_empty(), "{input}: {diagnostics:?}");
+}
+
+#[test]
+fn test_type_test_conditionals() {
+    for (input, expression, expected) in [
+        ("type([])", "type([])", "Literal[\"list\"]"),
+        ("type({})", "type({})", "Literal[\"dict\"]"),
+        ("type(())", "type(())", "Literal[\"tuple\"]"),
+        ("type(None)", "type(None)", "Literal[\"NoneType\"]"),
+        ("type(True)", "type(True)", "Literal[\"bool\"]"),
+        ("type(1)", "type(1)", "Literal[\"int\"]"),
+        ("type(1.0)", "type(1.0)", "Literal[\"float\"]"),
+        ("type('')", "type('')", "Literal[\"string\"]"),
+        ("type(b'')", "type(b'')", "Literal[\"bytes\"]"),
+        ("type(range(1))", "type(range(1))", "Literal[\"range\"]"),
+        (
+            "1 if type([]) == 'list' else ''",
+            "1 if type([]) == 'list' else ''",
+            "Literal[1]",
+        ),
+        (
+            "1 if type([]) != 'list' else ''",
+            "1 if type([]) != 'list' else ''",
+            "Literal[\"\"]",
+        ),
+        (
+            "def f(value):\n    return 1 if type(value) == 'list' else ''",
+            "1 if type(value) == 'list' else ''",
+            "int | string",
+        ),
+        (
+            "def type(value):\n    return 'list'\ntype([])",
+            "type([])",
+            "Unknown",
+        ),
+        ("type(*[])", "type(*[])", "string"),
+    ] {
+        let mut builder = TestDatabaseBuilder::default();
+        builder.set_inference_options(InferenceOptions {
+            infer_ctx_attributes: false,
+            use_code_flow_analysis: true,
+            allow_unused_definitions: true,
+        });
+        check_expr_types(builder, input, &[(expression, expected)]);
+    }
+}
+
 fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptions) {
     let mut builder = TestDatabaseBuilder::default();
     builder.add_function("provider");
@@ -1090,16 +1166,16 @@ x = 3 if True else 4
 y = 1. if True else ""
 "#,
         expect![[r#"
-            1..2 "x": int
+            1..2 "x": Literal[3]
             5..6 "3": Literal[3]
             10..14 "True": Literal[True]
             20..21 "4": Literal[4]
-            5..21 "3 if True else 4": int
-            22..23 "y": float | string
+            5..21 "3 if True else 4": Literal[3]
+            22..23 "y": float
             26..28 "1.": float
             32..36 "True": Literal[True]
             42..44 "\"\"": Literal[""]
-            26..44 "1. if True else \"\"": float | string
+            26..44 "1. if True else \"\"": float
         "#]],
     );
 }
@@ -2535,7 +2611,7 @@ def conditional_taken():
             259..263 "True": Literal[True]
             258..264 "(True)": Literal[True]
             270..274 "None": None
-            248..274 "fail() if (True) else None": None
+            248..274 "fail() if (True) else None": Never
             279..280 "x": Literal[1]
             283..284 "1": Literal[1]
 

@@ -19,6 +19,7 @@ use crate::def::flow::Predicate;
 use crate::def::ops::ArithOp;
 use crate::def::ops::BinaryOp;
 use crate::def::ops::BitwiseOp;
+use crate::def::ops::CmpOp;
 use crate::def::ops::LogicOp;
 use crate::def::ops::UnaryOp;
 use crate::def::resolver::Export;
@@ -1063,14 +1064,14 @@ impl TyContext<'_> {
                 test,
                 else_expr,
             } => {
-                self.infer_expr(file, *test);
-                Ty::union(
-                    [
-                        self.infer_expr(file, *if_expr),
-                        self.infer_expr(file, *else_expr),
-                    ]
-                    .into_iter(),
-                )
+                let test_ty = self.infer_expr(file, *test);
+                let if_ty = self.infer_expr(file, *if_expr);
+                let else_ty = self.infer_expr(file, *else_expr);
+                match test_ty.kind() {
+                    TyKind::Bool(Some(true)) => if_ty,
+                    TyKind::Bool(Some(false)) => else_ty,
+                    _ => Ty::union([if_ty, else_ty].into_iter()),
+                }
             }
             Expr::Slice {
                 lhs,
@@ -1290,7 +1291,18 @@ impl TyContext<'_> {
                 (TyKind::Tuple(Tuple::Simple(tys)), _) if tys.is_empty() => lhs,
                 _ => Ty::union([lhs, rhs].into_iter()),
             },
-            _ => self.bool_ty(),
+            BinaryOp::Cmp(op) => {
+                let (TyKind::String(Some(lhs)), TyKind::String(Some(rhs))) = (lhs_kind, rhs_kind)
+                else {
+                    return self.bool_ty();
+                };
+                let value = match op {
+                    CmpOp::Eq => lhs == rhs,
+                    CmpOp::Ne => lhs != rhs,
+                    _ => return self.bool_ty(),
+                };
+                TyKind::Bool(Some(value)).intern()
+            }
         }
     }
 
