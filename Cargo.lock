@@ -2207,7 +2207,6 @@ dependencies = [
  "anyhow",
  "dashmap 5.5.3",
  "expect-test",
- "memchr",
  "ruff_db",
  "ruff_python_ast",
  "ruff_text_size",

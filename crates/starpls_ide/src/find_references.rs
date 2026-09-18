@@ -1,151 +1,138 @@
-use memchr::memmem::Finder;
+use ruff_python_ast::find_node::covering_node;
+use ruff_python_ast::find_node::CoveringNode;
+use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+use ruff_python_ast::visitor::source_order::TraversalSignal;
+use ruff_python_ast::AnyNodeRef;
+use ruff_python_ast::ExprName;
+use ruff_python_ast::StmtFunctionDef;
+use ruff_text_size::Ranged;
+use starpls_common::parsed_module;
 use starpls_common::File;
 use starpls_hir::Name;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
-use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::{self};
-use starpls_syntax::match_ast;
-use starpls_syntax::TextSize;
-use starpls_syntax::T;
 
-use crate::util::pick_best_token;
+use crate::util::navigation_token;
+use crate::util::text_range;
 use crate::Database;
 use crate::FilePosition;
 use crate::Location;
 
-struct FindReferencesHandler<'a> {
-    sema: &'a Semantics<'a>,
-    file: File,
-    name: Name,
-    defs: Vec<ScopeDef<'a>>,
-    locations: Vec<Location>,
+enum NameNode<'a> {
+    Reference(&'a ExprName),
+    Definition(&'a StmtFunctionDef),
 }
 
-impl<'a> FindReferencesHandler<'a> {
-    fn handle(mut self) -> Vec<Location> {
-        let name = self.name.clone();
-        let finder = Finder::new(name.as_str());
-        let contents = self.file.contents(self.sema.db);
-        let offsets = finder.find_iter(contents.as_bytes()).map(|index| {
-            let offset: TextSize = index.try_into().unwrap();
-            offset
-        });
-
-        for offset in offsets {
-            let Some(parent) = self
-                .sema
-                .parse(self.file)
-                .syntax()
-                .token_at_offset(offset)
-                .find(|token| token.text() == self.name.as_str())
-                .and_then(|token| token.parent())
-            else {
-                continue;
-            };
-
-            match_ast! {
-                match parent {
-                    ast::Name(name) => self.check_matches_name(name),
-                    ast::NameRef(name_ref) => self.check_matches_name_ref(name_ref),
-                    _ => ()
-                }
-            };
-        }
-
-        self.locations
-    }
-
-    fn check_matches_name(&mut self, node: ast::Name) {
-        let Some(callable) = node
-            .syntax()
-            .parent()
-            .and_then(ast::DefStmt::cast)
-            .and_then(|def_stmt| self.sema.resolve_def_stmt(self.file, &def_stmt))
-        else {
-            return;
-        };
-        if self.defs.contains(&ScopeDef::Callable(callable)) {
-            self.locations.push(Location {
-                file_id: self.file,
-                range: node.syntax().text_range(),
-            });
-        }
-    }
-
-    fn check_matches_name_ref(&mut self, node: ast::NameRef) {
-        let Some(scope) = ast::Expression::cast(node.syntax().clone())
-            .and_then(|expr| self.sema.scope_for_expr(self.file, &expr))
-        else {
-            return;
-        };
-        for def in scope.resolve_name(&self.name).into_iter() {
-            if self.defs.contains(&def) {
-                self.locations.push(Location {
-                    file_id: self.file,
-                    range: node.syntax().text_range(),
-                });
-
-                // Add the current location at most once.
-                break;
+impl<'a> NameNode<'a> {
+    fn at(node: &CoveringNode<'a>, range: ruff_text_size::TextRange) -> Option<Self> {
+        match node.node() {
+            AnyNodeRef::ExprName(name) => Some(Self::Reference(name)),
+            AnyNodeRef::Identifier(_) => {
+                let AnyNodeRef::StmtFunctionDef(def) = node.parent()? else {
+                    return None;
+                };
+                (def.name.range() == range).then_some(Self::Definition(def))
             }
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Reference(name) => name.id.as_str(),
+            Self::Definition(def) => def.name.as_str(),
+        }
+    }
+
+    fn definitions<'db>(&self, sema: &Semantics<'db>, file: File) -> Vec<ScopeDef<'db>> {
+        match self {
+            Self::Reference(name) => sema
+                .scope_for_expr(file, (*name).into())
+                .map(|scope| scope.resolve_name(&Name::from(self.name())))
+                .unwrap_or_default(),
+            Self::Definition(def) => sema
+                .resolve_def_stmt(file, def)
+                .map(ScopeDef::Callable)
+                .into_iter()
+                .collect(),
         }
     }
 }
 
 pub(crate) fn find_references(
     db: &Database,
-    FilePosition { file_id, pos }: FilePosition,
+    FilePosition { file_id: file, pos }: FilePosition,
 ) -> Option<Vec<Location>> {
     let sema = Semantics::new(db);
-    let file = file_id;
-    let parse = sema.parse(file);
-    let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
-        T![ident] => 2,
-        T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}'] => 0,
-        kind if kind.is_trivia_token() => 0,
-        _ => 1,
-    })?;
-    let node = token.parent()?;
+    let parsed = parsed_module(db, file).load(db);
+    let source = file.contents(db);
+    let token = navigation_token(&source, parsed.tokens(), u32::from(pos).into())?;
+    let node = covering_node(parsed.syntax().into(), token.range());
+    let selected = NameNode::at(&node, token.range())?;
+    let name = selected.name();
+    let definitions = selected
+        .definitions(&sema, file)
+        .into_iter()
+        .filter(|def| match def {
+            ScopeDef::Variable(_) => true,
+            ScopeDef::Callable(callable) => callable.is_user_defined(),
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if definitions.is_empty() {
+        return None;
+    }
 
-    let (name, defs) = if let Some(node) = ast::NameRef::cast(node.clone()) {
-        let name = Name::from_ast_name_ref(node.clone());
-        let scope = sema.scope_for_expr(file, &ast::Expression::cast(node.syntax().clone())?)?;
-        let defs = scope
-            .resolve_name(&name)
-            .into_iter()
-            .flat_map(|def| match &def {
-                ScopeDef::Variable(_) => Some(def),
-                ScopeDef::Callable(ref callable) if callable.is_user_defined() => Some(def),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        if defs.is_empty() {
-            return None;
-        }
-
-        (name, defs)
-    } else {
-        let node = ast::Name::cast(node)?;
-        let def_stmt = ast::DefStmt::cast(node.syntax().parent()?)?;
-        let callable = sema.resolve_def_stmt(file, &def_stmt)?;
-        (
-            Name::from_ast_name(node),
-            vec![ScopeDef::Callable(callable)],
-        )
+    let mut visitor = ReferenceVisitor {
+        sema: &sema,
+        file,
+        name,
+        definitions: &definitions,
+        locations: Vec::new(),
     };
+    visitor.visit_body(&parsed.syntax().body);
+    Some(visitor.locations)
+}
 
-    Some(
-        FindReferencesHandler {
-            sema: &sema,
+struct ReferenceVisitor<'db, 'request> {
+    sema: &'request Semantics<'db>,
+    file: File,
+    name: &'request str,
+    definitions: &'request [ScopeDef<'db>],
+    locations: Vec<Location>,
+}
+
+impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
+    fn enter_node(&mut self, node: AnyNodeRef<'ast>) -> TraversalSignal {
+        let candidate = match node {
+            AnyNodeRef::ExprName(name) => NameNode::Reference(name),
+            AnyNodeRef::StmtFunctionDef(def) => NameNode::Definition(def),
+            _ => return TraversalSignal::Traverse,
+        };
+        let Self {
+            sema,
             file,
             name,
-            defs,
-            locations: vec![],
+            definitions,
+            locations,
+        } = self;
+        if candidate.name() == *name
+            && candidate
+                .definitions(sema, *file)
+                .iter()
+                .any(|def| definitions.contains(def))
+        {
+            let range = match candidate {
+                NameNode::Reference(name) => name.range(),
+                NameNode::Definition(def) => def.name.range(),
+            };
+            locations.push(Location {
+                file_id: *file,
+                range: text_range(range),
+            });
         }
-        .handle(),
-    )
+        TraversalSignal::Traverse
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +161,58 @@ mod tests {
         actual_locations.sort_by_key(|(file, _)| file.path(&analysis.db));
 
         assert_eq!(fixture.selected_ranges, actual_locations);
+    }
+
+    #[test]
+    fn native_identity_follows_edits() {
+        let original = "value = 1\nvalue\n";
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(original);
+        let file = fixture.main_file();
+        for prefix in ["", "unrelated = [1, 2, 3]\n", ""] {
+            let source = format!("{prefix}{original}");
+            analysis.update_file(file, source.clone());
+            let locations = analysis
+                .snapshot()
+                .find_references(FilePosition {
+                    file_id: file,
+                    pos: u32::try_from(source.rfind("value").unwrap())
+                        .unwrap()
+                        .into(),
+                })
+                .unwrap()
+                .unwrap();
+            let starts = locations
+                .into_iter()
+                .map(|location| u32::from(location.range.start()))
+                .collect::<Vec<_>>();
+            let base = u32::try_from(prefix.len()).unwrap();
+            assert_eq!(starts, [base, base + 10]);
+        }
+    }
+
+    #[test]
+    fn ignores_nonreference_occurrences() {
+        check_find_references(
+            r#"
+value = 1
+#^^^^
+value_suffix = "value"
+obj.value
+# value
+
+def f(value):
+    return value
+
+val$0ue
+#^^^^
+"#,
+        );
+    }
+
+    #[test]
+    fn selects_name_after_dedent_and_at_eof() {
+        check_find_references("def f():\n    pass\nvalue = 1\n#^^^^\n$0value\n#^^^^");
+        check_find_references("value = 1\n#^^^^\nvalue$0\n#^^^^");
     }
 
     #[test]

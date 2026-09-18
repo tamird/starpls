@@ -79,7 +79,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         skip_re_exports: bool,
     ) -> Option<Vec<LocationLink>> {
         let name = Name::from_ast_name_ref(name_ref.clone());
-        let scope = self.sema.scope_for_expr(
+        let scope = self.sema.scope_for_syntax_expr(
             self.file,
             &ast::Expression::cast(name_ref.syntax().clone())?,
         )?;

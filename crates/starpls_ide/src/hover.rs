@@ -100,7 +100,7 @@ pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) 
 
             return Some(text.into());
         } else if let Some(stmt) = ast::DefStmt::cast(parent.clone()) {
-            let func = sema.callable_for_def(file, stmt)?;
+            let func = sema.resolve_syntax_def_stmt(file, &stmt)?;
             let mut text = String::from("```python\n(function) ");
             write!(text, "{}\n```\n", func.ty()).ok()?;
             if let Some(doc) = func.doc() {
