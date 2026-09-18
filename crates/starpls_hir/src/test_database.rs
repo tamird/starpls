@@ -2,13 +2,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 use salsa::Setter;
 use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_common::File;
-use starpls_common::FileId;
 use starpls_common::FileInfo;
 use starpls_common::LoadItemCandidate;
 use starpls_common::ResolvedPath;
@@ -27,9 +25,12 @@ use crate::InferenceOptions;
 #[salsa::db]
 #[derive(Clone)]
 pub(crate) struct TestDatabase {
-    storage: salsa::Storage<Self>,
-    files: Arc<DashMap<FileId, File>>,
+    files: ruff_db::files::Files,
+    system: Arc<starpls_common::SourceSystem>,
+    vendored: ruff_db::vendored::VendoredFileSystem,
     environment: Option<Environment>,
+    // Release the shared source system before waking a cancelled writer.
+    storage: salsa::Storage<Self>,
 }
 
 impl Default for TestDatabase {
@@ -37,6 +38,10 @@ impl Default for TestDatabase {
         let mut db = Self {
             storage: Default::default(),
             files: Default::default(),
+            system: Arc::new(starpls_common::SourceSystem::new(
+                ruff_db::system::InMemorySystem::default(),
+            )),
+            vendored: Default::default(),
             environment: None,
         };
         db.environment = Some(Environment::initialize(&db, InferenceOptions::default()));
@@ -48,60 +53,36 @@ impl Default for TestDatabase {
 impl salsa::Database for TestDatabase {}
 
 #[salsa::db]
+impl ruff_db::Db for TestDatabase {
+    fn vendored(&self) -> &ruff_db::vendored::VendoredFileSystem {
+        &self.vendored
+    }
+    fn system(&self) -> &dyn ruff_db::system::System {
+        self.system.as_ref()
+    }
+    fn files(&self) -> &ruff_db::files::Files {
+        &self.files
+    }
+}
+#[salsa::db]
 impl starpls_common::Db for TestDatabase {
-    fn create_file(
-        &mut self,
-        file_id: FileId,
-        dialect: Dialect,
-        info: Option<FileInfo>,
-        contents: String,
-    ) -> File {
-        // Cancel snapshots before publishing files into the shared lazy-load map.
-        let environment = self.environment();
-        let revision = environment.load_revision(self) + 1;
-        environment.set_load_revision(self).to(revision);
-        let existing = self.files.get(&file_id).map(|file| *file);
-        if let Some(file) = existing {
-            file.set_dialect(self).to(dialect);
-            file.set_info(self).to(info);
-            file.set_contents(self).to(contents);
-            return file;
-        }
-        let file = File::new(self, file_id, dialect, info, contents);
-        self.files.insert(file_id, file);
-        file
+    fn source_system_mut(&mut self) -> &mut starpls_common::SourceSystem {
+        salsa::Database::trigger_cancellation(self);
+        Arc::get_mut(&mut self.system).expect("snapshots have drained")
     }
-
-    fn update_file(&mut self, file_id: FileId, contents: String) {
-        if let Some(file) = self.files.get(&file_id).map(|file_id| *file_id) {
-            file.set_contents(self).to(contents);
-        }
-    }
-
     fn load_file(
         &self,
         _path: &str,
         _dialect: Dialect,
-        _from: FileId,
+        _from: File,
     ) -> anyhow::Result<Option<File>> {
-        Ok(Some(File::new(
-            self,
-            FileId(0),
-            Dialect::Standard,
-            None,
-            String::new(),
-        )))
-    }
-
-    fn get_file(&self, file_id: FileId) -> Option<File> {
-        self.environment().load_revision(self);
-        self.files.get(&file_id).map(|file| *file)
+        Ok(None)
     }
 
     fn list_load_candidates(
         &self,
         _path: &str,
-        _from: FileId,
+        _from: File,
     ) -> anyhow::Result<Option<Vec<LoadItemCandidate>>> {
         Ok(None)
     }
@@ -110,12 +91,12 @@ impl starpls_common::Db for TestDatabase {
         &self,
         _path: &str,
         _dialect: Dialect,
-        _from: FileId,
+        _from: File,
     ) -> anyhow::Result<Option<ResolvedPath>> {
         Ok(None)
     }
 
-    fn resolve_build_file(&self, _file_id: FileId) -> Option<String> {
+    fn resolve_build_file(&self, _file_id: File) -> Option<String> {
         None
     }
 }
@@ -137,11 +118,11 @@ impl crate::Db for TestDatabase {
         self.environment().builtin_defs(self, *dialect)
     }
 
-    fn set_bazel_prelude_file(&mut self, file_id: FileId) {
+    fn set_bazel_prelude_file(&mut self, file_id: File) {
         self.environment().set_prelude_file(self).to(Some(file_id));
     }
 
-    fn get_bazel_prelude_file(&self) -> Option<FileId> {
+    fn get_bazel_prelude_file(&self) -> Option<File> {
         self.environment().prelude_file(self)
     }
 
@@ -196,19 +177,21 @@ impl TestDatabaseBuilder {
 }
 
 pub struct Fixture {
-    pub path_to_file_id: FxHashMap<PathBuf, FileId>,
-    pub selected_ranges: Vec<(FileId, TextRange)>,
-    pub cursor_pos: Option<(FileId, TextSize)>,
-    next_file_id: u32,
+    pub path_to_file_id: FxHashMap<PathBuf, File>,
+    pub selected_ranges: Vec<(File, TextRange)>,
+    pub cursor_pos: Option<(File, TextSize)>,
 }
 
 impl Fixture {
+    pub fn main_file(&self) -> File {
+        self.path_to_file_id[Path::new("main.bzl")]
+    }
+
     pub fn new(db: &mut dyn Db) -> Self {
         let fixture = Self {
             path_to_file_id: Default::default(),
             selected_ranges: Default::default(),
             cursor_pos: None,
-            next_file_id: 0,
         };
 
         // Add builtins here as needed for tests.
@@ -227,13 +210,13 @@ impl Fixture {
 
     /// Provides a convenient way to quickly construct a fixture from a single file, as is commonly
     /// needed by tests.
-    pub fn from_single_file(db: &mut dyn Db, contents: &str) -> (Self, FileId) {
+    pub fn from_single_file(db: &mut dyn Db, contents: &str) -> (Self, File) {
         let mut fixture = Self::new(db);
         let file_id = fixture.add_file(db, "main.bzl", contents);
         (fixture, file_id)
     }
 
-    pub fn add_file(&mut self, db: &mut dyn Db, path: impl AsRef<Path>, contents: &str) -> FileId {
+    pub fn add_file(&mut self, db: &mut dyn Db, path: impl AsRef<Path>, contents: &str) -> File {
         self.add_file_with_options(
             db,
             path,
@@ -246,7 +229,7 @@ impl Fixture {
         )
     }
 
-    pub fn add_prelude_file(&mut self, db: &mut dyn Db, contents: &str) -> FileId {
+    pub fn add_prelude_file(&mut self, db: &mut dyn Db, contents: &str) -> File {
         let file_id = self.add_file_with_options(
             db,
             "tools/build_rules/prelude_bazel",
@@ -268,13 +251,13 @@ impl Fixture {
         contents: &str,
         dialect: Dialect,
         info: Option<FileInfo>,
-    ) -> FileId {
+    ) -> File {
         let fixture = FixtureFile::parse(contents);
-        let file_id = FileId(self.next_file_id);
-        self.next_file_id += 1;
+        let file_id =
+            starpls_common::open_document(db, path.as_ref(), dialect, info, fixture.contents, 0)
+                .unwrap();
         self.path_to_file_id
             .insert(path.as_ref().to_path_buf(), file_id);
-        db.create_file(file_id, dialect, info, fixture.contents);
 
         if let Some(cursor_pos) = fixture.cursor_pos {
             if self.cursor_pos.is_some() {

@@ -1,15 +1,11 @@
-use starpls_common::Db;
 use starpls_common::Diagnostic;
-use starpls_common::FileId;
+use starpls_common::File;
 use starpls_hir::diagnostics_for_file;
 
 use crate::Database;
 
-pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
-    let file = match db.get_file(file_id) {
-        Some(file) => file,
-        None => return Vec::new(),
-    };
+pub(crate) fn diagnostics(db: &Database, file_id: File) -> Vec<Diagnostic> {
+    let file = file_id;
 
     let diagnostics = starpls_hir::inference_diagnostics(db, file);
 
@@ -23,7 +19,6 @@ pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use starpls_common::FileId;
 
     use crate::Analysis;
 
@@ -34,8 +29,11 @@ mod tests {
             "if x\n    pass\ny = {\"a\": 1}\n",
             "if x:\nif y:\n    pass\nz = 1\n",
         ] {
-            let (analysis, _) = Analysis::from_single_file_fixture(source);
-            let diagnostics = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+            let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
             assert!(!diagnostics.is_empty(), "{source}");
         }
     }

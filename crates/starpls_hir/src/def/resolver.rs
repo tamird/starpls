@@ -124,12 +124,12 @@ impl<'a> Resolver<'a> {
         let mut def = None;
 
         // Check prelude if this is a BUILD file.
-        if self.file.api_context(self.db) == Some(APIContext::Build) {
+        if self.file.api_context() == Some(APIContext::Build) {
             def = self
                 .db
                 .get_bazel_prelude_file()
                 .and_then(|prelude_file_id| {
-                    let prelude_file = self.db.get_file(prelude_file_id)?;
+                    let prelude_file = prelude_file_id;
                     Self::new_for_module(self.db, prelude_file).resolve_name_from_prelude(name)
                 })
         }
@@ -146,8 +146,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_name_in_builtin_globals(&self, name: &Name) -> Option<ScopeDef> {
-        let api_context = self.file.api_context(self.db)?;
-        let globals = builtin_globals(self.db, self.file.dialect(self.db));
+        let api_context = self.file.api_context()?;
+        let globals = builtin_globals(self.db, self.file.dialect);
         let resolve_in_api_globals = |api_globals: &APIGlobals| {
             api_globals
                 .functions
@@ -177,7 +177,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn names(&self) -> FxHashMap<Name, ScopeDef> {
-        let builtin_globals = builtin_globals(self.db, self.file.dialect(self.db));
+        let builtin_globals = builtin_globals(self.db, self.file.dialect);
 
         // Add names from this module.
         let mut names = self.module_names();
@@ -187,18 +187,14 @@ impl<'a> Resolver<'a> {
             names.insert(key.clone(), ScopeDef::IntrinsicFunction(func.clone()));
         }
 
-        let api_context = match self.file.api_context(self.db) {
+        let api_context = match self.file.api_context() {
             Some(api_context) => api_context,
             None => return names,
         };
 
         // If this is a BUILD file, add names from the prelude.
-        if api_context == APIContext::Build && self.file.is_external(self.db) == Some(false) {
-            if let Some(prelude_file) = self
-                .db
-                .get_bazel_prelude_file()
-                .and_then(|prelude_file_id| self.db.get_file(prelude_file_id))
-            {
+        if api_context == APIContext::Build && self.file.is_external() == Some(false) {
+            if let Some(prelude_file) = self.db.get_bazel_prelude_file() {
                 let prelude_resolver = Resolver::new_for_module(self.db, prelude_file);
                 names.extend(
                     prelude_resolver

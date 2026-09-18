@@ -1,4 +1,3 @@
-use starpls_common::Db;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_hir::LoadItem;
@@ -33,7 +32,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         skip_re_exports: bool,
     ) -> Option<Self> {
         let sema = Semantics::new(db);
-        let file = db.get_file(file_id)?;
+        let file = file_id;
         let parse = sema.parse(file);
         let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
             T![ident] => 2,
@@ -158,7 +157,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                                 origin_selection_range: None,
                                 target_range: range,
                                 target_selection_range: range,
-                                target_file_id: struct_call_expr.file.id(self.sema.db),
+                                target_file_id: struct_call_expr.file,
                             }]
                         })
                     }
@@ -202,7 +201,7 @@ impl<'a> GotoDefinitionHandler<'a> {
             origin_selection_range: None,
             target_range: range,
             target_selection_range: range,
-            target_file_id: file.id(self.sema.db),
+            target_file_id: file,
         }])
     }
 
@@ -213,7 +212,7 @@ impl<'a> GotoDefinitionHandler<'a> {
             origin_selection_range: Some(self.token.text_range()),
             target_range: Default::default(),
             target_selection_range: Default::default(),
-            target_file_id: file.id(self.sema.db),
+            target_file_id: file,
         }])
     }
 
@@ -240,11 +239,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         let resolved_path = self
             .sema
             .db
-            .resolve_path(
-                &value,
-                self.file.dialect(self.sema.db),
-                self.file.id(self.sema.db),
-            )
+            .resolve_path(&value, self.file.dialect, self.file)
             .ok()??;
 
         match resolved_path {
@@ -257,9 +252,8 @@ impl<'a> GotoDefinitionHandler<'a> {
             ResolvedPath::BuildTarget {
                 build_file: build_file_id,
                 target,
-                ..
             } => {
-                let build_file = self.sema.db.get_file(build_file_id)?;
+                let build_file = build_file_id;
                 let parse = self.sema.parse(build_file).syntax();
                 let optional_call_expr =
                     parse
@@ -327,7 +321,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                             origin_selection_range: None,
                             target_range: syntax.text_range(),
                             target_selection_range: syntax.text_range(),
-                            target_file_id: dict_expr.file.id(self.sema.db),
+                            target_file_id: dict_expr.file,
                         }])
                     }
                     _ => None,
@@ -347,7 +341,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                     origin_selection_range: None,
                     target_range: range,
                     target_selection_range: range,
-                    target_file_id: file.id(self.sema.db),
+                    target_file_id: file,
                 }
             }
             _ => {
@@ -357,7 +351,7 @@ impl<'a> GotoDefinitionHandler<'a> {
                     origin_selection_range: None,
                     target_range: range,
                     target_selection_range: range,
-                    target_file_id: file.id(self.sema.db),
+                    target_file_id: file,
                 }
             }
         };
@@ -561,7 +555,7 @@ load("//:foo.bzl", "foo")
 f$0oo()
 "#,
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, false);
     }
 
@@ -595,7 +589,7 @@ load("//:bar.bzl", "foo")
 f$0oo
 "#,
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, true);
     }
 
@@ -627,7 +621,7 @@ foo = _foo
 load("//:bar.bzl", "f$0oo")
 "#,
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, true);
     }
 
@@ -661,7 +655,7 @@ load("//:bar.bzl", "foo")
 f$0oo
 "#,
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, true);
     }
 
@@ -688,7 +682,7 @@ F$0OO
                 is_external: false,
             }),
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, false);
     }
 
@@ -716,7 +710,7 @@ f$0oo()
                 is_external: false,
             }),
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, false);
     }
 
@@ -751,7 +745,7 @@ j$0ava_library()
                 is_external: false,
             }),
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
         check_goto_definition_from_fixture(analysis, fixture, false);
     }
 }

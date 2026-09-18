@@ -1,8 +1,6 @@
 use starpls_bazel::APIContext;
 use starpls_common::parse;
-use starpls_common::Db;
 use starpls_common::File;
-use starpls_common::FileId;
 use starpls_common::InFile;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
@@ -58,9 +56,9 @@ pub struct DocumentSymbol {
     pub children: Option<Vec<DocumentSymbol>>,
 }
 
-pub(crate) fn document_symbols(db: &Database, file_id: FileId) -> Option<Vec<DocumentSymbol>> {
+pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<DocumentSymbol>> {
     let sema = Semantics::new(db);
-    let file = db.get_file(file_id)?;
+    let file = file_id;
     let scope = sema.scope_for_module(file);
     let mut symbols = scope
         .names()
@@ -89,7 +87,7 @@ pub(crate) fn document_symbols(db: &Database, file_id: FileId) -> Option<Vec<Doc
             })
         })
         .collect();
-    if file.api_context(db) == Some(APIContext::Build) {
+    if file.api_context() == Some(APIContext::Build) {
         add_target_symbols(db, file, &mut symbols);
     }
 
@@ -159,7 +157,7 @@ mod tests {
                 is_external: false,
             }),
         );
-        loader.add_files_from_fixture(&analysis.db, &fixture);
+        loader.add_files_from_fixture(&fixture);
 
         let symbols = analysis
             .snapshot()

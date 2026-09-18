@@ -339,8 +339,27 @@ pub(crate) fn lower_to_code_flow_graph(module: &Module, scopes: &Scopes) -> Code
     cx.result
 }
 
+pub(crate) fn code_flow_graph(db: &dyn Db, file: File) -> &CodeFlowGraph {
+    let File {
+        source,
+        dialect,
+        info,
+    } = file;
+    code_flow_graph_query(db, source, (dialect, info))
+}
+
 #[salsa::tracked(returns(ref))]
-pub(crate) fn code_flow_graph(db: &dyn Db, file: File) -> CodeFlowGraph {
+pub(crate) fn code_flow_graph_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> CodeFlowGraph {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     let info = lower(db, file);
     let scopes = module_scopes(db, file);
     lower_to_code_flow_graph(&info.module, scopes)
@@ -351,15 +370,21 @@ mod tests {
     use expect_test::expect;
     use expect_test::Expect;
     use starpls_common::Dialect;
-    use starpls_common::FileId;
 
     use super::*;
     use crate::test_database::TestDatabase;
 
     fn check(input: &str, expect: Expect) {
-        let db = TestDatabase::default();
-        let file_id = FileId(0);
-        let file = File::new(&db, file_id, Dialect::Standard, None, input.to_string());
+        let mut db = TestDatabase::default();
+        let file = starpls_common::open_document(
+            &mut db,
+            std::path::Path::new("main.bzl"),
+            Dialect::Standard,
+            None,
+            input.to_string(),
+            0,
+        )
+        .unwrap();
         let cfg = code_flow_graph(&db, file);
         expect.assert_eq(&cfg.pretty_print());
     }

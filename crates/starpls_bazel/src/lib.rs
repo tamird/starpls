@@ -122,7 +122,7 @@ pub const KNOWN_PROVIDER_TYPES: &[&str] = &[
     "ToolchainTypeInfo",
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum APIContext {
     Bzl,
     Build,

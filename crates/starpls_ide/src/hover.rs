@@ -1,6 +1,5 @@
 use std::fmt::Write;
 
-use starpls_common::Db as _;
 use starpls_hir::Semantics;
 use starpls_hir::Type;
 use starpls_syntax::ast::AstNode;
@@ -35,7 +34,7 @@ impl From<String> for Hover {
 }
 
 pub(crate) fn hover(db: &Database, FilePosition { file_id, pos }: FilePosition) -> Option<Hover> {
-    let file = db.get_file(file_id)?;
+    let file = file_id;
     let sema = Semantics::new(db);
     let parse = sema.parse(file);
     let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {

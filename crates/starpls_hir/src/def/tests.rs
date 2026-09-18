@@ -3,9 +3,7 @@ use std::collections::HashSet;
 use starpls_bazel::env::make_build_builtins;
 use starpls_bazel::env::make_bzl_builtins;
 use starpls_bazel::APIContext;
-use starpls_common::Db as _;
 use starpls_common::Dialect;
-use starpls_common::FileId;
 use starpls_common::FileInfo;
 use starpls_test_util::FixtureFile;
 
@@ -20,29 +18,33 @@ fn check_scope(fixture: &str, expected: &[&str]) {
 
 fn check_scope_full(fixture: &str, expected: &[&str], prelude: Option<&str>) {
     let mut test_db: TestDatabase = Default::default();
-    let file_id = FileId(0);
     let fixture = FixtureFile::parse(fixture);
-    let file = test_db.create_file(
-        file_id,
+    let file = starpls_common::open_document(
+        &mut test_db,
+        std::path::Path::new("BUILD"),
         Dialect::Bazel,
         Some(FileInfo::Bazel {
             api_context: APIContext::Build,
             is_external: false,
         }),
         fixture.contents,
-    );
+        0,
+    )
+    .unwrap();
 
     if let Some(prelude) = prelude {
-        let prelude_file_id = FileId(1);
-        test_db.create_file(
-            prelude_file_id,
+        let prelude_file_id = starpls_common::open_document(
+            &mut test_db,
+            std::path::Path::new("prelude_bazel"),
             Dialect::Bazel,
             Some(FileInfo::Bazel {
                 api_context: APIContext::Prelude,
                 is_external: false,
             }),
             prelude.to_string(),
-        );
+            0,
+        )
+        .unwrap();
         test_db.set_bazel_prelude_file(prelude_file_id);
     }
 

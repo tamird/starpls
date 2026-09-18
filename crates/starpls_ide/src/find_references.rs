@@ -1,5 +1,4 @@
 use memchr::memmem::Finder;
-use starpls_common::Db;
 use starpls_common::File;
 use starpls_hir::Name;
 use starpls_hir::ScopeDef;
@@ -27,12 +26,11 @@ impl<'a> FindReferencesHandler<'a> {
     fn handle(mut self) -> Vec<Location> {
         let name = self.name.clone();
         let finder = Finder::new(name.as_str());
-        let offsets = finder
-            .find_iter(self.file.contents(self.sema.db).as_bytes())
-            .map(|index| {
-                let offset: TextSize = index.try_into().unwrap();
-                offset
-            });
+        let contents = self.file.contents(self.sema.db);
+        let offsets = finder.find_iter(contents.as_bytes()).map(|index| {
+            let offset: TextSize = index.try_into().unwrap();
+            offset
+        });
 
         for offset in offsets {
             let Some(parent) = self
@@ -69,7 +67,7 @@ impl<'a> FindReferencesHandler<'a> {
         };
         if self.defs.contains(&ScopeDef::Callable(callable)) {
             self.locations.push(Location {
-                file_id: self.file.id(self.sema.db),
+                file_id: self.file,
                 range: node.syntax().text_range(),
             });
         }
@@ -84,7 +82,7 @@ impl<'a> FindReferencesHandler<'a> {
         for def in scope.resolve_name(&self.name).into_iter() {
             if self.defs.contains(&def) {
                 self.locations.push(Location {
-                    file_id: self.file.id(self.sema.db),
+                    file_id: self.file,
                     range: node.syntax().text_range(),
                 });
 
@@ -100,7 +98,7 @@ pub(crate) fn find_references(
     FilePosition { file_id, pos }: FilePosition,
 ) -> Option<Vec<Location>> {
     let sema = Semantics::new(db);
-    let file = db.get_file(file_id)?;
+    let file = file_id;
     let parse = sema.parse(file);
     let token = pick_best_token(parse.syntax().token_at_offset(pos), |kind| match kind {
         T![ident] => 2,
@@ -173,7 +171,7 @@ mod tests {
             .map(|location| (location.file_id, location.range))
             .collect::<Vec<_>>();
         actual_locations.sort_by_key(|(_, range)| range.start());
-        actual_locations.sort_by_key(|(file_id, _)| *file_id);
+        actual_locations.sort_by_key(|(file, _)| file.path(&analysis.db));
 
         assert_eq!(fixture.selected_ranges, actual_locations);
     }

@@ -7,12 +7,11 @@ pub(crate) fn did_open_text_document(
     params: lsp_types::DidOpenTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    server.document_manager.write().open(
-        path,
-        params.text_document.version,
+    server.open_document(
+        &path,
         params.text_document.text,
-    );
-    Ok(())
+        params.text_document.version,
+    )
 }
 
 pub(crate) fn did_close_text_document(
@@ -20,7 +19,16 @@ pub(crate) fn did_close_text_document(
     params: lsp_types::DidCloseTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    server.document_manager.write().close(&path);
+    if server.analysis.close_document(&path)?.is_some() {
+        server.invalidate_diagnostics();
+        server.send_notification::<lsp_types::notification::PublishDiagnostics>(
+            lsp_types::PublishDiagnosticsParams {
+                uri: params.text_document.uri,
+                diagnostics: Vec::new(),
+                version: None,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -28,15 +36,11 @@ pub(crate) fn did_change_text_document(
     server: &mut Server,
     params: lsp_types::DidChangeTextDocumentParams,
 ) -> anyhow::Result<()> {
-    let mut document_manager = server.document_manager.write();
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    if let Some(file_id) = document_manager.lookup_by_path_buf(&path) {
-        let contents = document_manager
-            .get(file_id)
-            .map(|document| document.contents.clone())
-            .expect("lookup contents of non-existent file");
-        let contents = apply_document_content_changes(contents, params.content_changes);
-        document_manager.modify(file_id, contents, Some(params.text_document.version))
+    if let Some(document) = server.analysis.document(&path) {
+        let contents =
+            apply_document_content_changes(document.contents.clone(), params.content_changes);
+        server.open_document(&path, contents, params.text_document.version)?;
     }
     Ok(())
 }
@@ -46,12 +50,7 @@ pub(crate) fn did_save_text_document(
     params: lsp_types::DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    if server
-        .document_manager
-        .read()
-        .lookup_by_path_buf(&path)
-        .is_some()
-    {
+    if server.analysis.document(&path).is_some() {
         match path.file_name().and_then(|file_name| file_name.to_str()) {
             Some("MODULE.bazel" | "WORKSPACE" | "WORKSPACE.bazel" | "WORKSPACE.bzlmod") => {}
             Some(file_name) if file_name.ends_with(".MODULE.bazel") => {}
@@ -63,6 +62,8 @@ pub(crate) fn did_save_text_document(
         }
         server.bazel_client.clear_repo_mappings();
         server.fetched_repos.clear();
+        server.analysis.invalidate_loads();
+        server.invalidate_diagnostics();
     }
     Ok(())
 }

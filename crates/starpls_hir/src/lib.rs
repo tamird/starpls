@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use def::resolver::Resolver;
 use def::scope;
-use def::scope::module_scopes;
+use def::scope::module_scopes_query;
 use def::scope::FunctionDef;
 use def::scope::ParameterDef;
 use def::Function;
@@ -15,7 +15,6 @@ use starpls_common::Diagnostic;
 use starpls_common::Diagnostics;
 use starpls_common::Dialect;
 use starpls_common::File;
-use starpls_common::FileId;
 use starpls_common::InFile;
 use starpls_common::Parse;
 use starpls_syntax::ast;
@@ -75,8 +74,8 @@ pub trait Db: starpls_common::Db {
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs;
 
-    fn set_bazel_prelude_file(&mut self, file_id: FileId);
-    fn get_bazel_prelude_file(&self) -> Option<FileId>;
+    fn set_bazel_prelude_file(&mut self, file_id: File);
+    fn get_bazel_prelude_file(&self) -> Option<File>;
     fn set_all_workspace_targets(&mut self, targets: Vec<String>);
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>>;
 }
@@ -92,7 +91,7 @@ pub struct Environment {
     #[returns(clone)]
     pub bazel_builtins: BuiltinDefs,
     #[returns(clone)]
-    pub prelude_file: Option<FileId>,
+    pub prelude_file: Option<File>,
     #[returns(clone)]
     pub all_workspace_targets: Arc<Vec<String>>,
     #[returns(clone)]
@@ -118,7 +117,7 @@ impl Environment {
 /// This does not include diagnostics from type inference, which are reported
 /// by [`inference_diagnostics`] instead.
 pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> + '_ {
-    module_scopes::accumulated::<Diagnostics>(db, file)
+    module_scopes_query::accumulated::<Diagnostics>(db, file.source, (file.dialect, file.info))
         .into_iter()
         .map(|diagnostic| diagnostic.0.clone())
 }
@@ -138,7 +137,7 @@ pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Dia
 /// fn inspect_then_edit(db: &mut dyn Db, file: File) -> String {
 ///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
 ///     let result = definition.ty().to_string();
-///     db.update_file(file.id(db), String::new());
+///     starpls_common::update_file(db, file, String::new());
 ///     result
 /// }
 /// ```
@@ -151,7 +150,7 @@ pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Dia
 ///
 /// fn edit_then_inspect(db: &mut dyn Db, file: File) -> String {
 ///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
-///     db.update_file(file.id(db), String::new());
+///     starpls_common::update_file(db, file, String::new());
 ///     definition.ty().to_string()
 /// }
 /// ```
@@ -999,8 +998,27 @@ impl<'a> ScopeDef<'a> {
     }
 }
 
+pub(crate) fn lower(db: &dyn Db, file: File) -> &ModuleInfo {
+    let File {
+        source,
+        dialect,
+        info,
+    } = file;
+    lower_query(db, source, (dialect, info))
+}
+
 #[salsa::tracked(returns(ref))]
-pub(crate) fn lower(db: &dyn Db, file: File) -> ModuleInfo {
+pub(crate) fn lower_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> ModuleInfo {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
     let parse = parse(db, file);
     let (module, source_map) = Module::new_with_source_map(db, file, parse.tree());
     ModuleInfo {

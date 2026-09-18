@@ -1,16 +1,15 @@
 use std::ops::Range;
 
 use ruff_source_file::LineIndex;
-use starpls_common::FileId;
-use starpls_common::Source;
+use starpls_common::File;
 use starpls_ide::LocationLink;
 
 use crate::convert;
 use crate::server::ServerSnapshot;
 
-fn text_range(source: Source<'_>, range: lsp_types::Range) -> Option<Range<usize>> {
-    let start = convert::offset_from_lsp_position(source, range.start)?;
-    let end = convert::offset_from_lsp_position(source, range.end)?;
+fn text_range(text: &str, index: &LineIndex, range: lsp_types::Range) -> Option<Range<usize>> {
+    let start = convert::offset_from_lsp_position(text, index, range.start)?;
+    let end = convert::offset_from_lsp_position(text, index, range.end)?;
     (start <= end).then_some(usize::from(start)..usize::from(end))
 }
 
@@ -22,11 +21,8 @@ pub(crate) fn apply_document_content_changes(
         match change.range {
             Some(range) => {
                 let index = LineIndex::from_source_text(&contents);
-                let source = Source {
-                    text: &contents,
-                    index: &index,
-                };
-                if let Some(range) = text_range(source, range) {
+                let range = text_range(&contents, &index, range);
+                if let Some(range) = range {
                     contents.replace_range(range, &change.text);
                 }
             }
@@ -38,7 +34,7 @@ pub(crate) fn apply_document_content_changes(
 
 pub(crate) fn response_from_locations<T, U>(
     snapshot: &ServerSnapshot,
-    source_file_id: FileId,
+    source_file_id: File,
     locations: T,
 ) -> U
 where
@@ -46,7 +42,7 @@ where
     U: From<Vec<lsp_types::Location>> + From<Vec<lsp_types::LocationLink>>,
 {
     let source = match snapshot.analysis_snapshot.source(source_file_id) {
-        Ok(Some(source)) => source,
+        Ok(source) => source,
         _ => return Vec::<lsp_types::Location>::new().into(),
     };
 
@@ -57,14 +53,11 @@ where
                 target_file_id,
                 ..
             } => {
-                let target = snapshot.analysis_snapshot.source(target_file_id).ok()??;
-                let range = convert::lsp_range_from_text_range(target_range, target);
+                let target = snapshot.analysis_snapshot.source(target_file_id).ok()?;
+                let range = convert::lsp_range_from_text_range(target_range, &target);
                 lsp_types::Location {
                     uri: lsp_types::Url::from_file_path(
-                        snapshot
-                            .document_manager
-                            .read()
-                            .lookup_by_file_id(target_file_id),
+                        snapshot.analysis_snapshot.path(target_file_id),
                     )
                     .ok()?,
                     range: range?,
@@ -87,18 +80,15 @@ where
                 target_file_id,
                 ..
             } => {
-                let target = snapshot.analysis_snapshot.source(target_file_id).ok()??;
-                let range = convert::lsp_range_from_text_range(target_range, target);
+                let target = snapshot.analysis_snapshot.source(target_file_id).ok()?;
+                let range = convert::lsp_range_from_text_range(target_range, &target);
                 lsp_types::LocationLink {
                     origin_selection_range: origin_selection_range
-                        .and_then(|range| convert::lsp_range_from_text_range(range, source)),
+                        .and_then(|range| convert::lsp_range_from_text_range(range, &source)),
                     target_range: range?,
                     target_selection_range: range?,
                     target_uri: lsp_types::Url::from_file_path(
-                        snapshot
-                            .document_manager
-                            .read()
-                            .lookup_by_file_id(target_file_id),
+                        snapshot.analysis_snapshot.path(target_file_id),
                     )
                     .ok()?,
                 }
@@ -108,7 +98,7 @@ where
                 target_path,
             } => lsp_types::LocationLink {
                 origin_selection_range: origin_selection_range
-                    .and_then(|range| convert::lsp_range_from_text_range(range, source)),
+                    .and_then(|range| convert::lsp_range_from_text_range(range, &source)),
                 target_range: Default::default(),
                 target_selection_range: Default::default(),
                 target_uri: lsp_types::Url::from_file_path(target_path).ok()?,

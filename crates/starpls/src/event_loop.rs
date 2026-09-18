@@ -4,13 +4,12 @@ use lsp_server::Connection;
 use lsp_types::InitializeParams;
 use lsp_types::WorkDoneProgressCreateParams;
 use rustc_hash::FxHashSet;
-use starpls_common::FileId;
+use starpls_common::File;
 
 use crate::commands::server::ServerCommand;
 use crate::config::ServerConfig;
 use crate::convert;
 use crate::dispatcher::RequestDispatcher;
-use crate::document::DocumentSource;
 use crate::extensions;
 use crate::handlers::notifications;
 use crate::handlers::requests;
@@ -33,12 +32,11 @@ macro_rules! match_notification {
 #[derive(Debug)]
 pub(crate) enum FetchExternalReposProgress {
     Begin(FxHashSet<String>),
-    End(FxHashSet<FileId>, Vec<String>),
+    End(Vec<String>),
 }
 
 #[derive(Debug)]
 pub(crate) struct FetchExternalRepoRequest {
-    pub(crate) file_id: FileId,
     pub(crate) repo: String,
 }
 
@@ -50,9 +48,15 @@ pub(crate) enum RefreshAllWorkspaceTargetsProgress {
 
 #[derive(Debug)]
 pub(crate) enum Task {
-    AnalysisRequested(Vec<FileId>),
+    AnalysisRequested(Vec<File>),
     /// A new set of diagnostics has been processed and is ready for forwarding.
-    DiagnosticsReady(Vec<(FileId, Vec<lsp_types::Diagnostic>)>),
+    DiagnosticsReady(
+        Vec<(
+            File,
+            crate::diagnostics::DiagnosticTicket,
+            Vec<lsp_types::Diagnostic>,
+        )>,
+    ),
     /// A request has been evaluated and its response is ready.
     ResponseReady(lsp_server::Response),
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
@@ -134,71 +138,37 @@ impl Server {
         // Update our diagnostics if a triggering event (e.g. document open/close/change) occured.
         // This is done asynchronously, so any new diagnostics resulting from this won't be seen until the next turn
         // of the event loop.
-        let (changed_file_ids, should_request_analysis) = self.process_changes();
-        let mut files_to_update = Vec::new();
-        if should_request_analysis {
+        if std::mem::take(&mut self.analysis_changed) {
             self.analysis_requested_for_files = None;
             self.analysis_debouncer
                 .sender
-                .send(changed_file_ids)
+                .send(self.analysis.open_files())
                 .unwrap();
         } else if let Some(file_ids) = self.analysis_requested_for_files.take() {
-            files_to_update.extend(file_ids);
-        }
-        files_to_update.extend(self.force_analysis_for_files.drain());
-        if !files_to_update.is_empty() {
-            self.update_diagnostics(files_to_update);
-        }
-
-        let changed_file_ids = self.diagnostics_manager.take_changes();
-
-        for file_id in changed_file_ids {
-            let document_manager = self.document_manager.read();
-            // Only send diagnostics for currently open editors.
-            let version = match document_manager
-                .get(file_id)
-                .map(|document| document.source)
-            {
-                Some(DocumentSource::Editor(version)) => version,
-                _ => continue,
-            };
-            let diagnostics = self
-                .diagnostics_manager
-                .get_diagnostics(file_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let path = document_manager.lookup_by_file_id(file_id);
-            let uri = lsp_types::Url::from_file_path(path).unwrap();
-
-            drop(document_manager);
-
-            self.send_notification::<lsp_types::notification::PublishDiagnostics>(
-                lsp_types::PublishDiagnosticsParams {
-                    uri,
-                    diagnostics,
-                    version: Some(version),
-                },
-            );
+            self.update_diagnostics(file_ids);
         }
 
         Ok(())
     }
 
-    fn update_diagnostics(&mut self, file_ids: Vec<FileId>) {
+    fn update_diagnostics(&mut self, file_ids: Vec<File>) {
         let snapshot = self.snapshot();
+        let jobs: Vec<_> = file_ids
+            .into_iter()
+            .filter_map(|file| {
+                self.diagnostics_manager
+                    .request(&snapshot.analysis_snapshot, file)
+            })
+            .collect();
         self.task_pool_handle.spawn(move || {
-            let mut res = Vec::new();
-
-            // Query the database for diagnostics for each file and convert them to an LSP-compatible format.
-            for file_id in file_ids {
-                let diagnostics = match collect_diagnostics(&snapshot, file_id) {
-                    Some(diagnositcs) => diagnositcs,
-                    None => continue,
-                };
-                res.push((file_id, diagnostics));
-            }
-
-            Task::DiagnosticsReady(res)
+            let results = jobs
+                .into_iter()
+                .filter_map(|(file, ticket)| {
+                    let diagnostics = collect_diagnostics(&snapshot, file)?;
+                    Some((file, ticket, diagnostics))
+                })
+                .collect();
+            Task::DiagnosticsReady(results)
         });
     }
 
@@ -236,10 +206,21 @@ impl Server {
     fn handle_task(&mut self, task: Task) {
         match task {
             Task::AnalysisRequested(file_ids) => self.analysis_requested_for_files = Some(file_ids),
-            Task::DiagnosticsReady(diagnostics) => {
-                for (file_id, diagnostics) in diagnostics {
-                    self.diagnostics_manager
-                        .set_diagnostics(file_id, diagnostics);
+            Task::DiagnosticsReady(results) => {
+                let snapshot = self.analysis.snapshot();
+                for (file, ticket, diagnostics) in results {
+                    let path = snapshot.path(file);
+                    let stamp = snapshot.document(path).map(|document| document.stamp());
+                    if self.diagnostics_manager.complete(file, ticket, stamp) {
+                        let uri = lsp_types::Url::from_file_path(path).expect("absolute file path");
+                        self.send_notification::<lsp_types::notification::PublishDiagnostics>(
+                            lsp_types::PublishDiagnosticsParams {
+                                uri,
+                                diagnostics,
+                                version: Some(ticket.document.version),
+                            },
+                        );
+                    }
                 }
             }
             Task::ResponseReady(resp) => {
@@ -274,9 +255,10 @@ impl Server {
                             ..Default::default()
                         })
                     }
-                    FetchExternalReposProgress::End(files, failed_repos) => {
+                    FetchExternalReposProgress::End(failed_repos) => {
                         self.is_fetching_repos = false;
-                        self.force_analysis_for_files.extend(files);
+                        self.analysis.invalidate_loads();
+                        self.invalidate_diagnostics();
 
                         // Fetching external repositories with `bazel query`, as in the case when bzlmod is disabled, often
                         // results in a non-zero exit code because of errors that we don't really care about. Therefore, to
@@ -302,10 +284,9 @@ impl Server {
                     },
                 );
             }
-            Task::FetchExternalRepoRequest(FetchExternalRepoRequest { file_id, repo }) => {
+            Task::FetchExternalRepoRequest(FetchExternalRepoRequest { repo }) => {
                 if !self.fetched_repos.contains(&repo) {
                     self.pending_repos.insert(repo);
-                    self.pending_files.insert(file_id);
                 }
             }
             Task::RefreshAllWorkspaceTargets(progress) => {
@@ -327,6 +308,7 @@ impl Server {
                         self.is_refreshing_all_workspace_targets = false;
                         if let Some(targets) = targets {
                             self.analysis.set_all_workspace_targets(targets);
+                            self.invalidate_diagnostics();
                         }
 
                         lsp_types::WorkDoneProgress::End(lsp_types::WorkDoneProgressEnd {
@@ -367,9 +349,9 @@ where
 
 fn collect_diagnostics(
     snapshot: &ServerSnapshot,
-    file_id: FileId,
+    file_id: File,
 ) -> Option<Vec<lsp_types::Diagnostic>> {
-    let source = snapshot.analysis_snapshot.source(file_id).ok()??;
+    let source = snapshot.analysis_snapshot.source(file_id).ok()?;
 
     // Get the diagnostics for the current path. If the operation was cancelled, simply continue to the next file.
     let diagnostics = snapshot.analysis_snapshot.diagnostics(file_id).ok()?;
@@ -378,7 +360,269 @@ fn collect_diagnostics(
     Some(
         diagnostics
             .into_iter()
-            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, source))
+            .flat_map(|diagnostic| convert::lsp_diagnostic_from_native(diagnostic, &source))
             .collect::<Vec<_>>(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crossbeam_channel::Receiver;
+    use crossbeam_channel::Sender;
+    use lsp_server::Connection;
+    use lsp_types::notification::Notification;
+    use ruff_db::system::InMemorySystem;
+    use ruff_db::system::SystemPath;
+    use ruff_db::system::WritableSystem;
+    use starpls_bazel::client::BazelCLI;
+    use starpls_common::File;
+    use starpls_ide::Analysis;
+
+    use super::collect_diagnostics;
+    use super::Event;
+    use super::FetchExternalReposProgress;
+    use super::RefreshAllWorkspaceTargetsProgress;
+    use super::Task;
+    use crate::config::ServerConfig;
+    use crate::debouncer::AnalysisDebouncer;
+    use crate::document::DefaultFileLoader;
+    use crate::server::Server;
+    use crate::task_pool::TaskPool;
+    use crate::task_pool::TaskPoolHandle;
+
+    struct TestServer {
+        server: Server,
+        client: Connection,
+        disk: InMemorySystem,
+        tasks: Sender<Task>,
+        debounced: Receiver<Vec<File>>,
+    }
+
+    fn server() -> TestServer {
+        let (connection, client) = Connection::memory();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (debounce_sender, debounced) = crossbeam_channel::unbounded();
+        let pool = TaskPool::with_num_threads(sender.clone(), 1).unwrap();
+        let bazel_client = Arc::new(BazelCLI::default());
+        let loader = DefaultFileLoader::new(
+            bazel_client.clone(),
+            "/workspace".into(),
+            None,
+            "/external".into(),
+            sender.clone(),
+            false,
+        );
+        let disk = InMemorySystem::default();
+        disk.create_directory_all(SystemPath::new("/workspace"))
+            .unwrap();
+        let analysis = Analysis::with_system(Arc::new(loader), Default::default(), disk.clone());
+        let server = Server {
+            config: Arc::new(ServerConfig {
+                args: Default::default(),
+                caps: Default::default(),
+            }),
+            connection,
+            req_queue: Default::default(),
+            task_pool_handle: TaskPoolHandle::new(receiver, pool),
+            workspace: "/workspace".into(),
+            analysis_changed: false,
+            diagnostics_manager: Default::default(),
+            analysis,
+            // Capture the actual roots chosen by the event loop, then deliver
+            // them without depending on a timer or worker scheduling order.
+            analysis_debouncer: AnalysisDebouncer {
+                sender: debounce_sender,
+            },
+            analysis_requested_for_files: None,
+            bazel_client,
+            pending_repos: Default::default(),
+            fetched_repos: Default::default(),
+            is_fetching_repos: false,
+            is_refreshing_all_workspace_targets: false,
+            bzlmod_enabled: false,
+        };
+        TestServer {
+            server,
+            client,
+            disk,
+            tasks: sender,
+            debounced,
+        }
+    }
+
+    fn notification<N: Notification>(params: N::Params) -> Event {
+        Event::Message(lsp_server::Notification::new(N::METHOD.into(), params).into())
+    }
+
+    fn captured_diagnostics(server: &mut Server, file: File) -> Task {
+        let snapshot = server.snapshot();
+        let (file, ticket) = server
+            .diagnostics_manager
+            .request(&snapshot.analysis_snapshot, file)
+            .unwrap();
+        let diagnostics = collect_diagnostics(&snapshot, file).unwrap();
+        Task::DiagnosticsReady(vec![(file, ticket, diagnostics)])
+    }
+
+    fn published(client: &Connection) -> Vec<lsp_types::PublishDiagnosticsParams> {
+        client
+            .receiver
+            .try_iter()
+            .filter_map(|message| {
+                let lsp_server::Message::Notification(notification) = message else {
+                    return None;
+                };
+                if notification.method != lsp_types::notification::PublishDiagnostics::METHOD {
+                    return None;
+                }
+                Some(serde_json::from_value(notification.params).unwrap())
+            })
+            .collect()
+    }
+
+    fn analyze_requested_files(server: &mut Server, debounced: &Receiver<Vec<File>>) {
+        let roots = debounced.try_recv().expect("event loop requested analysis");
+        assert!(debounced.is_empty());
+        server
+            .handle_event(Event::Task(Task::AnalysisRequested(roots)))
+            .unwrap();
+        let task = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(task, Task::DiagnosticsReady(_)), "{task:?}");
+        server.handle_event(Event::Task(task)).unwrap();
+    }
+
+    #[test]
+    fn dependency_changes_refresh_unchanged_callers() {
+        let TestServer {
+            mut server,
+            client,
+            disk,
+            tasks,
+            debounced,
+        } = server();
+        let dependency = Path::new("/workspace/dep.bzl");
+        let dependency_uri = lsp_types::Url::from_file_path(dependency).unwrap();
+        let caller = Path::new("/workspace/BUILD");
+        let caller_uri = lsp_types::Url::from_file_path(caller).unwrap();
+        let requires_int = "def f(value):\n    # type: (int) -> None\n    pass\n";
+        let requires_string = "def f(value):\n    # type: (string) -> None\n    pass\n";
+        disk.write_file(SystemPath::new("/workspace/dep.bzl"), requires_int)
+            .unwrap();
+        server
+            .open_document(dependency, requires_int.into(), 1)
+            .unwrap();
+        server
+            .open_document(
+                caller,
+                "load(\"@//:dep.bzl\", \"f\")\nf(\"value\")\n".into(),
+                7,
+            )
+            .unwrap();
+        let caller_file = server
+            .analysis
+            .snapshot()
+            .open_file(caller)
+            .unwrap()
+            .unwrap();
+        let old = captured_diagnostics(&mut server, caller_file);
+        assert!(!collect_diagnostics(&server.snapshot(), caller_file)
+            .unwrap()
+            .is_empty());
+
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidChangeTextDocument>(
+                    lsp_types::DidChangeTextDocumentParams {
+                        text_document: lsp_types::VersionedTextDocumentIdentifier {
+                            uri: dependency_uri.clone(),
+                            version: 2,
+                        },
+                        content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: requires_string.into(),
+                        }],
+                    },
+                ),
+            )
+            .unwrap();
+        server.handle_event(Event::Task(old)).unwrap();
+        assert!(published(&client).is_empty());
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        let caller_update = updates
+            .iter()
+            .find(|update| update.uri == caller_uri)
+            .unwrap();
+        assert!(caller_update.diagnostics.is_empty(), "{caller_update:?}");
+        assert_eq!(caller_update.version, Some(7));
+
+        // Closing the dependency restores its disk contents and checks the
+        // caller again, while clearing diagnostics for the closed buffer.
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidCloseTextDocument>(
+                    lsp_types::DidCloseTextDocumentParams {
+                        text_document: lsp_types::TextDocumentIdentifier {
+                            uri: dependency_uri.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        let updates = published(&client);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].uri, dependency_uri);
+        assert!(updates[0].diagnostics.is_empty());
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].uri, caller_uri);
+        assert!(!updates[0].diagnostics.is_empty());
+        assert_eq!(updates[0].version, Some(7));
+
+        // A completed repository fetch may be followed by an old result in
+        // the same event-loop batch. Cancel its ticket before draining it.
+        let old = captured_diagnostics(&mut server, caller_file);
+        disk.write_file(SystemPath::new("/workspace/dep.bzl"), requires_string)
+            .unwrap();
+        tasks.send(old).unwrap();
+        server
+            .handle_event(Event::Task(Task::FetchExternalRepos(
+                FetchExternalReposProgress::End(Vec::new()),
+            )))
+            .unwrap();
+        assert!(published(&client).is_empty());
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].uri, caller_uri);
+        assert!(updates[0].diagnostics.is_empty(), "{updates:?}");
+        assert_eq!(updates[0].version, Some(7));
+
+        // Completion metadata also changes a Salsa input, which can cancel
+        // diagnostic snapshots even though the source files did not change.
+        let old = captured_diagnostics(&mut server, caller_file);
+        tasks.send(old).unwrap();
+        server
+            .handle_event(Event::Task(Task::RefreshAllWorkspaceTargets(
+                RefreshAllWorkspaceTargetsProgress::End(Some(vec!["//:target".into()])),
+            )))
+            .unwrap();
+        assert!(published(&client).is_empty());
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].uri, caller_uri);
+        assert!(updates[0].diagnostics.is_empty());
+        assert_eq!(updates[0].version, Some(7));
+    }
 }

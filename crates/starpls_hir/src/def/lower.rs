@@ -708,7 +708,7 @@ impl<'a> LoweringContext<'a> {
             message: message.into(),
             severity: Severity::Error,
             range: FileRange {
-                file_id: self.file.id(self.db),
+                file_id: self.file,
                 range: syntax.text_range(),
             },
             tags: None,
