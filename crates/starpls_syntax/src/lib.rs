@@ -16,6 +16,7 @@ mod ruff;
 mod syntax_kind;
 mod type_comments;
 mod unescape;
+mod validation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StarlarkLanguage {}
