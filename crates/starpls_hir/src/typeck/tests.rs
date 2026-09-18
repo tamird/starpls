@@ -1369,7 +1369,7 @@ def f():
             40..44 "cond": bool
             54..55 "x": Literal["less"]
             58..64 "\"less\"": Literal["less"]
-            69..70 "x": string | int
+            69..70 "x": int | string
         "#]],
     );
 }
@@ -1755,7 +1755,7 @@ def f():
             74..78 "cond": bool
             88..89 "x": float
             92..94 "1.": float
-            99..100 "x": string | float | int
+            99..100 "x": int | string | float
         "#]],
     );
 }
@@ -2044,12 +2044,12 @@ def f():
             124..128 "cond": bool
             142..143 "x": bytes
             146..149 "b\"\"": bytes
-            158..159 "x": float | bytes | int
+            158..159 "x": int | float | bytes
             171..175 "cond": bool
             189..190 "x": Literal[True]
             193..197 "True": Literal[True]
-            206..207 "x": bool | float | bytes | int
-            212..213 "x": string | bool | float | bytes | int
+            206..207 "x": int | float | bytes | bool
+            212..213 "x": int | string | float | bytes | bool
         "#]],
     );
 }
@@ -2069,7 +2069,7 @@ def f():
             17..22 "1 < 2": bool
             32..33 "x": Literal[1]
             36..37 "1": Literal[1]
-            42..43 "x": int | Unbound
+            42..43 "x": Unbound | int
 
             42..43 "x" is possibly unbound
         "#]],
@@ -2358,4 +2358,170 @@ fn test_assign_int_literal_to_bool() {
 
     assert!(assign_tys(&db, &TyKind::Int(Some(1)).intern(), &Ty::bool()));
     assert!(assign_tys(&db, &TyKind::Int(Some(0)).intern(), &Ty::bool()));
+}
+
+#[test]
+fn test_flow_return_and_literal_bindings() {
+    check_infer_with_code_flow_analysis(
+        r#"
+def f(cond):
+    x = "foo"
+    y = x + "bar"
+    if cond:
+        return
+    else:
+        x = "ok"
+    x
+    return
+    y = 1
+    y
+"#,
+        expect![[r#"
+            18..19 "x": Literal["foo"]
+            22..27 "\"foo\"": Literal["foo"]
+            32..33 "y": Literal["foobar"]
+            36..37 "x": Literal["foo"]
+            40..45 "\"bar\"": Literal["bar"]
+            36..45 "x + \"bar\"": Literal["foobar"]
+            53..57 "cond": Unknown
+            92..93 "x": Literal["ok"]
+            96..100 "\"ok\"": Literal["ok"]
+            105..106 "x": Literal["ok"]
+            122..123 "y": Never
+            126..127 "1": Literal[1]
+            132..133 "y": Never
+
+            122..133 Code is unreachable
+        "#]],
+    );
+}
+
+#[test]
+fn test_flow_short_circuit_and_deferred_bodies() {
+    check_infer_with_code_flow_analysis(
+        r#"
+def skipped():
+    x = 1
+    True or fail()
+    False and fail()
+    fail() if False else None
+    lambda: fail()
+    x
+
+def and_taken():
+    (True) and fail()
+    x = 1
+
+def or_taken():
+    False or fail()
+    x = 1
+
+def conditional_taken():
+    fail() if (True) else None
+    x = 1
+"#,
+        expect![[r#"
+            20..21 "x": Literal[1]
+            24..25 "1": Literal[1]
+            30..34 "True": Literal[True]
+            38..42 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            38..44 "fail()": Never
+            30..44 "True or fail()": bool
+            49..54 "False": Literal[False]
+            59..63 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            59..65 "fail()": Never
+            49..65 "False and fail()": Literal[False]
+            70..74 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            70..76 "fail()": Never
+            80..85 "False": Literal[False]
+            91..95 "None": None
+            70..95 "fail() if False else None": None
+            108..112 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            108..114 "fail()": Never
+            100..114 "lambda: fail()": def lambda() -> Unknown
+            119..120 "x": Literal[1]
+            144..148 "True": Literal[True]
+            143..149 "(True)": Literal[True]
+            154..158 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            154..160 "fail()": Never
+            143..160 "(True) and fail()": bool
+            165..166 "x": Literal[1]
+            169..170 "1": Literal[1]
+            192..197 "False": Literal[False]
+            201..205 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            201..207 "fail()": Never
+            192..207 "False or fail()": Never
+            212..213 "x": Literal[1]
+            216..217 "1": Literal[1]
+            248..252 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            248..254 "fail()": Never
+            259..263 "True": Literal[True]
+            258..264 "(True)": Literal[True]
+            270..274 "None": None
+            248..274 "fail() if (True) else None": None
+            279..280 "x": Literal[1]
+            283..284 "1": Literal[1]
+
+            165..170 Code is unreachable
+            212..217 Code is unreachable
+            279..284 Code is unreachable
+        "#]],
+    );
+}
+
+#[test]
+fn test_flow_comprehension_evaluation() {
+    check_infer_with_code_flow_analysis(
+        r#"
+def list_iterable():
+    [x for x in fail()]
+    x = 1
+
+def dict_iterable():
+    {x: x for x in fail()}
+    x = 1
+
+def possibly_empty(xs):
+    x = "outer"
+    [fail() for x in xs]
+    {x: fail() for x in xs}
+    x
+"#,
+        expect![[r#"
+            27..28 "x": Never
+            33..34 "x": Unknown
+            38..42 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            38..44 "fail()": Never
+            26..45 "[x for x in fail()]": list[Never]
+            50..51 "x": Literal[1]
+            54..55 "1": Literal[1]
+            83..84 "x": Never
+            86..87 "x": Never
+            92..93 "x": Unknown
+            97..101 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            97..103 "fail()": Never
+            82..104 "{x: x for x in fail()}": dict[Never, Never]
+            109..110 "x": Literal[1]
+            113..114 "1": Literal[1]
+            144..145 "x": Literal["outer"]
+            148..155 "\"outer\"": Literal["outer"]
+            161..165 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            161..167 "fail()": Never
+            172..173 "x": Unknown
+            177..179 "xs": Unknown
+            160..180 "[fail() for x in xs]": list[Never]
+            186..187 "x": Unknown
+            189..193 "fail": def fail(msg: string = None, attr: string = None, sep: Literal[" "] = None, *args: Any) -> Never
+            189..195 "fail()": Never
+            200..201 "x": Unknown
+            205..207 "xs": Unknown
+            185..208 "{x: fail() for x in xs}": dict[Unknown, Never]
+            213..214 "x": Literal["outer"]
+
+            38..44 Type "Never" is not iterable
+            50..55 Code is unreachable
+            97..103 Type "Never" is not iterable
+            109..114 Code is unreachable
+        "#]],
+    );
 }

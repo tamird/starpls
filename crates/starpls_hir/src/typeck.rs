@@ -19,9 +19,8 @@ use starpls_common::InFile;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
 use starpls_syntax::ast::SyntaxNodePtr;
+use ty_flow::reachability_constraints::ScopedReachabilityConstraintId;
 
-use crate::def::codeflow::FlowNodeId;
-use crate::def::scope::ExecutionScopeId;
 use crate::def::scope::FunctionDef;
 use crate::def::ExprId;
 use crate::def::InternedString;
@@ -1724,14 +1723,6 @@ where
     db.gcx().with_tcx(db, f)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CodeFlowCacheKey {
-    file: File,
-    execution_scope: ExecutionScopeId,
-    name: Name,
-    flow_node: FlowNodeId,
-}
-
 #[allow(unused)]
 #[derive(Default)]
 pub(crate) struct InferenceContext {
@@ -1742,7 +1733,7 @@ pub(crate) struct InferenceContext {
     pub(crate) type_of_load_item: FxHashMap<FileLoadItemId, Ty>,
     pub(crate) type_of_param: FxHashMap<FileParamId, Ty>,
     pub(crate) source_assign_done: FxHashSet<FileExprId>,
-    pub(crate) flow_node_type_cache: FxHashMap<CodeFlowCacheKey, Option<Ty>>,
+    pub(crate) reachability: FxHashMap<(File, ScopedReachabilityConstraintId), bool>,
     pub(crate) definition_is_used: FxHashMap<InFile<Either<ExprId, StmtId>>, bool>,
 }
 

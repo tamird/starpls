@@ -20,7 +20,7 @@ use starpls_syntax::TextRange;
 use crate::typeck::TypeRef;
 use crate::Db;
 
-pub(crate) mod codeflow;
+pub(crate) mod flow;
 mod lower;
 pub(crate) mod resolver;
 pub(crate) mod scope;

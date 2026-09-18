@@ -18,11 +18,12 @@ use starpls_syntax::ast::LogicOp;
 use starpls_syntax::ast::UnaryOp;
 use starpls_syntax::ast::{self};
 use starpls_syntax::TextRange;
+use ty_flow::reachability_constraints::ScopedReachabilityConstraintId as Constraint;
 
-use crate::def::codeflow::code_flow_graph;
-use crate::def::codeflow::CodeFlowGraph;
-use crate::def::codeflow::FlowNode;
-use crate::def::codeflow::FlowNodeId;
+use crate::def::flow::flow_index;
+use crate::def::flow::BindingSource;
+use crate::def::flow::FlowIndex;
+use crate::def::flow::Predicate;
 use crate::def::resolver::Export;
 use crate::def::resolver::Resolver;
 use crate::def::scope::module_scopes;
@@ -58,7 +59,6 @@ use crate::typeck::intrinsics::IntrinsicTypes;
 use crate::typeck::resolve_builtin_type_ref;
 use crate::typeck::resolve_type_ref;
 use crate::typeck::resolve_type_ref_opt;
-use crate::typeck::CodeFlowCacheKey;
 use crate::typeck::DictLiteral;
 use crate::typeck::FileExprId;
 use crate::typeck::FileLoadItemId;
@@ -103,36 +103,21 @@ impl TyContext<'_> {
             return;
         }
 
-        let cfg = code_flow_graph(self.db, file).cfg(self.db);
-        let mut prev_flow_node_or_unreachable = {
-            self.walk_stmt(file, stmts[0]);
-            if let Some(flow_node_id) = cfg.hir_to_flow_node.get(&ScopeHirId::Stmt(stmts[0])) {
-                Either::Left(*flow_node_id)
-            } else {
-                Either::Right(stmts[0])
-            }
-        };
-
-        for stmt in stmts[1..].iter() {
+        let flow = flow_index(self.db, file).index(self.db);
+        let mut unreachable_start = None;
+        for stmt in stmts {
             self.walk_stmt(file, *stmt);
-
-            if let Either::Left(prev_flow_node) = prev_flow_node_or_unreachable {
-                // Check for reachability.
-                match cfg.hir_to_flow_node.get(&ScopeHirId::Stmt(*stmt)) {
-                    Some(flow_node_id) => {
-                        prev_flow_node_or_unreachable =
-                            if self.exists_flow_path(cfg, file, *flow_node_id, prev_flow_node) {
-                                Either::Left(*flow_node_id)
-                            } else {
-                                Either::Right(*stmt)
-                            }
-                    }
-                    None => prev_flow_node_or_unreachable = Either::Right(*stmt),
-                }
+            let constraint = flow
+                .statements
+                .get(stmt)
+                .copied()
+                .unwrap_or(Constraint::ALWAYS_FALSE);
+            if !self.is_reachable(flow, file, constraint) {
+                unreachable_start.get_or_insert(*stmt);
             }
         }
 
-        if let Either::Right(unreachable_start) = prev_flow_node_or_unreachable {
+        if let Some(unreachable_start) = unreachable_start {
             let unreachable_end = stmts[stmts.len() - 1];
             let source_map = source_map(self.db, file);
             if let Some((start, end)) =
@@ -1599,176 +1584,97 @@ impl TyContext<'_> {
         // See if we can narrow the effective type further through code-flow analysis. If not, then
         // fall back to the effective type.
         Some(
-            self.infer_name_from_code_flow(file, name, hir_id, curr_execution_scope, &start_ty)
+            self.infer_name_from_flow(file, hir_id, &start_ty)
                 .unwrap_or(effective_ty),
         )
     }
 
-    fn infer_name_from_code_flow(
-        &mut self,
-        file: File,
-        name: &Name,
-        usage: impl Into<ScopeHirId>,
-        execution_scope: ExecutionScopeId,
-        start_ty: &Ty,
-    ) -> Option<Ty> {
-        // If an expression is missing its corresponding node in the code flow graph, that
-        // means the expression is unreachable. We use the `Never` type to represent this case.
-        let cfg = code_flow_graph(self.db, file).cfg(self.db);
-        let start_node = match cfg.hir_to_flow_node.get(&usage.into()) {
-            Some(start_node) => start_node,
-            None => return Some(TyKind::Never.intern()),
+    fn infer_name_from_flow(&mut self, file: File, usage: ScopeHirId, start_ty: &Ty) -> Option<Ty> {
+        let ScopeHirId::Expr(expr) = usage else {
+            return Some(Ty::never());
         };
-        self.infer_ref_from_flow_node(cfg, file, execution_scope, name, start_ty, *start_node)
-    }
-
-    /// Returning `None` here means that code-flow analysis failed and that a fallback type should
-    /// be returned instead.
-    fn infer_ref_from_flow_node(
-        &mut self,
-        cfg: &CodeFlowGraph,
-        file: File,
-        execution_scope: ExecutionScopeId,
-        name: &Name,
-        start_ty: &Ty,
-        start_node: FlowNodeId,
-    ) -> Option<Ty> {
-        if let Some(res) =
-            self.read_cached_ref_type_at_flow_node(file, execution_scope, name, start_node)
-        {
-            return res;
-        }
-
-        let mut curr_node_id = start_node;
-        let res = 'outer: loop {
-            let curr_node = &cfg.flow_nodes[curr_node_id];
-            let curr_node_ty = match &curr_node {
-                FlowNode::Start => start_ty.clone(),
-                FlowNode::Assign {
-                    expr,
-                    name: node_name,
+        let flow = flow_index(self.db, file).index(self.db);
+        let Some(bindings) = flow.uses.get(&expr) else {
+            return Some(Ty::never());
+        };
+        let mut types = Vec::new();
+        for binding in bindings.iter() {
+            if !self.is_reachable(flow, file, binding.reachability_constraint()) {
+                continue;
+            }
+            let ty = match flow.definitions[binding.binding().as_u32() as usize] {
+                BindingSource::Unbound => start_ty.clone(),
+                BindingSource::Loop => return None,
+                BindingSource::Assignment {
+                    target,
                     source,
-                    antecedent,
-                    execution_scope: assign_execution_scope,
+                    execution_scope,
                 } => {
-                    // We need to do the extra check for the execution scope here to handle execution scopes from things
-                    // like list/dict comprehensions.
-                    if name != node_name || execution_scope != *assign_execution_scope {
-                        curr_node_id = *antecedent;
-                        continue;
-                    }
-
-                    self.infer_source_expr_assign(file, *source, None, execution_scope);
+                    self.infer_source_expr_assign(file, source, None, execution_scope);
                     self.cx
                         .type_of_expr
-                        .get(&FileExprId::new(file, *expr))
+                        .get(&FileExprId::new(file, target))
                         .cloned()
                         .unwrap_or_else(Ty::never)
                 }
-                FlowNode::Branch { antecedents } => {
-                    let mut antecedent_tys = Vec::with_capacity(antecedents.len());
-                    for antecedent in antecedents {
-                        match self.infer_ref_from_flow_node(
-                            cfg,
-                            file,
-                            execution_scope,
-                            name,
-                            start_ty,
-                            *antecedent,
-                        ) {
-                            Some(antecedent_ty) => {
-                                antecedent_tys.push(antecedent_ty);
-                            }
-                            None => break 'outer None,
-                        }
-                    }
-                    Ty::union(antecedent_tys.into_iter())
-                }
-                FlowNode::Loop { .. } => break 'outer None, // TODO(withered-magic): Correctly handle loops.
-                FlowNode::Call { expr, antecedent } => {
-                    let ty = self.infer_expr(file, *expr);
-                    if matches!(ty.kind(), TyKind::Never) {
-                        ty
-                    } else {
-                        curr_node_id = *antecedent;
-                        continue;
-                    }
-                }
-                FlowNode::Unreachable => Ty::never(),
             };
-
-            break Some(curr_node_ty);
-        };
-
-        self.cache_ref_type_at_flow_node(file, execution_scope, name, start_node, res)
+            types.push(ty);
+        }
+        Some(match types.as_slice() {
+            [ty] => ty.clone(),
+            _ => Ty::union(types.into_iter()),
+        })
     }
 
-    fn exists_flow_path(
-        &mut self,
-        cfg: &CodeFlowGraph,
-        file: File,
-        from_node: FlowNodeId,
-        to_node: FlowNodeId,
-    ) -> bool {
-        if from_node == to_node {
-            true
-        } else {
-            match &cfg.flow_nodes[from_node] {
-                FlowNode::Assign { antecedent, .. } => {
-                    self.exists_flow_path(cfg, file, *antecedent, to_node)
-                }
-                FlowNode::Branch { antecedents } => antecedents
-                    .iter()
-                    .any(|antecedent| self.exists_flow_path(cfg, file, *antecedent, to_node)),
-                FlowNode::Loop { .. } => true,
-                FlowNode::Call { expr, antecedent } => {
-                    if self.infer_expr(file, *expr) == Ty::never() {
-                        false
-                    } else {
-                        self.exists_flow_path(cfg, file, *antecedent, to_node)
+    /// Ty owns formula construction and simplification; Starpls interprets its atoms.
+    fn is_reachable(&mut self, flow: &FlowIndex, file: File, mut constraint: Constraint) -> bool {
+        let mut visited = Vec::new();
+        let reachable = loop {
+            if constraint.is_terminal() {
+                break constraint != Constraint::ALWAYS_FALSE;
+            }
+            if let Some(reachable) = self.cx.reachability.get(&(file, constraint)) {
+                break *reachable;
+            }
+            visited.push(constraint);
+            let node = flow.constraints.get_interior_node(constraint);
+            constraint = match flow.predicates[node.atom().as_u32() as usize] {
+                Predicate::Branch => node.if_ambiguous(),
+                Predicate::Truthiness(mut expr) => {
+                    let module = module(self.db, file);
+                    while let Expr::Paren { expr: inner } = &module[expr] {
+                        expr = *inner;
+                    }
+                    let truth = match &module[expr] {
+                        Expr::Literal { literal } => match literal {
+                            Literal::Bool(value) => Some(*value),
+                            Literal::Int(value) => Some(*value != 0),
+                            Literal::None => Some(false),
+                            Literal::String(value) => Some(!value.value(self.db).is_empty()),
+                            Literal::Float => None,
+                            Literal::Bytes => None,
+                        },
+                        _ => None,
+                    };
+                    match truth {
+                        Some(true) => node.if_true(),
+                        Some(false) => node.if_false(),
+                        None => node.if_ambiguous(),
                     }
                 }
-                _ => false,
-            }
+                Predicate::CallReturns(expr) => {
+                    if self.infer_expr(file, expr) == Ty::never() {
+                        node.if_false()
+                    } else {
+                        node.if_true()
+                    }
+                }
+            };
+        };
+        for constraint in visited {
+            self.cx.reachability.insert((file, constraint), reachable);
         }
-    }
-
-    fn read_cached_ref_type_at_flow_node(
-        &self,
-        file: File,
-        execution_scope: ExecutionScopeId,
-        name: &Name,
-        flow_node: FlowNodeId,
-    ) -> Option<Option<Ty>> {
-        self.cx
-            .flow_node_type_cache
-            .get(&CodeFlowCacheKey {
-                file,
-                execution_scope,
-                name: name.clone(),
-                flow_node,
-            })
-            .cloned()
-    }
-
-    fn cache_ref_type_at_flow_node(
-        &mut self,
-        file: File,
-        execution_scope: ExecutionScopeId,
-        name: &Name,
-        flow_node: FlowNodeId,
-        res: Option<Ty>,
-    ) -> Option<Ty> {
-        self.cx.flow_node_type_cache.insert(
-            CodeFlowCacheKey {
-                file,
-                execution_scope,
-                name: name.clone(),
-                flow_node,
-            },
-            res.clone(),
-        );
-        res
+        reachable
     }
 
     fn assign_expr_source_ty(

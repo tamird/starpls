@@ -23,9 +23,44 @@ pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use starpls_common::FileId;
+    use starpls_hir::Fixture;
 
     use crate::Analysis;
+    use crate::Change;
+    use crate::InferenceOptions;
+    use crate::SimpleFileLoader;
+
+    #[test]
+    fn flow_reachability_is_invalidated_after_edits() {
+        let options = InferenceOptions {
+            use_code_flow_analysis: true,
+            ..Default::default()
+        };
+        let mut analysis = Analysis::new(Arc::new(SimpleFileLoader::default()), options);
+        let original = "fail()\nx = 1\n";
+        Fixture::from_single_file(&mut analysis.db, original);
+
+        for (source, unreachable) in [
+            (original, true),
+            ("str()\nx = 1\n", false),
+            (original, true),
+        ] {
+            let mut change = Change::default();
+            change.update_file(FileId(0), source.to_owned());
+            analysis.apply_change(change);
+            let diagnostics = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == "Code is unreachable"),
+                unreachable,
+                "{source}: {diagnostics:?}",
+            );
+        }
+    }
 
     #[test]
     fn incomplete_headers_do_not_capture_later_statements() {

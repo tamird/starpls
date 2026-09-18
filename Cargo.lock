@@ -278,6 +278,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "bitvec"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddcec3d12c579d40898fe0a9a358a803c23e9c52ca3c425707f81c9436211837"
+dependencies = [
+ "funty",
+ "radium",
+ "tap",
+ "wyz",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,6 +612,12 @@ checksum = "e13624c2627564efccf4934284bdd98cbaa14e79b0b5a141218e507b3a823456"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "funty"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "futures-channel"
@@ -1449,6 +1467,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "radium"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
 name = "rand"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1550,6 +1574,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruff_index"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
+dependencies = [
+ "get-size2",
+ "ruff_macros",
+]
+
+[[package]]
+name = "ruff_macros"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
+dependencies = [
+ "heck 0.5.0",
+ "itertools 0.15.0",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "ruff_python_trivia 0.0.14 (git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0)",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "ruff_python_ast"
 version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1563,9 +1610,9 @@ dependencies = [
  "get-size2",
  "is-macro",
  "memchr",
- "ruff_python_trivia",
- "ruff_source_file",
- "ruff_text_size",
+ "ruff_python_trivia 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruff_source_file 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruff_text_size 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-hash 2.1.3",
  "thin-vec",
  "thiserror",
@@ -1584,8 +1631,8 @@ dependencies = [
  "hashbrown 0.17.1",
  "memchr",
  "ruff_python_ast",
- "ruff_python_trivia",
- "ruff_text_size",
+ "ruff_python_trivia 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruff_text_size 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-hash 2.1.3",
  "stacker",
  "static_assertions",
@@ -1602,8 +1649,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "990dadfad3aa3fd63040d98056112e5a377af8ada0c9c7659e8907a4b3c7cb34"
 dependencies = [
  "itertools 0.15.0",
- "ruff_source_file",
- "ruff_text_size",
+ "ruff_source_file 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruff_text_size 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rustc-hash 2.1.3",
+ "unicode-ident",
+]
+
+[[package]]
+name = "ruff_python_trivia"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
+dependencies = [
+ "itertools 0.15.0",
+ "memchr",
+ "ruff_source_file 0.0.14 (git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0)",
+ "ruff_text_size 0.0.14 (git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0)",
  "rustc-hash 2.1.3",
  "unicode-ident",
 ]
@@ -1615,7 +1675,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed11e9366de40e79707c0e575afd8beffad58ec94c253577d516b8679cf98308"
 dependencies = [
  "memchr",
- "ruff_text_size",
+ "ruff_text_size 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "ruff_source_file"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
+dependencies = [
+ "memchr",
+ "ruff_text_size 0.0.14 (git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0)",
 ]
 
 [[package]]
@@ -1626,6 +1695,11 @@ checksum = "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965"
 dependencies = [
  "get-size2",
 ]
+
+[[package]]
+name = "ruff_text_size"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
 
 [[package]]
 name = "runfiles"
@@ -1794,9 +1868,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.11.2"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dccd0940a2dcdf68d092b8cbab7dc0ad8fa938bf95787e1b916b0e3d0e8e970"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smol_str"
@@ -1853,7 +1927,7 @@ dependencies = [
  "lsp-types",
  "parking_lot",
  "rayon",
- "ruff_source_file",
+ "ruff_source_file 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
@@ -1886,7 +1960,7 @@ name = "starpls_common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ruff_source_file",
+ "ruff_source_file 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "salsa-2022",
  "starpls_bazel",
  "starpls_syntax",
@@ -1913,6 +1987,7 @@ dependencies = [
  "starpls_intern",
  "starpls_syntax",
  "starpls_test_util",
+ "ty_flow",
 ]
 
 [[package]]
@@ -1953,7 +2028,7 @@ dependencies = [
  "rowan",
  "ruff_python_ast",
  "ruff_python_parser",
- "ruff_text_size",
+ "ruff_text_size 0.0.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "runfiles",
  "stacker",
 ]
@@ -2016,6 +2091,12 @@ name = "sync_wrapper"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2047c6ded9c721764247e62cd3b03c09ffc529b2ba5b10ec482ae507a4a70160"
+
+[[package]]
+name = "tap"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tempfile"
@@ -2245,6 +2326,21 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "ty_flow"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=cbff046555e11add566bc35a3b29ef8ecf8ebdb0#cbff046555e11add566bc35a3b29ef8ecf8ebdb0"
+dependencies = [
+ "bitvec",
+ "get-size2",
+ "hashbrown 0.17.1",
+ "itertools 0.15.0",
+ "ruff_index",
+ "rustc-hash 2.1.3",
+ "smallvec",
+ "static_assertions",
+]
 
 [[package]]
 name = "unicode-bidi"
@@ -2533,6 +2629,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wyz"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
+dependencies = [
+ "tap",
+]
 
 [[package]]
 name = "zerocopy"
