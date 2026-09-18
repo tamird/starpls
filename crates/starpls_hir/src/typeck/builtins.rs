@@ -35,6 +35,7 @@ use crate::typeck::AttributeKind;
 use crate::typeck::CustomProvider;
 use crate::typeck::CustomProviderFields;
 use crate::typeck::DictLiteral;
+use crate::typeck::LabelTransition;
 use crate::typeck::Macro;
 use crate::typeck::ModuleExtension;
 use crate::typeck::Provider;
@@ -47,6 +48,7 @@ use crate::typeck::TagClass;
 use crate::typeck::TagClassData;
 use crate::typeck::Tuple;
 use crate::typeck::TyContext;
+use crate::typeck::TyData;
 use crate::Db;
 use crate::ExprId;
 use crate::Name;
@@ -181,6 +183,18 @@ impl BuiltinFunctionData {
 
         let db = tcx.db;
         let ret_kind = match (self.parent_type.as_deref(), self.name.as_str()) {
+            (None, "transition" | "analysis_test_transition") | (Some("config"), "target") => {
+                let ty = builtin_types(db, file.dialect).types.get("transition")?;
+                let TyKind::BuiltinType(ty, _) = ty.kind() else {
+                    return None;
+                };
+                TyKind::BuiltinType(
+                    ty.clone(),
+                    Some(TyData::Transition {
+                        is_split: self.parent_type.is_none(),
+                    }),
+                )
+            }
             (None, "struct") => {
                 let fields = args
                     .filter_map(|(arg, ty)| match arg {
@@ -348,6 +362,7 @@ impl BuiltinFunctionData {
                 let mut doc: Option<Arc<str>> = None;
                 let mut mandatory = false;
                 let mut default_range = None;
+                let mut transition = LabelTransition::None;
                 for (arg, ty) in args {
                     if let Argument::Keyword { name, expr } = arg {
                         match name.as_str() {
@@ -361,6 +376,7 @@ impl BuiltinFunctionData {
                                     mandatory = *b;
                                 }
                             }
+                            "cfg" => transition = LabelTransition::from_cfg(ty),
                             "default" => {
                                 if let Some(range) = source_map(db, file).expr_map_back.get(expr) {
                                     default_range = Some(*range);
@@ -368,6 +384,9 @@ impl BuiltinFunctionData {
                             }
                             _ => {}
                         }
+                    } else if let Argument::UnpackedDict { expr: _ } = arg {
+                        // Known keys need not describe the entire dictionary.
+                        transition = LabelTransition::Unknown;
                     }
                 }
 
@@ -376,7 +395,7 @@ impl BuiltinFunctionData {
                         "bool" => AttributeKind::Bool,
                         "int" => AttributeKind::Int,
                         "int_list" => AttributeKind::IntList,
-                        "label" => AttributeKind::Label,
+                        "label" => AttributeKind::Label { transition },
                         "label_keyed_string_dict" => AttributeKind::LabelKeyedStringDict,
                         "label_list" => AttributeKind::LabelList,
                         "output" => AttributeKind::Output,
@@ -940,7 +959,9 @@ pub(crate) fn common_attributes_query(_db: &dyn Db) -> CommonAttributes {
                             attr::AttributeKind::Bool => Bool,
                             attr::AttributeKind::Int => Int,
                             attr::AttributeKind::IntList => IntList,
-                            attr::AttributeKind::Label => Label,
+                            attr::AttributeKind::Label => Label {
+                                transition: LabelTransition::None,
+                            },
                             attr::AttributeKind::LabelKeyedStringDict => LabelKeyedStringDict,
                             attr::AttributeKind::LabelList => LabelList,
                             attr::AttributeKind::Output => Output,

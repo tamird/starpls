@@ -693,7 +693,14 @@ impl Ty {
                     .all(|ty1| tys2.iter().any(|ty2| Ty::eq(ty1, ty2)))
             }
             (TyKind::Attribute(_), TyKind::Attribute(_)) => true,
-            (TyKind::BuiltinType(ty1, _), TyKind::BuiltinType(ty2, _)) => ty1 == ty2,
+            (TyKind::BuiltinType(ty1, data1), TyKind::BuiltinType(ty2, data2)) => {
+                ty1 == ty2
+                    && match (data1, data2) {
+                        (Some(TyData::Transition { is_split: _ }), _)
+                        | (_, Some(TyData::Transition { is_split: _ })) => data1 == data2,
+                        _ => true,
+                    }
+            }
             _ => ty1 == ty2,
         }
     }
@@ -1155,6 +1162,10 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TyData {
     Attributes(RuleKind, Arc<RuleAttributes>),
+    /// Whether this transition exposes a list for a single-label dependency.
+    Transition {
+        is_split: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1289,7 +1300,7 @@ pub enum AttributeKind {
     Bool,
     Int,
     IntList,
-    Label,
+    Label { transition: LabelTransition },
     LabelKeyedStringDict,
     LabelList,
     Output,
@@ -1299,6 +1310,46 @@ pub enum AttributeKind {
     StringKeyedLabelDict,
     StringList,
     StringListDict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LabelTransition {
+    None,
+    Split,
+    Unknown,
+}
+
+impl LabelTransition {
+    pub(crate) fn from_cfg(ty: &Ty) -> Self {
+        match ty.kind() {
+            TyKind::None => Self::None,
+            TyKind::String(Some(value)) => match value.as_ref() {
+                "target" | "exec" => Self::None,
+                _ => Self::Unknown,
+            },
+            TyKind::BuiltinType(ty, data) => match data {
+                Some(TyData::Transition { is_split: true }) => Self::Split,
+                Some(TyData::Transition { is_split: false }) => Self::None,
+                _ => {
+                    if ty.name.as_str() == "ExecTransitionFactory" {
+                        Self::None
+                    } else {
+                        Self::Unknown
+                    }
+                }
+            },
+            TyKind::Union(types) => {
+                let mut kinds = types.iter().map(Self::from_cfg);
+                let first = kinds.next().unwrap_or(Self::Unknown);
+                if kinds.all(|kind| kind == first) {
+                    first
+                } else {
+                    Self::Unknown
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1329,7 +1380,9 @@ impl Attribute {
             AttributeKind::Bool => Ty::bool(),
             AttributeKind::Int => Ty::int(),
             AttributeKind::IntList => Ty::list(Ty::int()),
-            AttributeKind::String | AttributeKind::Label | AttributeKind::Output => Ty::string(),
+            AttributeKind::String
+            | AttributeKind::Label { transition: _ }
+            | AttributeKind::Output => Ty::string(),
             AttributeKind::StringDict
             | AttributeKind::LabelKeyedStringDict
             | AttributeKind::StringKeyedLabelDict => Ty::dict(Ty::string(), Ty::string(), None),
@@ -1353,7 +1406,14 @@ impl Attribute {
             AttributeKind::Int => Ty::int(),
             AttributeKind::IntList => Ty::list(Ty::int()),
             AttributeKind::String => Ty::string(),
-            AttributeKind::Label => resolved_label_ty(),
+            AttributeKind::Label { transition } => match rule_kind {
+                RuleKind::Repository => resolved_label_ty(),
+                RuleKind::Build => match transition {
+                    LabelTransition::None => Ty::target(),
+                    LabelTransition::Split => Ty::list(Ty::target()),
+                    LabelTransition::Unknown => Ty::unknown(),
+                },
+            },
             AttributeKind::Output => Ty::unknown(),
             AttributeKind::StringDict => Ty::dict(Ty::string(), Ty::string(), None),
             AttributeKind::StringKeyedLabelDict => {

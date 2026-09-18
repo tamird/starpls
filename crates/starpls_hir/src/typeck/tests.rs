@@ -1736,6 +1736,68 @@ my_rule = repository_rule(
 }
 
 #[test]
+fn test_label_transitions() {
+    for (cfg, expected) in [
+        ("", "Target"),
+        ("cfg = None", "Target"),
+        ("cfg = 'target'", "Target"),
+        ("cfg = 'exec'", "Target"),
+        ("cfg = config.target()", "Target"),
+        ("cfg = split", "list[Target]"),
+        (
+            "cfg = analysis_test_transition(settings = {})",
+            "list[Target]",
+        ),
+        ("cfg = get_cfg()", "Unknown"),
+        ("cfg = split if get_cfg() else config.target()", "Unknown"),
+        ("cfg = config.target() if get_cfg() else split", "Unknown"),
+        ("**{'cfg': split}", "Unknown"),
+        ("**{cfg_name: split}", "Unknown"),
+        ("**dict({'cfg': split})", "Unknown"),
+        ("**get_cfg()", "Unknown"),
+    ] {
+        let mut builder = TestDatabaseBuilder::default();
+        for name in ["rule", "transition", "analysis_test_transition"] {
+            builder.add_function(name);
+        }
+        builder.add_type(FixtureType::new("transition", vec![], vec![]));
+        builder.add_type(FixtureType::new("ctx", vec![("attr", "struct")], vec![]));
+        builder.add_type(FixtureType::new(
+            "attr",
+            vec![],
+            vec!["label", "label_list"],
+        ));
+        builder.add_type(FixtureType::new("config", vec![], vec!["target"]));
+        builder.add_global("attr", "attr");
+        builder.add_global("config", "config");
+        builder.set_inference_options(InferenceOptions {
+            infer_ctx_attributes: true,
+            use_code_flow_analysis: true,
+            allow_unused_definitions: true,
+        });
+        let input = format!(
+            "def get_cfg():\n    pass\n\
+             cfg_name = 'cfg'\n\
+             make_transition = transition\n\
+             split = make_transition(implementation = get_cfg, inputs = [], outputs = [])\n\
+             def _impl(ctx):\n    ctx.attr.dep\n    ctx.attr.deps\n\
+             my_rule = rule(implementation = _impl, attrs = {{\n\
+                 'dep': attr.label({cfg}),\n\
+                 'deps': attr.label_list({cfg}),\n\
+             }})\n"
+        );
+        check_expr_types(
+            builder,
+            &input,
+            &[
+                ("ctx.attr.dep", expected),
+                ("ctx.attr.deps", "list[Target]"),
+            ],
+        );
+    }
+}
+
+#[test]
 fn test_rule_context_without_known_attributes() {
     for (rule, context, method) in [
         ("rule", "ctx", "runfiles"),

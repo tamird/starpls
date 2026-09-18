@@ -345,3 +345,133 @@ pub(crate) fn load_bazel_build_language(client: &dyn BazelClient) -> anyhow::Res
     let build_language_output = client.build_language()?;
     decode_rules(&build_language_output)
 }
+
+#[cfg(test)]
+mod builtin_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use ruff_db::system::InMemorySystem;
+    use starpls_bazel::client::BazelCLI;
+    use starpls_bazel::APIContext;
+    use starpls_common::Dialect;
+    use starpls_common::File;
+    use starpls_common::FileInfo;
+    use starpls_ide::Analysis;
+    use starpls_ide::FilePosition;
+    use starpls_ide::InferenceOptions;
+
+    use super::load_bazel_builtins;
+    use crate::document::DefaultFileLoader;
+
+    fn analysis(infer_ctx_attributes: bool) -> Analysis {
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = DefaultFileLoader::new(
+            Arc::new(BazelCLI::new("bazel")),
+            "/workspace".into(),
+            None,
+            "/external".into(),
+            sender,
+            false,
+        );
+        let mut analysis = Analysis::with_system(
+            Arc::new(loader),
+            InferenceOptions {
+                infer_ctx_attributes,
+                use_code_flow_analysis: true,
+                allow_unused_definitions: true,
+            },
+            InMemorySystem::default(),
+        );
+        analysis.set_builtin_defs(load_bazel_builtins(), Default::default());
+        analysis
+    }
+
+    fn open(analysis: &mut Analysis, path: &str, source: &str) -> File {
+        analysis
+            .open_document(
+                Path::new(path),
+                Dialect::Bazel,
+                Some(FileInfo::Bazel {
+                    api_context: APIContext::Bzl,
+                    is_external: false,
+                }),
+                source.into(),
+                1,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn loaded_transition_controls_label_attribute_shape() {
+        let mut analysis = analysis(true);
+        open(
+            &mut analysis,
+            "/workspace/transitions.bzl",
+            "\
+def _impl(settings, attr):
+    return {}
+split = transition(implementation = _impl, inputs = [], outputs = [])
+",
+        );
+        let source = "\
+load('@@//:transitions.bzl', 'split')
+def _impl(ctx):
+    dep = ctx.attr.dep[0] if type(ctx.attr.dep) == 'list' else ctx.attr.dep
+    info = dep[DefaultInfo]
+    ctx.attr.ordinary
+    ctx.attr.exec
+    ctx.attr.unclassified
+    return [info]
+my_rule = rule(implementation = _impl, attrs = {
+    'dep': attr.label(cfg = split),
+    'ordinary': attr.label(cfg = config.target()),
+    'exec': attr.label(cfg = config.exec()),
+    'unclassified': attr.label(cfg = config.none()),
+})
+";
+        let file = open(&mut analysis, "/workspace/main.bzl", source);
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (name, expected) in [
+            ("dep", "list[Target]"),
+            ("ordinary", "Target"),
+            ("exec", "Target"),
+            ("unclassified", "Unknown"),
+        ] {
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id: file,
+                    pos: ((source.find(&format!("ctx.attr.{name}")).unwrap() + "ctx.attr.".len())
+                        as u32)
+                        .into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("{name}: {expected}")),
+                "{}",
+                hover.contents.value
+            );
+        }
+        let hover = snapshot
+            .hover(FilePosition {
+                file_id: file,
+                pos: (source.rfind("info").unwrap() as u32).into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover
+                .contents
+                .value
+                .contains("(variable) info: DefaultInfo"),
+            "{}",
+            hover.contents.value
+        );
+    }
+}
