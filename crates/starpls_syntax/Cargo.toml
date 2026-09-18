@@ -17,5 +17,5 @@ stacker = { workspace = true }
 cc = "*"
 
 [dev-dependencies]
-runfiles = { path = "../../vendor/runfiles" }
+runfiles = { git = "https://github.com/hermeticbuild/rules_rust.git", rev = "00f8db0ed456a59c5bf0643692cc5b30e564018e" }
 expect-test = "1.4.1"

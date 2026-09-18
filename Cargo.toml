@@ -9,7 +9,6 @@ members = [
     "crates/starpls_intern",
     "crates/starpls_syntax",
     "crates/starpls_test_util",
-    "vendor/runfiles",
 ]
 
 [workspace.dependencies]
