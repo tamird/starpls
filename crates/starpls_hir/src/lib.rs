@@ -229,16 +229,6 @@ impl<'a> Semantics<'a> {
         self.callable_from_type(ty)
     }
 
-    /// Temporary entry point for editor consumers still using Rowan.
-    pub fn resolve_syntax_call_expr(
-        &self,
-        file: File,
-        expr: &ast::CallExpr,
-    ) -> Option<Callable<'a>> {
-        let ty = self.type_of_syntax_expr(file, &expr.callee()?)?;
-        self.callable_from_type(ty)
-    }
-
     fn callable_from_type(&self, ty: Type<'a>) -> Option<Callable<'a>> {
         Some(match ty.ty.kind() {
             TyKind::Function(def) => Callable::new(*self, CallableInner::HirDef(def.clone())),
@@ -411,14 +401,16 @@ impl<'a> Semantics<'a> {
         }
     }
 
+    /// Bind an argument of a call in the canonical parsed revision of `file`.
     pub fn resolve_call_expr_active_param(
         &self,
         file: File,
-        expr: &ast::CallExpr,
+        expr: &ExprCall,
         active_arg: usize,
     ) -> Option<usize> {
-        let range = expr.syntax().text_range();
-        let expr = source_map(self.db, file).expr_map.get(&range)?;
+        let expr = source_map(self.db, file)
+            .expr_nodes
+            .get(&expr.node_index().load())?;
         queries::active_parameter(self.db, file, *expr, active_arg)
     }
 }
