@@ -1,7 +1,0 @@
-MODULE
-  DOT_EXPR
-    NAME_REF
-      IDENT "a"
-    DOT "."
-    NAME
-      IDENT "b"

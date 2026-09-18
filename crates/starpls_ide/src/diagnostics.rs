@@ -20,3 +20,23 @@ pub(crate) fn diagnostics(db: &Database, file_id: FileId) -> Vec<Diagnostic> {
         .chain(diagnostics)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use starpls_common::FileId;
+
+    use crate::Analysis;
+
+    #[test]
+    fn incomplete_headers_do_not_capture_later_statements() {
+        for source in [
+            "def broken()\nx = {\"k\": 1}\ny = 2\n",
+            "if x\n    pass\ny = {\"a\": 1}\n",
+            "if x:\nif y:\n    pass\nz = 1\n",
+        ] {
+            let (analysis, _) = Analysis::from_single_file_fixture(source);
+            let diagnostics = analysis.snapshot().diagnostics(FileId(0)).unwrap();
+            assert!(!diagnostics.is_empty(), "{source}");
+        }
+    }
+}

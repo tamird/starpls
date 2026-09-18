@@ -250,6 +250,18 @@ a$0bc = 123
     }
 
     #[test]
+    fn parenthesized_singleton_loop_target() {
+        check_hover(
+            "for (x,) in [(1,)]:\n    x$0\n",
+            expect![[r#"
+                ```python
+                (variable) x: Literal[1]
+                ```
+            "#]],
+        );
+    }
+
+    #[test]
     fn check_def_stmt() {
         check_hover(
             r#"

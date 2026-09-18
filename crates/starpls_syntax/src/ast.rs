@@ -1303,7 +1303,7 @@ impl String {
 
         let mut ok = true;
         let mut s = std::string::String::new();
-        starpls_lexer::unescape::unescape_string(
+        crate::unescape::unescape_string(
             &cursor.text()[..cursor.text().len() - suffix.len()],
             is_raw,
             suffix.len() == 3,

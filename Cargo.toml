@@ -7,10 +7,13 @@ members = [
     "crates/starpls_hir",
     "crates/starpls_ide",
     "crates/starpls_intern",
-    "crates/starpls_lexer",
-    "crates/starpls_parser",
     "crates/starpls_syntax",
     "crates/starpls_test_util",
     "vendor/runfiles",
-    "xtask",
 ]
+
+[workspace.dependencies]
+ruff_python_ast = "=0.0.14"
+ruff_python_parser = "=0.0.14"
+ruff_text_size = "=0.0.14"
+stacker = "0.1.25"

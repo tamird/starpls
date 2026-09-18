@@ -1,0 +1,41 @@
+MODULE@0..54
+  FOR_STMT@0..54
+    FOR@0..3 "for"
+    WHITESPACE@3..4 " "
+    LOOP_VARIABLES@4..12
+      NAME_REF@4..5
+        IDENT@4..5 "i"
+      COMMA@5..6 ","
+      WHITESPACE@6..7 " "
+      NAME_REF@7..12
+        IDENT@7..12 "value"
+    WHITESPACE@12..13 " "
+    IN@13..15 "in"
+    WHITESPACE@15..16 " "
+    CALL_EXPR@16..33
+      NAME_REF@16..25
+        IDENT@16..25 "enumerate"
+      ARGUMENTS@25..33
+        OPEN_PAREN@25..26 "("
+        SIMPLE_ARGUMENT@26..32
+          NAME_REF@26..32
+            IDENT@26..32 "values"
+        CLOSE_PAREN@32..33 ")"
+    COLON@33..34 ":"
+    SUITE@34..54
+      NEWLINE@34..35 "\n"
+      WHITESPACE@35..39 "    "
+      CALL_EXPR@39..54
+        NAME_REF@39..44
+          IDENT@39..44 "print"
+        ARGUMENTS@44..54
+          OPEN_PAREN@44..45 "("
+          SIMPLE_ARGUMENT@45..46
+            NAME_REF@45..46
+              IDENT@45..46 "i"
+          COMMA@46..47 ","
+          WHITESPACE@47..48 " "
+          SIMPLE_ARGUMENT@48..53
+            NAME_REF@48..53
+              IDENT@48..53 "value"
+          CLOSE_PAREN@53..54 ")"

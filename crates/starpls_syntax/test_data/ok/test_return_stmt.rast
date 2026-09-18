@@ -1,0 +1,15 @@
+MODULE@0..19
+  RETURN_STMT@0..6
+    RETURN@0..6 "return"
+  NEWLINE@6..7 "\n"
+  RETURN_STMT@7..19
+    RETURN@7..13 "return"
+    WHITESPACE@13..14 " "
+    BINARY_EXPR@14..19
+      LITERAL_EXPR@14..15
+        INT@14..15 "1"
+      WHITESPACE@15..16 " "
+      PLUS@16..17 "+"
+      WHITESPACE@17..18 " "
+      LITERAL_EXPR@18..19
+        INT@18..19 "2"
