@@ -326,7 +326,9 @@ fn cyclic_load_diagnostics_are_independent_of_query_order() {
     ] {
         let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
         assert!(
-            diagnostics.iter().any(|d| d.message.starts_with(expected)),
+            diagnostics
+                .iter()
+                .any(|d| d.headline_message().starts_with(expected)),
             "{diagnostics:?}"
         );
         hover_value(&analysis, file);
@@ -393,7 +395,7 @@ fn physical_sources_support_distinct_host_contexts() {
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.message == "Cannot load the current file"),
+            .any(|d| d.headline_message() == "Cannot load the current file"),
         "{diagnostics:?}"
     );
 }
@@ -418,7 +420,7 @@ fn invalid_utf8_loads_report_read_errors() {
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.message.contains("cannot read /bad.bzl")),
+            .any(|d| d.headline_message().contains("cannot read /bad.bzl")),
         "{diagnostics:?}"
     );
     assert!(analysis

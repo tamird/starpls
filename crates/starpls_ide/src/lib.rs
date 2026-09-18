@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use dashmap::DashMap;
+use ruff_db::diagnostic::DisplayDiagnosticConfig;
+use ruff_db::diagnostic::DisplayDiagnostics;
 use salsa::Setter;
 use starpls_bazel::Builtins;
 use starpls_common::Db;
@@ -368,6 +370,15 @@ impl AnalysisSnapshot {
 
     pub fn diagnostics(&self, file_id: File) -> Cancellable<Vec<Diagnostic>> {
         self.query(|db| diagnostics::diagnostics(db, file_id))
+    }
+
+    /// Renders diagnostics obtained from this snapshot using its captured source.
+    pub fn render_diagnostics(
+        &self,
+        diagnostics: &[Diagnostic],
+        config: &DisplayDiagnosticConfig,
+    ) -> Cancellable<String> {
+        self.query(|db| DisplayDiagnostics::new(db, config, diagnostics).to_string())
     }
 
     pub fn document_symbols(&self, file_id: File) -> Cancellable<Option<Vec<DocumentSymbol>>> {

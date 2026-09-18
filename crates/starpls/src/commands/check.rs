@@ -4,15 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use annotate_snippets::Level;
-use annotate_snippets::Message;
 use annotate_snippets::Renderer;
-use annotate_snippets::Snippet;
 use anyhow::anyhow;
 use anyhow::bail;
 use clap::Args;
+use ruff_db::diagnostic::DisplayDiagnosticConfig;
 use starpls_bazel::client::BazelCLI;
 use starpls_bazel::client::BazelInfo;
-use starpls_common::Diagnostic;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::FileInfo;
@@ -101,29 +99,8 @@ impl CheckCommand {
 struct Checker {
     analysis: Analysis,
     bazel_info: BazelInfo,
-    files: indexmap::IndexMap<File, PathBuf>,
+    files: indexmap::IndexSet<File>,
     ignored_files: HashSet<PathBuf>,
-}
-
-fn diagnostic_to_message<'a>(
-    diagnostic: &'a Diagnostic,
-    path: &'a Path,
-    contents: &'a str,
-) -> Message<'a> {
-    let start: usize = diagnostic.range.range.start().into();
-    let end: usize = diagnostic.range.range.end().into();
-    let level = match diagnostic.severity {
-        Severity::Info => Level::Info,
-        Severity::Warning => Level::Warning,
-        Severity::Error => Level::Error,
-    };
-    level.title(&diagnostic.message).snippet(
-        Snippet::source(contents)
-            .origin(path.as_os_str().to_str().unwrap_or(""))
-            .fold(true)
-            .line_start(1)
-            .annotation(level.span(start..end)),
-    )
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
@@ -207,7 +184,7 @@ impl Checker {
         });
 
         let file = self.analysis.file(&canonical_path, dialect, info)?;
-        self.files.entry(file).or_insert_with(|| path.to_path_buf());
+        self.files.insert(file);
 
         Ok(())
     }
@@ -216,24 +193,21 @@ impl Checker {
         &self,
         snapshot: &AnalysisSnapshot,
         file_id: File,
-        path: &Path,
         num_errors: &mut usize,
         num_warnings: &mut usize,
         num_infos: &mut usize,
     ) -> anyhow::Result<()> {
-        let source = snapshot.source(file_id)?;
-        let renderer = Renderer::styled();
-        for diagnostic in snapshot.diagnostics(file_id)? {
-            match diagnostic.severity {
+        let diagnostics = snapshot.diagnostics(file_id)?;
+        for diagnostic in &diagnostics {
+            match diagnostic.severity() {
                 Severity::Info => *num_infos += 1,
                 Severity::Warning => *num_warnings += 1,
                 Severity::Error => *num_errors += 1,
+                Severity::Fatal => *num_errors += 1,
             }
-            anstream::print!(
-                "{}\n\n",
-                renderer.render(diagnostic_to_message(&diagnostic, path, &source.text))
-            );
         }
+        let config = DisplayDiagnosticConfig::new("starpls").color(true);
+        anstream::print!("{}", snapshot.render_diagnostics(&diagnostics, &config)?);
         Ok(())
     }
 
@@ -256,11 +230,10 @@ impl Checker {
             num_warnings += 1;
         }
 
-        for (file_id, path) in &self.files {
+        for file_id in &self.files {
             self.report_diagnostics_for_file(
                 &snapshot,
                 *file_id,
-                path,
                 &mut num_errors,
                 &mut num_warnings,
                 &mut num_infos,

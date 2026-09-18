@@ -9,6 +9,7 @@ edition = "2021"
 ruff_notebook = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_db = { workspace = true }
+ruff_text_size = { workspace = true }
 ruff_source_file = { workspace = true }
 anyhow = "1.0.81"
 salsa = { workspace = true }

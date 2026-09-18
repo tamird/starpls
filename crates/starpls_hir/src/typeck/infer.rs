@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use either::Either;
+use starpls_common::diagnostic;
 use starpls_common::line_index;
 use starpls_common::Diagnostic;
+use starpls_common::DiagnosticId;
 use starpls_common::DiagnosticTag;
 use starpls_common::File;
-use starpls_common::FileRange;
 use starpls_common::InFile;
 use starpls_common::Severity;
 use starpls_syntax::ast::ArithOp;
@@ -74,6 +75,12 @@ use crate::typeck::TyKind;
 use crate::typeck::TypeRef;
 use crate::Name;
 
+const TYPE_CHECK: DiagnosticId = DiagnosticId::lint("type-check");
+const LOAD_ERROR: DiagnosticId = DiagnosticId::lint("load-error");
+const UNUSED_DEFINITION: DiagnosticId = DiagnosticId::lint("unused-definition");
+const UNREACHABLE_CODE: DiagnosticId = DiagnosticId::lint("unreachable-code");
+const DEPRECATED_ARGUMENT: DiagnosticId = DiagnosticId::lint("deprecated-argument");
+
 impl TyContext<'_> {
     fn infer_all_exprs(&mut self, file: File) {
         for (expr, _) in module(self.db, file).exprs.iter() {
@@ -131,6 +138,7 @@ impl TyContext<'_> {
             {
                 self.add_diagnostic_for_range(
                     file,
+                    UNREACHABLE_CODE,
                     Severity::Warning,
                     TextRange::new(start, end),
                     Some(vec![DiagnosticTag::Unnecessary]),
@@ -246,9 +254,11 @@ impl TyContext<'_> {
                 file,
                 value: Either::Left(expr),
             }) {
-                self.add_expr_diagnostic_warning(
+                self.add_expr_diagnostic_with_severity(
                     file,
                     expr,
+                    UNUSED_DEFINITION,
+                    Severity::Warning,
                     Some(vec![DiagnosticTag::Unnecessary]),
                     format!("\"{}\" is not accessed", name.as_str()),
                 );
@@ -293,6 +303,7 @@ impl TyContext<'_> {
 
                     tcx.add_diagnostic_for_range(
                         file,
+                        UNUSED_DEFINITION,
                         Severity::Warning,
                         range,
                         Some(vec![DiagnosticTag::Unnecessary]),
@@ -321,20 +332,22 @@ impl TyContext<'_> {
         self.cx
             .diagnostics
             .iter()
-            .filter(|diagnostic| {
-                if diagnostic.range.file_id != file {
-                    return false;
-                }
-                let start_line = line_index
-                    .line_index(u32::from(diagnostic.range.range.start()).into())
-                    .to_zero_indexed() as u32;
-                let end_line = line_index
-                    .line_index(u32::from(diagnostic.range.range.end()).into())
-                    .to_zero_indexed() as u32;
-                (start_line..=end_line)
-                    .all(|line| !module.type_ignore_comment_lines.contains(&line))
-            })
-            .cloned()
+            .filter_map(
+                |InFile {
+                     file: origin,
+                     value: diagnostic,
+                 }| {
+                    if *origin != file {
+                        return None;
+                    }
+                    let range = diagnostic.range().expect("source diagnostic has a range");
+                    let start_line = line_index.line_index(range.start()).to_zero_indexed() as u32;
+                    let end_line = line_index.line_index(range.end()).to_zero_indexed() as u32;
+                    (start_line..=end_line)
+                        .all(|line| !module.type_ignore_comment_lines.contains(&line))
+                        .then(|| diagnostic.clone())
+                },
+            )
             .collect()
     }
 
@@ -787,6 +800,7 @@ impl TyContext<'_> {
                                             {
                                                 self.add_diagnostic_for_range(
                                                     file,
+                                                    DEPRECATED_ARGUMENT,
                                                     Severity::Info,
                                                     *range,
                                                     Some(vec![DiagnosticTag::Deprecated]),
@@ -1357,6 +1371,7 @@ impl TyContext<'_> {
                         for error in errors {
                             self.add_diagnostic_for_range(
                                 file,
+                                TYPE_CHECK,
                                 Severity::Error,
                                 *range,
                                 None,
@@ -1829,17 +1844,32 @@ impl TyContext<'_> {
         tags: Option<Vec<DiagnosticTag>>,
         message: T,
     ) {
-        self.add_expr_diagnostic_with_severity(file, expr, Severity::Warning, tags, message)
+        self.add_expr_diagnostic_with_severity(
+            file,
+            expr,
+            TYPE_CHECK,
+            Severity::Warning,
+            tags,
+            message,
+        )
     }
 
     fn add_expr_diagnostic_error<T: Into<String>>(&mut self, file: File, expr: ExprId, message: T) {
-        self.add_expr_diagnostic_with_severity(file, expr, Severity::Error, None, message)
+        self.add_expr_diagnostic_with_severity(
+            file,
+            expr,
+            TYPE_CHECK,
+            Severity::Error,
+            None,
+            message,
+        )
     }
 
     fn add_expr_diagnostic_with_severity<T: Into<String>>(
         &mut self,
         file: File,
         expr: ExprId,
+        id: DiagnosticId,
         severity: Severity,
         tags: Option<Vec<DiagnosticTag>>,
         message: T,
@@ -1848,7 +1878,7 @@ impl TyContext<'_> {
             Some(ptr) => ptr.syntax_node_ptr().text_range(),
             None => return,
         };
-        self.add_diagnostic_for_range(file, severity, range, tags, message);
+        self.add_diagnostic_for_range(file, id, severity, range, tags, message);
     }
 
     fn add_expr_diagnostic_error_ty<T: Into<String>>(
@@ -1874,19 +1904,22 @@ impl TyContext<'_> {
     fn add_diagnostic_for_range<T: Into<String>>(
         &mut self,
         file: File,
+        id: DiagnosticId,
         severity: Severity,
         range: TextRange,
         tags: Option<Vec<DiagnosticTag>>,
         message: T,
     ) {
-        self.cx.diagnostics.push(Diagnostic {
-            message: message.into(),
-            severity,
-            range: FileRange {
-                file_id: file,
+        self.cx.diagnostics.push(InFile {
+            file,
+            value: diagnostic(
+                file,
+                id,
+                severity,
                 range,
-            },
-            tags,
+                message,
+                tags.into_iter().flatten(),
+            ),
         });
     }
 
@@ -1983,6 +2016,7 @@ impl TyContext<'_> {
             if let Some(ptr) = source_map(self.db, file).param_map_back.get(&param) {
                 self.add_diagnostic_for_range(
                     file,
+                    TYPE_CHECK,
                     Severity::Warning,
                     ptr.syntax_node_ptr().text_range(),
                     None,
@@ -2023,6 +2057,7 @@ impl TyContext<'_> {
                         if file.source == loaded_file.source {
                             self.add_diagnostic_for_range(
                                 file,
+                                LOAD_ERROR,
                                 Severity::Warning,
                                 range(),
                                 None,
@@ -2052,6 +2087,7 @@ impl TyContext<'_> {
                                 let (file, load_stmt) = self.cx.load_resolution_stack[i].clone();
                                 self.add_diagnostic_for_range(
                                     file,
+                                    LOAD_ERROR,
                                     Severity::Warning,
                                     load_stmt.ptr.text_range(),
                                     None,
@@ -2062,6 +2098,7 @@ impl TyContext<'_> {
                             // Also add the current (importing) file.
                             self.add_diagnostic_for_range(
                                 file,
+                                LOAD_ERROR,
                                 Severity::Warning,
                                 load_stmt.ptr.text_range(),
                                 None,
@@ -2088,6 +2125,7 @@ impl TyContext<'_> {
                                 None => {
                                     tcx.add_diagnostic_for_range(
                                         file,
+                                        LOAD_ERROR,
                                         Severity::Warning,
                                         range(),
                                         None,
@@ -2125,6 +2163,7 @@ impl TyContext<'_> {
             Err(err) => {
                 self.add_diagnostic_for_range(
                     file,
+                    LOAD_ERROR,
                     Severity::Warning,
                     load_stmt.ptr.text_range(),
                     None,

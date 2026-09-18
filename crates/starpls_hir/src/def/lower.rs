@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use either::Either;
 use salsa::Accumulator;
+use starpls_common::diagnostic;
 use starpls_common::line_index;
-use starpls_common::Diagnostic;
+use starpls_common::DiagnosticId;
 use starpls_common::Diagnostics;
 use starpls_common::File;
-use starpls_common::FileRange;
 use starpls_common::Severity;
 use starpls_intern::Interned;
 use starpls_syntax::ast::AstNode;
@@ -781,15 +781,14 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn add_error_diagnostic(&self, message: &str, syntax: &SyntaxNode) {
-        Diagnostics(Diagnostic {
-            message: message.into(),
-            severity: Severity::Error,
-            range: FileRange {
-                file_id: self.file,
-                range: syntax.text_range(),
-            },
-            tags: None,
-        })
+        Diagnostics(diagnostic(
+            self.file,
+            DiagnosticId::InvalidSyntax,
+            Severity::Error,
+            syntax.text_range(),
+            message,
+            [],
+        ))
         .accumulate(self.db);
     }
 }

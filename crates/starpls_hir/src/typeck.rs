@@ -1624,7 +1624,7 @@ pub enum Protocol {
 /// Working state for one inference query, including its demand-driven imports.
 #[derive(Default)]
 pub(crate) struct InferenceContext {
-    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) diagnostics: Vec<InFile<Diagnostic>>,
     pub(crate) resolved_load_stmts: FxHashMap<FileLoadStmt, Option<File>>,
     pub(crate) load_resolution_stack: Vec<(File, LoadStmt)>,
     pub(crate) type_of_expr: FxHashMap<FileExprId, Ty>,

@@ -163,16 +163,18 @@ fn check_infer_with_options(input: &str, expect: Expect, options: InferenceOptio
     let diagnostics = super::queries::diagnostics(&db, file);
     if !diagnostics.is_empty() {
         res.push('\n');
-        for diagnostic in diagnostics
-            .into_iter()
-            .sorted_by(|lhs, rhs| lhs.range.range.start().cmp(&rhs.range.range.start()))
-        {
+        for diagnostic in diagnostics.into_iter().sorted_by(|lhs, rhs| {
+            lhs.range()
+                .unwrap()
+                .start()
+                .cmp(&rhs.range().unwrap().start())
+        }) {
             writeln!(
                 res,
                 "{:?}..{:?} {}",
-                diagnostic.range.range.start(),
-                diagnostic.range.range.end(),
-                diagnostic.message
+                diagnostic.range().unwrap().start(),
+                diagnostic.range().unwrap().end(),
+                diagnostic.headline_message()
             )
             .unwrap();
         }

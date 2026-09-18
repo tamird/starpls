@@ -635,9 +635,9 @@ mod source_tests {
             .unwrap();
         let diagnostics = analysis.snapshot().diagnostics(main).unwrap();
         assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.starts_with("Could not resolve module")),
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .headline_message()
+                .starts_with("Could not resolve module")),
             "{diagnostics:?}"
         );
 
