@@ -2192,6 +2192,7 @@ dependencies = [
  "salsa",
  "smallvec",
  "smol_str",
+ "stacker",
  "starpls_bazel",
  "starpls_common",
  "starpls_intern",

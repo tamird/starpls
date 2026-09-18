@@ -19,7 +19,6 @@ use starpls_common::InFile;
 use starpls_common::Parse;
 use starpls_syntax::ast;
 use starpls_syntax::ast::AstNode;
-use starpls_syntax::ast::AstPtr;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 use typeck::builtins::BuiltinFunction;
@@ -190,8 +189,8 @@ impl<'a> Semantics<'a> {
     }
 
     pub fn callable_for_def(&self, file: File, node: ast::DefStmt) -> Option<Callable<'a>> {
-        let ptr = AstPtr::new(&ast::Statement::cast(node.syntax().clone())?);
-        let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
+        let range = node.syntax().text_range();
+        let stmt = source_map(self.db, file).stmt_map.get(&range)?;
         match &module(self.db, file)[*stmt] {
             Stmt::Def { func, .. } => Some(Callable::new(
                 *self,
@@ -261,7 +260,7 @@ impl<'a> Semantics<'a> {
         let module = module(self.db, file);
         let stmt = source_map(self.db, file)
             .stmt_map
-            .get(&AstPtr::new(&ast::Statement::Def(def_stmt.clone())))?;
+            .get(&def_stmt.syntax().text_range())?;
         let Stmt::Def { ref func, .. } = module[*stmt] else {
             return None;
         };
@@ -275,8 +274,8 @@ impl<'a> Semantics<'a> {
     }
 
     pub fn type_of_expr(&self, file: File, expr: &ast::Expression) -> Option<Type<'a>> {
-        let ptr = AstPtr::new(expr);
-        let expr = source_map(self.db, file).expr_map.get(&ptr)?;
+        let range = expr.syntax().text_range();
+        let expr = source_map(self.db, file).expr_map.get(&range)?;
         Some(Type::new(*self, queries::infer_expr(self.db, file, *expr)))
     }
 
@@ -288,7 +287,7 @@ impl<'a> Semantics<'a> {
         let module = module(self.db, file);
         let param = source_map(self.db, file)
             .param_map
-            .get(&AstPtr::new(param))?;
+            .get(&param.syntax().text_range())?;
         let (func, index) = module
             .param_to_def_stmt
             .get(param)
@@ -309,8 +308,8 @@ impl<'a> Semantics<'a> {
     }
 
     pub fn resolve_load_stmt(&self, file: File, load_stmt: &ast::LoadStmt) -> Option<File> {
-        let ptr = AstPtr::new(&ast::Statement::Load(load_stmt.clone()));
-        let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
+        let range = load_stmt.syntax().text_range();
+        let stmt = source_map(self.db, file).stmt_map.get(&range)?;
         let load_stmt = match module(self.db, file)[*stmt] {
             Stmt::Load { ref load_stmt, .. } => load_stmt.clone(),
             _ => return None,
@@ -319,8 +318,8 @@ impl<'a> Semantics<'a> {
     }
 
     pub fn resolve_load_item(&self, file: File, load_item: &ast::LoadItem) -> Option<LoadItem<'a>> {
-        let ptr = AstPtr::new(load_item);
-        let load_item = source_map(self.db, file).load_item_map.get(&ptr)?;
+        let range = load_item.syntax().text_range();
+        let load_item = source_map(self.db, file).load_item_map.get(&range)?;
         Some(LoadItem {
             sema: *self,
             id: InFile {
@@ -339,8 +338,8 @@ impl<'a> Semantics<'a> {
     }
 
     pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope<'a>> {
-        let ptr = AstPtr::new(expr);
-        let expr = source_map(self.db, file).expr_map.get(&ptr)?;
+        let range = expr.syntax().text_range();
+        let expr = source_map(self.db, file).expr_map.get(&range)?;
         let resolver = Resolver::new_for_expr(self.db, file, *expr);
         Some(SemanticsScope {
             sema: *self,
@@ -362,8 +361,8 @@ impl<'a> Semantics<'a> {
         expr: &ast::CallExpr,
         active_arg: usize,
     ) -> Option<usize> {
-        let ptr = AstPtr::new(&ast::Expression::Call(expr.clone()));
-        let expr = source_map(self.db, file).expr_map.get(&ptr)?;
+        let range = expr.syntax().text_range();
+        let expr = source_map(self.db, file).expr_map.get(&range)?;
         queries::active_parameter(self.db, file, *expr, active_arg)
     }
 }
@@ -1087,8 +1086,7 @@ pub(crate) fn lower_query(
         dialect,
         info,
     };
-    let parse = parse(db, file);
-    let (module, source_map) = Module::new_with_source_map(db, file, parse.tree());
+    let (module, source_map) = Module::new_with_source_map(db, file);
     ModuleInfo {
         file,
         module,

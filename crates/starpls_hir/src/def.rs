@@ -12,7 +12,6 @@ use starpls_common::File;
 use starpls_intern::impl_internable;
 use starpls_intern::Interned;
 use starpls_syntax::ast::AssignOp;
-use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::BinaryOp;
 use starpls_syntax::ast::UnaryOp;
 use starpls_syntax::ast::{self};
@@ -30,16 +29,12 @@ pub(crate) mod scope;
 mod tests;
 
 pub type ExprId = Id<Expr>;
-pub type ExprPtr = AstPtr<ast::Expression>;
 
 pub type StmtId = Id<Stmt>;
-pub type StmtPtr = AstPtr<ast::Statement>;
 
 pub type ParamId = Id<Param>;
-pub type ParamPtr = AstPtr<ast::Parameter>;
 
 pub type LoadItemId = Id<LoadItem>;
-pub type LoadItemPtr = AstPtr<ast::LoadItem>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Module {
@@ -67,13 +62,15 @@ pub(crate) struct ModuleSourceMap {
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
-    pub expr_map: FxHashMap<ExprPtr, ExprId>,
+    // Temporary correspondence for Rowan editor callers. Native consumers
+    // will use Ruff node indices; synthetic HIR retains source ranges.
+    pub expr_map: FxHashMap<TextRange, ExprId>,
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
-    pub stmt_map: FxHashMap<StmtPtr, StmtId>,
+    pub stmt_map: FxHashMap<TextRange, StmtId>,
     pub stmt_map_back: FxHashMap<StmtId, TextRange>,
-    pub param_map: FxHashMap<ParamPtr, ParamId>,
+    pub param_map: FxHashMap<TextRange, ParamId>,
     pub param_map_back: FxHashMap<ParamId, TextRange>,
-    pub load_item_map: FxHashMap<LoadItemPtr, LoadItemId>,
+    pub load_item_map: FxHashMap<TextRange, LoadItemId>,
     pub load_item_map_back: FxHashMap<LoadItemId, TextRange>,
 }
 
@@ -86,21 +83,31 @@ pub(crate) enum TypeCommentOwner {
 
 impl ModuleSourceMap {
     pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
+        let Self {
+            root,
+            function_names: _,
+            keyword_names: _,
+            type_comment_owners: _,
+            expr_map: _,
+            expr_map_back,
+            stmt_map: _,
+            stmt_map_back,
+            param_map: _,
+            param_map_back: _,
+            load_item_map: _,
+            load_item_map_back: _,
+        } = self;
         match hir {
-            scope::ScopeHirId::Module => self.root,
-            scope::ScopeHirId::Expr(expr) => self.expr_map_back[&expr],
-            scope::ScopeHirId::Stmt(stmt) => self.stmt_map_back[&stmt],
+            scope::ScopeHirId::Module => *root,
+            scope::ScopeHirId::Expr(expr) => expr_map_back[&expr],
+            scope::ScopeHirId::Stmt(stmt) => stmt_map_back[&stmt],
         }
     }
 }
 
 impl Module {
-    pub(crate) fn new_with_source_map(
-        db: &dyn Db,
-        file: File,
-        syntax: ast::Module,
-    ) -> (Module, ModuleSourceMap) {
-        lower::lower_module(db, file, syntax)
+    pub(crate) fn new_with_source_map(db: &dyn Db, file: File) -> (Module, ModuleSourceMap) {
+        lower::lower_module(db, file)
     }
 }
 
@@ -434,21 +441,6 @@ pub(crate) enum Literal {
     Bytes,
     Bool(bool),
     None,
-}
-
-impl Literal {
-    fn from_ast_literal(value: &ast::LiteralKind) -> Self {
-        match value {
-            ast::LiteralKind::Int(lit) => Literal::Int(lit.value().unwrap_or(0)),
-            ast::LiteralKind::Float(_) => Literal::Float,
-            ast::LiteralKind::String(lit) => {
-                Literal::String(Arc::<str>::from(lit.value().unwrap_or_default()))
-            }
-            ast::LiteralKind::Bytes(_) => Literal::Bytes,
-            ast::LiteralKind::Bool(lit) => Literal::Bool(*lit),
-            ast::LiteralKind::None => Literal::None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

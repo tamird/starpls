@@ -237,3 +237,275 @@ def f():
         ),
     )
 }
+
+#[test]
+fn source_ranges_remain_distinct_during_edits() {
+    let mut db = TestDatabase::default();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Bazel,
+        Some(FileInfo::Bazel {
+            api_context: APIContext::Bzl,
+            is_external: false,
+        }),
+        String::new(),
+        0,
+    )
+    .unwrap();
+    for source in [
+        "x = ((a + b))\ny = a and b or c\nz = a < b < c\n",
+        "def f(x=(1+2), *, y=0, **kwargs):\n    # type: (int) -> int\n    return x\n",
+        "[x for (x,) in xs if x for y in ys if y]\n",
+        "load(\":defs.bzl\", alias=\"name\", \"other\")\nf(x, key=(y))\n",
+        "x = {\"😀\": lambda a: a}\nif x:\n    pass\nelif y:\n    z = 1\n",
+        "def broken()\nx = {\"k\": 1}\ny = 2\n",
+    ] {
+        let prefixes = source
+            .char_indices()
+            .map(|(offset, _)| source[..offset].to_owned());
+        let deletions = source.char_indices().map(|(offset, character)| {
+            let mut edited = source.to_owned();
+            edited.replace_range(offset..offset + character.len_utf8(), "");
+            edited
+        });
+        for input in std::iter::once(source.to_owned())
+            .chain(prefixes)
+            .chain(deletions)
+        {
+            starpls_common::update_file(&mut db, file, input.clone());
+            let map = crate::source_map(&db, file);
+            assert_eq!(map.expr_map.len(), map.expr_map_back.len(), "{input}");
+            assert_eq!(map.stmt_map.len(), map.stmt_map_back.len(), "{input}");
+            assert_eq!(map.param_map.len(), map.param_map_back.len(), "{input}");
+            assert_eq!(
+                map.load_item_map.len(),
+                map.load_item_map_back.len(),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_declarations_preserve_editor_ranges() {
+    use starpls_syntax::ast::AstNode;
+    use starpls_syntax::ast::{self};
+    let source = "def f(x=(1+2), *, y=0):\n    if x:\n        pass\n    elif y:\n        pass\n    else:\n        pass\n        # trailing suite comment\n\nnext = f\n";
+    let mut db = TestDatabase::default();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Standard,
+        None,
+        source.to_owned(),
+        0,
+    )
+    .unwrap();
+    let map = crate::source_map(&db, file);
+    let tree = starpls_common::parse(&db, file).syntax();
+    for node in tree.descendants() {
+        if (node.kind() == starpls_syntax::SyntaxKind::IF_STMT
+            || node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    starpls_syntax::SyntaxKind::MODULE | starpls_syntax::SyntaxKind::SUITE
+                )
+            }))
+            && ast::Statement::cast(node.clone()).is_some()
+        {
+            assert!(
+                map.stmt_map.contains_key(&node.text_range()),
+                "{} at {:?}",
+                node,
+                node.text_range()
+            );
+        }
+        if ast::Parameter::cast(node.clone()).is_some() {
+            assert!(map.param_map.contains_key(&node.text_range()), "{node}");
+        }
+    }
+}
+
+#[test]
+fn native_type_comments_keep_attachment_boundaries() {
+    use crate::def::Stmt;
+    use crate::def::TypeCommentOwner;
+    let source = r#"a = 1; b = 2 # type: string
+
+def f(
+    x = (
+        1 # type: bool
+    ),
+    # ordinary comment
+
+    # type: int
+    *, # type: float
+    y, # type: string
+):
+    # type: bool
+    # type: (string, string, string) -> int
+    pass
+"#;
+    let mut db = TestDatabase::default();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Standard,
+        None,
+        source.to_owned(),
+        0,
+    )
+    .unwrap();
+    let info = crate::lower(&db, file);
+    let mut owners = info
+        .source_map
+        .type_comment_owners
+        .iter()
+        .map(|(range, owner)| {
+            let name = match owner {
+                TypeCommentOwner::Statement(stmt) => match &info.module.stmts[*stmt] {
+                    Stmt::Def { func, stmts: _ } => {
+                        assert!(
+                            func.ret_type_ref.is_none(),
+                            "later specification must not replace the first comment"
+                        );
+                        func.name.as_str()
+                    }
+                    Stmt::Assign {
+                        lhs,
+                        rhs: _,
+                        op: _,
+                        type_ref: _,
+                    } => {
+                        let crate::def::Expr::Name { name } = &info.module.exprs[*lhs] else {
+                            panic!("expected assignment name");
+                        };
+                        name.as_str()
+                    }
+                    other => panic!("unexpected comment owner {other:?}"),
+                },
+                TypeCommentOwner::Parameter(param) => info.module.params[*param].name().as_str(),
+            };
+            (
+                u32::from(range.start()),
+                &source[usize::from(range.start())..usize::from(range.end())],
+                name,
+            )
+        })
+        .collect::<Vec<_>>();
+    owners.sort_by_key(|(start, _, _)| *start);
+    let owners = owners
+        .into_iter()
+        .map(|(_, comment, owner)| (comment, owner))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners,
+        [
+            ("# type: string", "b"),
+            ("# type: int", "x"),
+            ("# type: float", "[missing name]"),
+            ("# type: string", "y"),
+            ("# type: bool", "f"),
+        ]
+    );
+}
+
+#[test]
+fn native_operators_and_recovered_slots() {
+    use starpls_syntax::ast::AssignOp;
+    use starpls_syntax::ast::BitwiseAssignOp;
+
+    use crate::def::Expr;
+    use crate::def::Stmt;
+    let mut db = TestDatabase::default();
+    let source = "a <<= 1\nb >>= 2\nvalues = [1, *unsupported, 2]\na = b = c\n";
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Standard,
+        None,
+        source.to_owned(),
+        0,
+    )
+    .unwrap();
+    let module = crate::module(&db, file);
+    let [left, right, list, chained] = module.top_level.as_ref() else {
+        panic!("expected four assignments");
+    };
+    for (stmt, expected) in [(left, BitwiseAssignOp::Shl), (right, BitwiseAssignOp::Shr)] {
+        let Stmt::Assign {
+            lhs: _,
+            rhs: _,
+            op,
+            type_ref: _,
+        } = module[*stmt]
+        else {
+            panic!("expected assignment");
+        };
+        assert_eq!(op, Some(AssignOp::Bitwise(expected)));
+    }
+    let Stmt::Assign {
+        lhs: _,
+        rhs,
+        op: _,
+        type_ref: _,
+    } = module[*list]
+    else {
+        panic!("expected assignment");
+    };
+    let Expr::List { exprs } = &module[rhs] else {
+        panic!("expected list");
+    };
+    let [_, missing, _] = exprs.as_ref() else {
+        panic!("unsupported element must retain its slot");
+    };
+    assert_eq!(module[*missing], Expr::Missing);
+    let Stmt::Assign {
+        lhs: _,
+        rhs,
+        op: _,
+        type_ref: _,
+    } = module[*chained]
+    else {
+        panic!("expected assignment");
+    };
+    let Expr::Name { name } = &module[rhs] else {
+        panic!("expected chained assignment value");
+    };
+    assert_eq!(name.as_str(), "c");
+}
+
+#[test]
+fn native_function_docs_select_direct_literals() {
+    let mut db = TestDatabase::default();
+    let file = starpls_common::open_document(
+        &mut db,
+        std::path::Path::new("main.bzl"),
+        Dialect::Standard,
+        None,
+        String::new(),
+        0,
+    )
+    .unwrap();
+    for (body, expected) in [
+        ("    (\"ignored\")\n    \"actual\"\n", Some("actual")),
+        ("    (1)\n    \"actual\"\n", Some("actual")),
+        (
+            "    \"unsupported\" \"concatenation\"\n    \"actual\"\n",
+            Some("actual"),
+        ),
+        ("    1\n    \"ignored\"\n", None),
+        ("    pass\n    \"actual\"\n", Some("actual")),
+    ] {
+        starpls_common::update_file(&mut db, file, format!("def f():\n{body}"));
+        let module = crate::module(&db, file);
+        let [stmt] = module.top_level.as_ref() else {
+            panic!("expected a function");
+        };
+        let crate::def::Stmt::Def { func, stmts: _ } = &module[*stmt] else {
+            panic!("expected a function");
+        };
+        assert_eq!(func.doc.as_deref(), expected, "{body}");
+    }
+}

@@ -1655,7 +1655,7 @@ impl TyContext<'_> {
                         .type_of_expr
                         .get(&FileExprId::new(file, *expr))
                         .cloned()
-                        .unwrap_or_else(Ty::never)
+                        .unwrap_or_else(Ty::unknown)
                 }
                 FlowNode::Branch { antecedents } => {
                     let mut antecedent_tys = Vec::with_capacity(antecedents.len());

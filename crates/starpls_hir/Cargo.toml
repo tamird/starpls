@@ -6,6 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
+stacker = { workspace = true }
 ruff_db = { workspace = true }
 id-arena = "2.2.1"
 salsa = { workspace = true }
@@ -21,7 +24,5 @@ either = "1.10.0"
 anyhow = "1.0.81"
 
 [dev-dependencies]
-ruff_python_ast = { workspace = true }
-ruff_text_size = { workspace = true }
 expect-test = "1.4.1"
 itertools = "0.12.1"

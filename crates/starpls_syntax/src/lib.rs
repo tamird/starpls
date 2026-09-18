@@ -3,16 +3,22 @@ pub use rowan::TextSize;
 pub use rowan::TokenAtOffset;
 
 pub use crate::ast::Module;
+pub use crate::parser::editor_tree;
 pub use crate::parser::from_parsed_module;
 pub use crate::parser::parse_module;
+pub use crate::parser::parse_type_comments;
 pub use crate::parser::ParseTree;
 pub use crate::parser::SyntaxError;
+pub use crate::parser::TypeComment;
 pub use crate::syntax_kind::SyntaxKind;
+pub use crate::validation::supports_expr;
+pub use crate::validation::validate;
 
 pub mod ast;
 mod lexical;
 mod parser;
 mod ruff;
+pub mod source;
 mod syntax_kind;
 mod type_comments;
 mod unescape;

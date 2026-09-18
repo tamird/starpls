@@ -62,7 +62,9 @@ pub fn from_parsed_module(
     parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
     errors_sink: &mut dyn FnMut(SyntaxError),
 ) -> ParseTree<Module> {
-    ParseTree::new(crate::ruff::parse(input, parsed, errors_sink))
+    crate::validate(input, parsed, errors_sink);
+    let comments = parse_type_comments(input, parsed.tokens(), errors_sink);
+    editor_tree(input, parsed, &comments)
 }
 
 pub(super) fn build_type_comment(
@@ -96,4 +98,48 @@ pub(super) fn build_type_comment(
     });
 
     builder.finish_node();
+}
+
+/// A type comment has its own small syntax tree; its ranges are relative to the
+/// comment, while `range` locates it in the source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeComment {
+    pub range: ruff_text_size::TextRange,
+    pub parsed: ParseTree<crate::ast::TypeComment>,
+}
+
+pub fn parse_type_comments(
+    source: &str,
+    tokens: &ruff_python_ast::token::Tokens,
+    errors: &mut dyn FnMut(SyntaxError),
+) -> Vec<TypeComment> {
+    use ruff_text_size::Ranged;
+    tokens
+        .iter()
+        .filter_map(|token| {
+            if token.kind() != ruff_python_ast::token::TokenKind::Comment {
+                return None;
+            }
+            let text = &source[token.range()];
+            if !text.starts_with(TYPE_COMMENT_PREFIX_STR) {
+                return None;
+            }
+            let mut builder = GreenNodeBuilder::new();
+            build_type_comment(&mut builder, text, usize::from(token.start()), errors);
+            Some(TypeComment {
+                range: token.range(),
+                parsed: ParseTree::new(builder.finish()),
+            })
+        })
+        .collect()
+}
+
+/// Constructs the transitional editor tree from already validated syntax and
+/// parsed comments. Callers must use comments from the exact same source.
+pub fn editor_tree(
+    input: &str,
+    parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+    comments: &[TypeComment],
+) -> ParseTree<Module> {
+    ParseTree::new(crate::ruff::parse(input, parsed, comments))
 }
