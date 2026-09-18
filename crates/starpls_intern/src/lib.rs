@@ -194,6 +194,12 @@ pub struct InternStorage<T: ?Sized> {
     map: OnceLock<InternMap<T>>,
 }
 
+impl<T: ?Sized> Default for InternStorage<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: ?Sized> InternStorage<T> {
     pub const fn new() -> Self {
         Self {

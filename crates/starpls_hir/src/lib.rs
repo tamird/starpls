@@ -166,16 +166,14 @@ impl<'a> Semantics<'a> {
                     } else {
                         return None;
                     }
-                } else if let Some(assign_stmt) = type_comment
-                    .syntax()
-                    .siblings_with_tokens(ast::Direction::Prev)
-                    .take_while(|el| !matches!(el.kind(), T!['\n'] | T![;]))
-                    .filter_map(|el| el.into_node())
-                    .find_map(ast::AssignStmt::cast)
-                {
-                    AstPtr::new(&ast::Statement::Assign(assign_stmt))
                 } else {
-                    return None;
+                    let assign_stmt = type_comment
+                        .syntax()
+                        .siblings_with_tokens(ast::Direction::Prev)
+                        .take_while(|el| !matches!(el.kind(), T!['\n'] | T![;]))
+                        .filter_map(|el| el.into_node())
+                        .find_map(ast::AssignStmt::cast)?;
+                    AstPtr::new(&ast::Statement::Assign(assign_stmt))
                 };
 
                 let stmt = source_map(self.db, file).stmt_map.get(&ptr)?;
@@ -276,19 +274,19 @@ impl<'a> Semantics<'a> {
         })
     }
 
-    pub fn scope_for_module(&self, file: File) -> SemanticsScope {
+    pub fn scope_for_module(&self, file: File) -> SemanticsScope<'_> {
         let resolver = Resolver::new_for_module(self.db, file);
         SemanticsScope { resolver }
     }
 
-    pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope> {
+    pub fn scope_for_expr(&self, file: File, expr: &ast::Expression) -> Option<SemanticsScope<'_>> {
         let ptr = AstPtr::new(expr);
         let expr = source_map(self.db, file).expr_map.get(&ptr)?;
         let resolver = Resolver::new_for_expr(self.db, file, *expr);
         Some(SemanticsScope { resolver })
     }
 
-    pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope {
+    pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope<'_> {
         let resolver = Resolver::new_for_offset(self.db, file, offset);
         SemanticsScope { resolver }
     }

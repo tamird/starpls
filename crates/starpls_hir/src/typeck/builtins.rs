@@ -1032,7 +1032,7 @@ fn normalize_doc(text: &str, is_type: bool) -> String {
                     _ => {}
                 }
                 in_tag = false;
-                tag.truncate(0);
+                tag.clear();
             }
             (_, true) => tag.push(ch),
             (_, false) => s.push(ch),

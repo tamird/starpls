@@ -167,7 +167,7 @@ impl<'a> GotoDefinitionHandler<'a> {
         } else if let Some(provider_fields) = ty.provider_fields_source(self.sema.db) {
             // Check for provider field definition. This only handles the case where the provider
             // fields are specified in a dictionary literal.
-            return self.find_name_in_dict_expr(provider_fields);
+            self.find_name_in_dict_expr(provider_fields)
         } else {
             None
         }

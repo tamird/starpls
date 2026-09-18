@@ -933,9 +933,7 @@ impl TyContext<'_> {
                                         }
                                     }
                                     SlotProvider::Missing => {
-                                        if attr.mandatory {
-                                            missing_attrs.push(name);
-                                        }
+                                        missing_attrs.extend(attr.mandatory.then_some(name));
                                     }
                                     _ => {}
                                 }
@@ -986,9 +984,8 @@ impl TyContext<'_> {
                                         }
                                     }
                                     SlotProvider::Missing => {
-                                        if data.attr.mandatory {
-                                            missing_attrs.push(&data.name);
-                                        }
+                                        missing_attrs
+                                            .extend(data.attr.mandatory.then_some(&data.name));
                                     }
                                     _ => {}
                                 }
@@ -1046,9 +1043,7 @@ impl TyContext<'_> {
                                         }
                                     }
                                     SlotProvider::Missing => {
-                                        if attr.mandatory {
-                                            missing_attrs.push(name);
-                                        }
+                                        missing_attrs.extend(attr.mandatory.then_some(name));
                                     }
                                     _ => {}
                                 }
@@ -1695,7 +1690,7 @@ impl TyContext<'_> {
                         continue;
                     }
                 }
-                FlowNode::Unreachable { .. } => Ty::never(),
+                FlowNode::Unreachable => Ty::never(),
             };
 
             break Some(curr_node_ty);

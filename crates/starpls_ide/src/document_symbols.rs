@@ -93,7 +93,7 @@ pub(crate) fn document_symbols(db: &Database, file_id: FileId) -> Option<Vec<Doc
         add_target_symbols(db, file, &mut symbols);
     }
 
-    symbols.sort_by(|s1, s2| s1.range.start().cmp(&s2.range.start()));
+    symbols.sort_by_key(|symbol| symbol.range.start());
     Some(symbols)
 }
 
