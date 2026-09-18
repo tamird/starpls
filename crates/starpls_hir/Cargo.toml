@@ -6,11 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ty_call_binding = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
 ruff_python_ast = { workspace = true }
 ruff_text_size = { workspace = true }
 stacker = { workspace = true }
 ruff_db = { workspace = true }
-ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
+ty_flow = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
 id-arena = "2.2.1"
 salsa = { workspace = true }
 starpls_bazel = { path = "../starpls_bazel" }

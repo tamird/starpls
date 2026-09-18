@@ -1736,7 +1736,7 @@ dependencies = [
 [[package]]
 name = "ruff_annotate_snippets"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "anstyle",
  "memchr",
@@ -1746,7 +1746,7 @@ dependencies = [
 [[package]]
 name = "ruff_db"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "anstyle",
  "arc-swap",
@@ -1786,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "ruff_diagnostics"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "get-size2",
  "is-macro",
@@ -1796,7 +1796,7 @@ dependencies = [
 [[package]]
 name = "ruff_index"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "get-size2",
  "ruff_macros",
@@ -1805,7 +1805,7 @@ dependencies = [
 [[package]]
 name = "ruff_macros"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "heck 0.5.0",
  "itertools 0.15.0",
@@ -1819,7 +1819,7 @@ dependencies = [
 [[package]]
 name = "ruff_memory_usage"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "get-size2",
 ]
@@ -1827,7 +1827,7 @@ dependencies = [
 [[package]]
 name = "ruff_notebook"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "anyhow",
  "rand 0.10.2",
@@ -1843,7 +1843,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_ast"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "aho-corasick",
  "arrayvec",
@@ -1864,7 +1864,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_parser"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "bitflags 2.13.2",
  "bstr",
@@ -1887,7 +1887,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_trivia"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "itertools 0.15.0",
  "memchr",
@@ -1900,7 +1900,7 @@ dependencies = [
 [[package]]
 name = "ruff_source_file"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "get-size2",
  "memchr",
@@ -1911,7 +1911,7 @@ dependencies = [
 [[package]]
 name = "ruff_text_size"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "get-size2",
  "serde",
@@ -2232,6 +2232,7 @@ dependencies = [
  "starpls_intern",
  "starpls_syntax",
  "starpls_test_util",
+ "ty_call_binding",
  "ty_flow",
 ]
 
@@ -2582,9 +2583,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "ty_call_binding"
+version = "0.0.14"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "ty_flow"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "bitvec",
  "get-size2",
@@ -2599,7 +2608,7 @@ dependencies = [
 [[package]]
 name = "ty_static"
 version = "0.0.14"
-source = "git+https://github.com/tamird/ruff.git?rev=da2f4eddf65f8283467c07bee563cc53041b4a60#da2f4eddf65f8283467c07bee563cc53041b4a60"
+source = "git+https://github.com/tamird/ruff.git?rev=c27242be93ca448438e5bce2d685a77ce7b0d7c9#c27242be93ca448438e5bce2d685a77ce7b0d7c9"
 dependencies = [
  "ruff_macros",
 ]

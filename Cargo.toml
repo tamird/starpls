@@ -12,11 +12,11 @@ members = [
 ]
 
 [workspace.dependencies]
-ruff_python_ast = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_python_parser = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_text_size = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_source_file = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
+ruff_python_ast = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
+ruff_python_parser = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
+ruff_text_size = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
+ruff_source_file = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }
 stacker = "0.1.25"
 salsa = { version = "=0.28.2", default-features = false, features = ["macros", "inventory", "accumulator"] }
-ruff_db = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60", features = ["os"] }
-ruff_notebook = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
+ruff_db = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9", features = ["os"] }
+ruff_notebook = { git = "https://github.com/tamird/ruff.git", rev = "c27242be93ca448438e5bce2d685a77ce7b0d7c9" }

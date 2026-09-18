@@ -50,14 +50,10 @@ use crate::module;
 use crate::source_map;
 use crate::typeck::assign_tys;
 use crate::typeck::builtins::builtin_types;
-use crate::typeck::call::Slot;
-use crate::typeck::call::SlotProvider;
-use crate::typeck::call::Slots;
-use crate::typeck::intrinsics::IntrinsicFunctionParam;
+use crate::typeck::call;
 use crate::typeck::intrinsics::IntrinsicTypes;
 use crate::typeck::resolve_builtin_type_ref;
 use crate::typeck::resolve_type_ref;
-use crate::typeck::resolve_type_ref_opt;
 use crate::typeck::DictLiteral;
 use crate::typeck::FileExprId;
 use crate::typeck::FileLoadItemId;
@@ -612,437 +608,41 @@ impl TyContext<'_> {
                 }
             }
             Expr::Call { callee, args } => {
-                let mut saw_keyword = false;
-                let mut saw_unpacked_dict = false;
                 let callee_ty = self.infer_expr(file, *callee);
+                for (index, message) in call::argument_order(args) {
+                    self.add_expr_diagnostic_error(
+                        file,
+                        call::argument_expr(&args[index]),
+                        message,
+                    );
+                }
                 let arg_tys: Vec<_> = args
                     .iter()
-                    .map(|arg| match arg {
-                        Argument::Simple { expr } => {
-                            if saw_keyword {
-                                self.add_expr_diagnostic_error(
-                                    file,
-                                    *expr,
-                                    String::from(
-                                        "Positional argument cannot follow keyword arguments",
-                                    ),
-                                );
-                            }
-                            if saw_unpacked_dict {
-                                self.add_expr_diagnostic_error(
-                                    file,
-                                    *expr,
-                                    String::from(
-                                        "Positional argument cannot follow keyword argument unpacking",
-                                    ),
-                                );
-                            }
-                            self.infer_expr(file, *expr)
-                        }
-                        Argument::Keyword { expr, .. } => {
-                            saw_keyword = true;
-                            self.infer_expr(file, *expr)
-                        }
-                        Argument::UnpackedList { expr } => {
-                            if saw_keyword {
-                                self.add_expr_diagnostic_error(
-                                    file,
-                                    *expr,
-                                    String::from(
-                                        "Unpacked iterable argument cannot follow keyword arguments",
-                                    ),
-                                );
-                            }
-                            if saw_unpacked_dict {
-                                self.add_expr_diagnostic_error(
-                                    file,
-                                    *expr,
-                                    String::from(
-                                        "Unpacked iterable argument cannot follow keyword argument unpacking",
-                                    ),
-                                );
-                            }
-                            self.infer_expr(file, *expr)
-                        }
-                        Argument::UnpackedDict { expr } => {
-                            saw_unpacked_dict = true;
-                            self.infer_expr(file, *expr)
-                        },
-                    })
+                    .map(|arg| self.infer_expr(file, call::argument_expr(arg)))
                     .collect();
+                if let Some(signature) = call::Signature::for_checking(db, &callee_ty) {
+                    let bindings = call::bind(self, file, &signature, args, &arg_tys, None);
+                    self.check_call_bindings(file, expr, args, &signature, bindings);
+                }
                 let args_with_ty = args.iter().zip(arg_tys.iter());
-
-                // TODO(withered-magic): This is hilariously non-DRY, should probably clean this up at some point.
                 match callee_ty.kind() {
-                    TyKind::Function(def) => {
-                        let module = module(db, def.func().file);
-                        let params = def.func().params.iter().copied();
-                        let mut slots: Slots = params
-                            .clone()
-                            .map(|param| module[param].clone())
-                            .collect::<Vec<_>>()[..]
-                            .into();
-                        let errors = slots.assign_args(args, None).0;
-
-                        for error in errors {
-                            self.add_expr_diagnostic_error(file, error.expr, error.message);
-                        }
-
-                        let mut missing_params = Vec::new();
-
-                        // Validate argument types.
-                        for (param, slot) in params.zip(slots.slots) {
-                            let hir_param = &module[param];
-                            let param_ty =
-                                resolve_type_ref_opt(self, hir_param.type_ref(), def.stmt());
-
-                            // TODO(withered-magic): Deduplicate the following logic for
-                            // validating providers, as it's currently shared between
-                            // the handlers for `Function`s, `IntrinsicFunction`s, and
-                            // `BuiltinFunction`s.
-                            let mut validate_provider = |provider| match provider {
-                                SlotProvider::Missing => {
-                                    if !hir_param.is_optional() {
-                                        let name = hir_param.name();
-                                        if !name.is_missing() {
-                                            missing_params.push(name.clone());
-                                        }
-                                    }
-                                }
-                                SlotProvider::Single(expr, index) => {
-                                    let ty = &arg_tys[index];
-                                    if !assign_tys(ty, &param_ty) {
-                                        self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
-                                    }
-                                }
-                                _ => {}
-                            };
-
-                            match slot {
-                                Slot::Positional { provider } | Slot::Keyword { provider, .. } => {
-                                    validate_provider(provider);
-                                }
-                                Slot::ArgsList { providers, .. }
-                                | Slot::KwargsDict { providers } => {
-                                    providers.into_iter().for_each(validate_provider);
-                                }
-                            }
-                        }
-
-                        // Emit diagnostic for missing parameters.
-                        if !missing_params.is_empty() {
-                            let mut message = String::from("Argument missing for parameter(s) ");
-                            for (i, name) in missing_params.into_iter().enumerate() {
-                                if i > 0 {
-                                    message.push_str(", ");
-                                }
-                                message.push('"');
-                                message.push_str(name.as_str());
-                                message.push('"');
-                            }
-
-                            self.add_expr_diagnostic_error(file, expr, message);
-                        }
-
-                        def.func()
-                            .ret_type_ref
-                            .as_ref()
-                            .map(|type_ref| resolve_type_ref(self, type_ref, def.stmt()).0)
-                            .unwrap_or_else(|| self.unknown_ty())
-                    }
-                    TyKind::IntrinsicFunction(func, subst) => {
-                        let params = &func.params;
-                        let mut slots: Slots = params[..].into();
-                        let errors = slots.assign_args(args, None).0;
-
-                        for error in errors {
-                            self.add_expr_diagnostic_error(file, error.expr, error.message);
-                        }
-
-                        // Validate argument types.
-                        for (param, slot) in params.iter().zip(slots.slots) {
-                            let param_ty = match param {
-                                IntrinsicFunctionParam::Positional { ty, .. }
-                                | IntrinsicFunctionParam::Keyword { ty, .. }
-                                | IntrinsicFunctionParam::ArgsList { ty } => ty.clone(),
-                                IntrinsicFunctionParam::KwargsDict => self.any_ty(),
-                            }
-                            .substitute(&subst.args);
-
-                            let mut validate_provider = |provider| match provider {
-                                SlotProvider::Missing => {
-                                    if !param.is_optional() {
-                                        self.add_expr_diagnostic_error(
-                                            file,
-                                            expr,
-                                            format!(
-                                                "Missing expected argument of type \"{}\"",
-                                                param_ty.display(db).alt()
-                                            ),
-                                        );
-                                    }
-                                }
-                                SlotProvider::Single(expr, index) => {
-                                    let ty = &arg_tys[index];
-                                    if !assign_tys(ty, &param_ty) {
-                                        self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
-                                    }
-                                    if let IntrinsicFunctionParam::Keyword {
-                                        name,
-                                        deprecated,
-                                        ..
-                                    } = param
-                                    {
-                                        if *deprecated {
-                                            let source_map = source_map(self.db, file);
-                                            if let Some(range) =
-                                                source_map.keyword_names.get(&expr).filter(|_| {
-                                                    source_map.expr_map_back.contains_key(&expr)
-                                                })
-                                            {
-                                                self.add_diagnostic_for_range(
-                                                    file,
-                                                    DEPRECATED_ARGUMENT,
-                                                    Severity::Info,
-                                                    *range,
-                                                    Some(vec![DiagnosticTag::Deprecated]),
-                                                    format!(
-                                                        "Argument \"{}\" is deprecated",
-                                                        name.as_str()
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            };
-
-                            match slot {
-                                Slot::Positional { provider } | Slot::Keyword { provider, .. } => {
-                                    validate_provider(provider)
-                                }
-                                Slot::ArgsList { providers, .. }
-                                | Slot::KwargsDict { providers } => {
-                                    providers.into_iter().for_each(validate_provider);
-                                }
-                            }
-                        }
-
-                        func.maybe_unique_ret_type(args_with_ty)
-                            .unwrap_or_else(|| func.ret_ty.substitute(&subst.args))
-                    }
-                    TyKind::BuiltinFunction(func) => {
-                        let params = &func.params;
-                        let mut slots: Slots = params[..].into();
-                        let errors = slots.assign_args(args, None).0;
-
-                        for error in errors {
-                            self.add_expr_diagnostic_error(file, error.expr, error.message);
-                        }
-
-                        let mut missing_params = Vec::new();
-
-                        // Validate argument types.
-                        for (param, slot) in params.iter().zip(slots.slots) {
-                            let param_ty = resolve_type_ref_opt(self, param.type_ref(), None);
-                            let mut validate_provider = |provider| match provider {
-                                SlotProvider::Missing => {
-                                    if param.is_mandatory() {
-                                        let name = param.name();
-                                        if !name.is_missing() {
-                                            missing_params.push(name.clone());
-                                        }
-                                    }
-                                }
-                                SlotProvider::Single(expr, index) => {
-                                    let ty = &arg_tys[index];
-                                    if !assign_tys(ty, &param_ty) {
-                                        self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), param_ty.display(self.db).alt()));
-                                    }
-                                }
-                                _ => {}
-                            };
-
-                            match slot {
-                                Slot::Positional { provider } | Slot::Keyword { provider, .. } => {
-                                    validate_provider(provider)
-                                }
-                                Slot::ArgsList { providers, .. }
-                                | Slot::KwargsDict { providers } => {
-                                    providers.into_iter().for_each(validate_provider);
-                                }
-                            }
-                        }
-
-                        // Emit diagnostic for missing parameters.
-                        if !missing_params.is_empty() {
-                            let mut message = String::from("Argument missing for parameter(s) ");
-                            for (i, name) in missing_params.into_iter().enumerate() {
-                                if i > 0 {
-                                    message.push_str(", ");
-                                }
-                                message.push('"');
-                                message.push_str(name.as_str());
-                                message.push('"');
-                            }
-
-                            self.add_expr_diagnostic_error(file, expr, message);
-                        }
-
-                        func.maybe_unique_ret_type(self, file, expr, args_with_ty)
-                            .unwrap_or_else(|| resolve_type_ref(self, &func.ret_type_ref, None).0)
-                    }
-                    TyKind::Rule(rule) => {
-                        let mut slots = Slots::from_rule(db, rule);
-                        let mut missing_attrs = Vec::new();
-                        slots.assign_args(args, None);
-
-                        // Validate argument types.
-                        for ((name, attr), slot) in rule.attrs(db).zip(slots.slots) {
-                            let expected_ty = attr.expected_ty();
-                            if let Slot::Keyword { provider, .. } = slot {
-                                match provider {
-                                    SlotProvider::Single(expr, index) => {
-                                        let ty = &arg_tys[index];
-                                        if !assign_tys(ty, &expected_ty) {
-                                            self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
-                                        }
-                                    }
-                                    SlotProvider::Missing => {
-                                        missing_attrs.extend(attr.mandatory.then_some(name));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        // Emit diagnostic for missing attributes.
-                        if !missing_attrs.is_empty() {
-                            let mut message = String::from("Argument missing for attribute(s) ");
-                            for (i, name) in missing_attrs.iter().enumerate() {
-                                if i > 0 {
-                                    message.push_str(", ");
-                                }
-                                message.push('"');
-                                message.push_str(name.as_str());
-                                message.push('"');
-                            }
-
-                            self.add_expr_diagnostic_error(file, expr, message);
-                        }
-
-                        self.none_ty()
-                    }
+                    TyKind::Function(def) => def
+                        .func()
+                        .ret_type_ref
+                        .as_ref()
+                        .map(|type_ref| resolve_type_ref(self, type_ref, def.stmt()).0)
+                        .unwrap_or_else(|| self.unknown_ty()),
+                    TyKind::IntrinsicFunction(func, subst) => func
+                        .maybe_unique_ret_type(args_with_ty)
+                        .unwrap_or_else(|| func.ret_ty.substitute(&subst.args)),
+                    TyKind::BuiltinFunction(func) => func
+                        .maybe_unique_ret_type(self, file, expr, args_with_ty)
+                        .unwrap_or_else(|| resolve_type_ref(self, &func.ret_type_ref, None).0),
+                    TyKind::Rule(_) => self.none_ty(),
+                    TyKind::Tag(_) => self.none_ty(),
+                    TyKind::Macro(_) => self.none_ty(),
                     TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
                         TyKind::ProviderInstance(provider.clone()).intern()
-                    }
-                    TyKind::Tag(tag_class) => {
-                        // TODO(withered-magic): Much of this logic is duplicated from handling `TyKind::Rule` above.
-                        let mut slots = Slots::from_tag_class(tag_class);
-                        slots.assign_args(args, None);
-
-                        let mut missing_attrs = Vec::new();
-
-                        // Validate argument types.
-                        for (data, slot) in tag_class
-                            .attrs
-                            .iter()
-                            .flat_map(|attrs| attrs.iter())
-                            .zip(slots.slots)
-                        {
-                            let expected_ty = data.attr.expected_ty();
-                            if let Slot::Keyword { provider, .. } = slot {
-                                match provider {
-                                    SlotProvider::Single(expr, index) => {
-                                        let ty = &arg_tys[index];
-                                        if !assign_tys(ty, &expected_ty) {
-                                            self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
-                                        }
-                                    }
-                                    SlotProvider::Missing => {
-                                        missing_attrs
-                                            .extend(data.attr.mandatory.then_some(&data.name));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        // Emit diagnostic for missing parameters.
-                        if !missing_attrs.is_empty() {
-                            let mut message = String::from("Argument missing for attribute(s) ");
-                            for (i, name) in missing_attrs.iter().enumerate() {
-                                if i > 0 {
-                                    message.push_str(", ");
-                                }
-                                message.push('"');
-                                message.push_str(name.as_str());
-                                message.push('"');
-                            }
-
-                            self.add_expr_diagnostic_error(file, expr, message);
-                        }
-
-                        self.none_ty()
-                    }
-                    TyKind::Macro(makro) => {
-                        let mut slots = Slots::from_macro(makro);
-                        let mut missing_attrs = Vec::new();
-                        slots.assign_args(args, None);
-
-                        // Check for any disallowed attributes.
-                        for arg in args.iter() {
-                            eprintln!("{:?}", arg);
-                            match arg {
-                                Argument::Keyword { name, expr }
-                                    if makro.disallowed_attrs().any(|n| n == name) =>
-                                {
-                                    self.add_expr_diagnostic_error(
-                                        file,
-                                        *expr,
-                                        format!("Cannot set attribute \"{}\"", name.as_str()),
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        // Validate attribute types.
-                        for ((name, attr), slot) in makro.attrs().zip(slots.slots) {
-                            let expected_ty = attr.expected_ty();
-                            if let Slot::Keyword { provider, .. } = slot {
-                                match provider {
-                                    SlotProvider::Single(expr, index) => {
-                                        let ty = &arg_tys[index];
-                                        if !assign_tys(ty, &expected_ty) {
-                                            self.add_expr_diagnostic_error(file, expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), expected_ty.display(self.db).alt()));
-                                        }
-                                    }
-                                    SlotProvider::Missing => {
-                                        missing_attrs.extend(attr.mandatory.then_some(name));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        // Emit diagnostic for missing attributes.
-                        if !missing_attrs.is_empty() {
-                            let mut message = String::from("Argument missing for attribute(s) ");
-                            for (i, name) in missing_attrs.iter().enumerate() {
-                                if i > 0 {
-                                    message.push_str(", ");
-                                }
-                                message.push('"');
-                                message.push_str(name.as_str());
-                                message.push('"');
-                            }
-
-                            self.add_expr_diagnostic_error(file, expr, message);
-                        }
-
-                        self.none_ty()
                     }
                     TyKind::Unknown | TyKind::Any | TyKind::Unbound => self.unknown_ty(),
                     _ => self.add_expr_diagnostic_warning_ty(
@@ -2209,50 +1809,110 @@ impl TyContext<'_> {
         let db = self.db;
         match &module(db, file)[expr] {
             Expr::Call { callee, args } => {
-                // Determine args that are in invalid positions.
-                let mut saw_keyword = false;
-                let mut saw_unpacked_dict = false;
-                for (index, arg) in args.iter().enumerate() {
-                    match arg {
-                        Argument::Simple { .. } | Argument::UnpackedList { .. } => {
-                            if saw_keyword || saw_unpacked_dict && index == active_arg {
-                                return None;
-                            }
-                        }
-                        Argument::Keyword { .. } => saw_keyword = true,
-                        Argument::UnpackedDict { .. } => saw_unpacked_dict = true,
-                    }
-                }
-
-                if active_arg == args.len() && (saw_keyword || saw_unpacked_dict) {
+                if call::argument_order(args)
+                    .iter()
+                    .any(|(index, _)| *index == active_arg)
+                {
                     return None;
                 }
-
+                if active_arg == args.len()
+                    && args
+                        .iter()
+                        .any(|arg| !matches!(arg, Argument::Simple { .. }))
+                {
+                    return None;
+                }
                 let callee_ty = self.infer_expr(file, *callee);
-                let mut slots: Slots = match callee_ty.kind() {
-                    TyKind::Function(def) => {
-                        let module = module(db, def.func().file);
-                        let params = def.func().params.iter().copied();
-                        params
-                            .clone()
-                            .map(|param| module[param].clone())
-                            .collect::<Vec<_>>()[..]
-                            .into()
-                    }
-                    TyKind::IntrinsicFunction(func, _) => func.params[..].into(),
-                    TyKind::BuiltinFunction(func) => func.params[..].into(),
-                    TyKind::Rule(rule) => Slots::from_rule(db, rule),
-                    TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
-                        Slots::from_provider(provider)
-                    }
-                    TyKind::Tag(tag_class) => Slots::from_tag_class(tag_class),
-                    TyKind::Macro(makro) => Slots::from_macro(makro),
-                    _ => return None,
-                };
-
-                slots.assign_args(args, Some(active_arg)).1
+                let signature = call::Signature::new(db, &callee_ty)?;
+                let types: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.infer_expr(file, call::argument_expr(arg)))
+                    .collect();
+                call::bind(self, file, &signature, args, &types, Some(active_arg)).active_parameter
             }
             _ => None,
+        }
+    }
+
+    fn check_call_bindings(
+        &mut self,
+        file: File,
+        expr: ExprId,
+        args: &[Argument],
+        signature: &call::Signature<'_>,
+        bindings: call::CallBindings,
+    ) {
+        let call::CallBindings {
+            arguments,
+            missing,
+            errors,
+            active_parameter: _,
+        } = bindings;
+        for (expr, message) in errors {
+            self.add_expr_diagnostic_error(file, expr, message);
+        }
+        let types: Vec<_> = signature
+            .parameters
+            .iter()
+            .map(|param| param.ty.resolve(self))
+            .collect();
+        for (argument_index, argument) in arguments.iter().enumerate() {
+            for matched in &argument.parameters {
+                let param = &signature.parameters[matched.index];
+                let call::Value { expr, ty } = &matched.data;
+                if let Some(ty) = ty {
+                    if !assign_tys(ty, &types[matched.index]) {
+                        self.add_expr_diagnostic_error(file, *expr, format!("Argument of type \"{}\" cannot be assigned to parameter of type \"{}\"", ty.display(self.db).alt(), types[matched.index].display(self.db).alt()));
+                    }
+                }
+                if param.deprecated {
+                    if let Argument::Keyword { name, expr } = &args[argument_index] {
+                        let source_map = source_map(self.db, file);
+                        if let Some(range) = source_map
+                            .keyword_names
+                            .get(expr)
+                            .filter(|_| source_map.expr_map_back.contains_key(expr))
+                        {
+                            self.add_diagnostic_for_range(
+                                file,
+                                DEPRECATED_ARGUMENT,
+                                Severity::Info,
+                                *range,
+                                Some(vec![DiagnosticTag::Deprecated]),
+                                format!("Argument \"{}\" is deprecated", name.as_str()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut names = Vec::new();
+        for index in missing {
+            let param = &signature.parameters[index];
+            if let Some(name) = param.name() {
+                names.push(format!("\"{name}\""));
+            } else {
+                self.add_expr_diagnostic_error(
+                    file,
+                    expr,
+                    format!(
+                        "Missing expected argument of type \"{}\"",
+                        types[index].display(self.db).alt()
+                    ),
+                );
+            }
+        }
+        if !names.is_empty() {
+            let kind = if signature.attributes {
+                "attribute"
+            } else {
+                "parameter"
+            };
+            self.add_expr_diagnostic_error(
+                file,
+                expr,
+                format!("Argument missing for {kind}(s) {}", names.join(", ")),
+            );
         }
     }
 

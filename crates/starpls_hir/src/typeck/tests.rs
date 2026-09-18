@@ -108,7 +108,7 @@ fn test_type_test_conditionals() {
             "type([])",
             "Unknown",
         ),
-        ("type(*[])", "type(*[])", "string"),
+        ("type(*[1])", "type(*[1])", "string"),
     ] {
         let mut builder = TestDatabaseBuilder::default();
         builder.set_inference_options(InferenceOptions {
@@ -592,9 +592,52 @@ foo(bar=1, bar=2)
             40..41 "2": Literal[2]
             25..42 "foo(bar=1, bar=2)": Unknown
 
-            40..41 Unexpected keyword argument "bar"
+            40..41 Multiple arguments for parameter "bar"
         "#]],
     );
+}
+
+#[test]
+fn call_binding_expansions() {
+    let mut builder = TestDatabaseBuilder::default();
+    builder.set_inference_options(InferenceOptions {
+        allow_unused_definitions: true,
+        ..Default::default()
+    });
+    let mut db = builder.build();
+    // Reopening the same document also checks that changed expansion shapes invalidate bindings.
+    for (call, expected) in [
+        ("f(1)", vec![]),
+        ("f(*[1])", vec![]),
+        ("f(*(1,))", vec![]),
+        ("f(**{\"x\": 1})", vec![]),
+        ("f(*[])", vec!["Argument missing for parameter(s) \"x\""]),
+        ("f(**{})", vec!["Argument missing for parameter(s) \"x\""]),
+        ("f(\"bad\", **{})", vec!["Argument of type \"Literal[\"bad\"]\" cannot be assigned to parameter of type \"int\""]),
+        ("f(*[\"bad\"])", vec!["Argument of type \"Literal[\"bad\"]\" cannot be assigned to parameter of type \"int\""]),
+        ("f(**{\"x\": \"bad\"})", vec!["Argument of type \"Literal[\"bad\"]\" cannot be assigned to parameter of type \"int\""]),
+        ("f(1, x=2)", vec!["Multiple arguments for parameter \"x\""]),
+        ("f(x=1, **{\"x\": 2})", vec!["Multiple arguments for parameter \"x\""]),
+        ("f(**{\"x\": 1, \"x\": 2})", vec!["Multiple arguments for parameter \"x\""]),
+        ("f(x=1, *())", vec![]),
+        ("f(x=1, *(2,))", vec!["Multiple arguments for parameter \"x\""]),
+        ("f(*[1, 2])", vec!["Unexpected positional argument"]),
+        ("values = (1, 2)\nf(*values)", vec!["Unexpected positional argument"]),
+        ("f(1, z=2, **{\"z\": 3})", vec!["Multiple arguments for parameter \"z\""]),
+        ("f(1, z=2, z=3)", vec!["Multiple arguments for parameter \"z\""]),
+        ("key = \"x\"\nf(**{\"x\": \"bad\", key: 1})", vec![]),
+        // Mutable aliases and dictionaries with dynamic keys are not closed shapes.
+        ("values = []\nf(*values)", vec![]),
+        ("values = {}\nf(**values)", vec![]),
+        ("key = \"x\"\nf(**{key: 1})", vec![]),
+        ("values = {\"x\": 1}\nvalues.clear()\nf(**values)", vec![]),
+        ("values = {}\nf(\"bad\", **values)", vec!["Argument of type \"Literal[\"bad\"]\" cannot be assigned to parameter of type \"int\""]),
+    ] {
+        let input = format!("def f(x, **kwargs):\n    # type: (int, **int) -> None\n    pass\n{call}\n");
+        let file = starpls_common::open_document(&mut db, std::path::Path::new("main.bzl"), Dialect::Bazel, Some(FileInfo::Bazel { api_context: APIContext::Bzl, is_external: false }), input.clone(), 0).unwrap();
+        let actual: Vec<_> = super::queries::diagnostics(&db, file).iter().map(|diagnostic| diagnostic.headline_message().to_string()).collect();
+        assert_eq!(actual, expected, "{input}");
+    }
 }
 
 #[test]
@@ -635,8 +678,6 @@ foo(**kwargs, *args)
 
             57..58 Positional argument cannot follow keyword arguments
             74..75 Positional argument cannot follow keyword argument unpacking
-            83..84 Unexpected keyword argument "y"
-            87..91 Unpacked iterable argument cannot follow keyword arguments
             108..112 Unpacked iterable argument cannot follow keyword argument unpacking
         "#]],
     );
@@ -1401,6 +1442,8 @@ miniature(
     e = "abc",
 )
 
+miniature(**{"c": "ok", "d": "forbidden"})
+
 "#,
         expect![[r#"
             24..33 "miniature": macro
@@ -1429,10 +1472,18 @@ miniature(
             256..261 "\"abc\"": Literal["abc"]
             271..276 "\"abc\"": Literal["abc"]
             211..279 "miniature(\n    a = \"abc\",\n    b = 1,\n    d = \"abc\",\n    e = \"abc\",\n)": None
+            281..290 "miniature": macro
+            294..297 "\"c\"": Literal["c"]
+            299..303 "\"ok\"": Literal["ok"]
+            305..308 "\"d\"": Literal["d"]
+            310..321 "\"forbidden\"": Literal["forbidden"]
+            293..322 "{\"c\": \"ok\", \"d\": \"forbidden\"}": dict[string, string]
+            281..323 "miniature(**{\"c\": \"ok\", \"d\": \"forbidden\"})": None
 
             211..279 Argument missing for attribute(s) "c"
             245..246 Argument of type "Literal[1]" cannot be assigned to parameter of type "string"
             256..261 Cannot set attribute "d"
+            310..321 Cannot set attribute "d"
         "#]],
     );
 }

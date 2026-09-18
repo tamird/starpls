@@ -341,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_binding_for_expanded_arguments() {
+        for (call, active) in [
+            ("f(x=1, *[2$0])", Some(0)),
+            ("f(y=1, *[2$0])", Some(0)),
+            ("f(**{\"y\": 2$0})", Some(2)),
+            ("f(x=1$0, 2)", Some(0)),
+            ("f(x=1, 2$0)", Some(100)),
+            ("f(1, y=2$0)", Some(2)),
+        ] {
+            let source = format!("def f(x, *, y): pass\n{call}");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let help = analysis
+                .snapshot()
+                .signature_help(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("{help:?}");
+            };
+            assert_eq!(signature.active_parameter, active, "{source}");
+        }
+    }
+
+    #[test]
     fn incomplete_call_after_comma() {
         let (analysis, fixture) = Analysis::from_single_file_fixture("def f(x, y): pass\nf(1, $0");
         let (file_id, pos) = fixture.cursor_pos.unwrap();
