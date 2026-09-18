@@ -440,9 +440,8 @@ impl ScopeCollector<'_> {
                     self.source_map
                         .expr_map_back
                         .get(&expr)
-                        .expect("expected expr to exist in source map")
-                        .syntax_node_ptr()
-                        .text_range(),
+                        .copied()
+                        .expect("expected expr to exist in source map"),
                     "Expression is not assignable",
                     [],
                 ))

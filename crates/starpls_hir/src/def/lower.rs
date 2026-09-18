@@ -12,7 +12,6 @@ use starpls_intern::Interned;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::AstPtr;
 use starpls_syntax::ast::AstToken;
-use starpls_syntax::ast::SyntaxNodePtr;
 use starpls_syntax::ast::{self};
 use starpls_syntax::SyntaxNode;
 use starpls_syntax::SyntaxToken;
@@ -50,7 +49,7 @@ pub(super) fn lower_module(
     file: File,
     syntax: ast::Module,
 ) -> (Module, ModuleSourceMap) {
-    let root = AstPtr::new(&syntax);
+    let root = syntax.syntax().text_range();
     LoweringContext {
         db,
         file,
@@ -130,7 +129,7 @@ impl<'a> LoweringContext<'a> {
                     name,
                     ret_type_ref: spec.map(|spec| spec.1),
                     doc,
-                    ptr: ptr.syntax_node_ptr(),
+                    range: ptr.syntax_node_ptr().text_range(),
                     params,
                 });
                 let stmt = self.alloc_stmt(
@@ -195,9 +194,9 @@ impl<'a> LoweringContext<'a> {
                 }
             }
             ast::Statement::Load(stmt) => {
-                let ptr = SyntaxNodePtr::new(stmt.syntax());
+                let range = stmt.syntax().text_range();
                 let module = self.lower_string_opt(stmt.module().and_then(|module| module.name()));
-                let load_stmt = Arc::new(LoadStmtData { module, ptr });
+                let load_stmt = Arc::new(LoadStmtData { module, range });
                 let items = self.lower_load_items(load_stmt.clone(), stmt.items());
                 Stmt::Load { load_stmt, items }
             }
@@ -263,7 +262,7 @@ impl<'a> LoweringContext<'a> {
                     name: Name::new_inline("lambda"),
                     ret_type_ref: None,
                     doc: None,
-                    ptr: ptr.syntax_node_ptr(),
+                    range: ptr.syntax_node_ptr().text_range(),
                     params,
                 });
                 let body = self.lower_expr_opt(node.body());
@@ -717,7 +716,9 @@ impl<'a> LoweringContext<'a> {
             }
         }
         source_map.stmt_map.insert(ptr.clone(), id);
-        source_map.stmt_map_back.insert(id, ptr);
+        source_map
+            .stmt_map_back
+            .insert(id, ptr.syntax_node_ptr().text_range());
         id
     }
 
@@ -760,21 +761,27 @@ impl<'a> LoweringContext<'a> {
             }
         }
         source_map.expr_map.insert(ptr.clone(), id);
-        source_map.expr_map_back.insert(id, ptr);
+        source_map
+            .expr_map_back
+            .insert(id, ptr.syntax_node_ptr().text_range());
         id
     }
 
     fn alloc_param(&mut self, param: Param, ptr: ParamPtr) -> ParamId {
         let id = self.module.params.alloc(param);
         self.source_map.param_map.insert(ptr.clone(), id);
-        self.source_map.param_map_back.insert(id, ptr.clone());
+        self.source_map
+            .param_map_back
+            .insert(id, ptr.syntax_node_ptr().text_range());
         id
     }
 
     fn alloc_load_item(&mut self, load_item: LoadItem, ptr: LoadItemPtr) -> LoadItemId {
         let id = self.module.load_items.alloc(load_item);
         self.source_map.load_item_map.insert(ptr.clone(), id);
-        self.source_map.load_item_map_back.insert(id, ptr.clone());
+        self.source_map
+            .load_item_map_back
+            .insert(id, ptr.syntax_node_ptr().text_range());
         id
     }
 

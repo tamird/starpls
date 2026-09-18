@@ -309,22 +309,7 @@ impl<'a> Resolver<'a> {
         let scope = scopes
             .scopes_by_hir_id
             .iter()
-            .map(|(hir, scope)| {
-                let ptr = match *hir {
-                    ScopeHirId::Module => source_map.root.syntax_node_ptr(),
-                    ScopeHirId::Expr(expr) => source_map
-                        .expr_map_back
-                        .get(&expr)
-                        .unwrap()
-                        .syntax_node_ptr(),
-                    ScopeHirId::Stmt(stmt) => source_map
-                        .stmt_map_back
-                        .get(&stmt)
-                        .unwrap()
-                        .syntax_node_ptr(),
-                };
-                (ptr.text_range(), *scope)
-            })
+            .map(|(hir, scope)| (source_map.range_for_hir(*hir), *scope))
             .filter(|(range, _)| range.start() <= offset && offset <= range.end())
             .min_by_key(|(range, _)| range.len())
             .map(|(hir_range, scope)| {
@@ -365,22 +350,7 @@ fn find_nearest_predecessor(
     scopes
         .scopes_by_hir_id
         .iter()
-        .map(|(hir, scope)| {
-            let ptr = match *hir {
-                ScopeHirId::Module => source_map.root.syntax_node_ptr(),
-                ScopeHirId::Expr(expr) => source_map
-                    .expr_map_back
-                    .get(&expr)
-                    .unwrap()
-                    .syntax_node_ptr(),
-                ScopeHirId::Stmt(stmt) => source_map
-                    .stmt_map_back
-                    .get(&stmt)
-                    .unwrap()
-                    .syntax_node_ptr(),
-            };
-            (ptr.text_range(), *scope)
-        })
+        .map(|(hir, scope)| (source_map.range_for_hir(*hir), *scope))
         .filter(|(range, _)| {
             range.start() <= offset && hir_range.contains_range(*range) && hir_range != *range
         })
