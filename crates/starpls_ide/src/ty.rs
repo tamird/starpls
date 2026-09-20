@@ -26,8 +26,10 @@ use crate::Database;
 mod factory;
 mod load;
 mod native;
+mod support;
 
 pub(crate) use factory::Documentation;
+pub(crate) use support::file_system;
 
 pub(crate) struct SemanticSettings {
     program: ProgramSettings,
@@ -245,6 +247,12 @@ impl ty_python_semantic::Db for Database {
         }
         if matches!(usage, BuiltinUsage::Annotation) {
             match name {
+                "bytes" => {
+                    return Some(ProvidedBindingValue::Value(
+                        KnownClass::Bytes
+                            .to_class_literal(self, &ProgramEnvironment::from_file(file)),
+                    ))
+                }
                 "Unknown" => {
                     return Some(ProvidedBindingValue::Value(
                         ty_python_semantic::types::Type::unknown(),

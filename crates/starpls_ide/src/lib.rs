@@ -235,7 +235,7 @@ impl Analysis {
         options: InferenceOptions,
         system: impl ruff_db::system::System + 'static,
     ) -> Self {
-        let vendored = ty_vendored::file_system().clone();
+        let vendored = ty::file_system().clone();
         let semantic = Arc::new(ty::SemanticSettings::new(&vendored));
         let mut db = Database {
             files: Default::default(),

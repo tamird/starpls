@@ -2420,6 +2420,7 @@ dependencies = [
  "ty_site_packages",
  "ty_vendored",
  "unindent",
+ "zip",
 ]
 
 [[package]]

@@ -6,7 +6,11 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "starpls_ide",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["src/ty/starlark.pyi"],
+    compile_data = [
+        "src/ty/collections.pyi",
+        "src/ty/primitives.pyi",
+        "src/ty/starlark.pyi",
+    ],
     aliases = {
         "@crates//:salsa": "salsa",
     },

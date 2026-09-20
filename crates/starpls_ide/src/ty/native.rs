@@ -184,12 +184,29 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
     for class in classes.values() {
-        writeln!(body, "    class {}:", class.name)?;
+        if class.name == "struct" {
+            writeln!(
+                body,
+                "    class struct(_starpls_typing.Generic[_StructField]):"
+            )?;
+        } else {
+            writeln!(body, "    class {}:", class.name)?;
+        }
         writeln!(
             body,
             "        {}",
             quoted(&env::normalize_doc(&class.doc, false))
         )?;
+        if class.name == "struct" {
+            // The inventory describes an open record. Known source factory
+            // fields are supplied separately; arbitrary native fields retain
+            // their declared element contract through ordinary member lookup.
+            writeln!(body, "        @_starpls_typing.type_check_only")?;
+            writeln!(
+                body,
+                "        def __getattr__(self, name: _starpls_builtins.str) -> _StructField: ..."
+            )?;
+        }
         let mut names = BTreeSet::new();
         for field in &class.field {
             if !names.insert(&field.name) {
@@ -205,12 +222,30 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     CallableKind::Method,
                     &declared_classes,
                 )?,
-                None => writeln!(
-                    body,
-                    "        {}: {}",
-                    field.name,
-                    annotation(&field.r#type, false, &declared_classes)
-                )?,
+                None => {
+                    let field_type = if class.name == "ctx" {
+                        match field.name.as_str() {
+                            "file" => Some("_starpls_types.struct[_starpls_types.File]"),
+                            "outputs" => Some("_starpls_types.struct[_starpls_types.File]"),
+                            "executable" => Some("_starpls_types.struct[_starpls_types.File]"),
+                            "files" => Some("_starpls_types.struct[_starpls_builtins.list[_starpls_types.File]]"),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let field_type = field_type
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| annotation(&field.r#type, false, &declared_classes));
+                    writeln!(body, "        {}: {field_type}", field.name)?;
+                    if !field.doc.is_empty() {
+                        writeln!(
+                            body,
+                            "        {}",
+                            quoted(&env::normalize_doc(&field.doc, false))
+                        )?;
+                    }
+                }
             }
         }
     }
@@ -254,7 +289,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
