@@ -59,7 +59,6 @@ pub(crate) enum AssignmentSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSourceMap {
-    pub root: TextRange,
     pub expr_nodes: FxHashMap<NodeIndex, ExprId>,
     pub stmt_nodes: FxHashMap<NodeIndex, StmtId>,
     pub param_nodes: FxHashMap<NodeIndex, ParamId>,
@@ -79,30 +78,6 @@ pub(crate) fn load_item_node(item: ruff_python_ast::ArgOrKeyword<'_>) -> NodeInd
     match item {
         ruff_python_ast::ArgOrKeyword::Arg(expr) => expr.node_index().load(),
         ruff_python_ast::ArgOrKeyword::Keyword(keyword) => keyword.node_index().load(),
-    }
-}
-
-impl ModuleSourceMap {
-    pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
-        let Self {
-            root,
-            expr_nodes: _,
-            stmt_nodes: _,
-            param_nodes: _,
-            load_item_nodes: _,
-            function_names: _,
-            keyword_names: _,
-            annotation_ranges: _,
-            expr_map_back,
-            stmt_map_back,
-            param_map_back: _,
-            load_item_map_back: _,
-        } = self;
-        match hir {
-            scope::ScopeHirId::Module => *root,
-            scope::ScopeHirId::Expr(expr) => expr_map_back[&expr],
-            scope::ScopeHirId::Stmt(stmt) => stmt_map_back[&stmt],
-        }
     }
 }
 

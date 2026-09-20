@@ -61,7 +61,6 @@ pub(crate) fn lower_module(db: &dyn Db, file: File) -> crate::ModuleInfo {
         module: Default::default(),
         diagnostics: Vec::new(),
         source_map: ModuleSourceMap {
-            root: source_range(TextRange::up_to(TextSize::of(&*source))),
             expr_nodes: Default::default(),
             stmt_nodes: Default::default(),
             param_nodes: Default::default(),

@@ -15,6 +15,7 @@ use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::provided::ProvidedClass;
 use ty_python_semantic::provided::ProvidedData;
+use ty_python_semantic::provided::ProvidedField;
 use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::CheckedArgument;
@@ -417,7 +418,14 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
             bases: declared_base(db, call, "struct"),
             class_members: Box::default(),
             instance_fields: ProvidedInstanceFields {
-                fields: fields.into_boxed_slice(),
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| ProvidedField {
+                        name,
+                        ty,
+                        source: None,
+                    })
+                    .collect(),
                 has_dynamic_fields,
                 data: None,
             },
@@ -540,7 +548,14 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             bases: Box::default(),
             class_members: Box::from([(Name::new("__init__"), init)]),
             instance_fields: ProvidedInstanceFields {
-                fields: fields.into_boxed_slice(),
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| ProvidedField {
+                        name,
+                        ty,
+                        source: None,
+                    })
+                    .collect(),
                 has_dynamic_fields: open,
                 data: Some(ProvidedData::new(documentation.clone())),
             },

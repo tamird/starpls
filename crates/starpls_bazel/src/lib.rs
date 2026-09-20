@@ -62,6 +62,7 @@ pub const BUILTINS_VALUES_DENY_LIST: &[&str] = &[
     "all",
     "any",
     "bool",
+    "bytes",
     "dict",
     "dir",
     "enumerate",

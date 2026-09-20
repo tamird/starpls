@@ -21,7 +21,6 @@ use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
 use starpls_syntax::TextRange;
-use starpls_syntax::TextSize;
 use typeck::builtins::BuiltinFunction;
 use typeck::intrinsics::IntrinsicFunction;
 use typeck::queries;
@@ -153,7 +152,7 @@ pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Dia
 ///
 /// fn inspect_then_edit(db: &mut dyn Db, file: File) -> String {
 ///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
-///     let result = definition.ty().to_string();
+///     let result = format!("{:?}", definition.definition_range());
 ///     starpls_common::update_file(db, file, String::new());
 ///     result
 /// }
@@ -168,7 +167,7 @@ pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Dia
 /// fn edit_then_inspect(db: &mut dyn Db, file: File) -> String {
 ///     let (_, definition) = Semantics::new(db).scope_for_module(file).exports().next().unwrap();
 ///     starpls_common::update_file(db, file, String::new());
-///     definition.ty().to_string()
+///     format!("{:?}", definition.definition_range())
 /// }
 /// ```
 #[derive(Clone, Copy)]
@@ -390,14 +389,6 @@ impl<'a> Semantics<'a> {
             resolver: Resolver::new_for_expr(*db, file, expr),
         }
     }
-
-    pub fn scope_for_offset(&self, file: File, offset: TextSize) -> SemanticsScope<'a> {
-        let resolver = Resolver::new_for_offset(self.db, file, offset);
-        SemanticsScope {
-            sema: *self,
-            resolver,
-        }
-    }
 }
 
 pub struct SemanticsScope<'a> {
@@ -406,11 +397,12 @@ pub struct SemanticsScope<'a> {
 }
 
 impl<'a> SemanticsScope<'a> {
-    pub fn names(&self) -> impl Iterator<Item = (Name, ScopeDef<'a>)> + 'a {
+    /// Source definitions for structural editor views, excluding builtins.
+    pub fn definitions(&self) -> impl Iterator<Item = (Name, ScopeDef<'a>)> + 'a {
         let Self { sema, resolver } = self;
         let sema = *sema;
         resolver
-            .names()
+            .module_defs(false)
             .into_iter()
             .map(move |(name, def)| (name, ScopeDef::new(sema, def)))
     }
@@ -458,19 +450,6 @@ impl<'a> Type<'a> {
             ty.kind(),
             TyKind::Function(_) | TyKind::BuiltinFunction(_) | TyKind::IntrinsicFunction(_, _)
         )
-    }
-
-    pub fn is_callable(&self) -> bool {
-        let Self { sema: _, ty } = self;
-        self.is_function()
-            || matches!(
-                ty.kind(),
-                TyKind::Rule(_)
-                    | TyKind::Provider(_)
-                    | TyKind::ProviderRawConstructor(_, _)
-                    | TyKind::Tag(_)
-                    | TyKind::Macro(_)
-            )
     }
 
     pub fn is_unknown(&self) -> bool {
@@ -994,38 +973,6 @@ impl<'a> ScopeDef<'a> {
             return Some(InFile { file, value: range });
         }
         self.source_range()
-    }
-
-    pub fn ty(&self) -> Type<'a> {
-        let db = self.semantics().db;
-        let ty = match self {
-            ScopeDef::Variable(Variable { sema: _, def }) => {
-                if let Some(scope::VariableDef {
-                    file,
-                    expr,
-                    source: _,
-                }) = def
-                {
-                    queries::infer_expr(db, *file, *expr)
-                } else {
-                    Ty::unknown()
-                }
-            }
-            ScopeDef::Callable(callable) => return callable.ty(),
-            ScopeDef::LoadItem(LoadItem { sema: _, id }) => {
-                queries::infer_load_item(db, id.file, id.value)
-            }
-            _ => Ty::unknown(),
-        };
-        Type::new(self.semantics(), ty)
-    }
-
-    pub fn is_user_defined(&self) -> bool {
-        match self {
-            ScopeDef::Callable(it) => it.is_user_defined(),
-            ScopeDef::Variable(it) => it.is_user_defined(),
-            _ => true,
-        }
     }
 }
 

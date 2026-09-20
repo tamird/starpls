@@ -16,6 +16,7 @@ use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::definition::ParameterDefinitionNodeKind;
 use ty_python_semantic::provided::ProvidedClass;
+use ty_python_semantic::provided::ProvidedField;
 use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
@@ -154,7 +155,7 @@ pub(super) fn parameter_type<'db>(
             }
         }
     }
-    let make_class = |name, base, fields| {
+    let make_class = |name, base, fields: Box<[(Name, Type<'db>)]>| {
         let class = model.provided_class_at_call(
             call,
             ProvidedClass {
@@ -162,7 +163,15 @@ pub(super) fn parameter_type<'db>(
                 bases: vec![factory::native_class(db, declarations, base)?].into_boxed_slice(),
                 class_members: Box::default(),
                 instance_fields: ProvidedInstanceFields {
-                    fields,
+                    fields: fields
+                        .into_vec()
+                        .into_iter()
+                        .map(|(name, ty)| ProvidedField {
+                            name,
+                            ty,
+                            source: None,
+                        })
+                        .collect(),
                     has_dynamic_fields: false,
                     data: None,
                 },

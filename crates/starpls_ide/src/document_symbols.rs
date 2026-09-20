@@ -60,7 +60,7 @@ pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<Docum
     let file = file_id;
     let scope = sema.scope_for_module(file);
     let mut symbols = scope
-        .names()
+        .definitions()
         .filter_map(|(name, def)| {
             let InFile {
                 file: def_file,

@@ -17,15 +17,19 @@ use starpls_common::Db as _;
 use starpls_common::File;
 use starpls_common::LoadItemCandidateKind;
 use starpls_hir::Db;
-use starpls_hir::Name;
-use starpls_hir::Param;
-use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
 use starpls_syntax::source::expr_range;
 use starpls_syntax::source::string_value;
 use starpls_syntax::source::suite_range;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+use ty_python_core::definition::DefinitionKind;
+use ty_python_core::global_scope;
+use ty_python_core::scope::FileScopeId;
+use ty_python_core::scope::NodeWithScopeRef;
+use ty_python_core::semantic_index;
+use ty_python_semantic::types::ide_support::call_signature_details;
+use ty_python_semantic::types::list_members::all_end_of_scope_members;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::HasType;
 use ty_python_semantic::ObjectMembers;
@@ -101,7 +105,7 @@ enum CompletionRelevance {
 
 enum CompletionAnalysis<'a> {
     Name(NameContext<'a>),
-    NameRef(NameRefContext<'a>),
+    NameRef(NameRefContext),
     String(StringContext),
 }
 
@@ -110,9 +114,9 @@ enum NameContext<'a> {
     Dot { receiver_ty: Type<'a> },
 }
 
-struct NameRefContext<'a> {
-    names: FxHashMap<Name, ScopeDef<'a>>,
-    params: Vec<Param<'a>>,
+struct NameRefContext {
+    names: Vec<CompletionItem>,
+    params: Vec<String>,
     is_in_def: bool,
     is_in_for: bool,
     is_lone_expr: bool,
@@ -162,21 +166,11 @@ pub(crate) fn completions(
             is_in_for,
             is_loop_variable,
         }) => {
-            // Add completions for parameter names (excluding arg list and kwarg dict parameters).
-            for name in params
-                .iter()
-                .filter(|param| {
-                    !param.is_args_list() && !param.is_kwargs_dict() && !param.is_positional_only()
-                })
-                .filter_map(|param| match param.name() {
-                    Some(name) if !name.is_missing() => Some(name),
-                    _ => None,
-                })
-            {
+            for name in params {
                 items.push(CompletionItem {
-                    label: format!("{}=", name.as_str()),
+                    label: format!("{name}="),
                     kind: CompletionItemKind::Variable,
-                    mode: Some(CompletionMode::InsertText(format!("{} = ", name.as_str()))),
+                    mode: Some(CompletionMode::InsertText(format!("{name} = "))),
                     relevance: CompletionRelevance::Parameter,
                     filter_text: None,
                 });
@@ -184,27 +178,7 @@ pub(crate) fn completions(
 
             if !is_loop_variable {
                 add_globals(&mut items);
-                for (name, def) in names {
-                    items.push(CompletionItem {
-                        label: name.to_string(),
-                        kind: match &def {
-                            ScopeDef::Callable(_) => CompletionItemKind::Function,
-                            def if def.ty().is_callable() => CompletionItemKind::Function,
-                            // All the global values in the Bazel builtins are modules.
-                            ScopeDef::Variable(it) if !it.is_user_defined() => {
-                                CompletionItemKind::Module
-                            }
-                            _ => CompletionItemKind::Variable,
-                        },
-                        mode: None,
-                        relevance: if def.is_user_defined() {
-                            CompletionRelevance::VariableOrKeyword
-                        } else {
-                            CompletionRelevance::Builtin
-                        },
-                        filter_text: None,
-                    });
-                }
+                items.extend(names);
 
                 if is_lone_expr {
                     add_keywords(&mut items, is_in_def, is_in_for);
@@ -284,29 +258,24 @@ pub(crate) fn completions(
         }
         CompletionAnalysis::String(StringContext::Unavailable) => return None,
         CompletionAnalysis::String(StringContext::LoadItem { loaded_file }) => {
-            let sema = Semantics::new(db);
-            let scope = sema.scope_for_module(loaded_file);
-            for (name, def) in scope.exports() {
-                items.push(CompletionItem {
-                    label: name.to_string(),
-                    kind: match &def {
-                        ScopeDef::Callable(it) if it.is_user_defined() => {
-                            CompletionItemKind::Function
-                        }
-                        ScopeDef::Variable(it) if it.is_user_defined() => {
-                            if def.ty().is_callable() {
-                                CompletionItemKind::Function
-                            } else {
-                                CompletionItemKind::Variable
-                            }
-                        }
-                        _ => continue,
-                    },
-                    mode: None,
-                    relevance: CompletionRelevance::VariableOrKeyword,
-                    filter_text: None,
-                });
+            let file = db.starlark_program_file(loaded_file);
+            let mut names = FxHashMap::default();
+            for declaration in all_end_of_scope_members(db, global_scope(db, file)) {
+                let member = declaration.member;
+                if member.name.starts_with('_')
+                    || member.is_type_check_only
+                    || matches!(
+                        declaration.first_reachable_definition.kind(db),
+                        DefinitionKind::ProvidedBinding(_)
+                    )
+                {
+                    continue;
+                }
+                names
+                    .entry(member.name.to_string())
+                    .or_insert_with(|| lexical_item(member.name.to_string(), Some(member.ty)));
             }
+            items.extend(names.into_values());
         }
         CompletionAnalysis::String(StringContext::DictKey { keys }) => {
             for key in keys {
@@ -593,6 +562,176 @@ fn original_expr<'a>(
     original.as_expr_ref()
 }
 
+fn lexical_item(name: String, ty: Option<Type<'_>>) -> CompletionItem {
+    CompletionItem {
+        label: name,
+        kind: if ty.is_some_and(|ty| {
+            crate::hover::is_function_type(ty)
+                || matches!(ty, Type::ClassLiteral(_) | Type::GenericAlias(_))
+        }) {
+            CompletionItemKind::Function
+        } else {
+            CompletionItemKind::Variable
+        },
+        mode: None,
+        filter_text: None,
+        relevance: CompletionRelevance::VariableOrKeyword,
+    }
+}
+
+fn lexical_names(
+    db: &Database,
+    file: File,
+    model: &SemanticModel<'_>,
+    scope: FileScopeId,
+) -> Vec<CompletionItem> {
+    let mut names = FxHashMap::default();
+    let mut add_lexical = |model: &SemanticModel<'_>, scope| {
+        for completion in model.lexical_completions(scope) {
+            if !completion.is_type_check_only {
+                names
+                    .entry(completion.name.to_string())
+                    .or_insert_with(|| lexical_item(completion.name.to_string(), completion.ty));
+            }
+        }
+    };
+    add_lexical(model, scope);
+    if let Some(prelude) = db.prelude_for_file(file) {
+        add_lexical(
+            &SemanticModel::new(db, db.starlark_program_file(prelude)),
+            FileScopeId::global(),
+        );
+    }
+    for (name, callable) in db.builtin_completion_names(file) {
+        names.entry(name.clone()).or_insert(CompletionItem {
+            label: name,
+            kind: if callable {
+                CompletionItemKind::Function
+            } else {
+                CompletionItemKind::Module
+            },
+            mode: None,
+            filter_text: None,
+            relevance: CompletionRelevance::Builtin,
+        });
+    }
+    names.into_values().collect()
+}
+
+fn keyword_parameters(
+    model: &SemanticModel<'_>,
+    module: &ModModule,
+    modified: &ruff_python_ast::ExprCall,
+    insertion: ruff_text_size::TextSize,
+) -> Vec<String> {
+    let Some(callee) = original_expr(module, &modified.func, insertion) else {
+        return Vec::new();
+    };
+    let node = covering_node(module.into(), callee.range());
+    let Some(call) = node.ancestors().find_map(|node| match node {
+        AnyNodeRef::ExprCall(call) => (call.func.range() == callee.range()).then_some(call),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    let mut names = HashSet::new();
+    for details in call_signature_details(model, call) {
+        for parameter in details.parameters {
+            if parameter.is_positional_only
+                || parameter.is_variadic
+                || parameter.is_keyword_variadic
+                || modified.arguments.keywords.iter().any(|keyword| {
+                    keyword
+                        .arg
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == parameter.name)
+                })
+            {
+                continue;
+            }
+            names.insert(parameter.name);
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// The marker parse recovers the cursor's syntactic owner, including trailing
+/// blank suites. Reconnect that owner to this revision's canonical AST before
+/// asking Ty for its scope; enumeration and binding remain in the semantic index.
+fn completion_scope(
+    db: &Database,
+    file: File,
+    module: &ModModule,
+    marker: &CoveringNode<'_>,
+    tokens: &Tokens,
+) -> FileScopeId {
+    let index = semantic_index(db, db.starlark_program_file(file));
+    let marker_range = marker.node().range();
+    // An existing partial name already has a canonical expression scope. The
+    // recovered owner path is needed only when insertion creates the expression.
+    let original_end = marker_range.end() - ruff_text_size::TextSize::of(COMPLETION_MARKER);
+    let original_range = ruff_text_size::TextRange::new(marker_range.start(), original_end);
+    if !original_range.is_empty() {
+        let node = covering_node(module.into(), original_range);
+        let expression = node.ancestors().find_map(|node| {
+            (node.range() == original_range)
+                .then(|| node.as_expr_ref())
+                .flatten()
+        });
+        if let Some(expression) = expression {
+            if let Some(scope) = index.try_expression_scope_id(&expression) {
+                return scope;
+            }
+        }
+    }
+    for owner in marker.ancestors() {
+        let body = match owner {
+            AnyNodeRef::StmtFunctionDef(function) => suite_range(
+                tokens,
+                &function.body,
+                function.parameters.end(),
+                function.end(),
+                None,
+            )
+            .is_some_and(|range| range.contains_range(marker_range)),
+            AnyNodeRef::ExprLambda(lambda) => lambda.body.range().contains_range(marker_range),
+            AnyNodeRef::ExprListComp(comp) => !comp
+                .generators
+                .first()
+                .is_some_and(|generator| generator.iter.range().contains_range(marker_range)),
+            AnyNodeRef::ExprDictComp(comp) => !comp
+                .generators
+                .first()
+                .is_some_and(|generator| generator.iter.range().contains_range(marker_range)),
+            _ => false,
+        };
+        if !body {
+            continue;
+        }
+        let node = covering_node(
+            module.into(),
+            ruff_text_size::TextRange::empty(owner.start()),
+        );
+        let Some(original) = node
+            .ancestors()
+            .find(|original| original.start() == owner.start() && original.kind() == owner.kind())
+        else {
+            continue;
+        };
+        let scope_owner = match original {
+            AnyNodeRef::StmtFunctionDef(function) => NodeWithScopeRef::Function(function),
+            AnyNodeRef::ExprLambda(lambda) => NodeWithScopeRef::Lambda(lambda),
+            AnyNodeRef::ExprListComp(comp) => NodeWithScopeRef::ListComprehension(comp),
+            AnyNodeRef::ExprDictComp(comp) => NodeWithScopeRef::DictComprehension(comp),
+            _ => continue,
+        };
+        if let Some(scope) = index.try_node_scope(scope_owner) {
+            return scope;
+        }
+    }
+    FileScopeId::global()
+}
+
 impl<'a> CompletionContext<'a> {
     fn new(
         db: &'a Database,
@@ -660,27 +799,10 @@ impl<'a> CompletionContext<'a> {
                     }
                     _ => None,
                 };
-                let params = call
-                    .and_then(|call| {
-                        let callee = original_expr(parsed.syntax(), &call.func, offset)?;
-                        let ty = sema.type_of_expr(file, callee)?;
-                        Some(
-                            ty.params()
-                                .into_iter()
-                                .filter_map(|(param, _)| {
-                                    let name = param.name()?;
-                                    (!call.arguments.keywords.iter().any(|keyword| {
-                                        keyword
-                                            .arg
-                                            .as_ref()
-                                            .is_some_and(|arg| arg.as_str() == name.as_str())
-                                    }))
-                                    .then_some(param)
-                                })
-                                .collect(),
-                        )
-                    })
-                    .unwrap_or_default();
+                let model = SemanticModel::new(db, db.starlark_program_file(file));
+                let params = call.map_or_else(Vec::new, |call| {
+                    keyword_parameters(&model, parsed.syntax(), call, offset)
+                });
                 let mut is_in_def = false;
                 let mut is_in_for = false;
                 let mut is_loop_variable = false;
@@ -704,7 +826,12 @@ impl<'a> CompletionContext<'a> {
                     _ => false,
                 };
                 CompletionAnalysis::NameRef(NameRefContext {
-                    names: sema.scope_for_offset(file, pos).names().collect(),
+                    names: lexical_names(
+                        db,
+                        file,
+                        &model,
+                        completion_scope(db, file, parsed.syntax(), &node, modified.tokens()),
+                    ),
                     params,
                     is_in_def,
                     is_in_for,
@@ -781,6 +908,214 @@ mod tests {
             actual.sort_unstable();
             assert_eq!(actual, parameters, "{call}");
             assert!(items.iter().any(|item| item.label == "f"), "{call}");
+        }
+    }
+
+    #[test]
+    fn lexical_scope_reconnects_recovered_owners() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "a = 0\nb, c = 1, 2\n[d, e] = [3, 4]\n$0",
+                &["a", "b", "c", "d", "e"],
+                &[],
+            ),
+            (
+                "def f(x, *args, **kwargs):\n    $0",
+                &["f", "x", "args", "kwargs"],
+                &[],
+            ),
+            ("for x, y in [(1, 2)]:\n    $0", &["x", "y"], &[]),
+            (
+                "outer = [1]\nvalues = [item for item in outer if it$0em]",
+                &["item", "outer"],
+                &[],
+            ),
+            (
+                "def outer(param):\n    local = 1\n    $0\n\ndef later(): pass\n",
+                &["param", "local", "outer", "later"],
+                &[],
+            ),
+            (
+                "def outer(param):\n    local = 1\n    # comment\n\n    $0",
+                &["param", "local"],
+                &[],
+            ),
+            (
+                "def outer(param):\n    local = 1\n\n# dedented comment\n$0",
+                &["outer"],
+                &["param", "local"],
+            ),
+            (
+                "def outer(param):\n    def inner(nested):\n        inside = 1\n        $0",
+                &["param", "nested", "inside", "inner"],
+                &[],
+            ),
+            ("def empty(param):\n    $0", &["param"], &[]),
+            (
+                "global_value = 1\ndef f(param=$0):\n    local = 1\n",
+                &["global_value"],
+                &["param", "local"],
+            ),
+            (
+                "global_value = 1\nf = lambda param=$0: param",
+                &["global_value"],
+                &["param"],
+            ),
+            ("f = lambda param: $0", &["param"], &[]),
+            (
+                "outer = [1]\nvalues = [item for item in $0]",
+                &["outer"],
+                &["item"],
+            ),
+            (
+                "outer = [[1]]\nvalues = [later for item in outer for later in $0]",
+                &["outer", "item", "later"],
+                &[],
+            ),
+            (
+                "outer = [1]\nvalues = {$0: item for item in outer}",
+                &["outer", "item"],
+                &[],
+            ),
+        ];
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        let file_id = fixture.main_file();
+        for (source, present, absent) in cases {
+            let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
+            analysis.update_file(file_id, source.replace("$0", ""));
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            if source.contains("lambda param=$0") {
+                assert!(starpls_hir::diagnostics_for_file(&analysis.db, file_id)
+                    .any(|diagnostic| diagnostic.is_invalid_syntax()));
+            }
+            if source.starts_with("for x, y") {
+                assert!(starpls_hir::diagnostics_for_file(&analysis.db, file_id)
+                    .any(|diagnostic| diagnostic.headline_message()
+                        == "Starlark does not allow top-level for statements"));
+            }
+            for name in *present {
+                assert!(
+                    items.iter().any(|item| item.label == *name),
+                    "missing {name} in {source}: {items:?}"
+                );
+            }
+            for name in *absent {
+                assert!(
+                    !items.iter().any(|item| item.label == *name),
+                    "unexpected {name} in {source}: {items:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prelude_completions_preserve_local_shadowing() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_prelude_file(&mut analysis.db, "value = 1\ndef action(): pass\n");
+        fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD",
+            "action = 1\nvalue$0",
+            starpls_common::Dialect::Bazel,
+            Some(starpls_common::FileInfo::Bazel {
+                api_context: starpls_bazel::APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        for is_external in [false, true, false] {
+            let file_id = starpls_common::File {
+                info: Some(starpls_common::FileInfo::Bazel {
+                    api_context: starpls_bazel::APIContext::Build,
+                    is_external,
+                }),
+                ..file_id
+            };
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            let action = items
+                .iter()
+                .filter(|item| item.label == "action")
+                .collect::<Vec<_>>();
+            assert_eq!(action.len(), 1, "{items:?}");
+            assert_eq!(action[0].kind, CompletionItemKind::Variable);
+            assert_eq!(
+                items.iter().any(|item| item.label == "value"),
+                !is_external,
+                "{items:?}"
+            );
+            let model = ty_python_semantic::SemanticModel::new(
+                &analysis.db,
+                analysis.db.starlark_program_file(file_id),
+            );
+            let parsed = starpls_common::parsed_module(&analysis.db, file_id).load(&analysis.db);
+            let ruff_python_ast::Stmt::Expr(statement) = parsed.syntax().body.last().unwrap()
+            else {
+                panic!("expected value reference")
+            };
+            use ty_python_semantic::HasType;
+            let ty = statement.value.inferred_type(&model).unwrap();
+            assert_eq!(
+                ty.display(&analysis.db, &model.program_environment())
+                    .to_string(),
+                if is_external { "Unknown" } else { "Literal[1]" }
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_keyword_and_name_completions_follow_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let definitions =
+            fixture.add_file(&mut analysis.db, "defs.bzl", "def action(first): pass\n");
+        fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "load(\"defs.bzl\", loaded = \"action\")\nlen = 1\nloaded($0)",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        for parameter in ["first", "second", "first"] {
+            analysis.update_file(definitions, format!("def action({parameter}): pass\n"));
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| item.relevance == CompletionRelevance::Parameter)
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                [format!("{parameter}=")]
+            );
+            for (name, kind) in [
+                ("loaded", CompletionItemKind::Function),
+                ("len", CompletionItemKind::Variable),
+            ] {
+                let matches = items
+                    .iter()
+                    .filter(|item| item.label == name)
+                    .collect::<Vec<_>>();
+                assert_eq!(matches.len(), 1, "{name}: {items:?}");
+                assert_eq!(matches[0].kind, kind);
+                assert_eq!(matches[0].relevance, CompletionRelevance::VariableOrKeyword);
+            }
+            assert!(!items.iter().any(|item| matches!(
+                item.label.as_str(),
+                "open" | "__file__" | "__build_class__"
+            )));
         }
     }
 
@@ -913,23 +1248,32 @@ d["\x$0"]"#,
     #[test]
     fn load_strings_complete_public_definitions() {
         for (input, expected) in [
-            ("load(\"defs.bzl\", \"$0\")", Some(vec!["f", "value"])),
+            (
+                "load(\"defs.bzl\", \"$0\")",
+                Some(vec!["alias", "f", "rebound", "value"]),
+            ),
             (
                 "load(\"defs.bzl\", alias = \"$0\")",
-                Some(vec!["f", "value"]),
+                Some(vec!["alias", "f", "rebound", "value"]),
             ),
-            (r#"load("defs.bzl", "\x$0")"#, Some(vec!["f", "value"])),
-            (r#"load("defs.bzl", f("$0"))"#, Some(vec!["f", "value"])),
+            (
+                r#"load("defs.bzl", "\x$0")"#,
+                Some(vec!["alias", "f", "rebound", "value"]),
+            ),
+            (
+                r#"load("defs.bzl", f("$0"))"#,
+                Some(vec!["alias", "f", "rebound", "value"]),
+            ),
             ("load(\"defs.bzl\", al$0ias = \"value\")", Some(vec![])),
             ("load(\"defs.bzl\", \"value\"$0,)", None),
         ] {
             let (mut analysis, loader) = Analysis::new_for_test();
             let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
-            fixture.add_file(&mut analysis.db, "other.bzl", "imported = 1\n");
+            fixture.add_file(&mut analysis.db, "other.bzl", "imported = 1\nrebound = 1\n");
             fixture.add_file(
                 &mut analysis.db,
                 "defs.bzl",
-                "load(\"other.bzl\", \"imported\")\nvalue = 1\n_private = 1\ndef f(): pass\n",
+                "load(\"other.bzl\", \"imported\", \"rebound\")\nalias = imported\nrebound = 2\nvalue = 1\n_private = 1\ndef f(): pass\n",
             );
             fixture.add_file(&mut analysis.db, "main.bzl", input);
             loader.add_files_from_fixture(&fixture);

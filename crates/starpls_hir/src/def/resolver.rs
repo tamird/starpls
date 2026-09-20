@@ -4,8 +4,6 @@ use std::iter;
 use rustc_hash::FxHashMap;
 use starpls_bazel::APIContext;
 use starpls_common::File;
-use starpls_syntax::TextRange;
-use starpls_syntax::TextSize;
 
 use crate::def::scope::module_scopes;
 use crate::def::scope::ExecutionScopeId;
@@ -17,8 +15,6 @@ use crate::def::scope::ScopeId;
 use crate::def::scope::Scopes;
 use crate::def::scope::VariableDef;
 use crate::def::ExprId;
-use crate::def::ModuleSourceMap;
-use crate::source_map;
 use crate::typeck::builtins::builtin_globals;
 use crate::typeck::builtins::APIGlobals;
 use crate::typeck::intrinsics::intrinsic_functions;
@@ -176,80 +172,6 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    pub(crate) fn names(&self) -> FxHashMap<Name, ScopeDef> {
-        let builtin_globals = builtin_globals(self.db, self.file.dialect);
-
-        // Add names from this module.
-        let mut names = self.module_names();
-
-        // Add names from Starlark intrinsics.
-        for (key, func) in intrinsic_functions(self.db).functions.iter() {
-            names.insert(key.clone(), ScopeDef::IntrinsicFunction(func.clone()));
-        }
-
-        let api_context = match self.file.api_context() {
-            Some(api_context) => api_context,
-            None => return names,
-        };
-
-        // If this is a BUILD file, add names from the prelude.
-        if api_context == APIContext::Build && self.file.is_external() == Some(false) {
-            if let Some(prelude_file) = self.db.get_bazel_prelude_file() {
-                let prelude_resolver = Resolver::new_for_module(self.db, prelude_file);
-                names.extend(
-                    prelude_resolver
-                        .module_defs(false)
-                        .into_iter()
-                        .filter(|(_, def)| {
-                            matches!(
-                                def,
-                                ScopeDef::Variable(_)
-                                    | ScopeDef::Function(_)
-                                    | ScopeDef::LoadItem(_)
-                            )
-                        }),
-                );
-            }
-        }
-
-        // Add names from builtins, taking the current Bazel API context into account.
-        let mut add_builtins = |api_globals: &APIGlobals| {
-            for (name, func) in api_globals.functions.iter() {
-                names.insert(
-                    Name::from_str(name),
-                    ScopeDef::BuiltinFunction(func.clone()),
-                );
-            }
-            for (name, type_ref) in api_globals.variables.iter() {
-                names.insert(
-                    Name::from_str(name),
-                    ScopeDef::BuiltinVariable(type_ref.clone()),
-                );
-            }
-        };
-
-        if api_context == APIContext::Repo {
-            add_builtins(&builtin_globals.repo_globals);
-        } else if api_context == APIContext::Cquery {
-            add_builtins(&builtin_globals.cquery_globals);
-        } else if api_context == APIContext::Vendor {
-            add_builtins(&builtin_globals.vendor_globals);
-        } else {
-            add_builtins(&builtin_globals.bzl_globals);
-            match api_context {
-                APIContext::Module => add_builtins(&builtin_globals.bzlmod_globals),
-                APIContext::Workspace => add_builtins(&builtin_globals.workspace_globals),
-                _ => {}
-            }
-        }
-
-        names
-    }
-
-    pub(crate) fn module_names(&self) -> FxHashMap<Name, ScopeDef> {
-        self.module_defs(false)
-    }
-
     pub(crate) fn module_defs(&self, filter_unexported: bool) -> FxHashMap<Name, ScopeDef> {
         let mut names = FxHashMap::default();
         for scope in self.scopes() {
@@ -303,21 +225,6 @@ impl<'a> Resolver<'a> {
         Self::from_parts(db, file, scopes, scope)
     }
 
-    pub(crate) fn new_for_offset(db: &'a dyn Db, file: File, offset: TextSize) -> Self {
-        let scopes = module_scopes(db, file);
-        let source_map = source_map(db, file);
-        let scope = scopes
-            .scopes_by_hir_id
-            .iter()
-            .map(|(hir, scope)| (source_map.range_for_hir(*hir), *scope))
-            .filter(|(range, _)| range.start() <= offset && offset <= range.end())
-            .min_by_key(|(range, _)| range.len())
-            .map(|(hir_range, scope)| {
-                find_nearest_predecessor(scopes, source_map, hir_range, offset).unwrap_or(scope)
-            });
-        Self::from_parts(db, file, scopes, scope)
-    }
-
     pub(crate) fn scope_for_hir_id(&self, hir: impl Into<ScopeHirId>) -> Option<ScopeId> {
         self.scopes.scope_for_hir_id(hir)
     }
@@ -339,31 +246,6 @@ impl<'a> Resolver<'a> {
             scope_chain,
         }
     }
-}
-
-fn find_nearest_predecessor(
-    scopes: &Scopes,
-    source_map: &ModuleSourceMap,
-    hir_range: TextRange,
-    offset: TextSize,
-) -> Option<ScopeId> {
-    scopes
-        .scopes_by_hir_id
-        .iter()
-        .map(|(hir, scope)| (source_map.range_for_hir(*hir), *scope))
-        .filter(|(range, _)| {
-            range.start() <= offset && hir_range.contains_range(*range) && hir_range != *range
-        })
-        .max_by(|(lhs, _), (rhs, _)| {
-            if lhs.contains_range(*rhs) {
-                std::cmp::Ordering::Greater
-            } else if rhs.contains_range(*lhs) {
-                std::cmp::Ordering::Less
-            } else {
-                lhs.start().cmp(&rhs.start())
-            }
-        })
-        .map(|(_, scope)| scope)
 }
 
 #[derive(Clone, Debug)]

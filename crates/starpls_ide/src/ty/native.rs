@@ -65,7 +65,7 @@ pub(super) fn generate(
     })
 }
 
-fn globals(
+pub(super) fn globals(
     dialect: Dialect,
     context: APIContext,
     builtins: &Builtins,

@@ -184,6 +184,48 @@ impl Database {
         }
     }
 
+    pub(crate) fn prelude_for_file(
+        &self,
+        file: starpls_common::File,
+    ) -> Option<starpls_common::File> {
+        use starpls_hir::Db;
+
+        if file.api_context() == Some(APIContext::Build) && file.is_external() == Some(false) {
+            self.get_bazel_prelude_file()
+        } else {
+            None
+        }
+    }
+
+    /// Runtime names come from the same finite inventory as native declarations.
+    /// Types and lexical shadowing are supplied separately by Ty.
+    pub(crate) fn builtin_completion_names(
+        &self,
+        file: starpls_common::File,
+    ) -> std::collections::BTreeMap<String, bool> {
+        use starpls_hir::Db;
+
+        let mut names: std::collections::BTreeMap<_, _> = starpls_bazel::BUILTINS_VALUES_DENY_LIST
+            .iter()
+            .filter(|name| !matches!(**name, "True" | "False" | "None"))
+            .map(|name| ((*name).to_owned(), true))
+            .collect();
+        if let Some(context) = file.api_context() {
+            let definitions = self.get_builtin_defs(&file.dialect);
+            names.extend(
+                native::globals(
+                    file.dialect,
+                    context,
+                    definitions.builtins(self),
+                    definitions.rules(self),
+                )
+                .into_iter()
+                .map(|(name, value)| (name, value.callable.is_some())),
+            );
+        }
+        names
+    }
+
     fn language_builtin<'db>(
         &'db self,
         file: ProgramFile<'db>,
@@ -222,12 +264,6 @@ impl Database {
         }
         if matches!(usage, BuiltinUsage::Annotation) {
             match name {
-                "bytes" => {
-                    return Some(ProvidedBindingValue::Value(
-                        KnownClass::Bytes
-                            .to_class_literal(self, &ProgramEnvironment::from_file(file)),
-                    ))
-                }
                 "unknown" => {
                     return Some(ProvidedBindingValue::Value(
                         ty_python_semantic::types::Type::unknown(),
@@ -333,18 +369,14 @@ impl ty_python_semantic::Db for Database {
         name: &str,
         usage: BuiltinUsage,
     ) -> Option<ProvidedBindingValue<'db>> {
-        use starpls_hir::Db;
-
         let source_file = self.starlark_file(file)?;
-        if source_file.api_context() == Some(APIContext::Build) {
-            if let Some(prelude) = self.get_bazel_prelude_file() {
-                let binding = ProvidedBindingValue::Export {
-                    file: self.starlark_program_file(prelude),
-                    name: Name::new(name),
-                };
-                if binding.clone().resolve_type(self).is_some() {
-                    return Some(binding);
-                }
+        if let Some(prelude) = self.prelude_for_file(source_file) {
+            let binding = ProvidedBindingValue::Export {
+                file: self.starlark_program_file(prelude),
+                name: Name::new(name),
+            };
+            if binding.clone().resolve_type(self).is_some() {
+                return Some(binding);
             }
         }
         self.language_builtin(file, name, usage)
