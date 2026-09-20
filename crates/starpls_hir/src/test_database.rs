@@ -275,3 +275,66 @@ impl Fixture {
         file_id
     }
 }
+
+#[cfg(test)]
+mod parse_tests {
+    use ruff_python_ast::HasNodeIndex;
+    use ruff_text_size::Ranged;
+
+    use super::TestDatabase;
+
+    #[test]
+    fn canonical_parse_uses_module_grammar_for_arbitrary_extensions() {
+        let mut db = TestDatabase::default();
+        let file = starpls_common::open_document(
+            &mut db,
+            std::path::Path::new("plain.ipynb"),
+            starpls_common::Dialect::Standard,
+            None,
+            "%timeit a = b".into(),
+            0,
+        )
+        .unwrap();
+        let source = file.contents(&db);
+        assert!(source.read_error().is_none());
+        assert!(!source.is_notebook());
+        let parsed = starpls_common::parsed_module(&db, file).load(&db);
+        assert!(!parsed.has_valid_syntax());
+    }
+
+    #[test]
+    fn canonical_parse_handles_deep_chains() {
+        std::thread::Builder::new()
+            .stack_size(ruff_db::STACK_SIZE)
+            .spawn(|| {
+                for separator in [" + ", ".", " or "] {
+                    let contents = std::iter::repeat_n("x", 10_000)
+                        .collect::<Vec<_>>()
+                        .join(separator);
+                    let mut db = TestDatabase::default();
+                    let file = starpls_common::open_document(
+                        &mut db,
+                        std::path::Path::new("deep.star"),
+                        starpls_common::Dialect::Standard,
+                        None,
+                        contents,
+                        0,
+                    )
+                    .unwrap();
+                    let parsed = starpls_common::parsed_module(&db, file).load(&db);
+                    assert!(parsed.errors().is_empty());
+                    let first = ruff_text_size::TextRange::new(0.into(), 1.into());
+                    let covering =
+                        ruff_python_ast::find_node::covering_node(parsed.syntax().into(), first);
+                    let node = covering.node();
+                    assert_eq!(node.range(), first);
+                    assert_eq!(parsed.get_by_index(node.node_index().load()).range(), first);
+                    let tree = starpls_common::parse(&db, file);
+                    assert!(!tree.syntax().text_range().is_empty());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

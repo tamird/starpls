@@ -13,7 +13,10 @@ impl<T> TaskPool<T> {
         sender: Sender<T>,
         num_threads: usize,
     ) -> anyhow::Result<TaskPool<T>> {
-        let thread_pool = ThreadPoolBuilder::new().num_threads(num_threads).build()?;
+        let thread_pool = ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .stack_size(ruff_db::STACK_SIZE)
+            .build()?;
         Ok(TaskPool {
             sender,
             inner: thread_pool,

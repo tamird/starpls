@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use ruff_source_file::LineIndex;
 use salsa::Accumulator;
 use starpls_bazel::APIContext;
-use starpls_syntax::parse_module;
+use starpls_syntax::from_parsed_module;
 use starpls_syntax::Module;
 use starpls_syntax::ParseTree;
 pub use system::DocumentStamp;
@@ -187,6 +187,17 @@ pub fn update_file(db: &mut dyn Db, file: File, contents: String) {
 
 pub type Parse = ParseTree<Module>;
 
+/// The canonical Python-shaped parse. Starlark validation is applied separately.
+pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule {
+    let file = ruff_db::PythonFile::new_with_source_type(
+        db,
+        file.source,
+        ruff_python_ast::PythonVersion::default(),
+        ruff_python_ast::PySourceType::Python,
+    );
+    ruff_db::parsed::parsed_module(db, file)
+}
+
 pub fn parse(db: &dyn Db, file: File) -> &Parse {
     let File {
         source,
@@ -221,7 +232,8 @@ fn parse_query(
         })
         .accumulate(db);
     }
-    parse_module(&contents, &mut |err| {
+    let parsed = parsed_module(db, file).load(db);
+    from_parsed_module(&contents, &parsed, &mut |err| {
         Diagnostics(Diagnostic {
             message: err.message,
             range: FileRange {

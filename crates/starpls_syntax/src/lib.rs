@@ -3,6 +3,7 @@ pub use rowan::TextSize;
 pub use rowan::TokenAtOffset;
 
 pub use crate::ast::Module;
+pub use crate::parser::from_parsed_module;
 pub use crate::parser::parse_module;
 pub use crate::parser::ParseTree;
 pub use crate::parser::SyntaxError;

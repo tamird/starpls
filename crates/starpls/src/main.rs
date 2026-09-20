@@ -49,7 +49,19 @@ fn main() -> anyhow::Result<()> {
         env_logger::init();
     }
 
-    match cli.command {
+    // Ruff indexes and traverses recursive ASTs after parsing. Keep CLI and
+    // server analysis on the same stack size as their background workers.
+    std::thread::Builder::new()
+        .name("starpls-main".into())
+        .stack_size(ruff_db::STACK_SIZE)
+        .spawn(move || run(cli))?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
+    let Cli { command } = cli;
+    match command {
         Some(Commands::Check(cmd)) => cmd.run(),
         Some(Commands::Server(cmd)) => cmd.run(),
         Some(Commands::Version) => run_version(),
