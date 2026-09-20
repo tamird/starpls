@@ -4,7 +4,7 @@ use ruff_python_ast::Expr;
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashSet;
 use starpls_common::File;
-use starpls_hir::Semantics;
+use starpls_hir::Source;
 use starpls_syntax::source::string_value;
 use starpls_syntax::TextRange;
 use ty_python_core::definition::Definition;
@@ -29,7 +29,7 @@ use crate::LocationLink;
 use crate::ResolvedPath;
 
 struct GotoDefinitionHandler<'a> {
-    sema: Semantics<'a>,
+    sema: Source<'a>,
     model: SemanticModel<'a>,
     file: File,
     origin: TextRange,
@@ -47,9 +47,7 @@ impl<'db> GotoDefinitionHandler<'db> {
         } = self;
         match selection {
             Selection::Reference(name) => {
-                if !sema.contains_expr(*file, name.into()) {
-                    return None;
-                }
+                model.scope(name.into())?;
                 let definitions = definitions_for_name(
                     model,
                     name.id.as_str(),
@@ -74,15 +72,11 @@ impl<'db> GotoDefinitionHandler<'db> {
                 Some(self.semantic_locations(definitions))
             }
             Selection::Attribute(expr) => {
-                if !sema.contains_expr(*file, expr.into()) {
-                    return None;
-                }
+                model.scope(expr.into())?;
                 Some(self.semantic_locations(definitions_for_attribute(model, expr)))
             }
             Selection::Keyword { keyword, call } => {
-                if !sema.contains_expr(*file, call.into()) {
-                    return None;
-                }
+                model.scope(call.into())?;
                 Some(
                     self.semantic_locations(definitions_for_keyword_argument(model, keyword, call)),
                 )
@@ -106,11 +100,8 @@ impl<'db> GotoDefinitionHandler<'db> {
                 Some(self.semantic_locations(definitions))
             }
             Selection::String(expr) => {
-                // The node must belong to Starlark lowering, not to an ignored
-                // Python-only annotation or unsupported statement subtree.
-                if !sema.contains_expr(*file, expr.into()) {
-                    return None;
-                }
+                // The node must be admitted by the Starlark frontend.
+                model.scope(expr.into())?;
                 let (value, _) = string_value(&source[expr.range()])?;
                 self.string_location(&value)
             }
@@ -258,7 +249,7 @@ pub(crate) fn goto_definition(
     FilePosition { file_id: file, pos }: FilePosition,
     skip_re_exports: bool,
 ) -> Option<Vec<LocationLink>> {
-    let sema = Semantics::new(db);
+    let sema = Source::new(db);
     let source = file.contents(db);
     let parsed = starpls_common::parsed_module(db, file).load(db);
     let token = navigation_token(&source, parsed.tokens(), u32::from(pos).into())?;

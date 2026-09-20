@@ -8,7 +8,6 @@ use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
-use starpls_hir::Semantics;
 use starpls_syntax::source::expr_range;
 use ty_python_semantic::types::ide_support::call_signature_details;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
@@ -59,10 +58,8 @@ pub(crate) fn signature_help(
         u32::from(pos).into(),
         TextSize::of(&*source),
     )?;
-    if !Semantics::new(db).contains_expr(file, expr.into()) {
-        return None;
-    }
     let model = SemanticModel::new(db, program_file);
+    model.scope(expr.into())?;
     let callee_type = expr.func.inferred_type(&model);
     let constructor = matches!(callee_type, Some(Type::ClassLiteral(_)));
     let provided_documentation = callee_type

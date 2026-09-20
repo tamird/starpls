@@ -72,8 +72,8 @@ pub fn validate(
     validator.excluded
 }
 
-/// Whether an expression has a Starlark representation. Unsupported expressions
-/// are omitted from semantic lowering as well as from the temporary editor tree.
+/// Whether an expression root belongs to Starlark syntax. Validation excludes
+/// its owning statement from semantic analysis when this returns false.
 pub fn supports_expr(expr: py::ExprRef<'_>, tokens: &Tokens) -> bool {
     match expr {
         py::ExprRef::Name(py::ExprName {

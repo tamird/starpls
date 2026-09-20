@@ -2,7 +2,6 @@ use ruff_text_size::Ranged;
 use starpls_bazel::APIContext;
 use starpls_common::parsed_module;
 use starpls_common::File;
-use starpls_hir::Semantics;
 use starpls_syntax::TextRange;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
@@ -59,7 +58,6 @@ pub struct DocumentSymbol {
 
 pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<DocumentSymbol>> {
     let file = file_id;
-    let sema = Semantics::new(db);
     let scope = global_scope(db, db.starlark_program_file(file));
     let places = place_table(db, scope);
     let parsed = parsed_module(db, file).load(db);
@@ -73,28 +71,18 @@ pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<Docum
                     Some(match kind {
                         DefinitionKind::Function(function) => {
                             let node = function.node(&parsed);
-                            sema.resolve_def_stmt(file, node)?;
                             (Some(SymbolKind::Function), node.range())
                         }
                         DefinitionKind::Assignment(assignment) => {
                             let target = assignment.target(&parsed);
-                            if !sema.contains_expr(file, target.into()) {
-                                return None;
-                            }
                             (Some(SymbolKind::Variable), target.range())
                         }
                         DefinitionKind::AugmentedAssignment(assignment) => {
                             let target = &assignment.node(&parsed).target;
-                            if !sema.contains_expr(file, target.as_ref().into()) {
-                                return None;
-                            }
                             (Some(SymbolKind::Variable), target.range())
                         }
                         DefinitionKind::For(for_stmt) => {
                             let target = for_stmt.target(&parsed);
-                            if !sema.contains_expr(file, target.into()) {
-                                return None;
-                            }
                             (Some(SymbolKind::Variable), target.range())
                         }
                         // A load binding hides an earlier local definition from the outline.

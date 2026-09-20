@@ -10,7 +10,7 @@ use ruff_text_size::Ranged;
 use starpls_common::parsed_module;
 use starpls_common::syntax_info;
 use starpls_common::File;
-use starpls_hir::Semantics;
+use starpls_hir::Source;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::{self};
 use starpls_syntax::source::expr_range;
@@ -55,7 +55,7 @@ pub(crate) fn hover(
     db: &Database,
     FilePosition { file_id: file, pos }: FilePosition,
 ) -> Option<Hover> {
-    let sema = Semantics::new(db);
+    let sema = Source::new(db);
     let source = file.contents(db);
     let parsed = parsed_module(db, file).load(db);
     let model = SemanticModel::new(db, db.starlark_program_file(file));
@@ -77,15 +77,9 @@ pub(crate) fn hover(
     let node = covering_node(parsed.syntax().into(), token.range());
     match crate::selection::classify(&node, token.range())? {
         Selection::Reference(expr) => {
-            if !sema.contains_expr(file, expr.into()) {
-                return None;
-            }
             Some(format_for_name(&model, expr.id.as_str(), expr.inferred_type(&model)?).into())
         }
         Selection::Attribute(expr) => {
-            if !sema.contains_expr(file, expr.into()) {
-                return None;
-            }
             let field_ty = expr.inferred_type(&model)?;
             let mut text = String::from("```python\n");
             if is_function_type(field_ty) {
@@ -121,13 +115,10 @@ pub(crate) fn hover(
             Some(text.into())
         }
         Selection::Definition(def) => {
-            sema.resolve_def_stmt(file, def)?;
             Some(format_for_name(&model, def.name.as_str(), def.inferred_type(&model)?).into())
         }
         Selection::Parameter(param) => {
-            if !sema.contains_parameter(file, param) {
-                return None;
-            }
+            model.scope(param.into())?;
             let documentation = node.ancestors().find_map(|node| {
                 let AnyNodeRef::StmtFunctionDef(function) = node else {
                     return None;
@@ -145,9 +136,7 @@ pub(crate) fn hover(
             )
         }
         Selection::Keyword { keyword, call } => {
-            if !sema.contains_expr(file, call.into()) {
-                return None;
-            }
+            model.scope(call.into())?;
             let signature = resolved_call_signature(&model, call)?;
             let name = keyword.arg.as_ref()?.as_str();
             let argument = call
@@ -220,7 +209,7 @@ fn keyword_hover(keyword: &str) -> Option<Hover> {
 fn type_comment_hover(
     db: &Database,
     model: &SemanticModel<'_>,
-    sema: &Semantics<'_>,
+    sema: &Source<'_>,
     file: File,
     comment: &starpls_syntax::TypeComment,
     offset: ruff_text_size::TextSize,
@@ -266,7 +255,7 @@ fn type_comment_hover(
     Some(text.into())
 }
 
-fn module_doc(sema: &Semantics<'_>, file: File) -> Option<Box<str>> {
+fn module_doc(sema: &Source<'_>, file: File) -> Option<Box<str>> {
     let source = file.contents(sema.db);
     let parsed = parsed_module(sema.db, file).load(sema.db);
     let first = parsed.syntax().body.first()?;

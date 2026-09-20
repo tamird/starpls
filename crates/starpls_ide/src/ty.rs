@@ -367,7 +367,7 @@ impl ty_python_core::Db for Database {
         owner: ruff_python_ast::NodeIndex,
     ) -> Option<ruff_text_size::TextRange> {
         let file = self.starlark_file(file)?;
-        starpls_hir::Semantics::new(self).type_comment_annotation(file, owner)
+        starpls_hir::Source::new(self).type_comment_annotation(file, owner)
     }
 }
 

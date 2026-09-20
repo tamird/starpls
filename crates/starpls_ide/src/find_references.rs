@@ -8,7 +8,6 @@ use ruff_python_ast::StmtFunctionDef;
 use ruff_text_size::Ranged;
 use starpls_common::parsed_module;
 use starpls_common::File;
-use starpls_hir::Semantics;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_semantic::types::ide_support::definitions_for_name;
@@ -48,31 +47,19 @@ impl<'a> NameNode<'a> {
         }
     }
 
-    fn definitions<'db>(
-        &self,
-        model: &SemanticModel<'db>,
-        sema: &Semantics<'db>,
-        file: File,
-    ) -> Vec<Definition<'db>> {
+    fn definitions<'db>(&self, model: &SemanticModel<'db>) -> Vec<Definition<'db>> {
         match self {
-            Self::Reference(name) => {
-                if !sema.contains_expr(file, (*name).into()) {
-                    return Vec::new();
-                }
-                definitions_for_name(
-                    model,
-                    self.name(),
-                    (*name).into(),
-                    ImportAliasResolution::PreserveAliases,
-                )
-                .into_iter()
-                .filter_map(|definition| definition.definition())
-                .collect()
-            }
+            Self::Reference(name) => definitions_for_name(
+                model,
+                self.name(),
+                (*name).into(),
+                ImportAliasResolution::PreserveAliases,
+            )
+            .into_iter()
+            .filter_map(|definition| definition.definition())
+            .collect(),
             Self::Definition(def) => {
-                if model.scope((*def).into()).is_none()
-                    || sema.resolve_def_stmt(file, def).is_none()
-                {
+                if model.scope((*def).into()).is_none() {
                     return Vec::new();
                 }
                 vec![def.definition(model)]
@@ -85,7 +72,6 @@ pub(crate) fn find_references(
     db: &Database,
     FilePosition { file_id: file, pos }: FilePosition,
 ) -> Option<Vec<Location>> {
-    let sema = Semantics::new(db);
     let model = SemanticModel::new(db, db.starlark_program_file(file));
     let parsed = parsed_module(db, file).load(db);
     let source = file.contents(db);
@@ -94,7 +80,7 @@ pub(crate) fn find_references(
     let selected = NameNode::at(&node, token.range())?;
     let name = selected.name();
     let definitions = selected
-        .definitions(&model, &sema, file)
+        .definitions(&model)
         .into_iter()
         .filter(|definition| {
             definition.program_file(db) == model.program_file()
@@ -114,7 +100,6 @@ pub(crate) fn find_references(
 
     let mut visitor = ReferenceVisitor {
         model: &model,
-        sema: &sema,
         file,
         name,
         definitions: &definitions,
@@ -126,7 +111,6 @@ pub(crate) fn find_references(
 
 struct ReferenceVisitor<'db, 'request> {
     model: &'request SemanticModel<'db>,
-    sema: &'request Semantics<'db>,
     file: File,
     name: &'request str,
     definitions: &'request [Definition<'db>],
@@ -142,7 +126,6 @@ impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
         };
         let Self {
             model,
-            sema,
             file,
             name,
             definitions,
@@ -150,7 +133,7 @@ impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
         } = self;
         if candidate.name() == *name
             && candidate
-                .definitions(model, sema, *file)
+                .definitions(model)
                 .iter()
                 .any(|def| definitions.contains(def))
         {

@@ -12,7 +12,6 @@ rust_library(
     deps = all_crate_deps() + [
         "//crates/starpls_bazel",
         "//crates/starpls_common",
-        "//crates/starpls_intern",
         "//crates/starpls_syntax",
         "//crates/starpls_test_util",
     ],

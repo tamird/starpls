@@ -17,7 +17,7 @@ use starpls_common::Db as _;
 use starpls_common::File;
 use starpls_common::LoadItemCandidateKind;
 use starpls_hir::Db;
-use starpls_hir::Semantics;
+use starpls_hir::Source;
 use starpls_syntax::source::expr_range;
 use starpls_syntax::source::string_value;
 use starpls_syntax::source::suite_range;
@@ -392,7 +392,7 @@ fn string_context(
     source: &str,
     pos: ruff_text_size::TextSize,
 ) -> Option<StringContext> {
-    let sema = Semantics::new(db);
+    let sema = Source::new(db);
     let CursorToken::Token(token) =
         pick_source_token(tokens, pos, ruff_text_size::TextSize::of(source), |_| 0)?
     else {
@@ -421,9 +421,8 @@ fn string_context(
             None => StringContext::Unavailable,
         }),
         Selection::String(expr) => {
-            if !sema.contains_expr(file, expr.into()) {
-                return None;
-            }
+            let model = SemanticModel::new(db, db.starlark_program_file(file));
+            model.scope(expr.into())?;
             let parent = node
                 .ancestors()
                 .skip_while(|node| !matches!(node, AnyNodeRef::ExprStringLiteral(_)))
@@ -669,7 +668,7 @@ fn completion_scope(
     module: &ModModule,
     marker: &CoveringNode<'_>,
     tokens: &Tokens,
-) -> FileScopeId {
+) -> Option<FileScopeId> {
     let index = semantic_index(db, db.starlark_program_file(file));
     let marker_range = marker.node().range();
     // An existing partial name already has a canonical expression scope. The
@@ -685,7 +684,7 @@ fn completion_scope(
         });
         if let Some(expression) = expression {
             if let Some(scope) = index.try_expression_scope_id(&expression) {
-                return scope;
+                return Some(scope);
             }
         }
     }
@@ -723,6 +722,9 @@ fn completion_scope(
         else {
             continue;
         };
+        if index.is_excluded(original.range()) {
+            return None;
+        }
         let scope_owner = match original {
             AnyNodeRef::StmtFunctionDef(function) => NodeWithScopeRef::Function(function),
             AnyNodeRef::ExprLambda(lambda) => NodeWithScopeRef::Lambda(lambda),
@@ -731,10 +733,10 @@ fn completion_scope(
             _ => continue,
         };
         if let Some(scope) = index.try_node_scope(scope_owner) {
-            return scope;
+            return Some(scope);
         }
     }
-    FileScopeId::global()
+    Some(FileScopeId::global())
 }
 
 impl<'a> CompletionContext<'a> {
@@ -746,6 +748,11 @@ impl<'a> CompletionContext<'a> {
         let parsed = parsed_module(db, file).load(db);
         let source = file.contents(db);
         let offset = u32::from(pos).into();
+        if semantic_index(db, db.starlark_program_file(file))
+            .is_excluded(ruff_text_size::TextRange::empty(offset))
+        {
+            return None;
+        }
         if let Some(context) =
             string_context(db, file, parsed.syntax(), parsed.tokens(), &source, offset)
         {
@@ -829,7 +836,7 @@ impl<'a> CompletionContext<'a> {
                         db,
                         file,
                         &model,
-                        completion_scope(db, file, parsed.syntax(), &node, modified.tokens()),
+                        completion_scope(db, file, parsed.syntax(), &node, modified.tokens())?,
                     ),
                     params,
                     is_in_def,
@@ -907,6 +914,45 @@ mod tests {
             actual.sort_unstable();
             assert_eq!(actual, parameters, "{call}");
             assert!(items.iter().any(|item| item.label == "f"), "{call}");
+        }
+    }
+
+    #[test]
+    fn excluded_statements_do_not_offer_completions() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        let file_id = fixture.main_file();
+        for source in [
+            "@decorator\ndef f(param):\n    par$0",
+            "def f(param: int):\n    par$0",
+            "def f(param: int):\n    pass\n    $0",
+            "value: int = par$0",
+        ] {
+            let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
+            analysis.update_file(file_id, source.replace("$0", ""));
+            assert!(
+                analysis
+                    .snapshot()
+                    .completions(FilePosition { file_id, pos }, None)
+                    .unwrap()
+                    .is_none(),
+                "{source}"
+            );
+        }
+        for source in [
+            "def f(param):\n    par$0",
+            "@decorator\ndef f(param):\n    pass\n$0",
+            "def f(param):\n    par$0",
+        ] {
+            let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
+            analysis.update_file(file_id, source.replace("$0", ""));
+            assert!(
+                analysis
+                    .snapshot()
+                    .completions(FilePosition { file_id, pos }, None)
+                    .unwrap()
+                    .is_some(),
+                "{source}"
+            );
         }
     }
 

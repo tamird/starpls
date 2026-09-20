@@ -6,7 +6,6 @@ members = [
     "crates/starpls_common",
     "crates/starpls_hir",
     "crates/starpls_ide",
-    "crates/starpls_intern",
     "crates/starpls_syntax",
     "crates/starpls_test_util",
 ]
