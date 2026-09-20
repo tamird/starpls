@@ -66,7 +66,6 @@ pub(crate) struct ModuleSourceMap {
     pub load_item_nodes: FxHashMap<NodeIndex, LoadItemId>,
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
-    pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
     pub annotation_ranges: FxHashMap<NodeIndex, ruff_text_size::TextRange>,
     // Source ranges also cover synthetic HIR nodes with no Ruff identity.
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
@@ -83,13 +82,6 @@ pub(crate) fn load_item_node(item: ruff_python_ast::ArgOrKeyword<'_>) -> NodeInd
     }
 }
 
-/// The HIR declaration whose type is described by a comment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TypeCommentOwner {
-    Statement(StmtId),
-    Parameter(ParamId),
-}
-
 impl ModuleSourceMap {
     pub(crate) fn range_for_hir(&self, hir: scope::ScopeHirId) -> TextRange {
         let Self {
@@ -100,7 +92,6 @@ impl ModuleSourceMap {
             load_item_nodes: _,
             function_names: _,
             keyword_names: _,
-            type_comment_owners: _,
             annotation_ranges: _,
             expr_map_back,
             stmt_map_back,

@@ -13,6 +13,7 @@ use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
 use starpls_common::parsed_module;
+use starpls_common::Db as _;
 use starpls_common::File;
 use starpls_common::LoadItemCandidateKind;
 use starpls_hir::Db;
@@ -20,16 +21,20 @@ use starpls_hir::Name;
 use starpls_hir::Param;
 use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
-use starpls_hir::Type;
 use starpls_syntax::source::expr_range;
 use starpls_syntax::source::string_value;
 use starpls_syntax::source::suite_range;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::HasType;
+use ty_python_semantic::ObjectMembers;
+use ty_python_semantic::SemanticModel;
 
 use crate::selection::Selection;
 use crate::util::pick_source_token;
 use crate::util::CursorToken;
+use crate::Database;
 use crate::FilePosition;
 
 const COMPLETION_MARKER: &str = "__STARPLS_COMPLETION_MARKER";
@@ -140,10 +145,11 @@ struct CompletionContext<'a> {
 }
 
 pub(crate) fn completions(
-    db: &dyn Db,
+    db: &Database,
     pos: FilePosition,
     trigger_character: Option<String>,
 ) -> Option<Vec<CompletionItem>> {
+    let model = SemanticModel::new(db, db.starlark_program_file(pos.file_id));
     let ctx = CompletionContext::new(db, pos, trigger_character.clone())?;
     let mut items = Vec::new();
 
@@ -206,10 +212,16 @@ pub(crate) fn completions(
             }
         }
         CompletionAnalysis::Name(NameContext::Dot { receiver_ty }) => {
-            for (name, ty) in receiver_ty.fields() {
+            for member in model.member_completions(receiver_ty, ObjectMembers::Exclude) {
+                if member.is_type_check_only {
+                    continue;
+                }
                 items.push(CompletionItem {
-                    label: name.name().to_string(),
-                    kind: if ty.is_callable() {
+                    label: member.name.to_string(),
+                    kind: if member.ty.is_some_and(|ty| {
+                        crate::hover::is_function_type(ty)
+                            || matches!(ty, Type::ClassLiteral(_) | Type::GenericAlias(_))
+                    }) {
                         CompletionItemKind::Function
                     } else {
                         CompletionItemKind::Field
@@ -583,7 +595,7 @@ fn original_expr<'a>(
 
 impl<'a> CompletionContext<'a> {
     fn new(
-        db: &'a dyn Db,
+        db: &'a Database,
         FilePosition { file_id: file, pos }: FilePosition,
         trigger_character: Option<String>,
     ) -> Option<Self> {
@@ -704,8 +716,9 @@ impl<'a> CompletionContext<'a> {
                 let context = match node.parent()? {
                     AnyNodeRef::ExprAttribute(expr) => {
                         let receiver = original_expr(parsed.syntax(), &expr.value, offset)?;
+                        let model = SemanticModel::new(db, db.starlark_program_file(file));
                         NameContext::Dot {
-                            receiver_ty: sema.type_of_expr(file, receiver)?,
+                            receiver_ty: receiver.inferred_type(&model)?,
                         }
                     }
                     _ => NameContext::Def,
@@ -774,6 +787,15 @@ mod tests {
     #[test]
     fn original_receiver_follows_edits() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
         let file_id = fixture.main_file();
         for (prefix, field) in [("", "first"), ("other = [1, 2]\n", "second"), ("", "first")] {
             let source = format!("{prefix}obj = struct({field}=1)\n(obj).");

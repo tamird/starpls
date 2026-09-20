@@ -17,6 +17,7 @@ use ty_python_semantic::types::Type;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
+use crate::util::parameter_doc;
 use crate::util::pick_source_token;
 use crate::util::unindent_doc;
 use crate::util::CursorToken;
@@ -104,23 +105,13 @@ pub(crate) fn signature_help(
                                 is_variadic: _,
                                 is_keyword_variadic: _,
                             } = parameter;
-                            let prefix = format!("{name}:");
                             let documentation = provided_documentation
                                 .and_then(|doc| {
                                     doc.parameters.iter().find_map(|(parameter, text)| {
                                         (parameter.as_str() == name).then(|| unindent_doc(text))
                                     })
                                 })
-                                .or_else(|| {
-                                    documentation.and_then(|doc| {
-                                        doc.lines().find_map(|line| {
-                                            line.trim()
-                                                .trim_start_matches('*')
-                                                .strip_prefix(&prefix)
-                                                .map(|text| text.trim().to_owned())
-                                        })
-                                    })
-                                });
+                                .or_else(|| parameter_doc(documentation, &name).map(str::to_owned));
                             ParameterInfo {
                                 label,
                                 documentation,

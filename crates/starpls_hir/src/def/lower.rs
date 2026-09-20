@@ -45,7 +45,6 @@ use crate::def::Param;
 use crate::def::ParamId;
 use crate::def::Stmt;
 use crate::def::StmtId;
-use crate::def::TypeCommentOwner;
 use crate::typeck::FunctionTypeRef;
 use crate::Db;
 use crate::TypeRef;
@@ -69,7 +68,6 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
             load_item_nodes: Default::default(),
             function_names: Default::default(),
             keyword_names: Default::default(),
-            type_comment_owners: Default::default(),
             annotation_ranges: Default::default(),
             expr_map_back: Default::default(),
             stmt_map_back: Default::default(),
@@ -183,7 +181,6 @@ impl<'a> LoweringContext<'a> {
     fn lower_stmt_inner(&mut self, stmt: &py::Stmt) -> Option<StmtId> {
         let parent = AnyNodeRef::from(stmt);
         let mut range = stmt.range();
-        let mut comment_range = None;
         let statement = match stmt {
             py::Stmt::FunctionDef(def) => {
                 let py::StmtFunctionDef {
@@ -206,7 +203,6 @@ impl<'a> LoweringContext<'a> {
                             .max(range.start()),
                     ))
                 });
-                comment_range = comment.map(|comment| source_range(comment.range));
                 let function_type =
                     comment.and_then(|comment| comment.parsed.tree().function_type());
                 let mut spec_ranges = Vec::new();
@@ -250,7 +246,6 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                     },
                     source_range(range),
-                    comment_range,
                 );
                 if !name.is_empty() {
                     self.source_map
@@ -343,7 +338,15 @@ impl<'a> LoweringContext<'a> {
                 };
                 let rhs = self.lower_expr(value, parent);
                 let comment = self.assignment_comment(range);
-                comment_range = comment.map(|comment| source_range(comment.range));
+                if let Some((comment, ty)) = comment
+                    .and_then(|comment| comment.parsed.tree().type_().map(|ty| (comment, ty)))
+                {
+                    if let Some(py::Expr::Name(target)) = targets.first() {
+                        self.source_map
+                            .annotation_ranges
+                            .insert(target.node_index().load(), comment_type_range(comment, &ty));
+                    }
+                }
                 let type_ref = self.lower_type_comment_opt(comment);
                 Stmt::Assign {
                     lhs,
@@ -363,7 +366,6 @@ impl<'a> LoweringContext<'a> {
                 let lhs = self.lower_expr(target, parent);
                 let rhs = self.lower_expr(value, parent);
                 let comment = self.assignment_comment(range);
-                comment_range = comment.map(|comment| source_range(comment.range));
                 Stmt::Assign {
                     lhs,
                     rhs,
@@ -383,11 +385,11 @@ impl<'a> LoweringContext<'a> {
                 // Unsupported statements have no HIR entry. Parenthesized
                 // recovery still has a located Paren containing Missing.
                 let range = self.source_map.expr_map_back.get(&expr).copied()?;
-                return Some(self.alloc_stmt(Stmt::Expr { expr }, range, None));
+                return Some(self.alloc_stmt(Stmt::Expr { expr }, range));
             }
             _ => return None,
         };
-        Some(self.alloc_stmt(statement, source_range(range), comment_range))
+        Some(self.alloc_stmt(statement, source_range(range)))
     }
 
     fn lower_suite(&mut self, body: &[py::Stmt], suite: Option<TextRange>) -> Box<[StmtId]> {
@@ -452,7 +454,6 @@ impl<'a> LoweringContext<'a> {
                     elif_or_else_stmts,
                 },
                 source_range(range),
-                None,
             );
             tail = Some(LoweredClause {
                 statements: Either::Left(stmt),
@@ -884,7 +885,7 @@ impl<'a> LoweringContext<'a> {
                 id
             })
             .collect();
-        let id = self.alloc_stmt(Stmt::Load { load_stmt, items }, range, None);
+        let id = self.alloc_stmt(Stmt::Load { load_stmt, items }, range);
         self.source_map
             .stmt_nodes
             .insert(call.node_index().load(), id);
@@ -981,7 +982,6 @@ impl<'a> LoweringContext<'a> {
                 .get(index + 1)
                 .map_or(syntax.end(), |(_, range)| range.start());
             let comment = self.comment_in(TextRange::new(range.end(), end.max(range.end())));
-            let comment_range = comment.map(|comment| source_range(comment.range));
             let type_ref = self
                 .lower_type_comment_opt(comment)
                 .map(|(ty, _)| ty)
@@ -1116,11 +1116,6 @@ impl<'a> LoweringContext<'a> {
                         .insert(node.node_index().load(), range);
                 }
             }
-            if let Some(range) = comment_range {
-                self.source_map
-                    .type_comment_owners
-                    .insert(range, TypeCommentOwner::Parameter(id));
-            }
             params.push(id);
         }
         params.into_boxed_slice()
@@ -1187,12 +1182,7 @@ impl<'a> LoweringContext<'a> {
         node.map(Self::lower_type).unwrap_or(TypeRef::Unknown)
     }
 
-    fn alloc_stmt(
-        &mut self,
-        stmt: Stmt,
-        range: starpls_syntax::TextRange,
-        type_comment: Option<starpls_syntax::TextRange>,
-    ) -> StmtId {
+    fn alloc_stmt(&mut self, stmt: Stmt, range: starpls_syntax::TextRange) -> StmtId {
         let Self {
             db: _,
             file: _,
@@ -1203,11 +1193,6 @@ impl<'a> LoweringContext<'a> {
             source_map,
         } = self;
         let id = module.stmts.alloc(stmt);
-        if let Some(range) = type_comment {
-            source_map
-                .type_comment_owners
-                .insert(range, TypeCommentOwner::Statement(id));
-        }
         let source = match &module.stmts[id] {
             Stmt::Assign {
                 lhs: _,

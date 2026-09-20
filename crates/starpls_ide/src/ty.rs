@@ -18,11 +18,13 @@ use ty_python_semantic::provided::ProvidedBindingResolution;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::types::KnownClass;
 use ty_python_semantic::AnalysisSettings;
+use ty_python_semantic::Db as _;
 use ty_python_semantic::ProgramEnvironment;
 use ty_site_packages::PythonVersionWithSource;
 
 use crate::Database;
 
+mod context;
 mod factory;
 mod load;
 mod native;
@@ -166,39 +168,23 @@ impl Database {
     }
 }
 
-#[salsa::db]
-impl ty_module_resolver::Db for Database {}
-
-#[salsa::db]
-impl ty_python_core::Db for Database {
-    fn should_check_file(&self, file: File) -> bool {
-        !file.path(self).is_vendored_path()
-    }
-
-    fn provided_statements(&self, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
-        load::statements(self, file)
-    }
-
-    fn provided_annotation(
-        &self,
-        file: ProgramFile<'_>,
-        owner: ruff_python_ast::NodeIndex,
-    ) -> Option<ruff_text_size::TextRange> {
-        let file = self.starlark_file(file)?;
-        starpls_hir::Semantics::new(self).type_comment_annotation(file, owner)
-    }
-}
-
-#[salsa::db]
-impl ty_python_semantic::Db for Database {
-    fn provided_call_result<'db>(
+impl Database {
+    /// Select language declarations without BUILD prelude lookup. Unattached
+    /// type comments have no source declaration scope or prelude contract.
+    pub(crate) fn annotation_builtin<'db>(
         &'db self,
-        call: &ty_python_semantic::types::CheckedCall<'_, 'db>,
+        source: starpls_common::File,
+        name: &str,
     ) -> Option<ty_python_semantic::types::Type<'db>> {
-        factory::result(self, call)
+        let file = self.starlark_program_file(source);
+        match self.language_builtin(file, name, BuiltinUsage::Annotation) {
+            Some(binding) => binding.resolve_type(self),
+            None => ty_python_semantic::SemanticModel::new(self, self.program_file(source.source))
+                .builtin_type(name, BuiltinUsage::Annotation),
+        }
     }
 
-    fn provided_builtin<'db>(
+    fn language_builtin<'db>(
         &'db self,
         file: ProgramFile<'db>,
         name: &str,
@@ -207,17 +193,6 @@ impl ty_python_semantic::Db for Database {
         use starpls_hir::Db;
 
         let source_file = self.starlark_file(file)?;
-        if source_file.api_context() == Some(APIContext::Build) {
-            if let Some(prelude) = self.get_bazel_prelude_file() {
-                let binding = ProvidedBindingValue::Export {
-                    file: self.starlark_program_file(prelude),
-                    name: Name::new(name),
-                };
-                if binding.clone().resolve_type(self).is_some() {
-                    return Some(binding);
-                }
-            }
-        }
         if name == "string" {
             if matches!(usage, BuiltinUsage::Runtime) {
                 return Some(ProvidedBindingValue::Unresolved);
@@ -250,6 +225,17 @@ impl ty_python_semantic::Db for Database {
                 "bytes" => {
                     return Some(ProvidedBindingValue::Value(
                         KnownClass::Bytes
+                            .to_class_literal(self, &ProgramEnvironment::from_file(file)),
+                    ))
+                }
+                "unknown" => {
+                    return Some(ProvidedBindingValue::Value(
+                        ty_python_semantic::types::Type::unknown(),
+                    ))
+                }
+                "NoneType" => {
+                    return Some(ProvidedBindingValue::Value(
+                        KnownClass::NoneType
                             .to_class_literal(self, &ProgramEnvironment::from_file(file)),
                     ))
                 }
@@ -299,6 +285,69 @@ impl ty_python_semantic::Db for Database {
             file: ty_python_semantic::Db::program_file(self, native_file.file()),
             name,
         })
+    }
+}
+
+#[salsa::db]
+impl ty_module_resolver::Db for Database {}
+
+#[salsa::db]
+impl ty_python_core::Db for Database {
+    fn should_check_file(&self, file: File) -> bool {
+        !file.path(self).is_vendored_path()
+    }
+
+    fn provided_statements(&self, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
+        load::statements(self, file)
+    }
+
+    fn provided_annotation(
+        &self,
+        file: ProgramFile<'_>,
+        owner: ruff_python_ast::NodeIndex,
+    ) -> Option<ruff_text_size::TextRange> {
+        let file = self.starlark_file(file)?;
+        starpls_hir::Semantics::new(self).type_comment_annotation(file, owner)
+    }
+}
+
+#[salsa::db]
+impl ty_python_semantic::Db for Database {
+    fn provided_parameter_type<'db>(
+        &'db self,
+        definition: Definition<'db>,
+    ) -> Option<ty_python_semantic::types::Type<'db>> {
+        context::parameter_type(self, definition)
+    }
+
+    fn provided_call_result<'db>(
+        &'db self,
+        call: &ty_python_semantic::types::CheckedCall<'_, 'db>,
+    ) -> Option<ty_python_semantic::types::Type<'db>> {
+        factory::result(self, call)
+    }
+
+    fn provided_builtin<'db>(
+        &'db self,
+        file: ProgramFile<'db>,
+        name: &str,
+        usage: BuiltinUsage,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        use starpls_hir::Db;
+
+        let source_file = self.starlark_file(file)?;
+        if source_file.api_context() == Some(APIContext::Build) {
+            if let Some(prelude) = self.get_bazel_prelude_file() {
+                let binding = ProvidedBindingValue::Export {
+                    file: self.starlark_program_file(prelude),
+                    name: Name::new(name),
+                };
+                if binding.clone().resolve_type(self).is_some() {
+                    return Some(binding);
+                }
+            }
+        }
+        self.language_builtin(file, name, usage)
     }
 
     fn provided_binding<'db>(

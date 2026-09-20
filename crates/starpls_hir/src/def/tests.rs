@@ -327,7 +327,6 @@ fn native_declaration_ranges_include_trivia() {
 #[test]
 fn native_type_comments_keep_attachment_boundaries() {
     use crate::def::Stmt;
-    use crate::def::TypeCommentOwner;
     let source = r#"a = 1; b = 2 # type: string
 
 def f(
@@ -355,40 +354,23 @@ def f(
     )
     .unwrap();
     let info = crate::lower(&db, file);
+    let parsed = starpls_common::parsed_module(&db, file).load(&db);
     let mut owners = info
         .source_map
-        .type_comment_owners
+        .annotation_ranges
         .iter()
-        .map(|(range, owner)| {
-            let name = match owner {
-                TypeCommentOwner::Statement(stmt) => match &info.module.stmts[*stmt] {
-                    Stmt::Def { func, stmts: _ } => {
-                        assert!(
-                            func.ret_type_ref.is_none(),
-                            "later specification must not replace the first comment"
-                        );
-                        func.name.as_str()
-                    }
-                    Stmt::Assign {
-                        lhs,
-                        rhs: _,
-                        op: _,
-                        type_ref: _,
-                    } => {
-                        let crate::def::Expr::Name { name } = &info.module.exprs[*lhs] else {
-                            panic!("expected assignment name");
-                        };
-                        name.as_str()
-                    }
-                    other => panic!("unexpected comment owner {other:?}"),
-                },
-                TypeCommentOwner::Parameter(param) => info.module.params[*param].name().as_str(),
+        .map(|(owner, range)| {
+            let name = match parsed.get_by_index(*owner) {
+                ruff_python_ast::AnyRootNodeRef::Expr(expr) => {
+                    let ruff_python_ast::Expr::Name(name) = expr else {
+                        panic!("unexpected annotation expression {expr:?}");
+                    };
+                    name.id.as_str()
+                }
+                ruff_python_ast::AnyRootNodeRef::Parameter(param) => param.name.as_str(),
+                other => panic!("unexpected annotation owner {other:?}"),
             };
-            (
-                u32::from(range.start()),
-                &source[usize::from(range.start())..usize::from(range.end())],
-                name,
-            )
+            (range.start(), &source[*range], name)
         })
         .collect::<Vec<_>>();
     owners.sort_by_key(|(start, _, _)| *start);
@@ -396,15 +378,19 @@ def f(
         .into_iter()
         .map(|(_, comment, owner)| (comment, owner))
         .collect::<Vec<_>>();
-    assert_eq!(
-        owners,
-        [
-            ("# type: string", "b"),
-            ("# type: int", "x"),
-            ("# type: float", "[missing name]"),
-            ("# type: string", "y"),
-            ("# type: bool", "f"),
-        ]
+    assert_eq!(owners, [("string", "b"), ("int", "x"), ("string", "y")]);
+    let function = info
+        .module
+        .stmts
+        .iter()
+        .find_map(|(_, stmt)| match stmt {
+            Stmt::Def { func, stmts: _ } => Some(func),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        function.ret_type_ref.is_none(),
+        "later specification must not replace the first comment"
     );
 }
 

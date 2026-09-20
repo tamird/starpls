@@ -9,6 +9,17 @@ pub(crate) fn pick_best_token(
     tokens.max_by_key(|token| f(token.kind()))
 }
 
+/// Read the parameter line shared by source and native declaration docstrings.
+pub(crate) fn parameter_doc<'a>(documentation: Option<&'a str>, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}:");
+    documentation?.lines().find_map(|line| {
+        line.trim()
+            .trim_start_matches('*')
+            .strip_prefix(&prefix)
+            .map(str::trim)
+    })
+}
+
 // TODO(withered-magic): This logic should probably be more sophisticated, but it works well
 // enough for now.
 pub(crate) fn unindent_doc(doc: &str) -> String {

@@ -2,12 +2,16 @@
 
 use ruff_db::files::FilePath;
 use ruff_db::files::FileRange;
+use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use starpls_bazel::attr::AttributeKind;
+use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
+use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::provided::ProvidedClass;
 use ty_python_semantic::provided::ProvidedData;
@@ -27,8 +31,8 @@ use ty_python_semantic::ProgramEnvironment;
 use crate::Database;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct Attribute {
-    kind: AttributeKind,
+pub(super) struct Attribute {
+    pub(super) kind: AttributeKind,
     mandatory: bool,
     default: Option<FileRange>,
     documentation: Option<Box<str>>,
@@ -53,8 +57,15 @@ fn doc_string(db: &Database, call: &CheckedCall<'_, '_>) -> Option<Box<str>> {
     ty.string_literal_value(db).map(Into::into)
 }
 
-pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
-    let declaration = call.declaration()?;
+pub(super) enum Factory {
+    Attribute(AttributeKind),
+    Rule { repository: bool },
+    Macro,
+    Struct,
+    Provider,
+}
+
+pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<Factory> {
     let file = declaration.program_file(db);
     let FilePath::SystemVirtual(path) = file.file(db).path(db) else {
         return None;
@@ -80,7 +91,7 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
             })
     });
     if attr_method {
-        return attribute(db, call, function.name.as_str());
+        return attribute_kind(function.name.as_str()).map(Factory::Attribute);
     }
     // A same-named method is not the global factory declaration.
     if !parsed.suite().iter().any(|statement| {
@@ -98,17 +109,35 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
         return None;
     }
     match function.name.as_str() {
-        "rule" => rule(db, call, RuleKind::Build),
-        "repository_rule" => rule(db, call, RuleKind::Repository),
-        "macro" => rule(db, call, RuleKind::Macro),
-        "struct" => structure(db, call),
-        "provider" => provider(db, call),
+        "rule" => Some(Factory::Rule { repository: false }),
+        "repository_rule" => Some(Factory::Rule { repository: true }),
+        "macro" => Some(Factory::Macro),
+        "struct" => Some(Factory::Struct),
+        "provider" => Some(Factory::Provider),
         _ => None,
     }
 }
 
-fn attribute<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, name: &str) -> Option<Type<'db>> {
-    let kind = match name {
+pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+    match declaration(db, call.declaration()?)? {
+        Factory::Attribute(kind) => attribute(db, call, kind),
+        Factory::Rule { repository } => rule(
+            db,
+            call,
+            if repository {
+                RuleKind::Repository
+            } else {
+                RuleKind::Build
+            },
+        ),
+        Factory::Macro => rule(db, call, RuleKind::Macro),
+        Factory::Struct => structure(db, call),
+        Factory::Provider => provider(db, call),
+    }
+}
+
+fn attribute_kind(name: &str) -> Option<AttributeKind> {
+    Some(match name {
         "bool" => AttributeKind::Bool,
         "int" => AttributeKind::Int,
         "int_list" => AttributeKind::IntList,
@@ -123,7 +152,14 @@ fn attribute<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, name: &str) ->
         "string_list_dict" => AttributeKind::StringListDict,
         "string_keyed_label_dict" => AttributeKind::StringKeyedLabelDict,
         _ => return None,
-    };
+    })
+}
+
+fn attribute<'db>(
+    db: &'db Database,
+    call: &CheckedCall<'_, 'db>,
+    kind: AttributeKind,
+) -> Option<Type<'db>> {
     let mandatory = match call.argument("mandatory") {
         CheckedArgument::Omitted => false,
         CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal()?,
@@ -285,18 +321,58 @@ fn attribute_type<'db>(
     kind: &AttributeKind,
 ) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
-    let string = KnownClass::Str.to_instance(db, &environment);
-    let int = KnownClass::Int.to_instance(db, &environment);
-    let list = |element| KnownClass::List.to_specialized_instance(db, &environment, &[element]);
+    let declaration = call.declaration()?;
+    attribute_value_type(
+        db,
+        &environment,
+        declaration.program_file(db),
+        kind,
+        AttributeUse::Input,
+    )
+}
+
+pub(super) enum AttributeUse {
+    Input,
+    BuildContext,
+    RepositoryContext,
+}
+
+pub(super) fn attribute_value_type<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    declarations: ProgramFile<'db>,
+    kind: &AttributeKind,
+    usage: AttributeUse,
+) -> Option<Type<'db>> {
+    let string = KnownClass::Str.to_instance(db, environment);
+    let int = KnownClass::Int.to_instance(db, environment);
+    let list = |element| KnownClass::List.to_specialized_instance(db, environment, &[element]);
     let dict =
-        |key, value| KnownClass::Dict.to_specialized_instance(db, &environment, &[key, value]);
+        |key, value| KnownClass::Dict.to_specialized_instance(db, environment, &[key, value]);
     let label = || {
-        let declaration = declared_class(db, call, "Label")?;
-        let label = declaration.to_instance_approximation(db, &environment)?;
-        Some(UnionType::from_elements(db, &environment, [label, string]))
+        let name = match usage {
+            AttributeUse::Input => "Label",
+            AttributeUse::BuildContext => "Target",
+            AttributeUse::RepositoryContext => "Label",
+        };
+        let declaration = native_class(db, declarations, name)?;
+        let label = declaration.to_instance_approximation(db, environment)?;
+        Some(match usage {
+            AttributeUse::Input => UnionType::from_elements(db, environment, [label, string]),
+            AttributeUse::BuildContext => label,
+            AttributeUse::RepositoryContext => label,
+        })
+    };
+    let output = || match usage {
+        AttributeUse::Input => Some(string),
+        AttributeUse::BuildContext => {
+            let class = native_class(db, declarations, "File")?;
+            class.to_instance_approximation(db, environment)
+        }
+        AttributeUse::RepositoryContext => Some(Type::unknown()),
     };
     Some(match kind {
-        AttributeKind::Bool => KnownClass::Bool.to_instance(db, &environment),
+        AttributeKind::Bool => KnownClass::Bool.to_instance(db, environment),
         AttributeKind::Int => int,
         AttributeKind::IntList => list(int),
         AttributeKind::String => string,
@@ -307,8 +383,8 @@ fn attribute_type<'db>(
         AttributeKind::LabelList => list(label()?),
         AttributeKind::LabelKeyedStringDict => dict(label()?, string),
         AttributeKind::StringKeyedLabelDict => dict(string, label()?),
-        AttributeKind::Output => string,
-        AttributeKind::OutputList => list(string),
+        AttributeKind::Output => output()?,
+        AttributeKind::OutputList => list(output()?),
     })
 }
 
@@ -424,10 +500,31 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             ),
         )
     };
+    let parsed = ruff_db::parsed::parsed_module(db, call.file().python_file(db)).load(db);
+    let node = covering_node(parsed.syntax().into(), call.call().range());
+    let name = node.parent().and_then(|parent| {
+        let AnyNodeRef::StmtAssign(assignment) = parent else {
+            return None;
+        };
+        let [target] = assignment.targets.as_slice() else {
+            return None;
+        };
+        let target = match target {
+            Expr::Tuple(tuple) => {
+                initializer?;
+                tuple.elts.first()?
+            }
+            _ => target,
+        };
+        let Expr::Name(name) = target else {
+            return None;
+        };
+        Some(name.id.clone())
+    });
     let class = call.class_type(
         db,
         ProvidedClass {
-            name: Name::new("provider"),
+            name: name.unwrap_or_else(|| Name::new("provider")),
             bases: Box::default(),
             class_members: Box::from([(Name::new("__init__"), init)]),
             instance_fields: ProvidedInstanceFields {
@@ -463,8 +560,17 @@ fn declared_class<'db>(
     call: &CheckedCall<'_, 'db>,
     name: &str,
 ) -> Option<Type<'db>> {
+    let declaration = call.declaration()?;
+    native_class(db, declaration.program_file(db), name)
+}
+
+pub(super) fn native_class<'db>(
+    db: &'db Database,
+    file: ProgramFile<'db>,
+    name: &str,
+) -> Option<Type<'db>> {
     ProvidedBindingValue::Export {
-        file: call.declaration()?.program_file(db),
+        file,
         name: Name::new(format!("_starpls_annotation_{name}")),
     }
     .resolve_type(db)

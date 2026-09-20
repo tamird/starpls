@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::AnyNodeRef;
+use ruff_python_ast::ArgOrKeyword;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
@@ -9,18 +11,23 @@ use starpls_common::parsed_module;
 use starpls_common::syntax_info;
 use starpls_common::File;
 use starpls_hir::Semantics;
-use starpls_hir::Type;
 use starpls_syntax::ast::AstNode;
 use starpls_syntax::ast::{self};
 use starpls_syntax::source::expr_range;
 use starpls_syntax::source::string_value;
 use starpls_syntax::TextRange;
 use starpls_syntax::T;
+use ty_python_semantic::types::ide_support::definitions_for_attribute;
+use ty_python_semantic::types::ide_support::resolved_call_signature;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::HasDefinition;
+use ty_python_semantic::HasType;
+use ty_python_semantic::SemanticModel;
 
 use crate::selection::Selection;
 use crate::util::navigation_token;
+use crate::util::parameter_doc;
 use crate::util::pick_best_token;
-use crate::util::text_range;
 use crate::util::unindent_doc;
 use crate::util::CursorToken;
 use crate::Database;
@@ -51,13 +58,14 @@ pub(crate) fn hover(
     let sema = Semantics::new(db);
     let source = file.contents(db);
     let parsed = parsed_module(db, file).load(db);
+    let model = SemanticModel::new(db, db.starlark_program_file(file));
     let offset = u32::from(pos).into();
     let token = navigation_token(&source, parsed.tokens(), offset)?;
     let comments = syntax_info(db, file);
     if let Some(comment) =
         crate::selection::type_comment_at_cursor(comments, offset, token, &source)
     {
-        return type_comment_hover(&sema, file, comment, offset);
+        return type_comment_hover(db, &model, &sema, file, comment, offset);
     }
     if let CursorToken::Token(token) = token {
         if token.kind().is_non_soft_keyword()
@@ -69,70 +77,117 @@ pub(crate) fn hover(
     let node = covering_node(parsed.syntax().into(), token.range());
     match crate::selection::classify(&node, token.range())? {
         Selection::Reference(expr) => {
-            Some(format_for_name(expr.id.as_str(), &sema.type_of_expr(file, expr.into())?).into())
+            if !sema.contains_expr(file, expr.into()) {
+                return None;
+            }
+            Some(format_for_name(&model, expr.id.as_str(), expr.inferred_type(&model)?).into())
         }
         Selection::Attribute(expr) => {
-            let ty = sema.type_of_expr(file, expr.value.as_ref().into())?;
-            let (field, field_ty) = ty
-                .fields()
-                .into_iter()
-                .find(|(field, _)| field.name().as_str() == expr.attr.as_str())?;
+            if !sema.contains_expr(file, expr.into()) {
+                return None;
+            }
+            let field_ty = expr.inferred_type(&model)?;
             let mut text = String::from("```python\n");
-            if field_ty.is_function() {
+            if is_function_type(field_ty) {
                 text.push_str("(method) ");
             } else {
                 write!(text, "(field) {}: ", expr.attr).ok()?;
             }
-            write!(text, "{}\n```\n", field_ty).ok()?;
-            let doc = field.doc();
-            if !doc.is_empty() {
+            writeln!(
+                text,
+                "{}\n```",
+                field_ty.display(db, &model.program_environment())
+            )
+            .ok()?;
+            let receiver = expr.value.inferred_type(&model)?;
+            let documentation = receiver
+                .provided_data(db, &model.program_environment())
+                .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+                .and_then(|docs| {
+                    docs.parameters.iter().find_map(|(name, text)| {
+                        (name.as_str() == expr.attr.as_str()).then(|| text.to_string())
+                    })
+                })
+                .or_else(|| {
+                    definitions_for_attribute(&model, expr)
+                        .into_iter()
+                        .filter_map(|definition| definition.definition())
+                        .find_map(|definition| definition.docstring(db).map(|doc| doc.to_string()))
+                });
+            if let Some(doc) = documentation {
                 text.push_str(&unindent_doc(&doc));
                 text.push('\n');
             }
             Some(text.into())
         }
         Selection::Definition(def) => {
-            let func = sema.resolve_def_stmt(file, def)?;
-            let mut text = format!("```python\n(function) {}\n```\n", func.ty());
-            if let Some(doc) = func.doc() {
-                text.push_str(&unindent_doc(&doc));
-                text.push('\n');
-            }
-            Some(text.into())
+            sema.resolve_def_stmt(file, def)?;
+            Some(format_for_name(&model, def.name.as_str(), def.inferred_type(&model)?).into())
         }
         Selection::Parameter(param) => {
-            let (param, ty) = sema.resolve_param(file, param)?;
-            let mut text = format!(
-                "```python\n(parameter) {}: {}\n```\n",
-                param.name().as_ref().map_or("", |name| name.as_str()),
-                ty
-            );
-            if let Some(doc) = param.doc() {
-                text.push_str(&unindent_doc(&doc));
-                text.push('\n');
+            if !sema.contains_parameter(file, param) {
+                return None;
             }
-            Some(text.into())
+            let documentation = node.ancestors().find_map(|node| {
+                let AnyNodeRef::StmtFunctionDef(function) = node else {
+                    return None;
+                };
+                function.definition(&model).docstring(db)
+            });
+            Some(
+                format_parameter(
+                    &model,
+                    param.name.as_str(),
+                    param.inferred_type(&model)?,
+                    parameter_doc(documentation.as_deref(), param.name.as_str()),
+                )
+                .into(),
+            )
         }
         Selection::Keyword { keyword, call } => {
-            let func = sema.resolve_call_expr(file, call)?;
-            let name = keyword.arg.as_ref()?.as_str();
-            let (param, ty) = func
-                .params()
-                .into_iter()
-                .find(|(param, _)| param.name().is_some_and(|param| param.as_str() == name))?;
-            let mut text = format!("```python\n(parameter) {name}: {ty}\n```\n");
-            if let Some(doc) = param.doc() {
-                if !doc.is_empty() {
-                    text.push_str(&unindent_doc(&doc));
-                    text.push('\n');
-                }
+            if !sema.contains_expr(file, call.into()) {
+                return None;
             }
-            Some(text.into())
+            let signature = resolved_call_signature(&model, call)?;
+            let name = keyword.arg.as_ref()?.as_str();
+            let argument = call
+                .arguments
+                .iter_source_order()
+                .position(|argument| argument.range() == keyword.range())?;
+            let parameter_index = signature
+                .argument_to_displayed_parameter_mapping
+                .get(argument)
+                .copied()
+                .flatten()?;
+            let parameter = signature.parameters.get(parameter_index)?;
+            let callee = call.func.inferred_type(&model)?;
+            let documentation = callee
+                .provided_data(db, &model.program_environment())
+                .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+                .and_then(|docs| {
+                    docs.parameters.iter().find_map(|(parameter, text)| {
+                        (parameter.as_str() == name).then(|| text.to_string())
+                    })
+                })
+                .or_else(|| {
+                    let docs = signature
+                        .definition
+                        .and_then(|definition| definition.docstring(db));
+                    parameter_doc(docs.as_deref(), name).map(str::to_owned)
+                });
+            Some(format_parameter(&model, name, parameter.ty, documentation.as_deref()).into())
         }
         Selection::LoadItem { call: _, item } => {
-            let item = sema.resolve_load_item(file, item)?;
-            let def = item.definition()?;
-            Some(format_for_name(item.name().as_str(), &def.ty()).into())
+            let (target, value): (AnyNodeRef<'_>, _) = match item {
+                ArgOrKeyword::Arg(expr) => (expr.into(), expr),
+                ArgOrKeyword::Keyword(keyword) => (keyword.into(), &keyword.value),
+            };
+            let (name, _) = string_value(&source[value.range()])?;
+            let index = ty_python_core::semantic_index(db, model.program_file());
+            let [definition] = index.try_definitions(target)? else {
+                return None;
+            };
+            Some(format_for_name(&model, &name, model.definition_type(*definition)).into())
         }
         Selection::LoadModule(call) => {
             let loaded = sema.resolve_load_stmt(file, call)?;
@@ -163,6 +218,8 @@ fn keyword_hover(keyword: &str) -> Option<Hover> {
 }
 
 fn type_comment_hover(
+    db: &Database,
+    model: &SemanticModel<'_>,
     sema: &Semantics<'_>,
     file: File,
     comment: &starpls_syntax::TypeComment,
@@ -181,9 +238,28 @@ fn type_comment_hover(
     }
     let segment = ast::PathSegment::cast(token.parent()?)?;
     let path = ast::PathType::cast(segment.syntax().parent()?)?;
-    let ty = sema.resolve_path_type(file, text_range(comment.range), &path)?;
-    let mut text = format!("```python\n(type) {ty}\n```\n");
-    if let Some(doc) = ty.doc() {
+    let ty = if let Some(owner) = sema.type_comment_owner(file, offset) {
+        model.provided_annotation_type_at(owner, offset)
+    } else {
+        // Unattached comments can describe builtins, but have no declaration
+        // scope in which local or prelude names acquire a type contract.
+        let names = path
+            .segments()
+            .filter_map(|segment| segment.value())
+            .collect::<Vec<_>>();
+        let [name] = names.as_slice() else {
+            return Some("```python\n(type) Unknown\n```\n".to_owned().into());
+        };
+        let name = name.text();
+        db.annotation_builtin(file, name)
+            .and_then(|ty| ty.to_instance_approximation(db, &model.program_environment()))
+    }
+    .unwrap_or(Type::unknown());
+    let mut text = format!(
+        "```python\n(type) {}\n```\n",
+        ty.display(db, &model.program_environment())
+    );
+    if let Some(doc) = type_documentation(model, ty) {
         text.push_str(&unindent_doc(&doc));
         text.push('\n');
     }
@@ -214,11 +290,23 @@ fn module_doc(sema: &Semantics<'_>, file: File) -> Option<Box<str>> {
     string_value(&source[stmt.value.range()]).map(|(doc, _)| doc)
 }
 
-fn format_for_name(name: &str, ty: &Type<'_>) -> String {
+pub(crate) fn is_function_type(ty: Type<'_>) -> bool {
+    matches!(
+        ty,
+        Type::FunctionLiteral(_)
+            | Type::Callable(_)
+            | Type::BoundMethod(_)
+            | Type::KnownBoundMethod(_)
+    )
+}
+
+fn format_for_name<'db>(model: &SemanticModel<'db>, name: &str, ty: Type<'db>) -> String {
+    let db = model.db();
+    let environment = model.program_environment();
     let mut text = String::from("```python\n");
 
     // Handle special `def` formatting for function types.
-    if ty.is_function() {
+    if is_function_type(ty) {
         text.push_str("(function) ");
     } else {
         text.push_str("(variable) ");
@@ -226,10 +314,11 @@ fn format_for_name(name: &str, ty: &Type<'_>) -> String {
         text.push_str(": ");
     }
 
-    write!(&mut text, "{}", ty).unwrap();
+    write!(&mut text, "{}", ty.display(db, &environment)).unwrap();
     text.push_str("\n```\n");
 
-    if let Some(doc) = ty.doc() {
+    let doc = type_documentation(model, ty);
+    if let Some(doc) = doc {
         text.push_str(&unindent_doc(&doc));
         text.push('\n');
     }
@@ -237,16 +326,72 @@ fn format_for_name(name: &str, ty: &Type<'_>) -> String {
     text
 }
 
+fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<String> {
+    let db = model.db();
+    let environment = model.program_environment();
+    if let Some(doc) = ty
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+        .and_then(|docs| docs.text.as_deref())
+    {
+        return Some(doc.to_owned());
+    }
+    let definition = ty.definition(db, &environment)?.definition()?;
+    let native = match definition.program_file(db).file(db).path(db) {
+        ruff_db::files::FilePath::SystemVirtual(path) => {
+            path.as_str().starts_with("starpls-native:")
+        }
+        _ => false,
+    };
+    if native || is_function_type(ty) {
+        definition.docstring(db).map(|doc| doc.to_string())
+    } else {
+        None
+    }
+}
+
+fn format_parameter<'db>(
+    model: &SemanticModel<'db>,
+    name: &str,
+    ty: Type<'db>,
+    documentation: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "```python\n(parameter) {name}: {}\n```\n",
+        ty.display(model.db(), &model.program_environment())
+    );
+    if let Some(doc) = documentation {
+        text.push_str(&unindent_doc(doc));
+        text.push('\n');
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use expect_test::expect;
     use expect_test::Expect;
+    use salsa::Setter;
+    use starpls_hir::Db;
 
     use crate::Analysis;
     use crate::FilePosition;
 
+    fn install_native(analysis: &mut Analysis) {
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
+    }
+
     fn check_hover(fixture: &str, expect: Expect) {
-        let (analysis, fixture) = Analysis::from_single_file_fixture(fixture);
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(fixture);
+        install_native(&mut analysis);
         let hover = analysis
             .snapshot()
             .hover(
@@ -381,7 +526,8 @@ mod tests {
             ("def f(x=(\n    1 # type: P$0\n)): pass", "Unknown"),
         ] {
             let input = format!("P = provider()\n{body}\n");
-            let (analysis, fixture) = Analysis::from_single_file_fixture(&input);
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&input);
+            install_native(&mut analysis);
             let (file_id, pos) = fixture.cursor_pos.unwrap();
             let hover = analysis
                 .snapshot()
@@ -392,6 +538,402 @@ mod tests {
                 hover.contents.value,
                 format!("```python\n(type) {expected}\n```\n"),
                 "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_record_contracts_and_documentation() {
+        for (expression, expected) in [
+            ("context.attr.arbitrary", "Unknown"),
+            ("context.file.input.path", "str"),
+            ("context.files.input[0].path", "str"),
+            ("record.arbitrary", "str"),
+        ] {
+            let source = format!(
+                "def inspect(context, record):\n    # type: (ctx, struct[string]) -> None\n    {expression}$0\n"
+            );
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            install_native(&mut analysis);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let snapshot = analysis.snapshot();
+            let hover = snapshot
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            let field = expression.rsplit('.').next().unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .starts_with(&format!("```python\n(field) {field}: {expected}\n```\n")),
+                "{source}: {}",
+                hover.contents.value
+            );
+            if field == "path" {
+                assert!(
+                    hover.contents.value.contains("execution path"),
+                    "{}",
+                    hover.contents.value
+                );
+            }
+            let diagnostics = ty_python_semantic::check_file_unwrap(
+                &snapshot.db,
+                snapshot.db.starlark_program_file(file_id),
+            );
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+        for source in ["a$0ttr", "# type: at$0tr"] {
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+            install_native(&mut analysis);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let hover = analysis
+                .snapshot()
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains("attribute"),
+                "{}",
+                hover.contents.value
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_members_keep_starlark_contracts() {
+        for (ty, expected) in [
+            (
+                "string",
+                "capitalize count elems endswith find format index isalnum
+                isalpha isdigit islower isspace istitle isupper join lower lstrip
+                partition removeprefix removesuffix replace rfind rindex rpartition
+                rsplit rstrip split splitlines startswith strip title upper",
+            ),
+            ("bytes", "elems"),
+            ("list[int]", "append clear extend index insert pop remove"),
+            (
+                "dict[string, int]",
+                "clear get items keys pop popitem setdefault update values",
+            ),
+            ("int", ""),
+            ("float", ""),
+            ("bool", ""),
+            ("tuple[int, ...]", ""),
+            ("range", ""),
+        ] {
+            let source = format!("def inspect(value):\n    # type: ({ty}) -> None\n    value.$0");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap();
+            let mut names: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                expected.split_whitespace().collect::<Vec<_>>(),
+                "{ty}"
+            );
+        }
+        for (expression, declaration, doc) in [
+            ("'text'.upper$0", "-> str", "uppercase"),
+            (
+                "{'key': 1}.items$0",
+                "-> list[tuple[str, int]]",
+                "key/value",
+            ),
+        ] {
+            let (analysis, fixture) = Analysis::from_single_file_fixture(expression);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let hover = analysis
+                .snapshot()
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains(declaration),
+                "{}",
+                hover.contents.value
+            );
+            assert!(
+                hover.contents.value.contains(doc),
+                "{}",
+                hover.contents.value
+            );
+        }
+    }
+
+    #[test]
+    fn context_attribute_option_updates_hover_and_completion() {
+        for factory in ["rule", "repository_rule"] {
+            let source = format!(
+                r#"def implementation(context):
+    context.attr.value
+
+example = {factory}(
+    implementation = implementation,
+    attrs = {{"value": attr.string()}},
+)
+"#
+            );
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            install_native(&mut analysis);
+            let file_id = fixture.main_file();
+            let offset = source.find("context.attr.value").unwrap() + "context.attr.".len();
+            for enabled in [false, true, false, true] {
+                analysis.db.environment().set_options(&mut analysis.db).to(
+                    crate::InferenceOptions {
+                        infer_ctx_attributes: enabled,
+                        use_code_flow_analysis: false,
+                        allow_unused_definitions: false,
+                    },
+                );
+                let snapshot = analysis.snapshot();
+                let hover = snapshot
+                    .hover(FilePosition {
+                        file_id,
+                        pos: (offset as u32 + 2).into(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                let expected = if enabled { "str" } else { "Unknown" };
+                assert!(
+                    hover
+                        .contents
+                        .value
+                        .contains(&format!("(field) value: {expected}\n")),
+                    "{factory}, enabled={enabled}: {}",
+                    hover.contents.value
+                );
+                let completions = snapshot
+                    .completions(
+                        FilePosition {
+                            file_id,
+                            pos: (offset as u32).into(),
+                        },
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    completions.iter().any(|item| item.label == "value"),
+                    enabled,
+                    "{factory}, enabled={enabled}: {completions:?}"
+                );
+            }
+            for (attribute, expected) in [("int", "int"), ("string", "str")] {
+                analysis.update_file(
+                    file_id,
+                    source.replace("attr.string()", &format!("attr.{attribute}()")),
+                );
+                let hover = analysis
+                    .snapshot()
+                    .hover(FilePosition {
+                        file_id,
+                        pos: (offset as u32 + 2).into(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    hover
+                        .contents
+                        .value
+                        .contains(&format!("(field) value: {expected}\n")),
+                    "{factory}: {}",
+                    hover.contents.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_registration_requires_resolved_unambiguous_identity() {
+        for (annotation, registration, expected) in [
+            (
+                "",
+                "register = rule
+callback = implementation
+example = register(implementation=callback, attrs={'value': attr.string()})",
+                "str",
+            ),
+            (
+                "",
+                "first = rule(implementation=implementation, attrs={'value': attr.string()})
+second = rule(implementation=implementation, attrs={'value': attr.int()})",
+                "Unknown",
+            ),
+            (
+                "    # type: (Unknown) -> None\n",
+                "example = rule(implementation=implementation, attrs={'value': attr.string()})",
+                "Unknown",
+            ),
+            (
+                "",
+                "def rule(implementation, attrs):
+    pass
+example = rule(implementation=implementation, attrs={'value': attr.string()})",
+                "Unknown",
+            ),
+            (
+                "",
+                "attrs = {'value': attr.string()}
+example = rule(implementation=implementation, attrs=attrs)",
+                "Unknown",
+            ),
+            (
+                "",
+                "def register():
+    return rule(implementation=implementation, attrs={'value': attr.string()})",
+                "Unknown",
+            ),
+            (
+                "",
+                "example = rule(implementation=implementation, attrs={'value': attr.string()})
+other = rule(**unknown_arguments)",
+                "Unknown",
+            ),
+            (
+                "",
+                "example = rule(implementation=implementation, attrs={'value': attr.string()})
+other = rule(implementation=unknown_callback)",
+                "Unknown",
+            ),
+        ] {
+            let source = format!(
+                "def implementation(context):\n{annotation}    context.attr.val$0ue\n\n{registration}\n"
+            );
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            install_native(&mut analysis);
+            analysis
+                .db
+                .environment()
+                .set_options(&mut analysis.db)
+                .to(crate::InferenceOptions {
+                    infer_ctx_attributes: true,
+                    use_code_flow_analysis: false,
+                    allow_unused_definitions: false,
+                });
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let hover = analysis
+                .snapshot()
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("(field) value: {expected}\n")),
+                "{source}: {}",
+                hover.contents.value
+            );
+        }
+    }
+
+    #[test]
+    fn detached_native_comment_does_not_read_prelude() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        install_native(&mut analysis);
+        let prelude = analysis
+            .open_document(
+                std::path::Path::new("/prelude.bzl"),
+                starpls_common::Dialect::Bazel,
+                Some(starpls_common::FileInfo::Bazel {
+                    api_context: starpls_bazel::APIContext::Prelude,
+                    is_external: false,
+                }),
+                "Label = provider()\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        analysis.set_bazel_prelude_file(prelude);
+        let file_id = analysis
+            .open_document(
+                std::path::Path::new("/BUILD"),
+                starpls_common::Dialect::Bazel,
+                Some(starpls_common::FileInfo::Bazel {
+                    api_context: starpls_bazel::APIContext::Build,
+                    is_external: false,
+                }),
+                "# type: Label\n".to_owned(),
+                1,
+            )
+            .unwrap();
+        let hover = analysis
+            .snapshot()
+            .hover(FilePosition {
+                file_id,
+                pos: 11.into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover
+                .contents
+                .value
+                .starts_with("```python\n(type) Label\n```\n"),
+            "{}",
+            hover.contents.value
+        );
+        assert!(
+            hover.contents.value.contains("target"),
+            "{}",
+            hover.contents.value
+        );
+    }
+
+    #[test]
+    fn loaded_field_hover_and_completion_follow_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        install_native(&mut analysis);
+        let dependency =
+            fixture.add_file(&mut analysis.db, "defs.bzl", "record = struct(value=1)\n");
+        let source = "load(\"defs.bzl\", \"record\")\nrecord.value\nrecord.";
+        let file_id = fixture.add_file(&mut analysis.db, "main.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        for (value, expected) in [
+            ("1", "Literal[1]"),
+            ("\"text\"", "Literal[\"text\"]"),
+            ("1", "Literal[1]"),
+        ] {
+            analysis.update_file(
+                dependency,
+                format!("Info = provider()\nrecord = struct(value={value}, __explicit__=1, Factory=Info)\n"),
+            );
+            let snapshot = analysis.snapshot();
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id,
+                    pos: (source.find("record.value").unwrap() as u32 + 9).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains(expected),
+                "{}",
+                hover.contents.value
+            );
+            let items = snapshot
+                .completions(
+                    FilePosition {
+                        file_id,
+                        pos: (source.len() as u32).into(),
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let mut names: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["Factory", "__explicit__", "value"], "{items:?}");
+            assert!(
+                items.iter().any(|item| item.label == "Factory"
+                    && item.kind == crate::completions::CompletionItemKind::Function),
+                "{items:?}"
             );
         }
     }
@@ -416,7 +958,7 @@ a$0bc = 123
             "for (x,) in [(1,)]:\n    x$0\n",
             expect![[r#"
                 ```python
-                (variable) x: Literal[1]
+                (variable) x: int
                 ```
             "#]],
         );
@@ -555,10 +1097,21 @@ Foo$0Info = provider(doc = "The foo provider")
 "#,
             expect![[r#"
                 ```python
-                (variable) FooInfo: Provider[FooInfo]
+                (variable) FooInfo: <class 'FooInfo'>
                 ```
                 The foo provider  
             "#]],
+        );
+    }
+
+    #[test]
+    fn provider_comment_keeps_documentation() {
+        check_hover(
+            r#"
+Info = provider(doc = "Source provider documentation")
+value = Info() # type: In$0fo
+"#,
+            expect!["```python\n(type) Info\n```\nSource provider documentation  \n"],
         );
     }
 
@@ -602,7 +1155,7 @@ foo(
 "#,
             expect![[r#"
                 ```python
-                (parameter) bar: string
+                (parameter) bar: str
                 ```
                 The bar attr  
             "#]],

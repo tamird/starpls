@@ -14,21 +14,17 @@ use ruff_python_ast::ExprRef;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::Parameter;
 use ruff_python_ast::StmtFunctionDef;
-use smallvec::SmallVec;
 use starpls_bazel::Builtins;
 use starpls_common::Diagnostic;
 use starpls_common::Diagnostics;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
-use starpls_syntax::ast;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 use typeck::builtins::BuiltinFunction;
 use typeck::intrinsics::IntrinsicFunction;
 use typeck::queries;
-use typeck::Field;
-use typeck::FieldInner;
 use typeck::Macro;
 use typeck::Provider;
 use typeck::Rule;
@@ -46,7 +42,6 @@ use crate::def::Literal;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
-use crate::def::TypeCommentOwner;
 pub use crate::test_database::Fixture;
 pub use crate::typeck::builtins::BuiltinDefs;
 pub use crate::typeck::queries::diagnostics as inference_diagnostics;
@@ -192,35 +187,6 @@ impl<'a> Semantics<'a> {
         Self { db }
     }
 
-    pub fn resolve_path_type(
-        &self,
-        file: File,
-        comment_range: TextRange,
-        node: &ast::PathType,
-    ) -> Option<Type<'a>> {
-        let usage = source_map(self.db, file)
-            .type_comment_owners
-            .get(&comment_range)
-            .and_then(|owner| {
-                let value = match owner {
-                    TypeCommentOwner::Statement(stmt) => *stmt,
-                    TypeCommentOwner::Parameter(param) => {
-                        module(self.db, file).param_to_def_stmt.get(param)?.0
-                    }
-                };
-                Some(InFile { file, value })
-            });
-        let segments = node
-            .segments()
-            .flat_map(|segment| segment.value())
-            .map(|token| Name::from_str(token.text()))
-            .collect::<SmallVec<_>>();
-        Some(Type::new(
-            *self,
-            queries::resolve_type(self.db, TypeRef::Path(segments, None), usage),
-        ))
-    }
-
     /// Resolve a call from the canonical parsed revision of `file`.
     pub fn resolve_call_expr(&self, file: File, expr: &ExprCall) -> Option<Callable<'a>> {
         let ty = self.type_of_expr(file, expr.func.as_ref().into())?;
@@ -289,6 +255,13 @@ impl<'a> Semantics<'a> {
             .contains_key(&expr.node_index().load())
     }
 
+    /// Whether a canonical parameter belongs to a supported Starlark declaration.
+    pub fn contains_parameter(&self, file: File, parameter: &Parameter) -> bool {
+        source_map(self.db, file)
+            .param_nodes
+            .contains_key(&parameter.node_index().load())
+    }
+
     /// Original type-comment expressions attached to canonical declaration nodes.
     pub fn type_comment_annotation(
         &self,
@@ -299,6 +272,18 @@ impl<'a> Semantics<'a> {
             .annotation_ranges
             .get(&owner)
             .copied()
+    }
+
+    /// The canonical owner of a supplied annotation under the cursor.
+    pub fn type_comment_owner(
+        &self,
+        file: File,
+        offset: ruff_text_size::TextSize,
+    ) -> Option<ruff_python_ast::NodeIndex> {
+        source_map(self.db, file)
+            .annotation_ranges
+            .iter()
+            .find_map(|(owner, range)| range.contains_inclusive(offset).then_some(*owner))
     }
 
     /// Resolve a parameter from the canonical parsed revision of `file`.
@@ -515,37 +500,6 @@ impl<'a> Type<'a> {
             TyKind::Macro(makro) => makro.doc.as_ref().map(|doc| doc.as_ref().to_string()),
             _ => None,
         }
-    }
-
-    pub fn fields(&self) -> Vec<(Field, Type<'a>)> {
-        let Self { sema, ty } = self;
-        let db = sema.db;
-        let fields = match ty.fields(db) {
-            Some(fields) => fields,
-            None => return Vec::new(),
-        };
-
-        let mut fields = fields
-            .map(|(name, ty)| (name, Type::new(*sema, ty)))
-            .collect::<Vec<_>>();
-
-        // TODO(withered-magic): This ideally should be handled in `Ty::fields()` instead.
-        if let TyKind::Struct(Some(typeck::Struct::RuleAttributes { rule_kind, attrs })) = ty.kind()
-        {
-            fields.extend(attrs.attrs.iter().filter_map(|(name, attr)| {
-                attr.as_ref().map(|attr| {
-                    (
-                        Field(FieldInner::StructField {
-                            name: name.clone(),
-                            doc: attr.doc.as_ref().map(|doc| doc.as_ref().to_string()),
-                        }),
-                        Type::new(*sema, attr.resolved_ty(rule_kind)),
-                    )
-                })
-            }));
-        }
-
-        fields
     }
 
     /// The original declaration of a struct or provider field, when known.

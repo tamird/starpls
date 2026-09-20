@@ -264,10 +264,7 @@ impl Ty {
                     .flat_map(|fields| fields.iter())
                     .map(|(name, ty)| {
                         (
-                            Field(FieldInner::StructField {
-                                name: name.clone(),
-                                doc: None,
-                            }),
+                            Field(FieldInner::StructField { name: name.clone() }),
                             ty.clone(),
                         )
                     }),
@@ -327,10 +324,7 @@ impl Ty {
                     .cloned()
                     .unwrap_or_else(Ty::unknown);
                 Fields::Static(iter::once((
-                    Field(FieldInner::StaticField {
-                        name: "label",
-                        doc: Some("The identifier of the target."),
-                    }),
+                    Field(FieldInner::StaticField { name: "label" }),
                     label_ty,
                 )))
             }
@@ -1002,7 +996,7 @@ impl Field {
             FieldInner::BuiltinField { ref parent, index } => parent.fields[index].name.clone(),
             FieldInner::BuiltinMethod { ref func } => func.name.clone(),
             FieldInner::IntrinsicField { ref parent, index } => parent.fields[index].name.clone(),
-            FieldInner::StructField { ref name, .. } => name.clone(),
+            FieldInner::StructField { ref name } => name.clone(),
             FieldInner::ProviderField {
                 ref provider,
                 index,
@@ -1025,44 +1019,7 @@ impl Field {
                 .expect("expected module_extension tag classes")[index]
                 .name
                 .clone(),
-            FieldInner::StaticField { name, .. } => Name::from_str(name),
-        }
-    }
-
-    pub fn doc(&self) -> String {
-        match self.0 {
-            FieldInner::BuiltinField { ref parent, index } => parent.fields[index].doc.clone(),
-            FieldInner::BuiltinMethod { ref func } => func.doc.clone(),
-            FieldInner::IntrinsicField { ref parent, index } => parent.fields[index].doc.clone(),
-            FieldInner::StructField { ref doc, .. } => doc.as_ref().cloned().unwrap_or_default(),
-            FieldInner::ProviderField {
-                ref provider,
-                index,
-            } => match provider {
-                Provider::Builtin(provider) => provider.fields[index].doc.clone(),
-                Provider::Custom(provider) => provider
-                    .fields
-                    .as_ref()
-                    .expect("expected provider fields")
-                    .fields[index]
-                    .doc
-                    .as_ref()
-                    .map(Box::to_string)
-                    .unwrap_or_default(),
-            },
-            FieldInner::ModuleExtensionProxyField {
-                ref module_extension,
-                index,
-            } => module_extension
-                .tag_classes
-                .as_ref()
-                .expect("expected module_extension tag classes")[index]
-                .tag_class
-                .doc
-                .as_ref()
-                .map(|doc| doc.as_ref().to_string())
-                .unwrap_or_default(),
-            FieldInner::StaticField { doc, .. } => doc.unwrap_or_default().to_string(),
+            FieldInner::StaticField { name } => Name::from_str(name),
         }
     }
 }
@@ -1081,7 +1038,6 @@ pub(crate) enum FieldInner {
     },
     StructField {
         name: Name,
-        doc: Option<String>,
     },
     ProviderField {
         provider: Provider,
@@ -1093,7 +1049,6 @@ pub(crate) enum FieldInner {
     },
     StaticField {
         name: &'static str,
-        doc: Option<&'static str>,
     },
 }
 
