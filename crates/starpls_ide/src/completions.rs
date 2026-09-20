@@ -384,14 +384,15 @@ fn add_keywords(items: &mut Vec<CompletionItem>, is_in_def: bool, is_in_for: boo
     }
 }
 
-fn string_context<'a>(
-    sema: &Semantics<'a>,
+fn string_context(
+    db: &Database,
     file: File,
     module: &ModModule,
     tokens: &Tokens,
     source: &str,
     pos: ruff_text_size::TextSize,
 ) -> Option<StringContext> {
+    let sema = Semantics::new(db);
     let CursorToken::Token(token) =
         pick_source_token(tokens, pos, ruff_text_size::TextSize::of(source), |_| 0)?
     else {
@@ -431,12 +432,16 @@ fn string_context<'a>(
                 if index.slice.range() == expr.range()
                     && expr_range(&index.slice, index.into(), tokens) == expr.range()
                 {
-                    let keys = sema
-                        .type_of_expr(file, index.value.as_ref().into())
-                        .and_then(|ty| ty.known_keys());
-                    return Some(match keys {
-                        Some(keys) => StringContext::DictKey { keys },
-                        None => StringContext::Unavailable,
+                    let model = SemanticModel::new(db, db.starlark_program_file(file));
+                    let keys: Vec<_> = model
+                        .expected_string_literal_completions(expr)
+                        .into_iter()
+                        .map(|candidate| candidate.value)
+                        .collect();
+                    return Some(if keys.is_empty() {
+                        StringContext::Unavailable
+                    } else {
+                        StringContext::DictKey { keys }
                     });
                 }
             }
@@ -738,18 +743,12 @@ impl<'a> CompletionContext<'a> {
         FilePosition { file_id: file, pos }: FilePosition,
         trigger_character: Option<String>,
     ) -> Option<Self> {
-        let sema = Semantics::new(db);
         let parsed = parsed_module(db, file).load(db);
         let source = file.contents(db);
         let offset = u32::from(pos).into();
-        if let Some(context) = string_context(
-            &sema,
-            file,
-            parsed.syntax(),
-            parsed.tokens(),
-            &source,
-            offset,
-        ) {
+        if let Some(context) =
+            string_context(db, file, parsed.syntax(), parsed.tokens(), &source, offset)
+        {
             return Some(Self {
                 analysis: CompletionAnalysis::String(context),
             });
@@ -1485,6 +1484,31 @@ d["$0"]
                 CompletionItem { label: "b", kind: Constant, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
+    }
+
+    #[test]
+    fn dictionary_keys_follow_loaded_source_bindings() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(
+            &mut analysis.db,
+            "defs.bzl",
+            "d = {'stale': 1}\nd = {'loaded': 2}\nexported = d\n",
+        );
+        fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "d = {'caller': 1}\nload('defs.bzl', imported='exported')\nalias = imported\nimported = {'replacement': 2}\nalias['$0']",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let items = analysis
+            .snapshot()
+            .completions(FilePosition { file_id, pos }, None)
+            .unwrap()
+            .unwrap();
+        let actual: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(actual, ["loaded"]);
     }
 
     #[test]
