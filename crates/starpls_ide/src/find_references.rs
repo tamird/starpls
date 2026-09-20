@@ -70,7 +70,9 @@ impl<'a> NameNode<'a> {
                 .collect()
             }
             Self::Definition(def) => {
-                if sema.resolve_def_stmt(file, def).is_none() {
+                if model.scope((*def).into()).is_none()
+                    || sema.resolve_def_stmt(file, def).is_none()
+                {
                     return Vec::new();
                 }
                 vec![def.definition(model)]

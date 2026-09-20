@@ -8,6 +8,8 @@ use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
 use ruff_python_ast::visitor::source_order::{self};
 use ruff_python_ast::ArgOrKeyword;
 use ruff_python_ast::Expr;
+use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Stmt;
 use ruff_python_parser::ParseErrorType;
 use ruff_python_parser::Parsed;
@@ -17,12 +19,21 @@ use ruff_text_size::TextRange;
 
 use crate::SyntaxError;
 
-pub fn validate(source: &str, parsed: &Parsed<py::ModModule>, errors: &mut dyn FnMut(SyntaxError)) {
+/// Validate Starlark syntax and identify complete subtrees with no Starlark semantics.
+/// Invalid headers and unsupported container forms are recovered as opaque owners; valid
+/// siblings remain available to semantic analysis.
+pub fn validate(
+    source: &str,
+    parsed: &Parsed<py::ModModule>,
+    errors: &mut dyn FnMut(SyntaxError),
+) -> Vec<NodeIndex> {
     crate::lexical::validate(source, parsed.tokens(), errors);
     let mut validator = Validator {
         tokens: parsed.tokens(),
         errors,
         loads: Vec::new(),
+        excluded: Vec::new(),
+        statement_node: None,
     };
     let py::ModModule {
         node_index: _,
@@ -58,6 +69,7 @@ pub fn validate(source: &str, parsed: &Parsed<py::ModModule>, errors: &mut dyn F
         }
         validator.error(error.range(), error.error.to_string());
     }
+    validator.excluded
 }
 
 /// Whether an expression has a Starlark representation. Unsupported expressions
@@ -129,6 +141,8 @@ struct Validator<'a> {
     tokens: &'a Tokens,
     errors: &'a mut dyn FnMut(SyntaxError),
     loads: Vec<TextRange>,
+    excluded: Vec<NodeIndex>,
+    statement_node: Option<NodeIndex>,
 }
 
 impl Validator<'_> {
@@ -137,6 +151,8 @@ impl Validator<'_> {
             tokens: _,
             errors,
             loads: _,
+            excluded: _,
+            statement_node: _,
         } = self;
         errors(SyntaxError {
             message: message.into(),
@@ -156,6 +172,8 @@ impl Validator<'_> {
             tokens,
             errors: _,
             loads: _,
+            excluded: _,
+            statement_node: _,
         } = self;
         let tokens = *tokens;
         let py::ExprCall {
@@ -224,6 +242,19 @@ impl Validator<'_> {
                         "Function annotations and decorators are not supported in Starlark",
                     );
                 }
+                if *is_async
+                    || !decorator_list.is_empty()
+                    || type_params.is_some()
+                    || returns.is_some()
+                    || !parameters.posonlyargs.is_empty()
+                    || parameters
+                        .iter()
+                        .any(|parameter| parameter.as_parameter().annotation.is_some())
+                    || name.as_str() == "load"
+                {
+                    self.excluded
+                        .push(self.statement_node.expect("visiting a statement"));
+                }
                 self.visit_identifier(name);
                 self.visit_parameters(parameters);
                 self.visit_body(body);
@@ -239,6 +270,8 @@ impl Validator<'_> {
                     orelse,
                 } = stmt;
                 if *is_async || !orelse.is_empty() {
+                    self.excluded
+                        .push(self.statement_node.expect("visiting a statement"));
                     self.error(
                         *range,
                         "Async loops and for-else are not supported in Starlark",
@@ -256,6 +289,8 @@ impl Validator<'_> {
                     value,
                 } = stmt;
                 if targets.len() != 1 {
+                    self.excluded
+                        .push(self.statement_node.expect("visiting a statement"));
                     self.error(*range, "Chained assignment is not supported in Starlark");
                 }
                 for target in targets {
@@ -272,6 +307,8 @@ impl Validator<'_> {
                     value,
                 } = stmt;
                 if matches!(op, py::Operator::Pow | py::Operator::MatMult) {
+                    self.excluded
+                        .push(self.statement_node.expect("visiting a statement"));
                     self.error(*range, "Unsupported Starlark assignment operator");
                 }
                 self.visit_expr(target);
@@ -327,14 +364,39 @@ impl Validator<'_> {
             Stmt::Break(_) => {}
             Stmt::Continue(_) => {}
             Stmt::Pass(_) => {}
-            _ => self.unsupported(stmt.range()),
+            _ => {
+                self.excluded.push(stmt.node_index().load());
+                self.unsupported(stmt.range());
+            }
         }
     }
 
     fn expression(&mut self, expr: &Expr) {
         if !supports_expr(expr.into(), self.tokens) {
+            self.excluded.push(
+                self.statement_node
+                    .expect("expressions belong to a statement"),
+            );
             self.unsupported(expr.range());
             return;
+        }
+        let unsupported_owner = match expr {
+            Expr::Dict(dict) => dict.items.iter().any(|item| item.key.is_none()),
+            Expr::ListComp(comp) => comp.generators.iter().any(|generator| generator.is_async),
+            Expr::DictComp(comp) => comp.generators.iter().any(|generator| generator.is_async),
+            Expr::List(list) => list.elts.iter().any(Expr::is_starred_expr),
+            Expr::Tuple(tuple) => tuple.elts.iter().any(Expr::is_starred_expr),
+            Expr::Lambda(lambda) => lambda
+                .parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.posonlyargs.is_empty()),
+            _ => false,
+        };
+        if unsupported_owner {
+            self.excluded.push(
+                self.statement_node
+                    .expect("expressions belong to a statement"),
+            );
         }
         match expr {
             Expr::Dict(py::ExprDict {
@@ -382,7 +444,9 @@ impl Validator<'_> {
 
 impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        let previous = self.statement_node.replace(stmt.node_index().load());
         stacker::maybe_grow(32 * 1024, 1024 * 1024, || self.statement(stmt));
+        self.statement_node = previous;
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {

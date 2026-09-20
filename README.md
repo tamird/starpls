@@ -89,6 +89,10 @@ Type diagnostics and `# type: ignore` use Ty's rules. For a diagnostic spanning 
 put the suppression on the first or last line of the diagnostic's range. A comment on an interior
 line does not suppress the entire diagnostic.
 
+Python-only syntax is diagnosed and its containing statement is omitted from analysis. Valid
+neighboring statements are still checked; names introduced only by an omitted statement remain
+undefined.
+
 ## Experimental features
 
 Starpls has a number of experimental features that can be enabled via command-line arguments:

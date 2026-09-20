@@ -207,6 +207,11 @@ pub fn syntax_info(db: &dyn Db, file: File) -> &[starpls_syntax::TypeComment] {
     &syntax_info_query(db, file.source, (file.dialect, file.info)).comments
 }
 
+/// Unsupported subtrees from the same canonical validation result as syntax diagnostics.
+pub fn syntax_exclusions(db: &dyn Db, file: File) -> &[ruff_python_ast::NodeIndex] {
+    &syntax_info_query(db, file.source, (file.dialect, file.info)).excluded
+}
+
 pub fn syntax_diagnostics(db: &dyn Db, file: File) -> &[Diagnostic] {
     &syntax_info_query(db, file.source, (file.dialect, file.info)).diagnostics
 }
@@ -216,6 +221,7 @@ pub fn syntax_diagnostics(db: &dyn Db, file: File) -> &[Diagnostic] {
 #[derive(Debug, PartialEq, Eq)]
 struct SyntaxInfo {
     comments: Vec<starpls_syntax::TypeComment>,
+    excluded: Vec<ruff_python_ast::NodeIndex>,
     diagnostics: Box<[Diagnostic]>,
 }
 
@@ -254,10 +260,11 @@ fn syntax_info_query(
             [],
         ));
     };
-    starpls_syntax::validate(&contents, &parsed, &mut errors);
+    let excluded = starpls_syntax::validate(&contents, &parsed, &mut errors);
     let comments = starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors);
     SyntaxInfo {
         comments,
+        excluded,
         diagnostics: diagnostics.into_boxed_slice(),
     }
 }

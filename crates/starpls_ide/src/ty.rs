@@ -338,6 +338,25 @@ impl ty_python_core::Db for Database {
         !file.path(self).is_vendored_path()
     }
 
+    fn source_exclusions(&self, file: ProgramFile<'_>) -> ty_python_core::SourceExclusions {
+        let Some(file) = self.starlark_file(file) else {
+            return ty_python_core::SourceExclusions::default();
+        };
+        let parsed = starpls_common::parsed_module(self, file).load(self);
+        ty_python_core::SourceExclusions::from_statements(
+            starpls_common::syntax_exclusions(self, file)
+                .iter()
+                .map(|node| {
+                    let ruff_python_ast::AnyRootNodeRef::Stmt(statement) =
+                        parsed.get_by_index(*node)
+                    else {
+                        unreachable!("validation excludes whole statements")
+                    };
+                    statement
+                }),
+        )
+    }
+
     fn provided_statements(&self, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
         load::statements(self, file)
     }
@@ -486,6 +505,65 @@ mod tests {
                 }),
                 "{diagnostics:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unsupported_statements_do_not_change_valid_bindings() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let path = Path::new("/admission.bzl");
+        for invalid in [
+            "while True:\n    value = 'bad'",
+            "class value:\n    pass",
+            "value: str = 'bad'",
+            "hidden = (value := 'bad')",
+            "def value(arg: int) -> str:\n    return 'bad'",
+            "@unknown_decorator\ndef value():\n    return 'bad'",
+            "async def value():\n    return 'bad'",
+            "def value[T]():\n    return 'bad'",
+            "for value in ['bad']:\n    pass\nelse:\n    value = 'bad'",
+            "hidden = [value async for value in []]",
+            "hidden = value = 'bad'",
+            "hidden = {**{'x': (value := 'bad')}}",
+            "if not ...:\n    value = 'bad'",
+            "def callback(arg):\n    # type: (int) -> int\n    raise NotImplementedError",
+            "def nested():\n    before = 1\n    while True:\n        before = 'bad'\n    after = before\n    return after",
+        ] {
+            for source in [
+                "value = 1\nobserved = value\n".to_owned(),
+                format!("value = 1\n{invalid}\nobserved = value\n"),
+                "value = 1\nobserved = value\n".to_owned(),
+            ] {
+                let file = analysis
+                    .open_document(path, Dialect::Bazel, None, source.clone(), 0)
+                    .unwrap();
+                let snapshot = analysis.snapshot();
+                let db = &snapshot.db;
+                let file = db.starlark_program_file(file);
+                let model = SemanticModel::new(db, file);
+                let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+                let Stmt::Assign(last) = parsed.suite().last().unwrap() else {
+                    unreachable!()
+                };
+                let observed = last.value.inferred_type(&model).unwrap();
+                assert_eq!(
+                    observed
+                        .display(db, &model.program_environment())
+                        .to_string(),
+                    "Literal[1]",
+                    "{source}"
+                );
+                let names = model
+                    .lexical_completions(ty_python_core::FileScopeId::global())
+                    .map(|item| item.name.to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !names.iter().any(|name| name == "hidden"),
+                    "{source}: {names:?}"
+                );
+                // Query full diagnostics after a type-first request on the same revision.
+                let _ = super::check(db, db.starlark_file(file).unwrap());
+            }
         }
     }
 
