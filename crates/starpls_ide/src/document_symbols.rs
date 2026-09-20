@@ -2,10 +2,12 @@ use ruff_text_size::Ranged;
 use starpls_bazel::APIContext;
 use starpls_common::parsed_module;
 use starpls_common::File;
-use starpls_common::InFile;
-use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
 use starpls_syntax::TextRange;
+use ty_python_core::definition::DefinitionKind;
+use ty_python_core::global_scope;
+use ty_python_core::place_table;
+use ty_python_core::use_def_map;
 
 use crate::Database;
 
@@ -56,27 +58,57 @@ pub struct DocumentSymbol {
 }
 
 pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<DocumentSymbol>> {
-    let sema = Semantics::new(db);
     let file = file_id;
-    let scope = sema.scope_for_module(file);
-    let mut symbols = scope
-        .definitions()
-        .filter_map(|(name, def)| {
-            let InFile {
-                file: def_file,
-                value: range,
-            } = def.source_range()?;
-            if file != def_file {
-                return None;
-            }
+    let sema = Semantics::new(db);
+    let scope = global_scope(db, db.starlark_program_file(file));
+    let places = place_table(db, scope);
+    let parsed = parsed_module(db, file).load(db);
+    let mut symbols = use_def_map(db, scope)
+        .all_reachable_symbols()
+        .filter_map(|(symbol, _declarations, bindings)| {
+            let (kind, range) = bindings
+                .filter_map(|binding| binding.binding.definition())
+                .filter_map(|definition| {
+                    let kind = definition.kind(db);
+                    Some(match kind {
+                        DefinitionKind::Function(function) => {
+                            let node = function.node(&parsed);
+                            sema.resolve_def_stmt(file, node)?;
+                            (Some(SymbolKind::Function), node.range())
+                        }
+                        DefinitionKind::Assignment(assignment) => {
+                            let target = assignment.target(&parsed);
+                            if !sema.contains_expr(file, target.into()) {
+                                return None;
+                            }
+                            (Some(SymbolKind::Variable), target.range())
+                        }
+                        DefinitionKind::AugmentedAssignment(assignment) => {
+                            let target = &assignment.node(&parsed).target;
+                            if !sema.contains_expr(file, target.as_ref().into()) {
+                                return None;
+                            }
+                            (Some(SymbolKind::Variable), target.range())
+                        }
+                        DefinitionKind::For(for_stmt) => {
+                            let target = for_stmt.target(&parsed);
+                            if !sema.contains_expr(file, target.into()) {
+                                return None;
+                            }
+                            (Some(SymbolKind::Variable), target.range())
+                        }
+                        // A load binding hides an earlier local definition from the outline.
+                        DefinitionKind::ProvidedBinding(_) => (None, kind.target_range(&parsed)),
+                        _ => return None,
+                    })
+                })
+                .max_by_key(|(_, range)| range.start())?;
+            let kind = kind?;
+            let range = crate::util::text_range(range);
             Some(DocumentSymbol {
-                name: name.as_str().to_string(),
+                name: places.symbol(symbol).name().to_string(),
                 detail: None,
-                kind: match def {
-                    ScopeDef::Callable(_) => SymbolKind::Function,
-                    ScopeDef::Variable(_) => SymbolKind::Variable,
-                    _ => return None,
-                },
+                kind,
                 tags: None,
                 range,
                 selection_range: range,
@@ -152,6 +184,41 @@ mod tests {
     }
 
     #[test]
+    fn includes_loop_bindings_and_the_last_assignment() {
+        let source = "value = 0\nfor item in [1]:\n    value = item\n    nested = item\n";
+        let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+        let symbols = analysis
+            .snapshot()
+            .document_symbols(fixture.main_file())
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(names, ["item", "value", "nested"]);
+        let value = symbols
+            .iter()
+            .find(|symbol| symbol.name == "value")
+            .unwrap();
+        assert_eq!(
+            usize::from(value.range.start()),
+            source.rfind("value").unwrap()
+        );
+    }
+
+    #[test]
+    fn excludes_definitions_in_unsupported_statements() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture(
+            "visible = 1\ndef visible_function():\n    pass\nwhile flag:\n    visible = 2\n    hidden = 2\n    def visible_function():\n        pass\n    def hidden_function():\n        pass\nclass visible:\n    field = 3\n",
+        );
+        let symbols = analysis
+            .snapshot()
+            .document_symbols(fixture.main_file())
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(names, ["visible", "visible_function"]);
+    }
+
+    #[test]
     fn test_none() {
         check(r#""#, expect![]);
     }
@@ -166,7 +233,7 @@ def foo():
 "#,
             expect![[r#"
                 DocumentSymbol { name: "s", detail: None, kind: Variable, tags: None, range: 0..1, selection_range: 0..1, children: None }
-                DocumentSymbol { name: "foo", detail: None, kind: Function, tags: None, range: 11..31, selection_range: 11..31, children: None }
+                DocumentSymbol { name: "foo", detail: None, kind: Function, tags: None, range: 11..30, selection_range: 11..30, children: None }
             "#]],
         );
     }

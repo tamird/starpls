@@ -8,9 +8,13 @@ use ruff_python_ast::StmtFunctionDef;
 use ruff_text_size::Ranged;
 use starpls_common::parsed_module;
 use starpls_common::File;
-use starpls_hir::Name;
-use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
+use ty_python_core::definition::Definition;
+use ty_python_core::definition::DefinitionKind;
+use ty_python_semantic::types::ide_support::definitions_for_name;
+use ty_python_semantic::types::ide_support::ImportAliasResolution;
+use ty_python_semantic::HasDefinition;
+use ty_python_semantic::SemanticModel;
 
 use crate::util::navigation_token;
 use crate::util::text_range;
@@ -44,17 +48,33 @@ impl<'a> NameNode<'a> {
         }
     }
 
-    fn definitions<'db>(&self, sema: &Semantics<'db>, file: File) -> Vec<ScopeDef<'db>> {
+    fn definitions<'db>(
+        &self,
+        model: &SemanticModel<'db>,
+        sema: &Semantics<'db>,
+        file: File,
+    ) -> Vec<Definition<'db>> {
         match self {
-            Self::Reference(name) => sema
-                .scope_for_expr(file, (*name).into())
-                .map(|scope| scope.resolve_name(&Name::from(self.name())))
-                .unwrap_or_default(),
-            Self::Definition(def) => sema
-                .resolve_def_stmt(file, def)
-                .map(ScopeDef::Callable)
+            Self::Reference(name) => {
+                if !sema.contains_expr(file, (*name).into()) {
+                    return Vec::new();
+                }
+                definitions_for_name(
+                    model,
+                    self.name(),
+                    (*name).into(),
+                    ImportAliasResolution::PreserveAliases,
+                )
                 .into_iter()
-                .collect(),
+                .filter_map(|definition| definition.definition())
+                .collect()
+            }
+            Self::Definition(def) => {
+                if sema.resolve_def_stmt(file, def).is_none() {
+                    return Vec::new();
+                }
+                vec![def.definition(model)]
+            }
         }
     }
 }
@@ -64,6 +84,7 @@ pub(crate) fn find_references(
     FilePosition { file_id: file, pos }: FilePosition,
 ) -> Option<Vec<Location>> {
     let sema = Semantics::new(db);
+    let model = SemanticModel::new(db, db.starlark_program_file(file));
     let parsed = parsed_module(db, file).load(db);
     let source = file.contents(db);
     let token = navigation_token(&source, parsed.tokens(), u32::from(pos).into())?;
@@ -71,12 +92,18 @@ pub(crate) fn find_references(
     let selected = NameNode::at(&node, token.range())?;
     let name = selected.name();
     let definitions = selected
-        .definitions(&sema, file)
+        .definitions(&model, &sema, file)
         .into_iter()
-        .filter(|def| match def {
-            ScopeDef::Variable(_) => true,
-            ScopeDef::Callable(callable) => callable.is_user_defined(),
-            _ => false,
+        .filter(|definition| {
+            definition.program_file(db) == model.program_file()
+                && matches!(
+                    definition.kind(db),
+                    DefinitionKind::Function(_)
+                        | DefinitionKind::Assignment(_)
+                        | DefinitionKind::AugmentedAssignment(_)
+                        | DefinitionKind::For(_)
+                        | DefinitionKind::Comprehension(_)
+                )
         })
         .collect::<Vec<_>>();
     if definitions.is_empty() {
@@ -84,6 +111,7 @@ pub(crate) fn find_references(
     }
 
     let mut visitor = ReferenceVisitor {
+        model: &model,
         sema: &sema,
         file,
         name,
@@ -95,10 +123,11 @@ pub(crate) fn find_references(
 }
 
 struct ReferenceVisitor<'db, 'request> {
+    model: &'request SemanticModel<'db>,
     sema: &'request Semantics<'db>,
     file: File,
     name: &'request str,
-    definitions: &'request [ScopeDef<'db>],
+    definitions: &'request [Definition<'db>],
     locations: Vec<Location>,
 }
 
@@ -110,6 +139,7 @@ impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
             _ => return TraversalSignal::Traverse,
         };
         let Self {
+            model,
             sema,
             file,
             name,
@@ -118,7 +148,7 @@ impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
         } = self;
         if candidate.name() == *name
             && candidate
-                .definitions(sema, *file)
+                .definitions(model, sema, *file)
                 .iter()
                 .any(|def| definitions.contains(def))
         {
@@ -204,6 +234,27 @@ def f(value):
     return value
 
 val$0ue
+#^^^^
+"#,
+        );
+    }
+
+    #[test]
+    fn distinguishes_closure_bindings_from_shadowed_locals() {
+        check_find_references(
+            r#"
+value = 1
+#^^^^
+def outer():
+    value = 2
+    def inner():
+        return value
+    return value
+
+def read_global():
+    return val$0ue
+           #^^^^
+value = 3
 #^^^^
 "#,
         );
