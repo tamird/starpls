@@ -11,7 +11,6 @@ pub use crate::diagnostics::diagnostic;
 pub use crate::diagnostics::Diagnostic;
 pub use crate::diagnostics::DiagnosticId;
 pub use crate::diagnostics::DiagnosticTag;
-pub use crate::diagnostics::Diagnostics;
 pub use crate::diagnostics::Severity;
 
 mod diagnostics;

@@ -5,6 +5,7 @@ use ruff_python_ast::name::Name;
 use starpls_bazel::APIContext;
 use starpls_common::Dialect;
 use starpls_common::FileInfo;
+use starpls_hir::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::ProvidedStatement;
 use ty_python_core::program::Program;
@@ -25,17 +26,20 @@ use ty_site_packages::PythonVersionWithSource;
 use crate::Database;
 
 mod context;
+mod diagnostics;
 mod factory;
 mod load;
 mod native;
 mod support;
 
+pub(crate) use diagnostics::check;
 pub(crate) use factory::Documentation;
 pub(crate) use support::file_system;
 
 pub(crate) struct SemanticSettings {
     program: ProgramSettings,
     rules: RuleSelection,
+    rules_with_flow_diagnostics: RuleSelection,
     analysis: AnalysisSettings,
 }
 
@@ -46,7 +50,8 @@ impl SemanticSettings {
         program.python_version.version = starpls_common::PARSER_VERSION;
         Self {
             program,
-            rules: RuleSelection::from_registry(ty_python_semantic::default_lint_registry()),
+            rules: diagnostics::rules(false),
+            rules_with_flow_diagnostics: diagnostics::rules(true),
             analysis: AnalysisSettings::default(),
         }
     }
@@ -123,7 +128,7 @@ impl Database {
         ProgramFile::from_python_file(self, python_file, program)
     }
 
-    fn starlark_file(&self, file: ProgramFile<'_>) -> Option<starpls_common::File> {
+    pub(crate) fn starlark_file(&self, file: ProgramFile<'_>) -> Option<starpls_common::File> {
         if file.file(self).path(self).is_vendored_path() {
             return None;
         }
@@ -406,11 +411,15 @@ impl ty_python_semantic::Db for Database {
     }
 
     fn rule_selection(&self, _file: File) -> &RuleSelection {
-        &self.semantic.rules
+        if self.environment().options(self).use_code_flow_analysis {
+            &self.semantic.rules_with_flow_diagnostics
+        } else {
+            &self.semantic.rules
+        }
     }
 
     fn lint_registry(&self) -> &LintRegistry {
-        ty_python_semantic::default_lint_registry()
+        diagnostics::registry()
     }
 
     fn analysis_settings(&self, _file: File) -> &AnalysisSettings {

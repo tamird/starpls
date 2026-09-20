@@ -12,15 +12,20 @@ use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
+use rustc_hash::FxHashSet;
 use starpls_common::Db;
 use starpls_syntax::source::string_value;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::definition::ProvidedBinding;
 use ty_python_core::definition::ProvidedStatement;
+use ty_python_core::global_scope;
+use ty_python_core::place_table;
+use ty_python_core::use_def_map;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingResolution;
 use ty_python_semantic::provided::ProvidedBindingValue;
+use ty_python_semantic::types::Type;
 
 use crate::Database;
 
@@ -135,19 +140,142 @@ pub(super) fn resolve<'db>(
     match db.load_file(&module_name, source_file.dialect, source_file) {
         Ok(Some(loaded)) => {
             if loaded.source == source_file.source {
-                return error("Cannot load the current file".to_owned());
+                return ProvidedBindingValue::Value(Type::unknown()).into();
+            }
+            let loaded_file = db.starlark_program_file(loaded);
+            if is_loaded_alias(db, loaded_file, &name) {
+                return error(format!(
+                    "Cannot load \"{name}\" from \"{module_name}\": loaded symbols are not exported"
+                ));
             }
             ProvidedBindingValue::Export {
-                file: db.starlark_program_file(loaded),
+                file: loaded_file,
                 name: Name::new(name),
             }
             .into()
         }
-        Ok(None) => ProvidedBindingValue::Unresolved.into(),
-        Err(error_message) => error(format!(
-            "Could not resolve module \"{module_name}\": {error_message}"
-        )),
+        // File diagnostics own module-resolution errors, including loads without bindings.
+        Ok(None) => ProvidedBindingValue::Value(Type::unknown()).into(),
+        Err(_) => ProvidedBindingValue::Value(Type::unknown()).into(),
     }
+}
+
+/// A load introduces a local binding, but only a declaration or assignment exports it again.
+/// Inspect binding origins without inferring the module's unrelated values.
+fn is_loaded_alias(db: &Database, file: ProgramFile<'_>, name: &str) -> bool {
+    let scope = global_scope(db, file);
+    let Some(symbol) = place_table(db, scope).symbol_id(name) else {
+        return false;
+    };
+    let mut has_load = false;
+    for definition in use_def_map(db, scope)
+        .end_of_scope_symbol_bindings(symbol)
+        .filter_map(|binding| binding.binding.definition())
+    {
+        if !matches!(definition.kind(db), DefinitionKind::ProvidedBinding(_)) {
+            return false;
+        }
+        has_load = true;
+    }
+    has_load
+}
+
+/// Starlark loads form a module graph independently of which exported value is requested.
+/// A type-inference cycle cannot establish whether this graph contains a load cycle.
+pub(super) fn diagnostics(db: &Database, file: ProgramFile<'_>) -> Vec<Diagnostic> {
+    fn visit(
+        db: &Database,
+        file: starpls_common::File,
+        path: &mut Vec<ruff_db::files::File>,
+        completed: &mut FxHashSet<ruff_db::files::File>,
+    ) -> Option<Vec<String>> {
+        if let Some(start) = path.iter().position(|source| *source == file.source) {
+            return Some(
+                path[start..]
+                    .iter()
+                    .chain(std::iter::once(&file.source))
+                    .map(|source| format!("- {}", source.path(db)))
+                    .collect(),
+            );
+        }
+        if completed.contains(&file.source) {
+            return None;
+        }
+        path.push(file.source);
+        let program_file = db.starlark_program_file(file);
+        let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
+        let source = file.contents(db);
+        let mut cycle = None;
+        for statement in parsed.suite() {
+            let Stmt::Expr(statement) = statement else {
+                continue;
+            };
+            let Some(call) = load_call(&statement.value) else {
+                continue;
+            };
+            let Some(module) = call.arguments.args.first() else {
+                continue;
+            };
+            let Some((module, _)) = string_value(&source[module.range()]) else {
+                continue;
+            };
+            let Ok(Some(loaded)) = db.load_file(&module, file.dialect, file) else {
+                continue;
+            };
+            cycle = visit(db, loaded, path, completed);
+            if cycle.is_some() {
+                break;
+            }
+        }
+        path.pop();
+        if cycle.is_none() {
+            completed.insert(file.source);
+        }
+        cycle
+    }
+
+    let Some(source_file) = db.starlark_file(file) else {
+        return Vec::new();
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let source = source_file.contents(db);
+    let mut diagnostics = Vec::new();
+    let mut path = vec![source_file.source];
+    let mut completed = FxHashSet::default();
+    for statement in parsed.suite() {
+        let Stmt::Expr(statement) = statement else {
+            continue;
+        };
+        let Some(call) = load_call(&statement.value) else {
+            continue;
+        };
+        let Some(module) = call.arguments.args.first() else {
+            continue;
+        };
+        let Some((module_name, _)) = string_value(&source[module.range()]) else {
+            continue;
+        };
+        let message = match db.load_file(&module_name, source_file.dialect, source_file) {
+            Ok(Some(loaded)) => {
+                if loaded.source == source_file.source {
+                    "Cannot load the current file".to_owned()
+                } else if let Some(cycle) = visit(db, loaded, &mut path, &mut completed) {
+                    format!("Detected circular import\n{}", cycle.join("\n"))
+                } else {
+                    continue;
+                }
+            }
+            Ok(None) => continue,
+            Err(error) => format!("Could not resolve module \"{module_name}\": {error}"),
+        };
+        let mut diagnostic =
+            Diagnostic::new(DiagnosticId::lint("load-error"), Severity::Warning, message);
+        diagnostic.annotate(Annotation::primary(
+            Span::from(source_file.source).with_range(module.range()),
+        ));
+        diagnostics.push(diagnostic);
+    }
+    diagnostics
 }
 
 fn load_call(expr: &Expr) -> Option<&ExprCall> {
@@ -171,6 +299,84 @@ mod tests {
 
     use crate::Analysis;
     use crate::FilePosition;
+
+    #[test]
+    fn load_cycles_do_not_depend_on_recursive_value_inference() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "a.bzl", "load(\"b.bzl\", \"b\")\na = 1\n");
+        let dependency = fixture.add_file(&mut analysis.db, "b.bzl", "b = 2\n");
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "load(\"a.bzl\", \"a\")\nresult = a\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+
+        for (source, cyclic) in [
+            ("load(\"a.bzl\", \"a\")\nb = 2\n", true),
+            ("b = 2\n", false),
+            ("load(\"a.bzl\", \"a\")\nb = 2\n", true),
+        ] {
+            analysis.update_file(dependency, source.to_owned());
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let diagnostics = super::diagnostics(db, db.starlark_program_file(caller));
+            assert_eq!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.id().as_str() == "load-error"
+                        && diagnostic.headline_message().contains("circular import")
+                }),
+                cyclic,
+                "{diagnostics:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn loads_without_bindings_still_report_module_errors() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture("load(\"missing.bzl\")\n");
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let diagnostics = super::diagnostics(db, db.starlark_program_file(fixture.main_file()));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .headline_message()
+            .starts_with("Could not resolve module"));
+    }
+
+    #[test]
+    fn loaded_bindings_require_an_explicit_assignment_to_be_exported() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "origin.bzl", "value = 1\n");
+        let dependency = fixture.add_file(&mut analysis.db, "middle.bzl", "");
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "load(\"middle.bzl\", \"value\")\nresult = value\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+
+        for (source, exported) in [
+            ("load(\"origin.bzl\", \"value\")\n", false),
+            ("load(\"origin.bzl\", \"value\")\nvalue = value\n", true),
+            ("load(\"origin.bzl\", \"value\")\n", false),
+        ] {
+            analysis.update_file(dependency, source.to_owned());
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let diagnostics =
+                ty_python_semantic::types::check_types(db, db.starlark_program_file(caller));
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| { diagnostic.headline_message().contains("not exported") }),
+                !exported,
+                "{diagnostics:?}",
+            );
+        }
+    }
 
     #[test]
     fn build_prelude_signature_tracks_loaded_declaration() {

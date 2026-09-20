@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use either::Either;
 use starpls_common::diagnostic;
+#[cfg(test)]
 use starpls_common::line_index;
+#[cfg(test)]
 use starpls_common::Diagnostic;
 use starpls_common::DiagnosticId;
 use starpls_common::DiagnosticTag;
@@ -22,6 +24,7 @@ use crate::def::ops::LogicOp;
 use crate::def::ops::UnaryOp;
 use crate::def::resolver::Export;
 use crate::def::resolver::Resolver;
+#[cfg(test)]
 use crate::def::scope::module_scopes;
 use crate::def::scope::ExecutionScopeId;
 use crate::def::scope::FunctionDef;
@@ -77,23 +80,28 @@ use crate::Name;
 
 const TYPE_CHECK: DiagnosticId = DiagnosticId::lint("type-check");
 const LOAD_ERROR: DiagnosticId = DiagnosticId::lint("load-error");
+#[cfg(test)]
 const UNUSED_DEFINITION: DiagnosticId = DiagnosticId::lint("unused-definition");
+#[cfg(test)]
 const UNREACHABLE_CODE: DiagnosticId = DiagnosticId::lint("unreachable-code");
 const DEPRECATED_ARGUMENT: DiagnosticId = DiagnosticId::lint("deprecated-argument");
 
 impl TyContext<'_> {
+    #[cfg(test)]
     fn infer_all_exprs(&mut self, file: File) {
         for (expr, _) in module(self.db, file).exprs.iter() {
             self.infer_expr(file, expr);
         }
     }
 
+    #[cfg(test)]
     fn infer_all_params(&mut self, file: File) {
         for (param, _) in module(self.db, file).params.iter() {
             self.infer_param(file, param);
         }
     }
 
+    #[cfg(test)]
     fn walk_stmts(&mut self, file: File, stmts: &[StmtId]) {
         if stmts.is_empty() {
             return;
@@ -161,6 +169,7 @@ impl TyContext<'_> {
         }
     }
 
+    #[cfg(test)]
     fn walk_stmt(&mut self, file: File, stmt: StmtId) {
         let module = module(self.db, file);
 
@@ -250,6 +259,7 @@ impl TyContext<'_> {
         }
     }
 
+    #[cfg(test)]
     fn report_unused_definitions(&mut self, file: File) {
         for (expr, name) in module(self.db, file).exprs.iter().filter_map(|(id, expr)| {
             if let Expr::Name { name } = expr {
@@ -330,6 +340,7 @@ impl TyContext<'_> {
         }
     }
 
+    #[cfg(test)]
     pub fn diagnostics_for_file(&mut self, file: File) -> Vec<Diagnostic> {
         let module = module(self.db, file);
 

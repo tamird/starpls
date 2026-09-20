@@ -559,6 +559,32 @@ mod dialect_tests {
     }
 
     #[test]
+    fn assignment_targets_are_checked_without_semantic_scopes() {
+        for source in [
+            "1 = value\n",
+            "f() = value\n",
+            "(a, 1) = value\n",
+            "for 1 in values:\n    pass\n",
+            "[x for 1 in values]\n",
+            "a, *rest = values\n",
+        ] {
+            let mut errors = Vec::new();
+            validate_source(source, &mut |error| errors.push(error));
+            assert!(!errors.is_empty(), "{source}");
+        }
+        for source in [
+            "a = value\n",
+            "(a, [b, c]) = values\n",
+            "obj.field = value\n",
+            "items[0] = value\n",
+            "items[:] = values\n",
+            "for a, b in values:\n    pass\n",
+        ] {
+            validate_source(source, &mut |error| panic!("{source}: {error:?}"));
+        }
+    }
+
+    #[test]
     fn starlark_load_grammar() {
         let source = "load(\":defs.bzl\", alias=\"name\", \"other\")\n";
         let mut errors = Vec::new();

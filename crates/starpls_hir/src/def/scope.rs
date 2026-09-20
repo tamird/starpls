@@ -5,13 +5,8 @@ use either::Either;
 use id_arena::Arena;
 use id_arena::Id;
 use rustc_hash::FxHashMap;
-use salsa::Accumulator;
-use starpls_common::diagnostic;
-use starpls_common::DiagnosticId;
-use starpls_common::Diagnostics;
 use starpls_common::File;
 use starpls_common::InFile;
-use starpls_common::Severity;
 
 use crate::def::CompClause;
 use crate::def::Expr;
@@ -30,7 +25,6 @@ use crate::typeck::TypeRef;
 use crate::Db;
 use crate::Module;
 use crate::ModuleInfo;
-use crate::ModuleSourceMap;
 use crate::Name;
 
 pub(crate) type ScopeId = Id<Scope>;
@@ -64,7 +58,7 @@ pub(crate) fn module_scopes_query(
         dialect,
         info,
     };
-    Scopes::new_for_module(db, lower(db, file))
+    Scopes::new_for_module(lower(db, file))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,13 +164,11 @@ struct FunctionData {
 }
 
 impl Scopes {
-    fn new_for_module(db: &dyn Db, info: &ModuleInfo) -> Self {
+    fn new_for_module(info: &ModuleInfo) -> Self {
         ScopeCollector {
-            db,
             deferred: VecDeque::new(),
             file: info.file,
             module: &info.module,
-            source_map: &info.source_map,
             scopes: Scopes {
                 scopes: Default::default(),
                 scopes_by_hir_id: Default::default(),
@@ -234,11 +226,9 @@ impl Scopes {
 }
 
 struct ScopeCollector<'a> {
-    db: &'a dyn Db,
     deferred: VecDeque<DeferredScope>,
     file: File,
     module: &'a Module,
-    source_map: &'a ModuleSourceMap,
     scopes: Scopes,
     curr_execution_scope: ExecutionScopeId,
 }
@@ -433,19 +423,8 @@ impl ScopeCollector<'_> {
                     self.record_expr_scope(expr, current);
                 }
                 Expr::Missing => {}
-                _ => Diagnostics(diagnostic(
-                    self.file,
-                    DiagnosticId::InvalidSyntax,
-                    Severity::Error,
-                    self.source_map
-                        .expr_map_back
-                        .get(&expr)
-                        .copied()
-                        .expect("expected expr to exist in source map"),
-                    "Expression is not assignable",
-                    [],
-                ))
-                .accumulate(self.db),
+                // Ruff's parser reports invalid targets before semantic lowering.
+                _ => {}
             }
         } else {
             match &self.module[expr] {

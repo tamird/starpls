@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use def::resolver::Resolver;
 use def::scope;
-use def::scope::module_scopes_query;
 use def::scope::FunctionDef;
 use def::scope::ParameterDef;
 use def::Function;
@@ -16,7 +15,6 @@ use ruff_python_ast::Parameter;
 use ruff_python_ast::StmtFunctionDef;
 use starpls_bazel::Builtins;
 use starpls_common::Diagnostic;
-use starpls_common::Diagnostics;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::InFile;
@@ -41,7 +39,6 @@ use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
 pub use crate::test_database::Fixture;
 pub use crate::typeck::builtins::BuiltinDefs;
-pub use crate::typeck::queries::diagnostics as inference_diagnostics;
 pub use crate::typeck::Cancelled;
 pub use crate::typeck::InferenceOptions;
 pub(crate) use crate::typeck::Ty;
@@ -118,22 +115,12 @@ impl Environment {
 }
 
 /// Syntax and lowering diagnostics are query results, not accumulators: semantic
-/// callbacks can read their source maps during Salsa fixpoint inference. Only
-/// scope diagnostics are accumulated by the structural analysis owner.
+/// callbacks can read their source maps during Salsa fixpoint inference.
 pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> + '_ {
     starpls_common::syntax_diagnostics(db, file)
         .iter()
         .chain(lower(db, file).diagnostics.iter())
         .cloned()
-        .chain(
-            module_scopes_query::accumulated::<Diagnostics>(
-                db,
-                file.source,
-                (file.dialect, file.info),
-            )
-            .into_iter()
-            .map(|diagnostic| diagnostic.0.clone()),
-        )
 }
 
 /// Semantic views for one database revision.
@@ -697,8 +684,6 @@ impl<'a> Callable<'a> {
         let Self { sema: _, inner } = self;
         matches!(*inner, CallableInner::Macro(_))
     }
-
-
 }
 
 /// Reperesents different types of callables.

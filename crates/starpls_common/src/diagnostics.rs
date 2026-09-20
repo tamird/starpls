@@ -31,7 +31,3 @@ pub fn diagnostic(
     diagnostic.annotate(annotation);
     diagnostic
 }
-
-#[salsa::accumulator]
-#[derive(Clone, Debug)]
-pub struct Diagnostics(pub Diagnostic);

@@ -9,7 +9,8 @@ pub(crate) struct InferenceOptions {
     #[clap(long = "experimental_infer_ctx_attributes", default_value_t = false)]
     pub(crate) infer_ctx_attributes: bool,
 
-    /// Use code-flow analysis during typechecking.
+    /// Report unreachable code and possibly unbound variables.
+    /// Type inference always uses code-flow analysis.
     #[clap(long = "experimental_use_code_flow_analysis", default_value_t = false)]
     pub(crate) use_code_flow_analysis: bool,
 }

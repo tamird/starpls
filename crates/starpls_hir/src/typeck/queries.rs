@@ -1,8 +1,6 @@
 //! Inference query boundaries. Each query owns its working state and follows
-//! only the imported definitions needed for its result. Diagnostics run a
-//! complete pass for their own file, independently of prior editor requests.
+//! only the imported definitions needed for its result.
 
-use starpls_common::Diagnostic;
 use starpls_common::File;
 use starpls_common::InFile;
 
@@ -49,28 +47,4 @@ pub(crate) fn resolve_type_query(
     usage: Option<InFile<StmtId>>,
 ) -> Ty {
     resolve_type_ref(&mut TyContext::new(db), &type_ref, usage).0
-}
-
-pub fn diagnostics(db: &dyn Db, file: File) -> Vec<Diagnostic> {
-    let File {
-        source,
-        dialect,
-        info,
-    } = file;
-    diagnostics_query(db, source, (dialect, info))
-}
-
-#[salsa::tracked(returns(clone))]
-fn diagnostics_query(
-    db: &dyn Db,
-    source: ruff_db::files::File,
-    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
-) -> Vec<Diagnostic> {
-    let (dialect, info) = context;
-    let file = File {
-        source,
-        dialect,
-        info,
-    };
-    TyContext::new(db).diagnostics_for_file(file)
 }

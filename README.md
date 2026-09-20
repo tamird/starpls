@@ -85,6 +85,10 @@ def _impl(ctx):
 
 then you'll get autocomplete suggestions for the attributes on `ctx`, like `ctx.actions`, `ctx.attr`, and so on!
 
+Type diagnostics and `# type: ignore` use Ty's rules. For a diagnostic spanning multiple lines,
+put the suppression on the first or last line of the diagnostic's range. A comment on an interior
+line does not suppress the entire diagnostic.
+
 ## Experimental features
 
 Starpls has a number of experimental features that can be enabled via command-line arguments:
@@ -107,15 +111,13 @@ foo = rule(
 
 ### `--experimental_use_code_flow_analysis`
 
-Use code flow analysis to determine additional information about types.
+Report unreachable code and uses of possibly unbound variables. Type inference always uses code
+flow analysis, regardless of this option.
 
 ```python
-if cond:
-    x = 1
-else:
-    x = "abc"
-
-x # type: int | string
+def example():
+    return
+    print("unreachable") # Reported when this option is enabled.
 ```
 
 ### `--experimental_enable_label_completions`
