@@ -3,9 +3,9 @@
 //! Replace only the owned classes in pinned typeshed inputs, retaining imports,
 //! support classes, generic identities, and Ty's ordinary inference machinery.
 //! These are immutable database inputs, assembled before any file is interned.
-//! User source is never rewritten. Scalar operator declarations remain Python
-//! contracts until the corresponding Ty operation policies support Starlark;
-//! hiding their presentation here does not establish operator compatibility.
+//! User source is never rewritten. Boolean values have their own nominal type;
+//! the remaining numeric operator declarations retain the pinned Python contracts.
+//! Hiding their presentation does not establish full operator compatibility.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ use zip::CompressionMethod;
 
 const PRIMITIVES: &str = include_str!("primitives.pyi");
 const COLLECTIONS: &str = include_str!("collections.pyi");
-const SCALARS: [&str; 5] = ["int", "float", "bool", "tuple", "range"];
+const SCALARS: [&str; 4] = ["int", "float", "tuple", "range"];
 
 pub(crate) fn file_system() -> &'static VendoredFileSystem {
     static FILE_SYSTEM: LazyLock<VendoredFileSystem> = LazyLock::new(|| {
@@ -386,6 +386,83 @@ element = values.pop()
         }
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn booleans_are_ordered_without_numeric_operations() {
+        let source = r#"
+def integer(value):
+    # type: (int) -> None
+    pass
+
+def boolean(value):
+    # type: (bool) -> None
+    pass
+
+def inspect(flag):
+    # type: (bool) -> None
+    boolean(flag)
+    boolean(True)
+    integer(1)
+    int(flag)
+    float(flag)
+    bool(0)
+    False < True
+    flag <= False
+    True >= flag
+    not flag
+    flag and True
+    boolean(1)
+    integer(flag)
+    integer(True)
+    +flag
+    ~True
+    flag + 1
+    True * 2
+    flag & False
+    [0][flag]
+    "x" * True
+    flag < 1
+"#;
+        let (mut analysis, _) = Analysis::new_for_test();
+        let file = analysis
+            .open_document(
+                Path::new("/booleans.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let file = db.starlark_program_file(file);
+        let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+        let mut rejected_lines: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let start =
+                    usize::from(diagnostic.primary_span().unwrap().range().unwrap().start());
+                let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                source[line_start..].lines().next().unwrap().trim()
+            })
+            .collect();
+        rejected_lines.sort_unstable();
+        let mut expected = [
+            "boolean(1)",
+            "integer(flag)",
+            "integer(True)",
+            "+flag",
+            "~True",
+            "flag + 1",
+            "True * 2",
+            "flag & False",
+            "[0][flag]",
+            "\"x\" * True",
+            "flag < 1",
+        ];
+        expected.sort_unstable();
+        assert_eq!(rejected_lines, expected, "{diagnostics:?}");
     }
 
     #[test]

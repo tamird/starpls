@@ -25,6 +25,12 @@ enum CallableKind {
     Method,
 }
 
+#[derive(Clone, Copy)]
+enum AnnotationUse {
+    Value,
+    AttributeInput,
+}
+
 pub(super) fn path(dialect: Dialect) -> SystemVirtualPathBuf {
     let dialect = match dialect {
         Dialect::Standard => "standard",
@@ -116,6 +122,12 @@ fn globals(
 }
 
 fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyhow::Result<String> {
+    let rule_names: BTreeSet<_> = rules
+        .global
+        .iter()
+        .filter(|_| dialect == Dialect::Bazel)
+        .map(|rule| rule.name.as_str())
+        .collect();
     let contexts: Vec<_> = [
         APIContext::Bzl,
         APIContext::Build,
@@ -216,10 +228,14 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                 Some(callable) => write_function(
                     &mut body,
                     "        ",
-                    &field.name,
+                    field,
                     callable,
-                    &field.doc,
                     CallableKind::Method,
+                    if class.name == "native" && rule_names.contains(field.name.as_str()) {
+                        AnnotationUse::AttributeInput
+                    } else {
+                        AnnotationUse::Value
+                    },
                     &declared_classes,
                 )?,
                 None => {
@@ -234,9 +250,14 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     } else {
                         None
                     };
-                    let field_type = field_type
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| annotation(&field.r#type, false, &declared_classes));
+                    let field_type = field_type.map(str::to_owned).unwrap_or_else(|| {
+                        annotation(
+                            &field.r#type,
+                            false,
+                            &declared_classes,
+                            AnnotationUse::Value,
+                        )
+                    });
                     writeln!(body, "        {}: {field_type}", field.name)?;
                     if !field.doc.is_empty() {
                         writeln!(
@@ -262,10 +283,18 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     write_function(
                         &mut exports,
                         "    ",
-                        &value.name,
+                        value,
                         callable,
-                        &value.doc,
                         CallableKind::Function,
+                        if matches!(
+                            context,
+                            APIContext::Bzl | APIContext::Build | APIContext::Prelude
+                        ) && rule_names.contains(value.name.as_str())
+                        {
+                            AnnotationUse::AttributeInput
+                        } else {
+                            AnnotationUse::Value
+                        },
                         &declared_classes,
                     )?;
                 }
@@ -273,7 +302,12 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     exports,
                     "    {}: {}",
                     value.name,
-                    annotation(&value.r#type, false, &declared_classes)
+                    annotation(
+                        &value.r#type,
+                        false,
+                        &declared_classes,
+                        AnnotationUse::Value
+                    )
                 )?,
             }
         }
@@ -305,13 +339,13 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
 fn write_function(
     output: &mut String,
     indent: &str,
-    name: &str,
+    value: &Value,
     callable: &Callable,
-    doc: &str,
     kind: CallableKind,
+    input: AnnotationUse,
     classes: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    write!(output, "{indent}def {name}(")?;
+    write!(output, "{indent}def {}(", value.name)?;
     let mut separator = "";
     if !matches!(kind, CallableKind::Function) {
         output.push_str("_starpls_self");
@@ -354,7 +388,7 @@ fn write_function(
         write!(
             output,
             "{name}: {}",
-            annotation(r#type, *is_star_arg || *is_star_star_arg, classes)
+            annotation(r#type, *is_star_arg || *is_star_star_arg, classes, input)
         )?;
         if !is_star_arg && !is_star_star_arg && !is_mandatory {
             optional = true;
@@ -367,8 +401,12 @@ fn write_function(
         }
     }
     let return_type = &callable.return_type;
-    writeln!(output, ") -> {}:", annotation(return_type, false, classes))?;
-    let mut documentation = env::normalize_doc(doc, false);
+    writeln!(
+        output,
+        ") -> {}:",
+        annotation(return_type, false, classes, AnnotationUse::Value)
+    )?;
+    let mut documentation = env::normalize_doc(&value.doc, false);
     for parameter in &callable.param {
         if !parameter.doc.is_empty() {
             write!(
@@ -386,15 +424,20 @@ fn write_function(
 
 /// Decode the inventory's prose vocabulary, not arbitrary annotation source.
 /// Undeclared umbrella/prose types carry no nominal identity or usable contract.
-fn annotation(text: &str, variadic: bool, classes: &BTreeSet<String>) -> String {
+fn annotation(
+    text: &str,
+    variadic: bool,
+    classes: &BTreeSet<String>,
+    usage: AnnotationUse,
+) -> String {
     let text = env::normalize_doc(text, true);
     text.split("; or ")
         .filter(|part| part.trim() != "unbound")
         .map(|part| {
             if let Some(mapping) = part.trim().strip_prefix("Dictionary: ") {
                 if let Some((key, value)) = mapping.split_once(" -> ") {
-                    let key = annotation(key, false, classes);
-                    let value = annotation(value, false, classes);
+                    let key = annotation(key, false, classes, AnnotationUse::Value);
+                    let value = annotation(value, false, classes, AnnotationUse::Value);
                     return format!("_starpls_builtins.dict[{key}, {value}]");
                 }
             }
@@ -419,7 +462,12 @@ fn annotation(text: &str, variadic: bool, classes: &BTreeSet<String>) -> String 
                 _ => None,
             };
             if let Some(container) = container {
-                let element = annotation(element.unwrap_or("Unknown"), false, classes);
+                let element = annotation(
+                    element.unwrap_or("Unknown"),
+                    false,
+                    classes,
+                    AnnotationUse::Value,
+                );
                 if variadic {
                     return element;
                 }
@@ -431,6 +479,13 @@ fn annotation(text: &str, variadic: bool, classes: &BTreeSet<String>) -> String 
                     format!("{container}[{element}]")
                 };
             }
+            let boolean = match usage {
+                AnnotationUse::Value => "_starpls_builtins.bool",
+                // Rule attributes convert 0 and 1; ordinary native parameters do not.
+                AnnotationUse::AttributeInput => {
+                    "_starpls_builtins.bool | _starpls_typing.Literal[0, 1]"
+                }
+            };
             let scalar = match name {
                 "" => "_starpls_typing.Any",
                 "Unknown" => "_starpls_typing.Any",
@@ -441,9 +496,9 @@ fn annotation(text: &str, variadic: bool, classes: &BTreeSet<String>) -> String 
                 "int" => "_starpls_builtins.int",
                 "Integer" => "_starpls_builtins.int",
                 "float" => "_starpls_builtins.float",
-                "bool" => "_starpls_builtins.bool",
-                "boolean" => "_starpls_builtins.bool",
-                "Boolean" => "_starpls_builtins.bool",
+                "bool" => boolean,
+                "boolean" => boolean,
+                "Boolean" => boolean,
                 "string" => "_starpls_builtins.str",
                 "String" => "_starpls_builtins.str",
                 "str" => "_starpls_builtins.str",
@@ -664,6 +719,116 @@ mod tests {
             help.signatures[0].label,
             "def native_value(value: str) -> str"
         );
+    }
+
+    #[test]
+    fn boolean_conversion_is_limited_to_rule_inputs() {
+        let function = |name: &str, returns: &str| Value {
+            name: name.to_owned(),
+            callable: Some(Callable {
+                param: vec![Param {
+                    name: "flag".to_owned(),
+                    r#type: "Boolean".to_owned(),
+                    is_mandatory: true,
+                    ..Default::default()
+                }],
+                return_type: returns.to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        builtins.global.push(function("strict_bool", "Boolean"));
+        builtins.r#type.push(Type {
+            name: "BooleanRecord".to_owned(),
+            field: vec![Value {
+                name: "value".to_owned(),
+                r#type: "Boolean".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        builtins.global.push(Value {
+            name: "boolean_record".to_owned(),
+            r#type: "BooleanRecord".to_owned(),
+            ..Default::default()
+        });
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(
+                builtins,
+                Builtins {
+                    global: vec![function("boolean_rule", "None")],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let source = "\
+boolean_rule(0)
+boolean_rule(1)
+boolean_rule(True)
+boolean_rule(False)
+native.boolean_rule(0)
+native.boolean_rule(1)
+native.boolean_rule(True)
+native.boolean_rule(False)
+returned = strict_bool(True)
+field = boolean_record.value
+strict_bool(False)
+";
+        let file = analysis
+            .open_document(
+                Path::new("/booleans.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        {
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let file = db.starlark_program_file(file);
+            let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            let model = SemanticModel::new(db, file);
+            for statement in parsed.suite() {
+                let Stmt::Assign(assignment) = statement else {
+                    continue;
+                };
+                let ty = assignment.value.inferred_type(&model).unwrap();
+                assert_eq!(
+                    ty.display(db, &model.program_environment()).to_string(),
+                    "bool"
+                );
+            }
+        }
+        for (statement, expected) in [
+            ("boolean_rule(2)", "invalid-argument-type"),
+            ("native.boolean_rule(2)", "invalid-argument-type"),
+            ("strict_bool(0)", "invalid-argument-type"),
+            ("strict_bool(1)", "invalid-argument-type"),
+            (
+                "def generic(flag):\n    # type: (int) -> None\n    boolean_rule(flag)",
+                "invalid-argument-type",
+            ),
+            (
+                "def generic(flag):\n    # type: (int) -> None\n    native.boolean_rule(flag)",
+                "invalid-argument-type",
+            ),
+            ("annotated = 1 # type: bool", "invalid-assignment"),
+        ] {
+            analysis.update_file(file, format!("{source}\n{statement}\n"));
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let diagnostics =
+                ty_python_semantic::check_file_unwrap(db, db.starlark_program_file(file));
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), expected, "{statement}");
+        }
     }
 
     #[test]

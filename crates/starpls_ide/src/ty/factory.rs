@@ -372,7 +372,19 @@ pub(super) fn attribute_value_type<'db>(
         AttributeUse::RepositoryContext => Some(Type::unknown()),
     };
     Some(match kind {
-        AttributeKind::Bool => KnownClass::Bool.to_instance(db, environment),
+        AttributeKind::Bool => {
+            let boolean = KnownClass::Bool.to_instance(db, environment);
+            match usage {
+                // Bazel converts only integer 0 and 1 at attribute inputs.
+                AttributeUse::Input => UnionType::from_elements(
+                    db,
+                    environment,
+                    [boolean, Type::int_literal(0), Type::int_literal(1)],
+                ),
+                AttributeUse::BuildContext => boolean,
+                AttributeUse::RepositoryContext => boolean,
+            }
+        }
         AttributeKind::Int => int,
         AttributeKind::IntList => list(int),
         AttributeKind::String => string,

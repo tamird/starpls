@@ -1,9 +1,27 @@
-# Fixed Starlark contracts replacing these four classes in pinned builtins.pyi.
+# Fixed Starlark contracts replacing these classes in pinned builtins.pyi.
 # Imports and type variables belong to that module, not to user Starlark source.
 # https://github.com/bazelbuild/starlark/blob/master/spec.md#built-in-methods
 # Special methods encode operations for Ty and are omitted from completion.
 
 from typing import TYPE_CHECKING
+
+@final
+@disjoint_base
+class bool:
+    @type_check_only
+    def __new__(cls, value: object = False, /) -> Self: ...
+    @type_check_only
+    def __int__(self) -> int: ...
+    @type_check_only
+    def __float__(self) -> float: ...
+    @type_check_only
+    def __lt__(self, other: bool, /) -> bool: ...
+    @type_check_only
+    def __le__(self, other: bool, /) -> bool: ...
+    @type_check_only
+    def __gt__(self, other: bool, /) -> bool: ...
+    @type_check_only
+    def __ge__(self, other: bool, /) -> bool: ...
 
 @disjoint_base
 class str:

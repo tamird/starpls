@@ -724,7 +724,7 @@ example = {factory}(
                     "{factory}, enabled={enabled}: {completions:?}"
                 );
             }
-            for (attribute, expected) in [("int", "int"), ("string", "str")] {
+            for (attribute, expected) in [("int", "int"), ("bool", "bool"), ("string", "str")] {
                 analysis.update_file(
                     file_id,
                     source.replace("attr.string()", &format!("attr.{attribute}()")),
