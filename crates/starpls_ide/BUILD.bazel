@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "starpls_ide",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["src/ty/starlark.pyi"],
     aliases = {
         "@crates//:salsa": "salsa",
     },
@@ -23,6 +24,7 @@ rust_test(
     aliases = {
         "@crates//:salsa": "salsa",
     },
+    compile_data = ["//crates/starpls:src/builtin/builtin.pb"],
     crate = ":starpls_ide",
     deps = all_crate_deps(normal_dev = True),
 )

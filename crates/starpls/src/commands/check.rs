@@ -71,7 +71,7 @@ impl CheckCommand {
             },
         )?;
 
-        analysis.set_builtin_defs(builtins, bazel_cx.rules);
+        analysis.set_builtin_defs(builtins, bazel_cx.rules)?;
 
         // Strip off the leading "." from each of the specified extensions.
         // This works better when filtering against files with .extension().

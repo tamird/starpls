@@ -8,6 +8,53 @@ use crate::builtin::Param;
 use crate::builtin::Value;
 use crate::Builtins;
 
+/// Normalize HTML embedded in Bazel's exported documentation and type names.
+pub fn normalize_doc(text: &str, is_type: bool) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+    let mut tag = String::new();
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                if !in_tag {
+                    result.push(ch);
+                    continue;
+                }
+                let replacement = match tag.as_str() {
+                    "p" => "\n\n",
+                    "code" => {
+                        if is_type {
+                            ""
+                        } else {
+                            "`"
+                        }
+                    }
+                    "/code" => {
+                        if is_type {
+                            ""
+                        } else {
+                            "`"
+                        }
+                    }
+                    _ => "",
+                };
+                result.push_str(replacement);
+                in_tag = false;
+                tag.clear();
+            }
+            _ => {
+                if in_tag {
+                    tag.push(ch);
+                } else {
+                    result.push(ch);
+                }
+            }
+        }
+    }
+    result
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BuiltinsJson {
     builtins: Vec<ValueJson>,

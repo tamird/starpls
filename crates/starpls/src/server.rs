@@ -128,7 +128,7 @@ impl Server {
         )?;
 
         analysis.set_all_workspace_targets(targets);
-        analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules);
+        analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules)?;
 
         // Check for a prelude file. We skip verifying that `//tools/build_tools` is actually a package (i.e.
         // that it actually contains a `BUILD.bazel`) file for simplicity.

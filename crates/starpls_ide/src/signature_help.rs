@@ -1,5 +1,3 @@
-use std::fmt::Write;
-
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::token::Tokens;
@@ -10,9 +8,14 @@ use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
-use starpls_common::parsed_module;
 use starpls_hir::Semantics;
 use starpls_syntax::source::expr_range;
+use ty_python_semantic::types::ide_support::call_signature_details;
+use ty_python_semantic::types::ide_support::CallSignatureDetails;
+use ty_python_semantic::types::ide_support::CallSignatureParameter;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::HasType;
+use ty_python_semantic::SemanticModel;
 
 use crate::util::pick_source_token;
 use crate::util::unindent_doc;
@@ -45,9 +48,9 @@ pub(crate) fn signature_help(
     db: &Database,
     FilePosition { file_id, pos }: FilePosition,
 ) -> Option<SignatureHelp> {
-    let sema = Semantics::new(db);
     let file = file_id;
-    let parsed = parsed_module(db, file).load(db);
+    let program_file = db.starlark_program_file(file);
+    let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let source = file.contents(db);
     let (expr, active_arg) = call_at_cursor(
         parsed.syntax(),
@@ -55,95 +58,84 @@ pub(crate) fn signature_help(
         u32::from(pos).into(),
         TextSize::of(&*source),
     )?;
-    let func = sema.resolve_call_expr(file, expr)?;
-    let params = func.params();
-    let param_labels: Vec<String> = params
-        .iter()
-        .map(|(param, ty)| {
-            let mut s = String::new();
-            if param.is_args_list() {
-                s.push('*');
-            } else if param.is_kwargs_dict() {
-                s.push_str("**");
+    if !Semantics::new(db).contains_expr(file, expr.into()) {
+        return None;
+    }
+    let model = SemanticModel::new(db, program_file);
+    let callee_type = expr.func.inferred_type(&model);
+    let constructor = matches!(callee_type, Some(Type::ClassLiteral(_)));
+    let provided_documentation = callee_type
+        .and_then(|ty| ty.provided_data(db, &model.program_environment()))
+        .and_then(|data| data.downcast_ref::<crate::ty::Documentation>());
+    let signatures = call_signature_details(&model, expr)
+        .into_iter()
+        .map(|details| {
+            let active_parameter = details.active_parameter(active_arg);
+            let CallSignatureDetails {
+                signature: _,
+                label,
+                parameters,
+                definition,
+                argument_to_parameter_mapping: _,
+                argument_to_displayed_parameter_mapping: _,
+            } = details;
+            let source_documentation = definition.and_then(|definition| definition.docstring(db));
+            let documentation = provided_documentation
+                .and_then(|doc| doc.text.as_deref())
+                .or(source_documentation.as_deref());
+            let name = if constructor {
+                None
+            } else {
+                definition.and_then(|definition| definition.name(db))
+            };
+            let name = name.as_deref().unwrap_or(&source[expr.func.range()]);
+            SignatureInfo {
+                label: format!("def {name}{label}"),
+                documentation: documentation.map(unindent_doc),
+                parameters: Some(
+                    parameters
+                        .into_iter()
+                        .map(|parameter| {
+                            let CallSignatureParameter {
+                                label,
+                                name,
+                                ty: _,
+                                is_positional_only: _,
+                                is_variadic: _,
+                                is_keyword_variadic: _,
+                            } = parameter;
+                            let prefix = format!("{name}:");
+                            let documentation = provided_documentation
+                                .and_then(|doc| {
+                                    doc.parameters.iter().find_map(|(parameter, text)| {
+                                        (parameter.as_str() == name).then(|| unindent_doc(text))
+                                    })
+                                })
+                                .or_else(|| {
+                                    documentation.and_then(|doc| {
+                                        doc.lines().find_map(|line| {
+                                            line.trim()
+                                                .trim_start_matches('*')
+                                                .strip_prefix(&prefix)
+                                                .map(|text| text.trim().to_owned())
+                                        })
+                                    })
+                                });
+                            ParameterInfo {
+                                label,
+                                documentation,
+                            }
+                        })
+                        .collect(),
+                ),
+                active_parameter: Some(active_parameter.unwrap_or(DEFAULT_ACTIVE_PARAMETER_INDEX)),
             }
-
-            match param.name() {
-                Some(name) if !name.is_missing() && !name.as_str().is_empty() => {
-                    s.push_str(name.as_str());
-
-                    let ty = if param.is_args_list() {
-                        ty.variable_tuple_element_ty()
-                    } else if param.is_kwargs_dict() {
-                        ty.dict_value_ty()
-                    } else {
-                        ty.clone().into()
-                    };
-
-                    match ty {
-                        Some(ty) if !ty.is_unknown() => {
-                            let _ = write!(&mut s, ": {}", ty);
-                        }
-                        _ => {}
-                    }
-
-                    match param.default_value() {
-                        Some(default_value) if !default_value.is_empty() => {
-                            s.push_str(" = ");
-                            s.push_str(&default_value);
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-
-            s
         })
-        .collect();
-
-    // Construct the labels for the function signature.
-    // TODO(withered-magic): Some of this logic is duplicated from the `DisplayWithDb` implementation on `TyKind`.
-    let mut label = String::new();
-    label.push_str("def ");
-    label.push_str(func.name().as_str());
-    label.push('(');
-
-    let is_rule_or_tag = func.is_rule() || func.is_tag() || func.is_macro();
-    if is_rule_or_tag {
-        label.push('*');
+        .collect::<Vec<_>>();
+    if signatures.is_empty() {
+        return None;
     }
-
-    for (index, param_label) in param_labels.iter().enumerate() {
-        if index > 0 || is_rule_or_tag {
-            label.push_str(", ");
-        }
-        label.push_str(param_label);
-    }
-
-    label.push_str(") -> ");
-    let _ = write!(&mut label, "{}", func.ret_ty());
-
-    let active_parameter = sema
-        .resolve_call_expr_active_param(file, expr, active_arg)
-        .unwrap_or(DEFAULT_ACTIVE_PARAMETER_INDEX); // active_parameter defaults to 0, so we just add a crazy high value here to avoid a false positive
-
-    Some(SignatureHelp {
-        signatures: vec![SignatureInfo {
-            label,
-            documentation: func.doc().map(|doc| unindent_doc(&doc)),
-            parameters: Some(
-                params
-                    .into_iter()
-                    .zip(param_labels.into_iter())
-                    .map(|((param, _), label)| ParameterInfo {
-                        label,
-                        documentation: param.doc().map(|doc| unindent_doc(&doc)),
-                    })
-                    .collect(),
-            ),
-            active_parameter: Some(active_parameter),
-        }],
-    })
+    Some(SignatureHelp { signatures })
 }
 
 /// Select the call and argument using concrete tokens, including trivia that
@@ -289,6 +281,15 @@ mod tests {
     fn imported_rule_default_follows_source_edits() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
         let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");
         fixture.add_file(
             &mut analysis.db,
@@ -300,7 +301,7 @@ mod tests {
         for default in ["\"é\"", "(\"日本語\")", "\"é\""] {
             analysis.update_file(
                 dependency,
-                format!("r = rule(attrs = {{\"foo\": attr.string(default = {default})}})"),
+                format!("r = rule(doc = \"Rule documentation\", attrs = {{\"foo\": attr.string(doc = \"Attribute documentation\", default = {default})}})"),
             );
             let help = analysis
                 .snapshot()
@@ -315,7 +316,15 @@ mod tests {
                 .iter()
                 .find(|param| param.label.starts_with("foo:"))
                 .unwrap();
-            assert_eq!(parameter.label, format!("foo: string = {default}"));
+            assert_eq!(parameter.label, format!("foo: str = {default}"));
+            assert_eq!(
+                signature.documentation.as_deref(),
+                Some("Rule documentation  ")
+            );
+            assert_eq!(
+                parameter.documentation.as_deref(),
+                Some("Attribute documentation  ")
+            );
         }
     }
 
@@ -332,12 +341,41 @@ mod tests {
         let [signature] = help.signatures.as_slice() else {
             panic!("{help:?}");
         };
-        assert_eq!(signature.active_parameter, Some(2));
+        assert_eq!(signature.active_parameter, Some(1));
         let parameters = signature.parameters.as_ref().unwrap();
-        let [_, _, keyword_only] = parameters.as_slice() else {
+        let [_, keyword_only] = parameters.as_slice() else {
             panic!("{parameters:?}");
         };
-        assert_eq!(keyword_only.label, "y");
+        assert_eq!(keyword_only.label, "y=0");
+    }
+
+    #[test]
+    fn shared_binding_for_expanded_arguments() {
+        let mut mismatches = Vec::new();
+        for (call, active) in [
+            ("f(x=1, *[2$0])", Some(0)),
+            ("f(y=1, *[2$0])", Some(0)),
+            ("f(**{\"y\": 2$0})", Some(1)),
+            ("f(x=1$0, 2)", Some(0)),
+            ("f(x=1, 2$0)", Some(100)),
+            ("f(1, y=2$0)", Some(1)),
+        ] {
+            let source = format!("def f(x, *, y): pass\n{call}");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let help = analysis
+                .snapshot()
+                .signature_help(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("{help:?}");
+            };
+            if signature.active_parameter != active {
+                mismatches.push((source, signature.active_parameter, active));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]

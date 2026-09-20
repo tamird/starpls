@@ -12,11 +12,16 @@ members = [
 ]
 
 [workspace.dependencies]
-ruff_python_ast = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_python_parser = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_text_size = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
-ruff_source_file = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
+ruff_python_ast = { path = "/Users/tamird/code/ty/ruff/crates/ruff_python_ast" }
+ruff_python_parser = { path = "/Users/tamird/code/ty/ruff/crates/ruff_python_parser" }
+ruff_text_size = { path = "/Users/tamird/code/ty/ruff/crates/ruff_text_size" }
+ruff_source_file = { path = "/Users/tamird/code/ty/ruff/crates/ruff_source_file" }
 stacker = "0.1.25"
 salsa = { version = "=0.28.2", default-features = false, features = ["macros", "inventory", "accumulator"] }
-ruff_db = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60", features = ["os"] }
-ruff_notebook = { git = "https://github.com/tamird/ruff.git", rev = "da2f4eddf65f8283467c07bee563cc53041b4a60" }
+ruff_db = { path = "/Users/tamird/code/ty/ruff/crates/ruff_db", features = ["os"] }
+ruff_notebook = { path = "/Users/tamird/code/ty/ruff/crates/ruff_notebook" }
+ty_module_resolver = { path = "/Users/tamird/code/ty/ruff/crates/ty_module_resolver" }
+ty_python_core = { path = "/Users/tamird/code/ty/ruff/crates/ty_python_core" }
+ty_python_semantic = { path = "/Users/tamird/code/ty/ruff/crates/ty_python_semantic" }
+ty_site_packages = { path = "/Users/tamird/code/ty/ruff/crates/ty_site_packages" }
+ty_vendored = { path = "/Users/tamird/code/ty/ruff/crates/ty_vendored" }

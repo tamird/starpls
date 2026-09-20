@@ -77,9 +77,9 @@ fn imported_function_views_follow_reparsed_definitions() {
     let dependency = fixture.add_file(&mut analysis.db, "dep.bzl", original);
     loader.add_files_from_fixture(&fixture);
 
-    for (contents, names, doc) in [
+    for (contents, labels, doc) in [
         (original, vec!["first"], "Original docs."),
-        (changed, vec!["second", "first"], "Changed docs."),
+        (changed, vec!["second", "first=0"], "Changed docs."),
         (original, vec!["first"], "Original docs."),
     ] {
         analysis.update_file(dependency, contents.into());
@@ -104,7 +104,7 @@ fn imported_function_views_follow_reparsed_definitions() {
                 .iter()
                 .map(|param| param.label.as_str())
                 .collect::<Vec<_>>(),
-            names,
+            labels,
         );
         let definitions = snapshot
             .goto_definition(
@@ -272,10 +272,14 @@ fn builtin_changes_update_existing_query_dependencies() {
     let original = analysis.db.get_builtin_defs(&Dialect::Bazel);
     let builtins = original.builtins(&analysis.db).clone();
     let original_hover = hover_value(&analysis, fixture.main_file());
-    analysis.set_builtin_defs(Builtins::default(), Builtins::default());
+    analysis
+        .set_builtin_defs(Builtins::default(), Builtins::default())
+        .unwrap();
     let empty_hover = hover_value(&analysis, fixture.main_file());
     assert_ne!(empty_hover, original_hover);
-    analysis.set_builtin_defs(builtins, Builtins::default());
+    analysis
+        .set_builtin_defs(builtins, Builtins::default())
+        .unwrap();
     assert_eq!(hover_value(&analysis, fixture.main_file()), original_hover);
 }
 

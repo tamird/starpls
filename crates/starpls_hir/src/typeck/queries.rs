@@ -51,16 +51,6 @@ pub(crate) fn resolve_type_query(
     resolve_type_ref(&mut TyContext::new(db), &type_ref, usage).0
 }
 
-#[salsa::tracked(returns(clone))]
-pub(crate) fn active_parameter(
-    db: &dyn Db,
-    file: File,
-    expr: ExprId,
-    argument: usize,
-) -> Option<usize> {
-    TyContext::new(db).resolve_call_expr_active_param(file, expr, argument)
-}
-
 pub fn diagnostics(db: &dyn Db, file: File) -> Vec<Diagnostic> {
     let File {
         source,

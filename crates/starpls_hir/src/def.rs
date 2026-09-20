@@ -67,6 +67,7 @@ pub(crate) struct ModuleSourceMap {
     pub function_names: FxHashMap<StmtId, TextRange>,
     pub keyword_names: FxHashMap<ExprId, TextRange>,
     pub type_comment_owners: FxHashMap<TextRange, TypeCommentOwner>,
+    pub annotation_ranges: FxHashMap<NodeIndex, ruff_text_size::TextRange>,
     // Source ranges also cover synthetic HIR nodes with no Ruff identity.
     pub expr_map_back: FxHashMap<ExprId, TextRange>,
     pub stmt_map_back: FxHashMap<StmtId, TextRange>,
@@ -100,6 +101,7 @@ impl ModuleSourceMap {
             function_names: _,
             keyword_names: _,
             type_comment_owners: _,
+            annotation_ranges: _,
             expr_map_back,
             stmt_map_back,
             param_map_back: _,

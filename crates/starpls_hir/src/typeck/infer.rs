@@ -2282,62 +2282,6 @@ impl TyContext<'_> {
         res
     }
 
-    pub(crate) fn resolve_call_expr_active_param(
-        &mut self,
-        file: File,
-        expr: ExprId,
-        active_arg: usize,
-    ) -> Option<usize> {
-        let db = self.db;
-        match &module(db, file)[expr] {
-            Expr::Call { callee, args } => {
-                // Determine args that are in invalid positions.
-                let mut saw_keyword = false;
-                let mut saw_unpacked_dict = false;
-                for (index, arg) in args.iter().enumerate() {
-                    match arg {
-                        Argument::Simple { .. } | Argument::UnpackedList { .. } => {
-                            if saw_keyword || saw_unpacked_dict && index == active_arg {
-                                return None;
-                            }
-                        }
-                        Argument::Keyword { .. } => saw_keyword = true,
-                        Argument::UnpackedDict { .. } => saw_unpacked_dict = true,
-                    }
-                }
-
-                if active_arg == args.len() && (saw_keyword || saw_unpacked_dict) {
-                    return None;
-                }
-
-                let callee_ty = self.infer_expr(file, *callee);
-                let mut slots: Slots = match callee_ty.kind() {
-                    TyKind::Function(def) => {
-                        let module = module(db, def.func().file);
-                        let params = def.func().params.iter().copied();
-                        params
-                            .clone()
-                            .map(|param| module[param].clone())
-                            .collect::<Vec<_>>()[..]
-                            .into()
-                    }
-                    TyKind::IntrinsicFunction(func, _) => func.params[..].into(),
-                    TyKind::BuiltinFunction(func) => func.params[..].into(),
-                    TyKind::Rule(rule) => Slots::from_rule(db, rule),
-                    TyKind::Provider(provider) | TyKind::ProviderRawConstructor(_, provider) => {
-                        Slots::from_provider(provider)
-                    }
-                    TyKind::Tag(tag_class) => Slots::from_tag_class(tag_class),
-                    TyKind::Macro(makro) => Slots::from_macro(makro),
-                    _ => return None,
-                };
-
-                slots.assign_args(args, Some(active_arg)).1
-            }
-            _ => None,
-        }
-    }
-
     fn types(&self) -> &IntrinsicTypes {
         &self.intrinsics.types
     }

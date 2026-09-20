@@ -70,6 +70,7 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
             function_names: Default::default(),
             keyword_names: Default::default(),
             type_comment_owners: Default::default(),
+            annotation_ranges: Default::default(),
             expr_map_back: Default::default(),
             stmt_map_back: Default::default(),
             param_map_back: Default::default(),
@@ -83,6 +84,14 @@ fn source_range(range: TextRange) -> starpls_syntax::TextRange {
     starpls_syntax::TextRange::new(
         u32::from(range.start()).into(),
         u32::from(range.end()).into(),
+    )
+}
+
+fn comment_type_range(comment: &TypeComment, ty: &ast::Type) -> TextRange {
+    let range = ty.syntax().text_range();
+    TextRange::new(
+        comment.range.start() + TextSize::from(u32::from(range.start())),
+        comment.range.start() + TextSize::from(u32::from(range.end())),
     )
 }
 
@@ -198,12 +207,30 @@ impl<'a> LoweringContext<'a> {
                     ))
                 });
                 comment_range = comment.map(|comment| source_range(comment.range));
-                let spec = self.lower_func_type_opt(
-                    comment.and_then(|comment| comment.parsed.tree().function_type()),
-                );
+                let function_type =
+                    comment.and_then(|comment| comment.parsed.tree().function_type());
+                let mut spec_ranges = Vec::new();
+                if let Some(function_type) = &function_type {
+                    let comment = comment.expect("function type belongs to its comment");
+                    if let Some(parameters) = function_type.parameter_types() {
+                        spec_ranges.extend(parameters.types().map(|parameter| {
+                            parameter.type_().map(|ty| comment_type_range(comment, &ty))
+                        }));
+                    }
+                    if let Some(ty) = function_type.ret_type() {
+                        self.source_map
+                            .annotation_ranges
+                            .insert(def.node_index().load(), comment_type_range(comment, &ty));
+                    }
+                }
+                let spec = self.lower_func_type_opt(function_type);
                 let doc = suite.and_then(|_| self.doc(body));
-                let params =
-                    self.lower_params(parameters, spec.as_ref().map_or(&[], |spec| &spec.0), &doc);
+                let params = self.lower_params(
+                    parameters,
+                    spec.as_ref().map_or(&[], |spec| &spec.0),
+                    &spec_ranges,
+                    &doc,
+                );
                 let stmts = self.lower_suite(body, suite);
                 range = self.cover_statements(range, &stmts);
                 if let Some(suite) = suite {
@@ -583,7 +610,7 @@ impl<'a> LoweringContext<'a> {
                     body,
                 } = node;
                 let params = match parameters {
-                    Some(params) => self.lower_params(params, &[], &None),
+                    Some(params) => self.lower_params(params, &[], &[], &None),
                     None => Box::default(),
                 };
                 let func = Interned::new(FunctionData {
@@ -919,6 +946,7 @@ impl<'a> LoweringContext<'a> {
         &mut self,
         syntax: &py::Parameters,
         spec_type_refs: &[TypeRef],
+        spec_ranges: &[Option<TextRange>],
         doc: &Option<Box<str>>,
     ) -> Box<[ParamId]> {
         let mut parameters = syntax
@@ -1073,6 +1101,20 @@ impl<'a> LoweringContext<'a> {
                 self.source_map
                     .param_nodes
                     .insert(node.node_index().load(), id);
+                let annotation = comment
+                    .and_then(|comment| {
+                        comment
+                            .parsed
+                            .tree()
+                            .type_()
+                            .map(|ty| comment_type_range(comment, &ty))
+                    })
+                    .or_else(|| spec_ranges.get(index).copied().flatten());
+                if let Some(range) = annotation {
+                    self.source_map
+                        .annotation_ranges
+                        .insert(node.node_index().load(), range);
+                }
             }
             if let Some(range) = comment_range {
                 self.source_map

@@ -10,6 +10,7 @@ use starpls_bazel::builtin::Param;
 use starpls_bazel::builtin::Type;
 use starpls_bazel::builtin::Value;
 use starpls_bazel::env::make_workspace_builtins;
+use starpls_bazel::env::normalize_doc;
 use starpls_bazel::env::{self};
 use starpls_bazel::Builtins;
 use starpls_bazel::BUILTINS_TYPES_DENY_LIST;
@@ -974,35 +975,6 @@ pub(crate) fn common_attributes_query(_db: &dyn Db) -> CommonAttributes {
 /// Normalizes text from the generated Bazel documentation.
 fn normalize_doc_text(text: &str) -> String {
     normalize_doc(text, false)
-}
-
-fn normalize_doc(text: &str, is_type: bool) -> String {
-    // The main thing we need to normalize is that many Bazel types in
-    // builtins file are wrapped with HTML tags, e.g. `<a>None</a>`.
-    // We fix this by removing any text between angle brackets.
-    let mut s = String::new();
-    let mut in_tag = false;
-    let chars = text.chars();
-    let mut tag = String::new();
-
-    for ch in chars {
-        match (ch, in_tag) {
-            ('<', _) => in_tag = true,
-            ('>', _) => {
-                match tag.as_str() {
-                    "p" => s.push_str("\n\n"),
-                    "code" | "/code" if !is_type => s.push('`'),
-                    _ => {}
-                }
-                in_tag = false;
-                tag.clear();
-            }
-            (_, true) => tag.push(ch),
-            (_, false) => s.push(ch),
-        }
-    }
-
-    s.to_string()
 }
 
 fn maybe_strip_iterable_or_dict(type_ref: TypeRef) -> TypeRef {

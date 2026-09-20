@@ -183,12 +183,16 @@ pub fn update_file(db: &mut dyn Db, file: File, contents: String) {
     open_document(db, &path, file.dialect, file.info, contents, 0).expect("known file path");
 }
 
+/// Python syntax version shared by source parsing and semantic queries.
+pub const PARSER_VERSION: ruff_python_ast::PythonVersion =
+    ruff_python_ast::PythonVersion::latest_ty();
+
 /// The canonical Python-shaped parse. Starlark validation is applied separately.
 pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule {
     let file = ruff_db::PythonFile::new_with_source_type(
         db,
         file.source,
-        ruff_python_ast::PythonVersion::default(),
+        PARSER_VERSION,
         ruff_python_ast::PySourceType::Python,
     );
     ruff_db::parsed::parsed_module(db, file)

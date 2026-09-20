@@ -12,6 +12,7 @@ use ruff_db::system::System;
 use ruff_db::system::SystemPath;
 use ruff_db::system::SystemPathBuf;
 use ruff_db::system::SystemVirtualPath;
+use ruff_db::system::SystemVirtualPathBuf;
 use ruff_db::system::WhichResult;
 use ruff_db::system::WritableSystem;
 use ruff_notebook::Notebook;
@@ -58,6 +59,7 @@ impl OpenDocument {
 pub struct SourceSystem {
     base: Arc<dyn System>,
     documents: HashMap<SystemPathBuf, OpenDocument>,
+    virtual_sources: HashMap<SystemVirtualPathBuf, String>,
     revision: u64,
 }
 
@@ -66,6 +68,7 @@ impl SourceSystem {
         Self {
             base: Arc::new(base),
             documents: HashMap::new(),
+            virtual_sources: HashMap::new(),
             revision: 0,
         }
     }
@@ -81,6 +84,7 @@ impl SourceSystem {
         let Self {
             base,
             documents,
+            virtual_sources: _,
             revision,
         } = self;
         *revision += 1;
@@ -103,6 +107,7 @@ impl SourceSystem {
         let Self {
             base,
             documents,
+            virtual_sources: _,
             revision: _,
         } = self;
         let path = SystemPath::absolute(path, base.current_directory());
@@ -113,16 +118,34 @@ impl SourceSystem {
         let Self {
             base,
             documents,
+            virtual_sources: _,
             revision: _,
         } = self;
         let path = SystemPath::absolute(path, base.current_directory());
         documents.get(&path)
     }
 
+    /// Replace an application-owned declaration input before syncing its Ruff file.
+    pub fn set_virtual_source(&mut self, path: &SystemVirtualPath, source: String) -> bool {
+        match self.virtual_sources.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() == &source {
+                    return false;
+                }
+                entry.insert(source);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(source);
+            }
+        }
+        true
+    }
+
     pub fn documents(&self) -> impl Iterator<Item = (&SystemPath, &OpenDocument)> {
         let Self {
             base: _,
             documents,
+            virtual_sources: _,
             revision: _,
         } = self;
         documents
@@ -146,6 +169,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.path_metadata(path)
@@ -165,6 +189,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.read_to_string(path)
@@ -174,13 +199,18 @@ impl System for SourceSystem {
         Some(PySourceType::Python)
     }
 
-    fn virtual_path_source_type(&self, _path: &SystemVirtualPath) -> Option<PySourceType> {
-        Some(PySourceType::Python)
+    fn virtual_path_source_type(&self, path: &SystemVirtualPath) -> Option<PySourceType> {
+        if self.virtual_sources.contains_key(path) {
+            Some(PySourceType::Stub)
+        } else {
+            Some(PySourceType::Python)
+        }
     }
     fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.canonicalize_path(path)
@@ -189,6 +219,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.is_same_file(first, second)
@@ -197,6 +228,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.which(binary_name)
@@ -205,6 +237,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.command_executor()
@@ -213,14 +246,19 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.read_to_notebook(path)
     }
     fn read_virtual_path_to_string(&self, path: &SystemVirtualPath) -> Result<String> {
+        if let Some(source) = self.virtual_sources.get(path) {
+            return Ok(source.clone());
+        }
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.read_virtual_path_to_string(path)
@@ -232,6 +270,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.read_virtual_path_to_notebook(path)
@@ -240,6 +279,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.current_directory()
@@ -248,6 +288,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.user_config_directory()
@@ -256,6 +297,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.cache_dir()
@@ -267,6 +309,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.read_directory(path)
@@ -275,6 +318,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.walk_directory(path)
@@ -283,6 +327,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.env_var(name)
@@ -291,6 +336,7 @@ impl System for SourceSystem {
         let Self {
             base,
             documents: _,
+            virtual_sources: _,
             revision: _,
         } = self;
         base.as_writable()

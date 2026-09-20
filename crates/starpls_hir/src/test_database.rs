@@ -108,10 +108,16 @@ impl crate::Db for TestDatabase {
             .expect("database initialization is complete")
     }
 
-    fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins) {
+    fn set_builtin_defs(
+        &mut self,
+        dialect: Dialect,
+        builtins: Builtins,
+        rules: Builtins,
+    ) -> anyhow::Result<()> {
         let defs = self.environment().builtin_defs(self, dialect);
         defs.set_builtins(self).to(builtins);
         defs.set_rules(self).to(rules);
+        Ok(())
     }
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs {
@@ -171,7 +177,8 @@ impl TestDatabaseBuilder {
             Dialect::Bazel,
             make_test_builtins(self.functions, self.globals, self.types),
             Builtins::default(),
-        );
+        )
+        .expect("test builtin metadata is valid");
         db
     }
 }
@@ -203,7 +210,8 @@ impl Fixture {
             Dialect::Bazel,
             make_test_builtins(functions, globals, types),
             Builtins::default(),
-        );
+        )
+        .expect("test builtin metadata is valid");
 
         fixture
     }

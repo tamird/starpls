@@ -55,6 +55,7 @@ mod show_syntax_tree;
 mod signature_help;
 #[cfg(test)]
 mod source;
+mod ty;
 mod util;
 
 #[cfg(test)]
@@ -70,6 +71,7 @@ pub(crate) struct Database {
     vendored: ruff_db::vendored::VendoredFileSystem,
     loader: Arc<dyn FileLoader>,
     environment: Option<Environment>,
+    semantic: Arc<ty::SemanticSettings>,
     #[cfg(test)]
     executions: Arc<std::sync::atomic::AtomicUsize>,
     // Drop shared source ownership before Salsa wakes a cancelled writer.
@@ -90,6 +92,7 @@ impl ruff_db::Db for Database {
             vendored,
             loader: _,
             environment: _,
+            semantic: _,
             #[cfg(test)]
                 executions: _,
         } = self;
@@ -103,6 +106,7 @@ impl ruff_db::Db for Database {
             vendored: _,
             loader: _,
             environment: _,
+            semantic: _,
             #[cfg(test)]
                 executions: _,
         } = self;
@@ -116,6 +120,7 @@ impl ruff_db::Db for Database {
             vendored: _,
             loader: _,
             environment: _,
+            semantic: _,
             #[cfg(test)]
                 executions: _,
         } = self;
@@ -133,6 +138,7 @@ impl starpls_common::Db for Database {
             vendored: _,
             loader: _,
             environment: _,
+            semantic: _,
             #[cfg(test)]
                 executions: _,
         } = self;
@@ -172,10 +178,17 @@ impl starpls_hir::Db for Database {
             .expect("database initialization is complete")
     }
 
-    fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins) {
+    fn set_builtin_defs(
+        &mut self,
+        dialect: Dialect,
+        builtins: Builtins,
+        rules: Builtins,
+    ) -> anyhow::Result<()> {
+        self.set_native_metadata(dialect, &builtins, &rules)?;
         let defs = self.environment().builtin_defs(self, dialect);
         defs.set_builtins(self).to(builtins);
         defs.set_rules(self).to(rules);
+        Ok(())
     }
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs {
@@ -222,13 +235,16 @@ impl Analysis {
         options: InferenceOptions,
         system: impl ruff_db::system::System + 'static,
     ) -> Self {
+        let vendored = ty_vendored::file_system().clone();
+        let semantic = Arc::new(ty::SemanticSettings::new(&vendored));
         let mut db = Database {
             files: Default::default(),
             system: Arc::new(starpls_common::SourceSystem::new(system)),
-            vendored: Default::default(),
+            vendored,
             storage: Default::default(),
             loader,
             environment: None,
+            semantic,
             #[cfg(test)]
             executions: Default::default(),
         };
@@ -242,6 +258,10 @@ impl Analysis {
             })));
         }
         db.environment = Some(Environment::initialize(&db, options));
+        for dialect in [Dialect::Standard, Dialect::Bazel] {
+            db.set_builtin_defs(dialect, Builtins::default(), Builtins::default())
+                .expect("bundled native declarations are valid");
+        }
         Self { db }
     }
 
@@ -316,9 +336,9 @@ impl Analysis {
         AnalysisSnapshot { db: db.clone() }
     }
 
-    pub fn set_builtin_defs(&mut self, builtins: Builtins, rules: Builtins) {
+    pub fn set_builtin_defs(&mut self, builtins: Builtins, rules: Builtins) -> anyhow::Result<()> {
         let Self { db } = self;
-        db.set_builtin_defs(Dialect::Bazel, builtins, rules);
+        db.set_builtin_defs(Dialect::Bazel, builtins, rules)
     }
 
     pub fn set_bazel_prelude_file(&mut self, file_id: File) {

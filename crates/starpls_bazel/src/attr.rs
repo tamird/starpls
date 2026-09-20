@@ -7,7 +7,7 @@ pub struct CommonAttributes {
     pub repository: Vec<Attribute>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AttributeKind {
     #[serde(rename = "boolean")]
     Bool,

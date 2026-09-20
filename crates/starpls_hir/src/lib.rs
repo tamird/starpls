@@ -76,7 +76,12 @@ const TARGET_DOC: &str = "The BUILD target for a dependency. Appears in the fiel
 pub trait Db: starpls_common::Db {
     fn environment(&self) -> Environment;
 
-    fn set_builtin_defs(&mut self, dialect: Dialect, builtins: Builtins, rules: Builtins);
+    fn set_builtin_defs(
+        &mut self,
+        dialect: Dialect,
+        builtins: Builtins,
+        rules: Builtins,
+    ) -> anyhow::Result<()>;
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs;
 
@@ -284,6 +289,18 @@ impl<'a> Semantics<'a> {
             .contains_key(&expr.node_index().load())
     }
 
+    /// Original type-comment expressions attached to canonical declaration nodes.
+    pub fn type_comment_annotation(
+        &self,
+        file: File,
+        owner: ruff_python_ast::NodeIndex,
+    ) -> Option<ruff_text_size::TextRange> {
+        source_map(self.db, file)
+            .annotation_ranges
+            .get(&owner)
+            .copied()
+    }
+
     /// Resolve a parameter from the canonical parsed revision of `file`.
     pub fn resolve_param(&self, file: File, param: &Parameter) -> Option<(Param<'a>, Type<'a>)> {
         let module = module(self.db, file);
@@ -384,19 +401,6 @@ impl<'a> Semantics<'a> {
             sema: *self,
             resolver,
         }
-    }
-
-    /// Bind an argument of a call in the canonical parsed revision of `file`.
-    pub fn resolve_call_expr_active_param(
-        &self,
-        file: File,
-        expr: &ExprCall,
-        active_arg: usize,
-    ) -> Option<usize> {
-        let expr = source_map(self.db, file)
-            .expr_nodes
-            .get(&expr.node_index().load())?;
-        queries::active_parameter(self.db, file, *expr, active_arg)
     }
 }
 
