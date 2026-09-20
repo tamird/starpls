@@ -11,11 +11,10 @@ use ruff_python_ast::HasNodeIndex;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
-use salsa::Accumulator;
 use starpls_common::diagnostic;
 use starpls_common::line_index;
+use starpls_common::Diagnostic;
 use starpls_common::DiagnosticId;
-use starpls_common::Diagnostics;
 use starpls_common::File;
 use starpls_common::Severity;
 use starpls_intern::Interned;
@@ -49,7 +48,7 @@ use crate::typeck::FunctionTypeRef;
 use crate::Db;
 use crate::TypeRef;
 
-pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap) {
+pub(crate) fn lower_module(db: &dyn Db, file: File) -> crate::ModuleInfo {
     let source = file.contents(db);
     let parsed = starpls_common::parsed_module(db, file).load(db);
     let comments = starpls_common::syntax_info(db, file);
@@ -60,6 +59,7 @@ pub(super) fn lower_module(db: &dyn Db, file: File) -> (Module, ModuleSourceMap)
         tokens: parsed.tokens(),
         comments,
         module: Default::default(),
+        diagnostics: Vec::new(),
         source_map: ModuleSourceMap {
             root: source_range(TextRange::up_to(TextSize::of(&*source))),
             expr_nodes: Default::default(),
@@ -106,10 +106,11 @@ struct LoweringContext<'a> {
     comments: &'a [TypeComment],
     module: Module,
     source_map: ModuleSourceMap,
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> LoweringContext<'a> {
-    fn lower(mut self, syntax: &py::ModModule) -> (Module, ModuleSourceMap) {
+    fn lower(mut self, syntax: &py::ModModule) -> crate::ModuleInfo {
         let line_index = line_index(self.db, self.file);
         self.module.type_ignore_comment_lines = self
             .comments
@@ -146,7 +147,12 @@ impl<'a> LoweringContext<'a> {
             }
         }
         self.module.top_level = top_level.into_boxed_slice();
-        (self.module, self.source_map)
+        crate::ModuleInfo {
+            file: self.file,
+            module: self.module,
+            source_map: self.source_map,
+            diagnostics: self.diagnostics.into_boxed_slice(),
+        }
     }
 
     fn comment_in(&self, range: TextRange) -> Option<&'a TypeComment> {
@@ -1191,6 +1197,7 @@ impl<'a> LoweringContext<'a> {
             comments: _,
             module,
             source_map,
+            diagnostics: _,
         } = self;
         let id = module.stmts.alloc(stmt);
         let source = match &module.stmts[id] {
@@ -1228,6 +1235,7 @@ impl<'a> LoweringContext<'a> {
             comments: _,
             module,
             source_map,
+            diagnostics: _,
         } = self;
         let id = module.exprs.alloc(expr);
         let clauses = match &module.exprs[id] {
@@ -1280,16 +1288,15 @@ impl<'a> LoweringContext<'a> {
         id
     }
 
-    fn add_error_diagnostic(&self, message: &str, range: starpls_syntax::TextRange) {
-        Diagnostics(diagnostic(
+    fn add_error_diagnostic(&mut self, message: &str, range: starpls_syntax::TextRange) {
+        self.diagnostics.push(diagnostic(
             self.file,
             DiagnosticId::InvalidSyntax,
             Severity::Error,
             range,
             message,
             [],
-        ))
-        .accumulate(self.db);
+        ));
     }
 }
 

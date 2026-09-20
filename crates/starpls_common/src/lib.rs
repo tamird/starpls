@@ -2,7 +2,6 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 
 use ruff_source_file::LineIndex;
-use salsa::Accumulator;
 use starpls_bazel::APIContext;
 pub use system::DocumentStamp;
 pub use system::OpenDocument;
@@ -200,7 +199,19 @@ pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule 
 
 /// Starlark validation and type comments for the canonical parsed revision.
 pub fn syntax_info(db: &dyn Db, file: File) -> &[starpls_syntax::TypeComment] {
-    syntax_info_query(db, file.source, (file.dialect, file.info))
+    &syntax_info_query(db, file.source, (file.dialect, file.info)).comments
+}
+
+pub fn syntax_diagnostics(db: &dyn Db, file: File) -> &[Diagnostic] {
+    &syntax_info_query(db, file.source, (file.dialect, file.info)).diagnostics
+}
+
+// Semantic annotation callbacks read this query during fixpoint inference,
+// where Salsa accumulators are unsupported. Reporting consumes these results.
+#[derive(Debug, PartialEq, Eq)]
+struct SyntaxInfo {
+    comments: Vec<starpls_syntax::TypeComment>,
+    diagnostics: Box<[Diagnostic]>,
 }
 
 #[salsa::tracked(returns(ref))]
@@ -208,7 +219,7 @@ fn syntax_info_query(
     db: &dyn Db,
     source: ruff_db::files::File,
     context: (Dialect, Option<FileInfo>),
-) -> Vec<starpls_syntax::TypeComment> {
+) -> SyntaxInfo {
     let (dialect, info) = context;
     let file = File {
         source,
@@ -216,31 +227,34 @@ fn syntax_info_query(
         info,
     };
     let contents = file.contents(db);
+    let mut diagnostics = Vec::new();
     if let Some(error) = contents.read_error() {
-        Diagnostics(diagnostic(
+        diagnostics.push(diagnostic(
             file,
             DiagnosticId::Io,
             Severity::Error,
             Default::default(),
             format!("cannot read {}: {error}", file.path(db).display()),
             [],
-        ))
-        .accumulate(db);
+        ));
     }
     let parsed = parsed_module(db, file).load(db);
     let mut errors = |err: starpls_syntax::SyntaxError| {
-        Diagnostics(diagnostic(
+        diagnostics.push(diagnostic(
             file,
             DiagnosticId::InvalidSyntax,
             Severity::Error,
             err.range,
             err.message,
             [],
-        ))
-        .accumulate(db);
+        ));
     };
     starpls_syntax::validate(&contents, &parsed, &mut errors);
-    starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors)
+    let comments = starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors);
+    SyntaxInfo {
+        comments,
+        diagnostics: diagnostics.into_boxed_slice(),
+    }
 }
 
 pub fn line_index(db: &dyn Db, file: File) -> LineIndex {

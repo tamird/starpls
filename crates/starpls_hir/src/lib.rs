@@ -61,6 +61,7 @@ pub(crate) struct ModuleInfo {
     pub(crate) file: File,
     pub(crate) module: Module,
     pub(crate) source_map: ModuleSourceMap,
+    pub(crate) diagnostics: Box<[Diagnostic]>,
 }
 
 /// Documentation for the `Target` type defined by Bazel.
@@ -119,13 +120,23 @@ impl Environment {
     }
 }
 
-/// Return the diagnostics accumulated by Salsa queries on the given file.
-/// This does not include diagnostics from type inference, which are reported
-/// by [`inference_diagnostics`] instead.
+/// Syntax and lowering diagnostics are query results, not accumulators: semantic
+/// callbacks can read their source maps during Salsa fixpoint inference. Only
+/// scope diagnostics are accumulated by the structural analysis owner.
 pub fn diagnostics_for_file(db: &dyn Db, file: File) -> impl Iterator<Item = Diagnostic> + '_ {
-    module_scopes_query::accumulated::<Diagnostics>(db, file.source, (file.dialect, file.info))
-        .into_iter()
-        .map(|diagnostic| diagnostic.0.clone())
+    starpls_common::syntax_diagnostics(db, file)
+        .iter()
+        .chain(lower(db, file).diagnostics.iter())
+        .cloned()
+        .chain(
+            module_scopes_query::accumulated::<Diagnostics>(
+                db,
+                file.source,
+                (file.dialect, file.info),
+            )
+            .into_iter()
+            .map(|diagnostic| diagnostic.0.clone()),
+        )
 }
 
 /// Semantic views for one database revision.
@@ -1077,12 +1088,7 @@ pub(crate) fn lower_query(
         dialect,
         info,
     };
-    let (module, source_map) = Module::new_with_source_map(db, file);
-    ModuleInfo {
-        file,
-        module,
-        source_map,
-    }
+    def::lower_module(db, file)
 }
 
 /// Shortcut to immediately access a `lower` query's `Module`.

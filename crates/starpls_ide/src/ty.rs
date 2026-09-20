@@ -419,6 +419,36 @@ mod tests {
     use crate::Analysis;
 
     #[test]
+    fn recursive_recovery_preserves_syntax_diagnostics() {
+        for diagnostics_first in [false, true] {
+            let (analysis, fixture) = Analysis::from_single_file_fixture(
+                "f = lambda param=: param\nfor item in []: pass\n",
+            );
+            let file = fixture.main_file();
+            let db = &analysis.db;
+            if diagnostics_first {
+                let _ = starpls_hir::diagnostics_for_file(db, file).collect::<Vec<_>>();
+            }
+            let program_file = db.starlark_program_file(file);
+            let model = SemanticModel::new(db, program_file);
+            let parsed = starpls_common::parsed_module(db, file).load(db);
+            let Stmt::Assign(assignment) = &parsed.syntax().body[0] else {
+                panic!("expected lambda assignment");
+            };
+            assert!(assignment.value.inferred_type(&model).is_some());
+            assert!(!starpls_common::syntax_diagnostics(db, file).is_empty());
+            let diagnostics = starpls_hir::diagnostics_for_file(db, file).collect::<Vec<_>>();
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.headline_message()
+                        == "Starlark does not allow top-level for statements"
+                }),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn infer_real_starlark_source_with_ty() {
         let (mut analysis, _) = Analysis::new_for_test();
         let path = Path::new("/main.bzl");

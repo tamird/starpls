@@ -18,10 +18,10 @@ use crate::def::ops::AssignOp;
 use crate::def::ops::BinaryOp;
 use crate::def::ops::UnaryOp;
 use crate::typeck::TypeRef;
-use crate::Db;
 
 pub(crate) mod codeflow;
 mod lower;
+pub(crate) use lower::lower_module;
 pub(crate) mod ops;
 pub(crate) mod resolver;
 pub(crate) mod scope;
@@ -103,12 +103,6 @@ impl ModuleSourceMap {
             scope::ScopeHirId::Expr(expr) => expr_map_back[&expr],
             scope::ScopeHirId::Stmt(stmt) => stmt_map_back[&stmt],
         }
-    }
-}
-
-impl Module {
-    pub(crate) fn new_with_source_map(db: &dyn Db, file: File) -> (Module, ModuleSourceMap) {
-        lower::lower_module(db, file)
     }
 }
 
