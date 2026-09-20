@@ -83,6 +83,12 @@ pub struct File {
     pub info: Option<FileInfo>,
 }
 
+impl From<File> for ruff_db::files::File {
+    fn from(file: File) -> Self {
+        file.source
+    }
+}
+
 impl File {
     pub fn from_path(
         db: &dyn Db,
@@ -268,10 +274,10 @@ pub struct Source {
     pub index: LineIndex,
 }
 
-pub fn source(db: &dyn Db, file: File) -> Source {
+pub fn source(db: &dyn Db, file: ruff_db::files::File) -> Source {
     Source {
-        text: file.contents(db),
-        index: line_index(db, file),
+        text: ruff_db::source::source_text(db, file),
+        index: ruff_db::source::line_index(db, file),
     }
 }
 

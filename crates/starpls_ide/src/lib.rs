@@ -376,9 +376,13 @@ pub struct AnalysisSnapshot {
 }
 
 impl AnalysisSnapshot {
-    pub fn path(&self, file: File) -> &std::path::Path {
+    pub fn path(&self, file: impl Into<ruff_db::files::File>) -> &std::path::Path {
         let Self { db } = self;
-        file.path(db)
+        file.into()
+            .path(db)
+            .as_system_path()
+            .expect("navigation targets have system paths")
+            .as_std_path()
     }
 
     pub fn document(&self, path: &std::path::Path) -> Option<&starpls_common::OpenDocument> {
@@ -436,8 +440,9 @@ impl AnalysisSnapshot {
         self.query(|db| hover::hover(db, pos))
     }
 
-    pub fn source(&self, file_id: File) -> Cancellable<Source> {
-        self.query(move |db| starpls_common::source(db, file_id))
+    pub fn source(&self, file: impl Into<ruff_db::files::File>) -> Cancellable<Source> {
+        let file = file.into();
+        self.query(move |db| starpls_common::source(db, file))
     }
 
     pub fn show_hir(&self, file_id: File) -> Cancellable<Option<String>> {
@@ -478,7 +483,7 @@ pub enum LocationLink {
         origin_selection_range: Option<TextRange>,
         target_range: TextRange,
         target_selection_range: TextRange,
-        target_file_id: File,
+        target_file_id: ruff_db::files::File,
     },
     External {
         origin_selection_range: Option<TextRange>,

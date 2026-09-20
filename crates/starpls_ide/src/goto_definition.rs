@@ -1,13 +1,24 @@
 use ruff_python_ast::find_node::covering_node;
+use ruff_python_ast::ArgOrKeyword;
+use ruff_python_ast::Expr;
 use ruff_text_size::Ranged;
+use rustc_hash::FxHashSet;
 use starpls_common::File;
-use starpls_common::InFile;
-use starpls_hir::LoadItem;
-use starpls_hir::Name;
-use starpls_hir::ScopeDef;
 use starpls_hir::Semantics;
 use starpls_syntax::source::string_value;
 use starpls_syntax::TextRange;
+use ty_python_core::definition::Definition;
+use ty_python_core::definition::DefinitionKind;
+use ty_python_core::definition::ParameterDefinitionNodeKind;
+use ty_python_core::semantic_index;
+use ty_python_semantic::definitions_for_attribute;
+use ty_python_semantic::types::ide_support::definitions_for_keyword_argument;
+use ty_python_semantic::types::ide_support::definitions_for_name;
+use ty_python_semantic::types::ide_support::resolve_definition;
+use ty_python_semantic::ImportAliasResolution;
+use ty_python_semantic::ProgramEnvironment;
+use ty_python_semantic::ResolvedDefinition;
+use ty_python_semantic::SemanticModel;
 
 use crate::selection::Selection;
 use crate::util::navigation_token;
@@ -19,58 +30,80 @@ use crate::ResolvedPath;
 
 struct GotoDefinitionHandler<'a> {
     sema: Semantics<'a>,
+    model: SemanticModel<'a>,
     file: File,
     origin: TextRange,
     skip_re_exports: bool,
 }
 
-impl GotoDefinitionHandler<'_> {
+impl<'db> GotoDefinitionHandler<'db> {
     fn handle(&self, selection: Selection<'_>, source: &str) -> Option<Vec<LocationLink>> {
         let Self {
             sema,
+            model,
             file,
             origin,
             skip_re_exports: _,
         } = self;
         match selection {
             Selection::Reference(name) => {
-                let scope = sema.scope_for_expr(*file, name.into())?;
-                Some(
-                    scope
-                        .resolve_name(&Name::from(name.id.as_str()))
-                        .into_iter()
-                        .filter_map(|def| {
-                            if let ScopeDef::LoadItem(item) = def {
-                                self.load_item_location(&item)
-                            } else {
-                                self.def_to_location_link(def)
+                if !sema.contains_expr(*file, name.into()) {
+                    return None;
+                }
+                let definitions = definitions_for_name(
+                    model,
+                    name.id.as_str(),
+                    name.into(),
+                    ImportAliasResolution::PreserveAliases,
+                );
+                let definitions = definitions
+                    .into_iter()
+                    .flat_map(|resolved| {
+                        if let ResolvedDefinition::Definition(definition) = resolved {
+                            if matches!(
+                                definition.kind(model.db()),
+                                DefinitionKind::ProvidedBinding(_)
+                            ) {
+                                return self
+                                    .load_definitions(definition, &mut FxHashSet::default());
                             }
-                        })
-                        .collect(),
-                )
+                        }
+                        vec![resolved]
+                    })
+                    .collect();
+                Some(self.semantic_locations(definitions))
             }
             Selection::Attribute(expr) => {
-                let ty = sema.type_of_expr(*file, expr.value.as_ref().into())?;
-                Some(vec![location_link(
-                    ty.field_definition(expr.attr.as_str())?,
-                )])
+                if !sema.contains_expr(*file, expr.into()) {
+                    return None;
+                }
+                Some(self.semantic_locations(definitions_for_attribute(model, expr)))
             }
             Selection::Keyword { keyword, call } => {
-                let callable = sema.resolve_call_expr(*file, call)?;
-                Some(vec![location_link(
-                    callable.keyword_definition(keyword.arg.as_ref()?.as_str())?,
-                )])
+                if !sema.contains_expr(*file, call.into()) {
+                    return None;
+                }
+                Some(
+                    self.semantic_locations(definitions_for_keyword_argument(model, keyword, call)),
+                )
             }
             Selection::LoadModule(call) => Some(vec![LocationLink::Local {
                 origin_selection_range: Some(*origin),
                 target_range: Default::default(),
                 target_selection_range: Default::default(),
-                target_file_id: sema.resolve_load_stmt(*file, call)?,
+                target_file_id: sema.resolve_load_stmt(*file, call)?.source,
             }]),
             Selection::LoadItem { call: _, item } => {
-                let item = sema.resolve_load_item(*file, item)?;
-                self.load_item_location(&item)
-                    .map(|location| vec![location])
+                let target = match item {
+                    ArgOrKeyword::Arg(expression) => expression.into(),
+                    ArgOrKeyword::Keyword(keyword) => keyword.into(),
+                };
+                let index = semantic_index(model.db(), model.program_file());
+                let [definition] = index.try_definitions(target)? else {
+                    return None;
+                };
+                let definitions = self.load_definitions(*definition, &mut FxHashSet::default());
+                Some(self.semantic_locations(definitions))
             }
             Selection::String(expr) => {
                 // The node must belong to Starlark lowering, not to an ignored
@@ -86,35 +119,108 @@ impl GotoDefinitionHandler<'_> {
         }
     }
 
-    fn load_item_location(&self, item: &LoadItem<'_>) -> Option<LocationLink> {
-        let Self {
-            sema: _,
-            file: _,
-            origin: _,
-            skip_re_exports,
-        } = self;
-        if *skip_re_exports {
-            self.try_resolve_re_export(item)
-        } else {
-            self.def_to_location_link(item.definition()?)
-        }
+    fn semantic_locations(&self, definitions: Vec<ResolvedDefinition<'db>>) -> Vec<LocationLink> {
+        definitions
+            .into_iter()
+            .filter_map(|definition| {
+                let db = self.model.db();
+                let source = definition.focus_range(db);
+                let file = source.file();
+                // Native and vendored declarations are checker inputs, not user
+                // source files the Starlark client can open.
+                file.path(db).as_system_path()?;
+                let selection = text_range(source.range());
+                let target = definition
+                    .definition()
+                    .and_then(|definition| {
+                        let DefinitionKind::Parameter(parameter) = definition.kind(db) else {
+                            return None;
+                        };
+                        let ParameterDefinitionNodeKind::Parameter(parameter) = parameter else {
+                            return None;
+                        };
+                        let parsed =
+                            ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+                        Some(text_range(parameter.node(&parsed).range()))
+                    })
+                    .unwrap_or(selection);
+                Some(LocationLink::Local {
+                    origin_selection_range: Some(self.origin),
+                    target_range: target,
+                    target_selection_range: selection,
+                    target_file_id: file,
+                })
+            })
+            .collect()
     }
 
-    fn try_resolve_re_export(&self, load_item: &LoadItem<'_>) -> Option<LocationLink> {
-        let def = load_item.definition()?;
-        if let ScopeDef::Variable(variable) = &def {
-            if let Some(item) = variable.re_export() {
-                if let Some(location) = self.try_resolve_re_export(&item) {
-                    return Some(location);
+    fn load_definitions(
+        &self,
+        definition: Definition<'db>,
+        visited: &mut FxHashSet<Definition<'db>>,
+    ) -> Vec<ResolvedDefinition<'db>> {
+        let db = self.model.db();
+        if !visited.insert(definition) {
+            return Vec::new();
+        }
+        let environment = ProgramEnvironment::from_file(definition.program_file(db));
+        resolve_definition(
+            db,
+            &environment,
+            definition,
+            None,
+            ImportAliasResolution::ResolveAliases,
+        )
+        .into_iter()
+        .filter(|resolved| resolved.definition() != Some(definition))
+        .flat_map(|resolved| {
+            if self.skip_re_exports {
+                if let Some(reexport) = resolved
+                    .definition()
+                    .and_then(|definition| self.reexported_binding(definition))
+                {
+                    let targets = self.load_definitions(reexport, visited);
+                    if !targets.is_empty() {
+                        return targets;
+                    }
                 }
             }
+            vec![resolved]
+        })
+        .collect()
+    }
+
+    /// The Starlark option follows a direct assignment of a loaded name. Shared
+    /// name resolution decides which binding that source expression refers to.
+    fn reexported_binding(&self, definition: Definition<'db>) -> Option<Definition<'db>> {
+        let db = self.model.db();
+        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+            return None;
+        };
+        if assignment.unpack().is_some() {
+            return None;
         }
-        self.def_to_location_link(def)
+        let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+        let Expr::Name(name) = assignment.value(&parsed) else {
+            return None;
+        };
+        let model = SemanticModel::new(db, definition.program_file(db));
+        let definitions = definitions_for_name(
+            &model,
+            name.id.as_str(),
+            name.into(),
+            ImportAliasResolution::PreserveAliases,
+        );
+        let [ResolvedDefinition::Definition(binding)] = definitions.as_slice() else {
+            return None;
+        };
+        matches!(binding.kind(db), DefinitionKind::ProvidedBinding(_)).then_some(*binding)
     }
 
     fn string_location(&self, value: &str) -> Option<Vec<LocationLink>> {
         let Self {
             sema,
+            model: _,
             file,
             origin,
             skip_re_exports: _,
@@ -140,23 +246,10 @@ impl GotoDefinitionHandler<'_> {
                     origin_selection_range: Some(*origin),
                     target_range: range,
                     target_selection_range: range,
-                    target_file_id: build_file,
+                    target_file_id: build_file.source,
                 }])
             }
         }
-    }
-
-    fn def_to_location_link(&self, def: ScopeDef<'_>) -> Option<LocationLink> {
-        Some(location_link(def.definition_range()?))
-    }
-}
-
-fn location_link(InFile { file, value: range }: InFile<TextRange>) -> LocationLink {
-    LocationLink::Local {
-        origin_selection_range: None,
-        target_range: range,
-        target_selection_range: range,
-        target_file_id: file,
     }
 }
 
@@ -183,6 +276,7 @@ pub(crate) fn goto_definition(
     let selection = crate::selection::classify(&node, token.range())?;
     GotoDefinitionHandler {
         sema,
+        model: SemanticModel::new(db, db.starlark_program_file(file)),
         file,
         origin: text_range(token.range()),
         skip_re_exports,
@@ -207,10 +301,19 @@ mod tests {
     }
 
     fn check_goto_definition_from_fixture(
-        analysis: Analysis,
+        mut analysis: Analysis,
         fixture: Fixture,
         skip_re_exports: bool,
     ) {
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
         let actual = analysis
             .snapshot()
             .goto_definition(
@@ -232,7 +335,12 @@ mod tests {
                 _ => panic!("expected local location"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(fixture.selected_ranges, actual);
+        let expected: Vec<_> = fixture
+            .selected_ranges
+            .into_iter()
+            .map(|(file, range)| (file.source, range))
+            .collect();
+        assert_eq!(expected, actual);
     }
 
     #[test]
@@ -385,13 +493,109 @@ info.fo$0o
             let (mut analysis, loader) = Analysis::new_for_test();
             let mut fixture = Fixture::new(&mut analysis.db);
             fixture.add_file(&mut analysis.db, "//:defs.bzl", definition);
-            fixture.add_file(
+            fixture.add_file_with_options(
                 &mut analysis.db,
-                "//:main.bzl",
+                "BUILD.bazel",
                 &format!("load(\"//:defs.bzl\", alias = \"value\")\n{usage}"),
+                Dialect::Bazel,
+                Some(Bazel {
+                    api_context: APIContext::Build,
+                    is_external: false,
+                }),
             );
             loader.add_files_from_fixture(&fixture);
             check_goto_definition_from_fixture(analysis, fixture, false);
+        }
+    }
+
+    #[test]
+    fn supplied_parameter_origins() {
+        check_goto_definition(
+            r#"
+P = provider(fields=["foo"])
+                     #^^^^
+P(fo$0o=1)
+"#,
+        );
+        check_goto_definition(
+            r#"
+P, raw = provider(fields=["foo"], init=lambda **kwargs: kwargs)
+                          #^^^^
+raw(fo$0o=1)
+"#,
+        );
+        check_goto_definition(
+            r#"
+def initialize(foo):
+               #^^
+    return {"foo": foo}
+P, raw = provider(fields=["foo"], init=initialize)
+P(fo$0o=1)
+"#,
+        );
+    }
+
+    #[test]
+    fn selected_load_binding_survives_later_reassignment() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "//:defs.bzl", "value = 1\n#^^^^");
+        fixture.add_file(
+            &mut analysis.db,
+            "//:main.bzl",
+            "load(\"//:defs.bzl\", \"va$0lue\")\nvalue = 2",
+        );
+        loader.add_files_from_fixture(&fixture);
+        check_goto_definition_from_fixture(analysis, fixture, false);
+    }
+
+    #[test]
+    fn imported_field_origins_follow_source_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let original = "value = struct(field=1)";
+        let dependency = fixture.add_file(&mut analysis.db, "//:defs.bzl", original);
+        let main = fixture.add_file(
+            &mut analysis.db,
+            "//:main.bzl",
+            "load(\"//:defs.bzl\", \"value\")\nvalue.fi$0eld",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let (_, pos) = fixture.cursor_pos.unwrap();
+        for (revision, source) in [
+            original,
+            "# moved\nvalue = struct(field='edited')",
+            original,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            analysis.update_file(dependency, source.into());
+            let snapshot = analysis.snapshot();
+            let position = FilePosition { file_id: main, pos };
+            if revision == 1 {
+                let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+                assert!(
+                    hover.contents.value.contains("edited"),
+                    "{}",
+                    hover.contents.value
+                );
+            }
+            let locations = snapshot.goto_definition(position, false).unwrap().unwrap();
+            let [LocationLink::Local {
+                origin_selection_range: _,
+                target_range,
+                target_selection_range,
+                target_file_id,
+            }] = locations.as_slice()
+            else {
+                panic!("expected one source field: {locations:?}");
+            };
+            assert_eq!(*target_file_id, dependency.source);
+            let start = source.find("field").unwrap() as u32;
+            assert_eq!(u32::from(target_range.start()), start);
+            assert_eq!(u32::from(target_range.end()), start + 5);
+            assert_eq!(target_range, target_selection_range);
         }
     }
 
@@ -421,10 +625,10 @@ f(ab$0c = 0)
     #[test]
     fn test_re_export_assignment_shapes() {
         for (definition, declaration) in [
-            ("foo = 1", "foo = (_foo)\n#^^"),
-            ("foo = 1", "(foo) = _foo\n #^^"),
+            ("foo = 1\n#^^", "foo = (_foo)"),
+            ("foo = 1\n#^^", "(foo) = _foo"),
             ("foo = 1", "foo, other = _foo\n#^^"),
-            ("foo = 1\n#^^", "_foo = 0\nfoo = _foo"),
+            ("foo = 1", "_foo = 0\nfoo = _foo\n#^^"),
         ] {
             let (mut analysis, loader) = Analysis::new_for_test();
             let mut fixture = Fixture::new(&mut analysis.db);

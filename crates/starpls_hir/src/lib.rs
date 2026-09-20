@@ -33,11 +33,9 @@ use typeck::TagClass;
 use typeck::TagParam;
 use typeck::Tuple;
 
-use crate::def::Argument;
 use crate::def::AssignmentSource;
 use crate::def::Expr;
 use crate::def::ExprId;
-use crate::def::Literal;
 use crate::def::Module;
 use crate::def::ModuleSourceMap;
 pub use crate::def::Name;
@@ -492,45 +490,6 @@ impl<'a> Type<'a> {
         }
     }
 
-    /// The original declaration of a struct or provider field, when known.
-    pub fn field_definition(&self, name: &str) -> Option<InFile<TextRange>> {
-        let Self { sema, ty } = self;
-        match ty.kind() {
-            TyKind::Struct(strukt) => {
-                let typeck::Struct::Inline {
-                    fields: _,
-                    call_expr,
-                } = strukt.as_ref()?
-                else {
-                    return None;
-                };
-                let InFile { file, value } = *call_expr;
-                let Expr::Call { callee: _, args } = &module(sema.db, file)[value] else {
-                    return None;
-                };
-                args.iter().find_map(|arg| {
-                    let Argument::Keyword {
-                        name: keyword,
-                        expr,
-                    } = arg
-                    else {
-                        return None;
-                    };
-                    if keyword.as_str() != name {
-                        return None;
-                    }
-                    let range = *source_map(sema.db, file).keyword_names.get(expr)?;
-                    Some(InFile { file, value: range })
-                })
-            }
-            TyKind::Provider(provider) => provider_field_definition(sema.db, provider, name),
-            TyKind::ProviderInstance(provider) => {
-                provider_field_definition(sema.db, provider, name)
-            }
-            _ => None,
-        }
-    }
-
     pub fn known_keys(&self) -> Option<Vec<String>> {
         let Self { sema: _, ty } = self;
         ty.known_keys().map(|known_keys| {
@@ -564,38 +523,6 @@ fn expr_source_range(db: &dyn Db, expr: InFile<ExprId>) -> Option<InFile<TextRan
     Some(InFile {
         file,
         value: *range,
-    })
-}
-
-fn provider_field_definition(
-    db: &dyn Db,
-    provider: &Provider,
-    name: &str,
-) -> Option<InFile<TextRange>> {
-    let expr = match provider {
-        Provider::Builtin(_) => return None,
-        Provider::Custom(provider) => provider.fields.as_ref()?.expr?,
-    };
-    dict_key_definition(db, expr, name)
-}
-
-fn dict_key_definition(db: &dyn Db, expr: InFile<ExprId>, name: &str) -> Option<InFile<TextRange>> {
-    let InFile { file, value } = expr;
-    let module = module(db, file);
-    let Expr::Dict { entries } = &module[value] else {
-        return None;
-    };
-    entries.iter().find_map(|def::DictEntry { key, value: _ }| {
-        let Expr::Literal { literal } = &module[*key] else {
-            return None;
-        };
-        let Literal::String(key_name) = literal else {
-            return None;
-        };
-        if key_name.as_ref() != name {
-            return None;
-        }
-        expr_source_range(db, InFile { file, value: *key })
     })
 }
 
@@ -771,20 +698,7 @@ impl<'a> Callable<'a> {
         matches!(*inner, CallableInner::Macro(_))
     }
 
-    /// The declaration associated with a named argument at a call site.
-    pub fn keyword_definition(&self, name: &str) -> Option<InFile<TextRange>> {
-        let Self { sema, inner } = self;
-        if let CallableInner::Rule(rule) = inner {
-            if let Some(expr) = rule.attrs.as_ref().and_then(|attrs| attrs.expr) {
-                return dict_key_definition(sema.db, expr, name);
-            }
-        }
-        let (param, _) = self
-            .params()
-            .into_iter()
-            .find(|(param, _)| param.name().as_ref().map(Name::as_str) == Some(name))?;
-        param.source_range()
-    }
+
 }
 
 /// Reperesents different types of callables.

@@ -8,6 +8,7 @@ use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
+use rustc_hash::FxHashMap;
 use starpls_bazel::attr::AttributeKind;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -249,26 +250,30 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                 // Initializer provenance does not prove an alias's current mapping.
                 return None;
             };
+            let mut sources = FxHashMap::default();
             for item in &dictionary.items {
-                let name = call
-                    .expression_type(item.key.as_ref()?)?
-                    .string_literal_value(db)?;
+                let key = item.key.as_ref()?;
+                let name = call.expression_type(key)?.string_literal_value(db)?;
+                let source = *sources
+                    .entry(name)
+                    .or_insert_with(|| FileRange::new(call.file().file(db), key.range()));
                 if name.starts_with('_') {
                     continue;
                 }
                 let value = call.expression_type(&item.value)?;
-                let mut parameter = Parameter::keyword_only(Name::new(name));
+                let attribute = value
+                    .provided_data(db, &environment)
+                    .and_then(|data| data.downcast_ref::<Attribute>());
+                let mut parameter =
+                    Parameter::keyword_only(Name::new(name)).with_source_range(source);
                 if matches!(kind, RuleKind::Macro) && value == Type::none(db, &environment) {
                     // A removed macro attribute can be omitted, but cannot accept a value.
                     parameter = parameter
                         .with_annotated_type(Type::Never)
                         .with_default_type(Type::unknown());
-                } else {
-                    let ty = call.expression_type(&item.value)?;
-                    let attribute = ty
-                        .provided_data(db, &environment)?
-                        .downcast_ref::<Attribute>()?;
+                } else if let Some(attribute) = attribute {
                     let ty = attribute_type(db, call, &attribute.kind)?;
+                    parameter = parameter.with_annotated_type(ty);
                     if let Some(doc) = &attribute.documentation {
                         documentation
                             .parameters
@@ -277,7 +282,6 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                             .parameters
                             .push((Name::new(name), doc.clone()));
                     }
-                    parameter = parameter.with_annotated_type(ty);
                     if !attribute.mandatory {
                         parameter = match attribute.default {
                             Some(source) => {
@@ -286,6 +290,10 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                             None => parameter.with_default_type(Type::unknown()),
                         };
                     }
+                } else {
+                    // Keep a known attribute name navigable during recovery. An
+                    // invalid descriptor supplies no type or requiredness contract.
+                    parameter = parameter.with_default_type(Type::unknown());
                 }
                 if let Some(existing) = parameters
                     .iter()
@@ -407,7 +415,11 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
     let mut has_dynamic_fields = false;
     for keyword in &call.call().arguments.keywords {
         match &keyword.arg {
-            Some(name) => fields.push((name.id.clone(), call.expression_type(&keyword.value)?)),
+            Some(name) => fields.push(ProvidedField {
+                name: name.id.clone(),
+                ty: call.expression_type(&keyword.value)?,
+                source: Some(FileRange::new(call.file().file(db), name.range())),
+            }),
             None => has_dynamic_fields = true,
         }
     }
@@ -418,14 +430,7 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
             bases: declared_base(db, call, "struct"),
             class_members: Box::default(),
             instance_fields: ProvidedInstanceFields {
-                fields: fields
-                    .into_iter()
-                    .map(|(name, ty)| ProvidedField {
-                        name,
-                        ty,
-                        source: None,
-                    })
-                    .collect(),
+                fields: fields.into_boxed_slice(),
                 has_dynamic_fields,
                 data: None,
             },
@@ -436,7 +441,7 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
 
 fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
-    let mut fields = Vec::new();
+    let mut fields: Vec<ProvidedField<'_>> = Vec::new();
     let mut open = false;
     let mut documentation = Documentation {
         text: doc_string(db, call),
@@ -470,11 +475,15 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
                     }
                     _ => return None,
                 };
-                for name in names {
-                    let ty = call.expression_type(name)?;
+                for expression in names {
+                    let ty = call.expression_type(expression)?;
                     let name = Name::new(ty.string_literal_value(db)?);
-                    if !fields.iter().any(|(existing, _)| existing == &name) {
-                        fields.push((name, Type::unknown()));
+                    if !fields.iter().any(|field| field.name == name) {
+                        fields.push(ProvidedField {
+                            name,
+                            ty: Type::unknown(),
+                            source: Some(FileRange::new(call.file().file(db), expression.range())),
+                        });
                     }
                 }
             }
@@ -482,10 +491,14 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     }
     let mut parameters: Vec<_> = fields
         .iter()
-        .map(|(name, ty)| {
-            Parameter::keyword_only(name.clone())
+        .map(|ProvidedField { name, ty, source }| {
+            let parameter = Parameter::keyword_only(name.clone())
                 .with_annotated_type(*ty)
-                .with_default_type(Type::unknown())
+                .with_default_type(Type::unknown());
+            match source {
+                Some(source) => parameter.with_source_range(*source),
+                None => parameter,
+            }
         })
         .collect();
     if open {
@@ -548,14 +561,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             bases: Box::default(),
             class_members: Box::from([(Name::new("__init__"), init)]),
             instance_fields: ProvidedInstanceFields {
-                fields: fields
-                    .into_iter()
-                    .map(|(name, ty)| ProvidedField {
-                        name,
-                        ty,
-                        source: None,
-                    })
-                    .collect(),
+                fields: fields.into_boxed_slice(),
                 has_dynamic_fields: open,
                 data: Some(ProvidedData::new(documentation.clone())),
             },

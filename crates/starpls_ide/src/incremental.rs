@@ -125,7 +125,7 @@ fn imported_function_views_follow_reparsed_definitions() {
         else {
             panic!("expected one local definition: {definitions:?}");
         };
-        assert_eq!(*target_file_id, dependency);
+        assert_eq!(*target_file_id, dependency.source);
         assert_eq!(
             u32::from(target_selection_range.start()),
             contents.find("value").unwrap() as u32,
