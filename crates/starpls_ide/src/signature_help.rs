@@ -9,6 +9,9 @@ use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use starpls_syntax::source::expr_range;
+use ty_ide::Docstring;
+use ty_ide::DocstringFragment;
+use ty_ide::MarkupKind;
 use ty_python_semantic::types::ide_support::call_signature_details;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
 use ty_python_semantic::types::ide_support::CallSignatureParameter;
@@ -16,9 +19,7 @@ use ty_python_semantic::types::Type;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
-use crate::util::parameter_doc;
 use crate::util::pick_source_token;
-use crate::util::unindent_doc;
 use crate::util::CursorToken;
 use crate::Database;
 use crate::FilePosition;
@@ -80,7 +81,12 @@ pub(crate) fn signature_help(
             let source_documentation = definition.and_then(|definition| definition.docstring(db));
             let documentation = provided_documentation
                 .and_then(|doc| doc.text.as_deref())
-                .or(source_documentation.as_deref());
+                .or(source_documentation.as_deref())
+                .map(|doc| Docstring::new(doc.to_owned()));
+            let parameter_documentation = documentation
+                .as_ref()
+                .map(Docstring::parameter_documentation)
+                .unwrap_or_default();
             let name = if constructor {
                 None
             } else {
@@ -89,7 +95,7 @@ pub(crate) fn signature_help(
             let name = name.as_deref().unwrap_or(&source[expr.func.range()]);
             SignatureInfo {
                 label: format!("def {name}{label}"),
-                documentation: documentation.map(unindent_doc),
+                documentation: documentation.map(|doc| doc.render(MarkupKind::Markdown)),
                 parameters: Some(
                     parameters
                         .into_iter()
@@ -105,10 +111,17 @@ pub(crate) fn signature_help(
                             let documentation = provided_documentation
                                 .and_then(|doc| {
                                     doc.parameters.iter().find_map(|(parameter, text)| {
-                                        (parameter.as_str() == name).then(|| unindent_doc(text))
+                                        (parameter.as_str() == name).then(|| {
+                                            Docstring::new(text.to_string())
+                                                .render(MarkupKind::Markdown)
+                                        })
                                     })
                                 })
-                                .or_else(|| parameter_doc(documentation, &name).map(str::to_owned));
+                                .or_else(|| {
+                                    parameter_documentation.get(&name).map(|doc| {
+                                        DocstringFragment::new(doc).render(MarkupKind::Markdown)
+                                    })
+                                });
                             ParameterInfo {
                                 label,
                                 documentation,
@@ -289,7 +302,20 @@ mod tests {
         for default in ["\"é\"", "(\"日本語\")", "\"é\""] {
             analysis.update_file(
                 dependency,
-                format!("r = rule(doc = \"Rule documentation\", attrs = {{\"foo\": attr.string(doc = \"Attribute documentation\", default = {default})}})"),
+                format!(
+                    r#"r = rule(doc = """Rule documentation.
+
+Args:
+    foo: General parameter documentation.
+""", attrs = {{"foo": attr.string(doc = """Attribute documentation.
+    More detail.
+
+    ```python
+    if True:
+        value = 1
+    ```
+""", default = {default})}})"#
+                ),
             );
             let help = analysis
                 .snapshot()
@@ -305,13 +331,35 @@ mod tests {
                 .find(|param| param.label.starts_with("foo:"))
                 .unwrap();
             assert_eq!(parameter.label, format!("foo: str = {default}"));
-            assert_eq!(
-                signature.documentation.as_deref(),
-                Some("Rule documentation  ")
-            );
+            assert!(signature
+                .documentation
+                .as_ref()
+                .unwrap()
+                .contains("General parameter documentation."));
             assert_eq!(
                 parameter.documentation.as_deref(),
-                Some("Attribute documentation  ")
+                Some("Attribute documentation.  \nMore detail.  \n  \n```python\nif True:\n    value = 1\n```")
+            );
+            let hover = analysis
+                .snapshot()
+                .hover(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(parameter.documentation.as_ref().unwrap()),
+                "{}",
+                hover.contents.value
+            );
+            assert!(
+                !hover
+                    .contents
+                    .value
+                    .contains("General parameter documentation."),
+                "{}",
+                hover.contents.value
             );
         }
     }

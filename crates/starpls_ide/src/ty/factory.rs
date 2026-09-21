@@ -737,7 +737,7 @@ raw(field=1)
         assert!(signature.label.starts_with("def Info("), "{help:?}");
         assert_eq!(
             signature.documentation.as_deref(),
-            Some("Provider documentation  ")
+            Some("Provider documentation")
         );
         let labels: Vec<_> = signature
             .parameters

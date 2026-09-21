@@ -14,6 +14,8 @@ use starpls_bazel::APIContext;
 use starpls_bazel::Builtins;
 use starpls_bazel::BUILTINS_VALUES_DENY_LIST;
 use starpls_common::Dialect;
+use ty_ide::Docstring;
+use ty_ide::MarkupKind;
 
 pub(super) struct DeclarationSource {
     pub(super) path: SystemVirtualPathBuf,
@@ -407,14 +409,26 @@ fn write_function(
         annotation(return_type, false, classes, AnnotationUse::Value)
     )?;
     let mut documentation = env::normalize_doc(&value.doc, false);
-    for parameter in &callable.param {
-        if !parameter.doc.is_empty() {
-            write!(
-                documentation,
-                "\n{}: {}",
-                parameter.name.trim_start_matches('*'),
-                env::normalize_doc(&parameter.doc, false)
-            )?;
+    let mut documented_parameters = callable
+        .param
+        .iter()
+        .filter(|parameter| !parameter.doc.is_empty())
+        .peekable();
+    if documented_parameters.peek().is_some() {
+        documentation.push_str("\n\nArgs:");
+    }
+    for parameter in documented_parameters {
+        let description =
+            Docstring::new(env::normalize_doc(&parameter.doc, false)).render(MarkupKind::PlainText);
+        let mut lines = description.lines();
+        write!(
+            documentation,
+            "\n    {}: {}",
+            parameter.name.trim_start_matches('*'),
+            lines.next().unwrap_or_default()
+        )?;
+        for line in lines {
+            write!(documentation, "\n        {line}")?;
         }
     }
     writeln!(output, "{indent}    {}", quoted(&documentation))?;
@@ -627,6 +641,7 @@ mod tests {
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "unresolved-reference");
         }
+        let documentation = "A documented native parameter.\n    A continuation.\n\n    ```python\n    if True:\n        value = 1\n    ```";
         let metadata = |ty: &str| Builtins {
             global: vec![Value {
                 name: "native_value".to_owned(),
@@ -634,7 +649,7 @@ mod tests {
                     param: vec![Param {
                         name: "value".to_owned(),
                         r#type: ty.to_owned(),
-                        doc: "A documented native parameter.".to_owned(),
+                        doc: documentation.to_owned(),
                         is_mandatory: true,
                         ..Default::default()
                     }],
@@ -689,7 +704,7 @@ mod tests {
                     signature.parameters.as_ref().unwrap()[0]
                         .documentation
                         .as_deref(),
-                    Some("A documented native parameter.")
+                    Some("A documented native parameter.  \nA continuation.  \n  \n```python\nif True:\n    value = 1\n```")
                 );
                 let snapshot = analysis.snapshot();
                 let db = &snapshot.db;

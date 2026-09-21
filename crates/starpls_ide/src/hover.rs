@@ -17,6 +17,9 @@ use starpls_syntax::source::expr_range;
 use starpls_syntax::source::string_value;
 use starpls_syntax::TextRange;
 use starpls_syntax::T;
+use ty_ide::Docstring;
+use ty_ide::DocstringFragment;
+use ty_ide::MarkupKind;
 use ty_python_semantic::types::ide_support::definitions_for_attribute;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::Type;
@@ -26,9 +29,7 @@ use ty_python_semantic::SemanticModel;
 
 use crate::selection::Selection;
 use crate::util::navigation_token;
-use crate::util::parameter_doc;
 use crate::util::pick_best_token;
-use crate::util::unindent_doc;
 use crate::util::CursorToken;
 use crate::Database;
 use crate::FilePosition;
@@ -109,7 +110,7 @@ pub(crate) fn hover(
                         .find_map(|definition| definition.docstring(db).map(|doc| doc.to_string()))
                 });
             if let Some(doc) = documentation {
-                text.push_str(&unindent_doc(&doc));
+                text.push_str(&Docstring::new(doc).render(MarkupKind::Markdown));
                 text.push('\n');
             }
             Some(text.into())
@@ -119,18 +120,26 @@ pub(crate) fn hover(
         }
         Selection::Parameter(param) => {
             model.scope(param.into())?;
-            let documentation = node.ancestors().find_map(|node| {
-                let AnyNodeRef::StmtFunctionDef(function) = node else {
-                    return None;
-                };
-                function.definition(&model).docstring(db)
-            });
+            let documentation = node
+                .ancestors()
+                .find_map(|node| {
+                    let AnyNodeRef::StmtFunctionDef(function) = node else {
+                        return None;
+                    };
+                    function.definition(&model).docstring(db)
+                })
+                .and_then(|doc| {
+                    Docstring::new(doc.to_string())
+                        .parameter_documentation()
+                        .swap_remove(param.name.as_str())
+                })
+                .map(|doc| DocstringFragment::new(&doc).render(MarkupKind::Markdown));
             Some(
                 format_parameter(
                     &model,
                     param.name.as_str(),
                     param.inferred_type(&model)?,
-                    parameter_doc(documentation.as_deref(), param.name.as_str()),
+                    documentation.as_deref(),
                 )
                 .into(),
             )
@@ -155,14 +164,18 @@ pub(crate) fn hover(
                 .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
                 .and_then(|docs| {
                     docs.parameters.iter().find_map(|(parameter, text)| {
-                        (parameter.as_str() == name).then(|| text.to_string())
+                        (parameter.as_str() == name)
+                            .then(|| Docstring::new(text.to_string()).render(MarkupKind::Markdown))
                     })
                 })
                 .or_else(|| {
-                    let docs = signature
+                    let doc = signature
                         .definition
-                        .and_then(|definition| definition.docstring(db));
-                    parameter_doc(docs.as_deref(), name).map(str::to_owned)
+                        .and_then(|definition| definition.docstring(db))?;
+                    Docstring::new(doc.to_string())
+                        .parameter_documentation()
+                        .swap_remove(name)
+                        .map(|doc| DocstringFragment::new(&doc).render(MarkupKind::Markdown))
                 });
             Some(format_parameter(&model, name, parameter.ty, documentation.as_deref()).into())
         }
@@ -182,7 +195,7 @@ pub(crate) fn hover(
             let loaded = sema.resolve_load_stmt(file, call)?;
             let mut text = format!("```python\n(module) {}\n```\n", &source[token.range()]);
             if let Some(doc) = module_doc(&sema, loaded) {
-                text.push_str(&unindent_doc(&doc));
+                text.push_str(&Docstring::new(doc.to_string()).render(MarkupKind::Markdown));
                 text.push('\n');
             }
             Some(text.into())
@@ -249,7 +262,7 @@ fn type_comment_hover(
         ty.display(db, &model.program_environment())
     );
     if let Some(doc) = type_documentation(model, ty) {
-        text.push_str(&unindent_doc(&doc));
+        text.push_str(&doc.render(MarkupKind::Markdown));
         text.push('\n');
     }
     Some(text.into())
@@ -308,14 +321,14 @@ fn format_for_name<'db>(model: &SemanticModel<'db>, name: &str, ty: Type<'db>) -
 
     let doc = type_documentation(model, ty);
     if let Some(doc) = doc {
-        text.push_str(&unindent_doc(&doc));
+        text.push_str(&doc.render(MarkupKind::Markdown));
         text.push('\n');
     }
 
     text
 }
 
-fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<String> {
+fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Docstring> {
     let db = model.db();
     let environment = model.program_environment();
     if let Some(doc) = ty
@@ -323,7 +336,7 @@ fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<
         .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
         .and_then(|docs| docs.text.as_deref())
     {
-        return Some(doc.to_owned());
+        return Some(Docstring::new(doc.to_owned()));
     }
     let definition = ty.definition(db, &environment)?.definition()?;
     let native = match definition.program_file(db).file(db).path(db) {
@@ -333,7 +346,9 @@ fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<
         _ => false,
     };
     if native || is_function_type(ty) {
-        definition.docstring(db).map(|doc| doc.to_string())
+        definition
+            .docstring(db)
+            .map(|doc| Docstring::new(doc.to_string()))
     } else {
         None
     }
@@ -350,7 +365,7 @@ fn format_parameter<'db>(
         ty.display(model.db(), &model.program_environment())
     );
     if let Some(doc) = documentation {
-        text.push_str(&unindent_doc(doc));
+        text.push_str(doc);
         text.push('\n');
     }
     text
@@ -965,7 +980,7 @@ def f$0oo(x, y):
                 ```python
                 (function) def foo(x, y) -> Unknown
                 ```
-                Doc string  
+                Doc string
             "#]],
         );
     }
@@ -975,17 +990,15 @@ def f$0oo(x, y):
         check_hover(
             r#"
 def foo(x, y):
-    """Doc string"""
+    """Doc string
+
+    x: Unsectioned parameter text.
+    """
     pass
 
 f$0oo(1, 2)
 "#,
-            expect![[r#"
-                ```python
-                (function) def foo(x, y) -> Unknown
-                ```
-                Doc string  
-            "#]],
+            expect!["```python\n(function) def foo(x, y) -> Unknown\n```\nDoc string  \n  \nx: Unsectioned parameter text.\n"],
         );
     }
 
@@ -1005,6 +1018,16 @@ x = 1 # type: i$0nt
 
     #[test]
     fn check_param() {
+        // Unsectioned text remains in the function hover, but is not a
+        // parameter description in the shared docstring parser.
+        check_hover(
+            "def foo(a$0bc):\n    \"\"\"abc: Unsectioned parameter text.\"\"\"\n    pass",
+            expect![[r#"
+                ```python
+                (parameter) abc: Unknown
+                ```
+            "#]],
+        );
         check_hover(
             r#"
 def foo(a$0bc):
@@ -1018,7 +1041,7 @@ def foo(a$0bc):
                 ```python
                 (parameter) abc: Unknown
                 ```
-                Easy as 123!  
+                Easy as 123!
             "#]],
         );
     }
@@ -1040,7 +1063,7 @@ foo(a$0bc = 123)
                 ```python
                 (parameter) abc: Unknown
                 ```
-                Easy as 123!  
+                Easy as 123!
             "#]],
         );
     }
@@ -1088,7 +1111,7 @@ Foo$0Info = provider(doc = "The foo provider")
                 ```python
                 (variable) FooInfo: <class 'FooInfo'>
                 ```
-                The foo provider  
+                The foo provider
             "#]],
         );
     }
@@ -1100,7 +1123,12 @@ Foo$0Info = provider(doc = "The foo provider")
 Info = provider(doc = "Source provider documentation")
 value = Info() # type: In$0fo
 "#,
-            expect!["```python\n(type) Info\n```\nSource provider documentation  \n"],
+            expect![[r#"
+                ```python
+                (type) Info
+                ```
+                Source provider documentation
+            "#]],
         );
     }
 
@@ -1122,7 +1150,7 @@ foo.b$0ar
                 ```python
                 (field) bar: Unknown
                 ```
-                The bar field  
+                The bar field
             "#]],
         );
     }
@@ -1146,7 +1174,7 @@ foo(
                 ```python
                 (parameter) bar: str
                 ```
-                The bar attr  
+                The bar attr
             "#]],
         );
     }

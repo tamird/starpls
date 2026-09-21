@@ -9,42 +9,6 @@ pub(crate) fn pick_best_token(
     tokens.max_by_key(|token| f(token.kind()))
 }
 
-/// Read the parameter line shared by source and native declaration docstrings.
-pub(crate) fn parameter_doc<'a>(documentation: Option<&'a str>, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}:");
-    documentation?.lines().find_map(|line| {
-        line.trim()
-            .trim_start_matches('*')
-            .strip_prefix(&prefix)
-            .map(str::trim)
-    })
-}
-
-// TODO(withered-magic): This logic should probably be more sophisticated, but it works well
-// enough for now.
-pub(crate) fn unindent_doc(doc: &str) -> String {
-    let mut is_in_code_block = false;
-    unindent::unindent(doc)
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            let num_trimmed = line.len() - trimmed.len();
-            let mut s = String::new();
-
-            if trimmed.starts_with("```") {
-                is_in_code_block = !is_in_code_block;
-            }
-
-            (0..num_trimmed)
-                .for_each(|_| s.push_str(if is_in_code_block { " " } else { "&nbsp;" }));
-            s.push_str(trimmed);
-            s.push_str("  ");
-            s
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Convert Ruff's byte range at the editor protocol boundary.
 pub(crate) fn text_range(range: ruff_text_size::TextRange) -> starpls_syntax::TextRange {
     starpls_syntax::TextRange::new(

@@ -20,6 +20,7 @@ salsa = { version = "=0.28.2", default-features = false, features = ["macros", "
 ruff_db = { path = "/Users/tamird/code/ty/ruff/crates/ruff_db", features = ["os"] }
 ruff_notebook = { path = "/Users/tamird/code/ty/ruff/crates/ruff_notebook" }
 ty_module_resolver = { path = "/Users/tamird/code/ty/ruff/crates/ty_module_resolver" }
+ty_ide = { path = "/Users/tamird/code/ty/ruff/crates/ty_ide" }
 ty_python_core = { path = "/Users/tamird/code/ty/ruff/crates/ty_python_core" }
 ty_python_semantic = { path = "/Users/tamird/code/ty/ruff/crates/ty_python_semantic" }
 ty_site_packages = { path = "/Users/tamird/code/ty/ruff/crates/ty_site_packages" }
