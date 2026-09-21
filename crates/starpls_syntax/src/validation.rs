@@ -25,6 +25,7 @@ use crate::SyntaxError;
 pub fn validate(
     source: &str,
     parsed: &Parsed<py::ModModule>,
+    allow_function_annotations: bool,
     errors: &mut dyn FnMut(SyntaxError),
 ) -> Vec<NodeIndex> {
     crate::lexical::validate(source, parsed.tokens(), errors);
@@ -34,6 +35,8 @@ pub fn validate(
         loads: Vec::new(),
         excluded: Vec::new(),
         statement_node: None,
+        allow_function_annotations,
+        in_annotation: false,
     };
     let py::ModModule {
         node_index: _,
@@ -143,6 +146,8 @@ struct Validator<'a> {
     loads: Vec<TextRange>,
     excluded: Vec<NodeIndex>,
     statement_node: Option<NodeIndex>,
+    allow_function_annotations: bool,
+    in_annotation: bool,
 }
 
 impl Validator<'_> {
@@ -153,6 +158,8 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
+            allow_function_annotations: _,
+            in_annotation: _,
         } = self;
         errors(SyntaxError {
             message: message.into(),
@@ -174,6 +181,8 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
+            allow_function_annotations: _,
+            in_annotation: _,
         } = self;
         let tokens = *tokens;
         let py::ExprCall {
@@ -235,21 +244,26 @@ impl Validator<'_> {
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || returns.is_some()
+                    || (!self.allow_function_annotations && returns.is_some())
                 {
                     self.error(
                         *range,
-                        "Function annotations and decorators are not supported in Starlark",
+                        if self.allow_function_annotations {
+                            "Async functions, decorators, and type parameters are not supported in Starlark"
+                        } else {
+                            "Function annotations and decorators are not supported in Starlark"
+                        },
                     );
                 }
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || returns.is_some()
+                    || (!self.allow_function_annotations && returns.is_some())
                     || !parameters.posonlyargs.is_empty()
-                    || parameters
-                        .iter()
-                        .any(|parameter| parameter.as_parameter().annotation.is_some())
+                    || (!self.allow_function_annotations
+                        && parameters
+                            .iter()
+                            .any(|parameter| parameter.as_parameter().annotation.is_some()))
                     || name.as_str() == "load"
                 {
                     self.excluded
@@ -257,6 +271,11 @@ impl Validator<'_> {
                 }
                 self.visit_identifier(name);
                 self.visit_parameters(parameters);
+                if self.allow_function_annotations {
+                    if let Some(annotation) = returns {
+                        self.annotation(annotation);
+                    }
+                }
                 self.visit_body(body);
             }
             Stmt::For(stmt) => {
@@ -371,7 +390,18 @@ impl Validator<'_> {
         }
     }
 
+    fn annotation(&mut self, expr: &Expr) {
+        let previous = std::mem::replace(&mut self.in_annotation, true);
+        self.visit_expr(expr);
+        self.in_annotation = previous;
+    }
+
     fn expression(&mut self, expr: &Expr) {
+        // Bazel's syntax-only mode accepts Starlark expressions in annotations,
+        // with ellipsis additionally allowed for forms such as tuple[int, ...].
+        if self.in_annotation && matches!(expr, Expr::EllipsisLiteral(_)) {
+            return;
+        }
         if !supports_expr(expr.into(), self.tokens) {
             self.excluded.push(
                 self.statement_node
@@ -480,10 +510,14 @@ impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
             annotation,
         } = parameter;
         if let Some(annotation) = annotation {
-            self.error(
-                annotation.range(),
-                "Type annotations are not supported in Starlark",
-            );
+            if self.allow_function_annotations {
+                self.annotation(annotation);
+            } else {
+                self.error(
+                    annotation.range(),
+                    "Type annotations are not supported in Starlark",
+                );
+            }
         }
         self.visit_identifier(name);
     }
@@ -530,6 +564,29 @@ impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn function_annotations_keep_host_expression_validation() {
+        for (source, valid) in [
+            (
+                "def f(value: api.Info | None, items: tuple[int, ...]) -> list[string]: pass",
+                true,
+            ),
+            ("def f(value: int = ...): pass", false),
+            ("def f(value: int ** str): pass", false),
+            ("def f(value: int):\n    result: int = 1", false),
+            ("@decorator\ndef f(value: int): pass", false),
+        ] {
+            let parsed = ruff_python_parser::parse_unchecked_source(
+                source,
+                ruff_python_ast::PySourceType::Python,
+            );
+            let mut errors = Vec::new();
+            let excluded = super::validate(source, &parsed, true, &mut |error| errors.push(error));
+            assert_eq!(errors.is_empty(), valid, "{source}: {errors:?}");
+            assert_eq!(excluded.is_empty(), valid, "{source}");
+        }
+    }
+
+    #[test]
     fn recovered_suites_are_validated_without_a_colon() {
         let source = "if x\n    obj.load\n    load(\":defs.bzl\", alias=\"first\", \"second\")\n";
         let parsed = ruff_python_parser::parse_unchecked_source(
@@ -539,7 +596,9 @@ mod tests {
         assert!(parsed.errors().iter().any(|error| error.error
             == ruff_python_parser::ParseErrorType::PositionalAfterKeywordArgument));
         let mut errors = Vec::new();
-        super::validate(source, &parsed, &mut |error| errors.push(error.message));
+        super::validate(source, &parsed, false, &mut |error| {
+            errors.push(error.message)
+        });
         assert!(
             errors
                 .iter()
@@ -562,7 +621,7 @@ mod tests {
             ruff_python_ast::PySourceType::Python,
         );
         let mut errors = Vec::new();
-        super::validate(source, &parsed, &mut |error| errors.push(error));
+        super::validate(source, &parsed, false, &mut |error| errors.push(error));
         assert_eq!(errors.len(), 3, "{errors:?}");
         assert!(
             errors
@@ -606,7 +665,9 @@ mod tests {
                 ruff_python_ast::PySourceType::Python,
             );
             let mut errors = Vec::new();
-            super::validate(source, &parsed, &mut |error| errors.push(error.message));
+            super::validate(source, &parsed, false, &mut |error| {
+                errors.push(error.message)
+            });
             assert_eq!(errors, expected, "{source}");
         }
     }
@@ -619,7 +680,7 @@ mod dialect_tests {
             source,
             ruff_python_ast::PySourceType::Python,
         );
-        super::validate(source, &parsed, errors);
+        super::validate(source, &parsed, false, errors);
     }
 
     #[test]

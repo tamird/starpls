@@ -28,6 +28,7 @@ use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
+use ty_python_semantic::provided::BuiltinUsage;
 use ty_python_semantic::types::ide_support::call_signature_details;
 use ty_python_semantic::types::list_members::all_end_of_scope_members;
 use ty_python_semantic::types::Type;
@@ -118,6 +119,7 @@ struct NameRefContext {
     is_in_def: bool,
     is_in_for: bool,
     is_lone_expr: bool,
+    is_annotation: bool,
 }
 
 enum StringContext {
@@ -161,6 +163,7 @@ pub(crate) fn completions(
             is_lone_expr,
             is_in_def,
             is_in_for,
+            is_annotation,
         }) => {
             for name in params {
                 items.push(CompletionItem {
@@ -172,7 +175,7 @@ pub(crate) fn completions(
                 });
             }
 
-            add_globals(&mut items);
+            add_globals(&mut items, is_annotation);
             items.extend(names);
 
             if is_lone_expr {
@@ -336,7 +339,7 @@ pub(crate) fn completions(
     Some(items)
 }
 
-pub(crate) fn add_globals(items: &mut Vec<CompletionItem>) {
+fn add_globals(items: &mut Vec<CompletionItem>, is_annotation: bool) {
     let add_global = &mut |global: &'static str| {
         items.push(CompletionItem {
             label: global.to_string(),
@@ -346,8 +349,10 @@ pub(crate) fn add_globals(items: &mut Vec<CompletionItem>) {
             filter_text: None,
         })
     };
-    add_global("True");
-    add_global("False");
+    if !is_annotation {
+        add_global("True");
+        add_global("False");
+    }
     add_global("None");
 }
 
@@ -474,11 +479,12 @@ fn lexical_names(
     file: File,
     model: &SemanticModel<'_>,
     scope: FileScopeId,
+    usage: BuiltinUsage,
 ) -> Vec<CompletionItem> {
     let mut names = FxHashMap::default();
     let mut add_lexical = |model: &SemanticModel<'_>, scope| {
         for completion in model.lexical_completions(scope) {
-            if !completion.is_type_check_only {
+            if !completion.is_type_check_only || matches!(usage, BuiltinUsage::Annotation) {
                 names
                     .entry(completion.name.to_string())
                     .or_insert_with(|| lexical_item(completion.name.to_string(), completion.ty));
@@ -492,7 +498,7 @@ fn lexical_names(
             FileScopeId::global(),
         );
     }
-    for (name, callable) in db.builtin_completion_names(file) {
+    for (name, callable) in db.builtin_completion_names(file, usage) {
         names.entry(name.clone()).or_insert(CompletionItem {
             label: name,
             kind: if callable {
@@ -564,11 +570,11 @@ impl<'a> CompletionContext<'a> {
         }
         let target = cursor.target()?;
         for node in cursor.ancestors() {
-            // A recovered Python owner can include syntax that Starlark omits:
-            // function return annotations and for-else clauses.
+            // Recovered owners can contain suites that the host grammar omits.
             let suite = match node {
-                AnyNodeRef::StmtFunctionDef(function) => (offset > function.parameters.end())
-                    .then_some((function.body.as_slice(), function.parameters.end())),
+                AnyNodeRef::StmtFunctionDef(function) => (!file.allows_function_annotations(db)
+                    && offset > function.parameters.end())
+                .then_some((function.body.as_slice(), function.parameters.end())),
                 AnyNodeRef::StmtFor(statement) => (offset > statement.iter.end())
                     .then_some((statement.body.as_slice(), statement.iter.end())),
                 _ => None,
@@ -619,14 +625,21 @@ impl<'a> CompletionContext<'a> {
                             _ => {}
                         }
                     }
+                    let is_annotation = cursor.is_in_annotation();
+                    let usage = if is_annotation {
+                        BuiltinUsage::Annotation
+                    } else {
+                        BuiltinUsage::Runtime
+                    };
                     CompletionAnalysis::NameRef(NameRefContext {
-                        names: lexical_names(db, file, &model, cursor.scope(&model)?),
+                        names: lexical_names(db, file, &model, cursor.scope(&model)?, usage),
                         params: cursor
                             .keyword_call()
                             .map_or_else(Vec::new, |call| keyword_parameters(&model, call)),
                         is_in_def,
                         is_in_for,
-                        is_lone_expr: cursor.is_statement_start(),
+                        is_lone_expr: !is_annotation && cursor.is_statement_start(),
+                        is_annotation,
                     })
                 }
             }
@@ -689,15 +702,59 @@ mod tests {
     }
 
     #[test]
+    fn native_annotation_completions_use_the_type_namespace() {
+        let mut failures = Vec::new();
+        let types = &["Info", "Label", "list", "str", "string", "Sequence", "None"][..];
+        for (expression, expected) in [
+            ("def f(value: $0): pass", types),
+            ("def f() -> $0: pass", types),
+            ("def f(value: st$0r): pass", types),
+            ("def f(value: list[$0]): pass", types),
+            ("def f(value: list[int | $0]): pass", types),
+            ("def f(value: $0", types),
+            ("def f(value: api.$0): pass", &["Info"][..]),
+        ] {
+            let source =
+                format!("Info = provider(fields=[])\napi = struct(Info=Info)\n{expression}");
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            analysis
+                .set_builtin_defs(
+                    starpls_bazel::decode_builtins(include_bytes!(
+                        "../../starpls/src/builtin/builtin.pb"
+                    ))
+                    .unwrap(),
+                    starpls_bazel::Builtins::default(),
+                )
+                .unwrap();
+            let (file_id, pos) = fixture.cursor_pos.unwrap();
+            let items = analysis
+                .snapshot()
+                .completions(FilePosition { file_id, pos }, None)
+                .unwrap()
+                .unwrap_or_default();
+            let names = items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>();
+            for &expected in expected {
+                if !names.contains(&expected) {
+                    failures.push(format!("{expression}: missing {expected}: {names:?}"));
+                }
+            }
+            for unexpected in ["fail", "len", "print", "value", "return", "True"] {
+                if names.contains(&unexpected) {
+                    failures.push(format!("{expression}: unexpected {unexpected}: {names:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
     fn excluded_statements_do_not_offer_completions() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         let file_id = fixture.main_file();
-        for source in [
-            "@decorator\ndef f(param):\n    par$0",
-            "def f(param: int):\n    par$0",
-            "def f(param: int):\n    pass\n    $0",
-            "value: int = par$0",
-        ] {
+        for source in ["@decorator\ndef f(param):\n    par$0", "value: int = par$0"] {
             let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
             analysis.update_file(file_id, source.replace("$0", ""));
             assert!(
@@ -711,6 +768,8 @@ mod tests {
         }
         for source in [
             "def f(param):\n    par$0",
+            "def f(param: int):\n    par$0",
+            "def f(param: int):\n    pass\n    $0",
             "@decorator\ndef f(param):\n    pass\n$0",
             "def f(param):\n    par$0",
         ] {
@@ -1006,8 +1065,6 @@ d["\x$0"]"#,
             "class C:\n    load(\"m\", al$0ias=\"x\")",
             "load(\"m\", f(al$0ias=\"x\"))",
             "d=1\nd[$0\"foo\"]",
-            "def f(x: $0): pass",
-            "def f() -> $0: pass",
             "1 ** $0",
             "{**$0}",
             "for x in []:\n    pass\nelse:\n    $0",

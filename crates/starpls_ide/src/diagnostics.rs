@@ -44,6 +44,158 @@ mod tests {
     }
 
     #[test]
+    fn native_function_annotations_check_bodies_and_build_calls() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let original = "def identity(value: int = 1) -> int:\n    # type: (string) -> string\n    return value\n";
+        let definition = fixture.add_file(&mut analysis.db, "//:defs.bzl", original);
+        let caller = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            r#"load("//:defs.bzl", "identity")
+answer = identity(1)
+"#,
+            starpls_common::Dialect::Bazel,
+            Some(starpls_common::FileInfo::Bazel {
+                api_context: starpls_bazel::APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        for file in [definition, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        for (source, expected) in [
+            (
+                original.replace("= 1", "= 'bad'"),
+                "invalid-parameter-default",
+            ),
+            (
+                original.replace("return value", "return 'bad'"),
+                "invalid-return-type",
+            ),
+            (
+                original.replace("return value", "return value + 'bad'"),
+                "unsupported-operator",
+            ),
+        ] {
+            analysis.update_file(definition, source.clone());
+            let diagnostics = analysis.snapshot().diagnostics(definition).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].id().as_str(),
+                expected,
+                "{source}: {diagnostics:?}"
+            );
+        }
+        for (source, valid) in [
+            (original.to_owned(), true),
+            (
+                "def identity(value: string = 'ok') -> string:\n    return value\n".to_owned(),
+                false,
+            ),
+            (original.to_owned(), true),
+        ] {
+            analysis.update_file(definition, source);
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            assert_eq!(diagnostics.is_empty(), valid, "{diagnostics:?}");
+            if !valid {
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            }
+        }
+    }
+
+    #[test]
+    fn native_annotations_keep_host_types_and_nominal_shadowing() {
+        let source = r#"
+First = provider(fields=["value"])
+Second = provider(fields=["value"])
+api = struct(Info=First)
+def consume(value: api.Info, items: list[int | string], pairs: tuple[int, ...]) -> api.Info:
+    return value
+def label(value: Label) -> Label:
+    return value
+def local():
+    Label = First
+    def identity(value: Label) -> Label:
+        return value
+    return identity(First(value=1))
+consume(First(value=1), [1, "two"], (1, 2))
+label(Label("//:target"))
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for call in [
+            "consume(Second(value=1), [], ())",
+            "consume(First(value=1), [None], ())",
+            "label(First(value=1))",
+        ] {
+            analysis.update_file(file, format!("{source}\n{call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+        }
+        analysis.update_file(file, format!("{source}\nruntime_name = string\n"));
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].id().as_str(), "unresolved-reference");
+    }
+
+    #[test]
+    fn native_function_annotations_remain_a_bzl_policy() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        for (path, dialect, context) in [
+            (
+                "defs.bzl",
+                starpls_common::Dialect::Bazel,
+                starpls_bazel::APIContext::Bzl,
+            ),
+            (
+                "defs.scl",
+                starpls_common::Dialect::Bazel,
+                starpls_bazel::APIContext::Bzl,
+            ),
+            (
+                "prelude.bzl",
+                starpls_common::Dialect::Bazel,
+                starpls_bazel::APIContext::Prelude,
+            ),
+            (
+                "deploy.star",
+                starpls_common::Dialect::Standard,
+                starpls_bazel::APIContext::Bzl,
+            ),
+            (
+                "BUILD.bazel",
+                starpls_common::Dialect::Bazel,
+                starpls_bazel::APIContext::Build,
+            ),
+        ] {
+            let file = fixture.add_file_with_options(
+                &mut analysis.db,
+                path,
+                "def identity(value: int) -> int:\n    return value\n",
+                dialect,
+                Some(starpls_common::FileInfo::Bazel {
+                    api_context: context,
+                    is_external: false,
+                }),
+            );
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(
+                diagnostics.is_empty(),
+                path == "defs.bzl",
+                "{path}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn macro_attributes_use_shared_call_checking() {
         let source = r#"
 def implementation(**kwargs):

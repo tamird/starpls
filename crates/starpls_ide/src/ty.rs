@@ -202,13 +202,41 @@ impl Database {
         }
     }
 
-    /// Runtime names come from the same finite inventory as native declarations.
-    /// Types and lexical shadowing are supplied separately by Ty.
+    /// Names come from the same inventory and usage policy as native declarations.
+    /// Lexical bindings and their shadowing are supplied separately by Ty.
     pub(crate) fn builtin_completion_names(
         &self,
         file: starpls_common::File,
+        usage: BuiltinUsage,
     ) -> std::collections::BTreeMap<String, bool> {
         use starpls_hir::Db;
+
+        if matches!(usage, BuiltinUsage::Annotation) {
+            let definitions = self.get_builtin_defs(&file.dialect);
+            let candidates = definitions
+                .builtins(self)
+                .r#type
+                .iter()
+                .map(|class| class.name.as_str())
+                .chain(starpls_bazel::BUILTINS_VALUES_DENY_LIST.iter().copied())
+                .chain([
+                    "str", "string", "Any", "Unknown", "unknown", "NoneType", "Sequence",
+                    "Iterable",
+                ]);
+            return candidates
+                .filter(|name| {
+                    matches!(
+                        self.annotation_builtin(file, name),
+                        Some(
+                            ty_python_semantic::types::Type::ClassLiteral(_)
+                                | ty_python_semantic::types::Type::GenericAlias(_)
+                                | ty_python_semantic::types::Type::Dynamic(_)
+                        )
+                    )
+                })
+                .map(|name| (name.to_owned(), false))
+                .collect();
+        }
 
         let mut names: std::collections::BTreeMap<_, _> = starpls_bazel::BUILTINS_VALUES_DENY_LIST
             .iter()
@@ -479,6 +507,129 @@ mod tests {
     use crate::Analysis;
 
     #[test]
+    fn native_annotations_drive_editor_requests_across_import_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let providers = fixture.add_file(
+            &mut analysis.db,
+            "//:providers.bzl",
+            r#"Info = provider(fields=["value"])
+"#,
+        );
+        let original = r#"load("//:providers.bzl", Label="Info")
+def identity(value: Label) -> Label:
+    return value
+"#;
+        let definition = fixture.add_file(&mut analysis.db, "//:defs.bzl", original);
+        let caller_source = r#"load("//:defs.bzl", "identity")
+load("//:providers.bzl", "Info")
+identity(value=Info(value=1))
+"#;
+        let caller = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            caller_source,
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
+        for (source, expected) in [
+            (original.to_owned(), "Info"),
+            (
+                original
+                    .replace(": Label", ": int")
+                    .replace("-> Label", "-> int"),
+                "int",
+            ),
+            (original.to_owned(), "Info"),
+        ] {
+            analysis.update_file(definition, source.clone());
+            let snapshot = analysis.snapshot();
+            let position = crate::FilePosition {
+                file_id: caller,
+                pos: (caller_source.rfind("value=Info").unwrap() as u32).into(),
+            };
+            let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+            assert!(
+                hover.contents.value.contains(&format!("value: {expected}")),
+                "{}",
+                hover.contents.value
+            );
+            let help = snapshot.signature_help(position.clone()).unwrap().unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("expected one signature: {help:?}");
+            };
+            assert!(
+                signature.label.contains(&format!("value: {expected}")),
+                "{signature:?}"
+            );
+            assert!(
+                signature.label.ends_with(&format!("-> {expected}")),
+                "{signature:?}"
+            );
+            let locations = snapshot
+                .goto_definition(position.clone(), true)
+                .unwrap()
+                .unwrap();
+            let [crate::LocationLink::Local {
+                origin_selection_range: _,
+                target_range: _,
+                target_file_id,
+                target_selection_range,
+            }] = locations.as_slice()
+            else {
+                panic!("expected one parameter definition: {locations:?}");
+            };
+            assert_eq!(*target_file_id, definition.source);
+            assert_eq!(&source[*target_selection_range], "value");
+            let diagnostics = snapshot.diagnostics(caller).unwrap();
+            assert_eq!(
+                diagnostics.is_empty(),
+                expected == "Info",
+                "{diagnostics:?}"
+            );
+            if expected == "Info" {
+                let position = crate::FilePosition {
+                    file_id: definition,
+                    pos: (source.find(": Label").unwrap() as u32 + 3).into(),
+                };
+                let locations = snapshot
+                    .goto_definition(position.clone(), true)
+                    .unwrap()
+                    .unwrap();
+                let [crate::LocationLink::Local {
+                    origin_selection_range: _,
+                    target_range: _,
+                    target_file_id,
+                    target_selection_range: _,
+                }] = locations.as_slice()
+                else {
+                    panic!("expected the loaded provider declaration: {locations:?}");
+                };
+                assert_eq!(*target_file_id, providers.source);
+                let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+                assert!(
+                    hover.contents.value.contains("Info"),
+                    "{}",
+                    hover.contents.value
+                );
+            }
+        }
+    }
+
+    #[test]
     fn recursive_recovery_preserves_syntax_diagnostics() {
         for diagnostics_first in [false, true] {
             let (analysis, fixture) = Analysis::from_single_file_fixture(
@@ -517,7 +668,6 @@ mod tests {
             "class value:\n    pass",
             "value: str = 'bad'",
             "hidden = (value := 'bad')",
-            "def value(arg: int) -> str:\n    return 'bad'",
             "@unknown_decorator\ndef value():\n    return 'bad'",
             "async def value():\n    return 'bad'",
             "def value[T]():\n    return 'bad'",
