@@ -272,7 +272,12 @@ impl Analysis {
         info: Option<FileInfo>,
     ) -> anyhow::Result<File> {
         let Self { db } = self;
-        File::from_path(db, path, dialect, info)
+        let system_path = starpls_common::system_path(path)?;
+        let source = db.system.source_path(system_path)?;
+        let info = db
+            .loader
+            .file_info(path, source.as_std_path(), dialect, info)?;
+        File::from_path(db, source.as_std_path(), dialect, info)
     }
 
     pub fn open_document(
@@ -284,18 +289,24 @@ impl Analysis {
         version: i32,
     ) -> anyhow::Result<File> {
         let Self { db } = self;
+        let system_path = starpls_common::system_path(path)?;
+        let source = db.system.source_path(system_path)?;
+        let info = db
+            .loader
+            .file_info(path, source.as_std_path(), dialect, info)?;
         starpls_common::open_document(db, path, dialect, info, contents, version)
     }
 
     pub fn close_document(&mut self, path: &std::path::Path) -> anyhow::Result<Option<File>> {
         let Self { db } = self;
         let path = starpls_common::system_path(path)?;
-        let Some(document) = db.system.document(path) else {
+        let path = db.system.source_path(path)?;
+        let Some(document) = db.system.document(&path) else {
             return Ok(None);
         };
         let file = File::from_path(db, path.as_std_path(), document.dialect, document.info)?;
-        db.source_system_mut().close(path);
-        ruff_db::files::File::sync_path(db, path);
+        db.source_system_mut().close(&path);
+        ruff_db::files::File::sync_path(db, &path);
         Ok(Some(file))
     }
 
@@ -332,7 +343,8 @@ impl Analysis {
         salsa::Database::trigger_cancellation(db);
         for path in paths {
             let path = starpls_common::system_path(path)?;
-            ruff_db::files::File::sync_path(db, path);
+            let path = db.system.source_path(path)?;
+            ruff_db::files::File::sync_path(db, &path);
         }
         let environment = db.environment();
         let revision = environment.load_revision(db) + 1;
@@ -417,10 +429,10 @@ impl AnalysisSnapshot {
 
     pub fn open_file(&self, path: &std::path::Path) -> Cancellable<Option<File>> {
         self.query(|db| {
-            let document = db
-                .system
-                .document(starpls_common::system_path(path).ok()?)?;
-            File::from_path(db, path, document.dialect, document.info).ok()
+            let path = starpls_common::system_path(path).ok()?;
+            let path = db.system.source_path(path).ok()?;
+            let document = db.system.document(&path)?;
+            File::from_path(db, path.as_std_path(), document.dialect, document.info).ok()
         })
     }
 
@@ -536,6 +548,17 @@ pub struct FilePosition {
 
 /// A trait for loading a path and listing its exported symbols.
 pub trait FileLoader: Send + Sync + 'static {
+    /// Establish host context before a file enters semantic analysis.
+    fn file_info(
+        &self,
+        _path: &std::path::Path,
+        _source: &std::path::Path,
+        _dialect: Dialect,
+        info: Option<FileInfo>,
+    ) -> anyhow::Result<Option<FileInfo>> {
+        Ok(info)
+    }
+
     fn resolve_path(
         &self,
         db: &dyn Db,

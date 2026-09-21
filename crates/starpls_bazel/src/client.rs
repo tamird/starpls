@@ -139,8 +139,7 @@ impl BazelClient for BazelCLI {
         }
         drop(mappings);
 
-        // Otherwise, fetch the repo mapping and cache it. For now, we always cache the result, even if the call failed.
-        let mapping = self.dump_repo_mapping(from_repo).unwrap_or_default();
+        let mapping = self.dump_repo_mapping(from_repo)?;
         let canonical_repo = mapping.get(apparent_repo).cloned();
         self.repo_mappings
             .write()
@@ -164,8 +163,7 @@ impl BazelClient for BazelCLI {
         }
         drop(mappings);
 
-        // Otherwise, fetch the repo mapping and cache it. For now, we always cache the result, even if the call failed.
-        let mapping = self.dump_repo_mapping(from_repo).unwrap_or_default();
+        let mapping = self.dump_repo_mapping(from_repo)?;
         let keys = mapping.keys().cloned().collect();
         self.repo_mappings
             .write()

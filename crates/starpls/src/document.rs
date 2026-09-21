@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -6,7 +8,9 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::Context;
 use crossbeam_channel::Sender;
+use parking_lot::RwLock;
 use starpls_bazel::client::BazelClient;
 use starpls_bazel::label::PartialParse;
 use starpls_bazel::label::RepoKind;
@@ -42,6 +46,7 @@ pub(crate) struct DefaultFileLoader {
     external_output_base: PathBuf,
     fetch_repo_sender: Sender<Task>,
     bzlmod_enabled: bool,
+    repositories: RwLock<HashMap<PathBuf, Option<Repository>>>,
 }
 
 impl DefaultFileLoader {
@@ -60,13 +65,20 @@ impl DefaultFileLoader {
             external_output_base,
             fetch_repo_sender,
             bzlmod_enabled,
+            repositories: Default::default(),
         }
     }
 }
 
-struct ResolvedLabel {
-    resolved_path: PathBuf,
-    canonical_repo: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Repository {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
+}
+
+pub(crate) struct ResolvedLabel {
+    pub(crate) resolved_path: PathBuf,
+    pub(crate) repository: Repository,
 }
 
 impl DefaultFileLoader {
@@ -76,81 +88,154 @@ impl DefaultFileLoader {
         label: &Label,
         from: File,
     ) -> anyhow::Result<Option<ResolvedLabel>> {
-        let repo_kind = label.kind();
-        let mut canonical_repo_res = None;
-        let (root, package) = match &repo_kind {
-            RepoKind::Apparent if self.bzlmod_enabled => {
-                let from_path = from.path(db).to_path_buf();
-                let from_repo = try_opt!(self
-                    .repo_for_path(&from_path)
-                    .or_else(|| from.is_type_interface(db).then_some("")));
-                let canonical_repo = self
-                    .bazel_client
-                    .resolve_repo_from_mapping(label.repo(), from_repo)?;
-                match canonical_repo {
-                    Some(canonical_repo) => (
-                        if canonical_repo.is_empty() {
-                            self.workspace.clone()
-                        } else {
-                            canonical_repo_res = Some(canonical_repo.clone());
-                            self.external_output_base.join(canonical_repo)
-                        },
-                        PathBuf::new(),
-                    ),
-                    None => {
-                        bail!(
-                            "Could not resolve repository \"{}{}\" from current repository mapping",
-                            match label.kind() {
-                                RepoKind::Canonical => "@@",
-                                _ => "@",
-                            },
-                            label.repo()
-                        )
-                    }
-                }
-            }
-            RepoKind::Canonical | RepoKind::Apparent => {
-                if !label.repo().is_empty() {
-                    canonical_repo_res = Some(label.repo().to_string());
-                }
-
-                if self.workspace_name.as_deref() == Some(label.repo()) || label.repo().is_empty() {
-                    (self.workspace.clone(), PathBuf::new())
-                } else {
-                    (self.external_output_base.join(label.repo()), PathBuf::new())
-                }
-            }
-            RepoKind::Current => {
-                // Find the Bazel workspace root.
-                let from_path = from.path(db).to_path_buf();
-                if from.is_type_interface(db)
-                    && !label.is_relative()
-                    && self.repo_for_path(&from_path).is_none()
-                {
-                    (self.workspace.clone(), PathBuf::new())
-                } else {
-                    match starpls_bazel::resolve_workspace(from_path)? {
-                        Some(root) => root,
-                        None => {
-                            bail!("not in a Bazel workspace")
-                        }
-                    }
-                }
-            }
-        };
-
-        // Loading targets using a relative label causes them to be resolved from the closest package to the importing file.
+        let from_path = from.path(db);
+        let repository = try_opt!(self.repository_for_source(from_path, from_path)?);
+        let repository = self.resolve_repository(label, &repository)?;
         let resolved_path = if label.is_relative() {
-            package
+            package_for_path(from_path, &repository.root)?
         } else {
-            root.join(label.package())
+            repository.root.join(label.package())
         }
         .join(label.target());
 
         Ok(Some(ResolvedLabel {
             resolved_path,
-            canonical_repo: canonical_repo_res,
+            repository,
         }))
+    }
+
+    pub(crate) fn main_repository(&self) -> Repository {
+        Repository {
+            name: String::new(),
+            root: self.workspace.clone(),
+        }
+    }
+
+    pub(crate) fn resolve_repository(
+        &self,
+        label: &Label,
+        from: &Repository,
+    ) -> anyhow::Result<Repository> {
+        let name = match label.kind() {
+            RepoKind::Current => return Ok(from.clone()),
+            RepoKind::Canonical => label.repo().to_owned(),
+            RepoKind::Apparent => {
+                if label.repo().is_empty() {
+                    String::new()
+                } else if self.bzlmod_enabled {
+                    let name = self
+                        .bazel_client
+                        .resolve_repo_from_mapping(label.repo(), &from.name)?;
+                    name.with_context(|| {
+                        format!(
+                            "cannot resolve repository @{} from @@{}",
+                            label.repo(),
+                            from.name
+                        )
+                    })?
+                } else if self.workspace_name.as_deref() == Some(label.repo()) {
+                    String::new()
+                } else {
+                    label.repo().to_owned()
+                }
+            }
+        };
+        let root = if name.is_empty() {
+            self.workspace.clone()
+        } else {
+            self.external_output_base.join(&name)
+        };
+        Ok(Repository { name, root })
+    }
+
+    /// Each physical file has one repository context for the lifetime of the loader.
+    pub(crate) fn register_path(
+        &self,
+        path: &Path,
+        repository: &Repository,
+    ) -> anyhow::Result<PathBuf> {
+        let path = path.canonicalize()?;
+        let Repository { name, root } = repository;
+        let root = root.canonicalize()?;
+        let repository = Repository {
+            name: name.clone(),
+            root,
+        };
+        self.record_repository(&path, Some(repository))?;
+        Ok(path)
+    }
+
+    fn record_repository(&self, path: &Path, repository: Option<Repository>) -> anyhow::Result<()> {
+        match self.repositories.write().entry(path.to_path_buf()) {
+            Entry::Vacant(entry) => {
+                entry.insert(repository);
+            }
+            Entry::Occupied(entry) => {
+                if entry.get() != &repository {
+                    bail!(
+                        "conflicting Bazel repositories for {}: {:?} and {:?}",
+                        entry.key().display(),
+                        entry.get(),
+                        repository
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn repository_for_path(&self, path: &Path) -> anyhow::Result<Option<Repository>> {
+        let canonical = path.canonicalize()?;
+        self.repository_for_source(path, &canonical)
+    }
+
+    fn repository_for_source(
+        &self,
+        path: &Path,
+        canonical: &Path,
+    ) -> anyhow::Result<Option<Repository>> {
+        if !path.starts_with(&self.external_output_base) {
+            if let Some(repository) = self.repositories.read().get(canonical) {
+                return Ok(repository.clone());
+            }
+        }
+        let repository = if let Ok(relative) = path.strip_prefix(&self.external_output_base) {
+            let name = relative
+                .components()
+                .next()
+                .context("missing Bazel repository name")?;
+            let name = name
+                .as_os_str()
+                .to_str()
+                .context("Bazel repository name is not UTF-8")?;
+            Some(Repository {
+                name: name.to_owned(),
+                root: self.external_output_base.join(name),
+            })
+        } else if path.starts_with(&self.workspace)
+            || path.extension().is_some_and(|ext| ext == "bzli")
+        {
+            Some(self.main_repository())
+        } else {
+            None
+        };
+        let repository = match repository {
+            Some(Repository { name, root }) => {
+                let root = match root.canonicalize() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            return Err(error.into());
+                        }
+                        root
+                    }
+                };
+                Some(Repository { name, root })
+            }
+            None => None,
+        };
+        self.record_repository(canonical, repository.clone())?;
+        Ok(repository)
     }
 
     fn read_file(
@@ -159,49 +244,83 @@ impl DefaultFileLoader {
         path: PathBuf,
         dialect: Dialect,
         info: Option<FileInfo>,
-        fetch_repo_on_err: Option<String>,
+        repository: Option<Repository>,
     ) -> anyhow::Result<File> {
-        match File::from_path(db, &path, dialect, info) {
-            Ok(file) => Ok(file),
-            Err(error) => {
-                if let Some(canonical_repo) = fetch_repo_on_err {
-                    if !self
+        let result = (|| {
+            let system_path = starpls_common::system_path(&path)?;
+            let canonical = match db.system().canonicalize_path(system_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    // Record missing inputs so creating a dependency invalidates loads.
+                    File::from_path(db, &path, dialect, info)?;
+                    return Err(error.into());
+                }
+            };
+            if let Some(Repository { name, root }) = &repository {
+                let root = starpls_common::system_path(root)?;
+                let root = db.system().canonicalize_path(root)?;
+                let repository = Repository {
+                    name: name.clone(),
+                    root: root.as_std_path().to_path_buf(),
+                };
+                self.record_repository(canonical.as_std_path(), Some(repository))?;
+            }
+            let info = self.file_info(
+                canonical.as_std_path(),
+                canonical.as_std_path(),
+                dialect,
+                info,
+            )?;
+            File::from_path(db, canonical.as_std_path(), dialect, info)
+        })();
+        if result.is_err() {
+            if let Some(Repository {
+                name: canonical_repo,
+                root: _,
+            }) = repository
+            {
+                if !canonical_repo.is_empty()
+                    && !self
                         .external_output_base
                         .join(&canonical_repo)
                         .try_exists()
                         .unwrap_or(false)
-                    {
-                        let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
-                            FetchExternalRepoRequest {
-                                repo: canonical_repo,
-                            },
-                        ));
-                    }
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn repo_for_path<'a>(&'a self, path: &'a Path) -> Option<&'a str> {
-        match path.strip_prefix(&self.external_output_base) {
-            Ok(stripped) => stripped
-                .components()
-                .next()
-                .as_ref()
-                .and_then(|component| component.as_os_str().to_str()),
-            Err(_) => {
-                if path.starts_with(&self.workspace) {
-                    Some("")
-                } else {
-                    None
+                {
+                    let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
+                        FetchExternalRepoRequest {
+                            repo: canonical_repo,
+                        },
+                    ));
                 }
             }
         }
+        result
     }
 }
 
 impl FileLoader for DefaultFileLoader {
+    fn file_info(
+        &self,
+        path: &Path,
+        source: &Path,
+        dialect: Dialect,
+        info: Option<FileInfo>,
+    ) -> anyhow::Result<Option<FileInfo>> {
+        if dialect != Dialect::Bazel {
+            return Ok(info);
+        }
+        let repository = self.repository_for_source(path, source)?;
+        Ok(info.map(
+            |FileInfo::Bazel {
+                 api_context,
+                 is_external,
+             }| FileInfo::Bazel {
+                api_context,
+                is_external: repository
+                    .map_or(is_external, |repository| !repository.name.is_empty()),
+            },
+        ))
+    }
     fn resolve_path(
         &self,
         db: &dyn Db,
@@ -251,7 +370,7 @@ impl FileLoader for DefaultFileLoader {
                     api_context: APIContext::Build,
                     is_external: false,
                 }),
-                resolved_label.canonical_repo,
+                Some(resolved_label.repository),
             )?;
 
             ResolvedPath::BuildTarget {
@@ -270,19 +389,14 @@ impl FileLoader for DefaultFileLoader {
         dialect: Dialect,
         from: File,
     ) -> anyhow::Result<Option<File>> {
-        let (path, info, canonical_repo) = match dialect {
+        let (path, info, repository) = match dialect {
             Dialect::Standard => {
                 // Find the importing file's directory.
                 let mut from_path = from.path(db).to_path_buf();
                 assert!(from_path.pop());
 
                 // Resolve the given path relative to the importing file's directory.
-                let candidate = from_path.join(path);
-                // Track missing paths before canonicalization can fail outside Salsa.
-                File::from_path(db, &candidate, dialect, None)?;
-                let candidate = starpls_common::system_path(&candidate)?;
-                let canonical = db.system().canonicalize_path(candidate)?;
-                (canonical.as_std_path().to_path_buf(), None, None)
+                (from_path.join(path), None, None)
             }
             Dialect::Bazel => {
                 // Parse the load path as a Bazel label.
@@ -298,22 +412,22 @@ impl FileLoader for DefaultFileLoader {
 
                 let ResolvedLabel {
                     resolved_path,
-                    canonical_repo,
+                    repository,
                 } = try_opt!(self.resolve_label(db, &label, from)?);
 
-                let is_external = !resolved_path.starts_with(&self.workspace);
+                let is_external = !repository.name.is_empty();
                 (
                     resolved_path,
                     Some(FileInfo::Bazel {
                         api_context: APIContext::Bzl,
                         is_external,
                     }),
-                    canonical_repo,
+                    Some(repository),
                 )
             }
         };
 
-        let file = self.read_file(db, path, dialect, info, canonical_repo)?;
+        let file = self.read_file(db, path, dialect, info, repository)?;
         Ok(Some(file))
     }
 
@@ -361,33 +475,26 @@ impl FileLoader for DefaultFileLoader {
                     Ok(label) => (label, None),
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
                 };
-                // External interfaces use the main workspace for qualified labels.
-                // Relative labels still require the file's physical package.
-                let (mut root, package) = if from.is_type_interface(db)
-                    && !label.is_relative()
-                    && self.repo_for_path(&from_path).is_none()
-                {
-                    (self.workspace.clone(), PathBuf::new())
-                } else {
-                    try_opt!(starpls_bazel::resolve_workspace(from.path(db))?)
-                };
+                let repository = try_opt!(self.repository_for_source(&from_path, &from_path)?);
 
                 if !label.has_leading_slashes()
                     && !label.is_relative()
                     && err != Some(ParseError::InvalidRepo)
                 {
-                    return Ok(match label.kind() {
-                        RepoKind::Apparent if self.bzlmod_enabled => Some(
-                            self.bazel_client
-                                .repo_mapping_keys("")?
+                    if label.kind() == RepoKind::Apparent && self.bzlmod_enabled {
+                        let names = self.bazel_client.repo_mapping_keys(&repository.name)?;
+                        return Ok(Some(
+                            names
                                 .into_iter()
-                                .map(|repo| LoadItemCandidate {
+                                .map(|name| LoadItemCandidate {
                                     kind: LoadItemCandidateKind::Directory,
-                                    path: repo.to_string(),
+                                    path: name,
                                     replace_trailing_slash: false,
                                 })
                                 .collect(),
-                        ),
+                        ));
+                    }
+                    return Ok(match label.kind() {
                         RepoKind::Canonical | RepoKind::Apparent => Some(
                             fs::read_dir(&self.external_output_base)?
                                 .filter_map(|entry| {
@@ -409,30 +516,13 @@ impl FileLoader for DefaultFileLoader {
                     });
                 }
 
-                match label.kind() {
-                    RepoKind::Apparent | RepoKind::Canonical => {
-                        root = if self.bzlmod_enabled {
-                            let from_repo = try_opt!(self
-                                .repo_for_path(&from_path)
-                                .or_else(|| from.is_type_interface(db).then_some("")));
-                            let canonical_repo = try_opt!(self
-                                .bazel_client
-                                .resolve_repo_from_mapping(label.repo(), from_repo)?);
-                            if canonical_repo.is_empty() {
-                                self.workspace.clone()
-                            } else {
-                                self.external_output_base.join(canonical_repo)
-                            }
-                        } else if self.workspace_name.as_deref() == Some(label.repo())
-                            || label.repo().is_empty()
-                        {
-                            self.workspace.clone()
-                        } else {
-                            self.external_output_base.join(label.repo())
-                        };
-                    }
-                    RepoKind::Current => {}
-                }
+                let repository = self.resolve_repository(&label, &repository)?;
+                let root = repository.root;
+                let package = if label.is_relative() {
+                    package_for_path(&from_path, &root)?
+                } else {
+                    PathBuf::new()
+                };
 
                 match err {
                     Some(ParseError::EmptyPackage) => {
@@ -495,6 +585,29 @@ impl FileLoader for DefaultFileLoader {
             None
         }
     }
+}
+
+fn package_for_path(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    if !path.starts_with(root) {
+        bail!(
+            "{} is outside repository {}",
+            path.display(),
+            root.display()
+        );
+    }
+    for directory in path.ancestors().skip(1) {
+        if directory.join("BUILD").try_exists()? || directory.join("BUILD.bazel").try_exists()? {
+            return Ok(directory.to_path_buf());
+        }
+        if directory == root {
+            return Ok(root.to_path_buf());
+        }
+    }
+    bail!(
+        "{} is outside repository {}",
+        path.display(),
+        root.display()
+    )
 }
 
 fn read_dir_packages_and_targets(
@@ -623,6 +736,218 @@ mod source_tests {
     use starpls_ide::FilePosition;
 
     use super::DefaultFileLoader;
+
+    #[derive(Default)]
+    pub(crate) struct TestBazelClient;
+
+    impl starpls_bazel::client::BazelClient for TestBazelClient {
+        fn build_language(&self) -> anyhow::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn info(&self) -> anyhow::Result<starpls_bazel::client::BazelInfo> {
+            unimplemented!()
+        }
+        fn resolve_repo_from_mapping(
+            &self,
+            apparent: &str,
+            from: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(Some(
+                match apparent {
+                    "dep" => {
+                        if from == "stubs+" {
+                            "rules+"
+                        } else {
+                            "wrong+"
+                        }
+                    }
+                    "stubs" => "stubs+",
+                    "rules" => "rules+",
+                    _ => return Ok(None),
+                }
+                .to_owned(),
+            ))
+        }
+        fn clear_repo_mappings(&self) {}
+        fn null_query_external_repo_targets(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn repo_mapping_keys(&self, from: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![from.to_owned()])
+        }
+        fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn fetch_repo(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn dump_repo_mapping(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_files_keep_their_repository_context() {
+        use starpls_bazel::Label;
+        use starpls_ide::FileLoader;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("repository-context");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        // The override lives inside the main workspace and has a different mapping.
+        let stubs = workspace.join("local-stubs");
+        for directory in [&stubs, &external.join("rules+"), &external.join("wrong+")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let text = "load(\"@dep//:defs.bzl\", \"identity\")\nvalue: int\n";
+        std::fs::write(stubs.join("defs.bzli"), text).unwrap();
+        std::fs::write(external.join("rules+/defs.bzl"), "def identity(): pass\n").unwrap();
+        std::fs::write(stubs.join("BUILD"), "").unwrap();
+        std::os::unix::fs::symlink(&stubs, external.join("stubs+")).unwrap();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = Arc::new(DefaultFileLoader::new(
+            Arc::new(TestBazelClient),
+            workspace.clone(),
+            None,
+            external.clone(),
+            sender,
+            true,
+        ));
+        let mut analysis = Analysis::new(loader.clone(), Default::default()).unwrap();
+        let repository = loader
+            .resolve_repository(
+                &Label::parse("@stubs//:defs.bzli").unwrap(),
+                &loader.main_repository(),
+            )
+            .unwrap();
+        let canonical = loader
+            .register_path(&external.join("stubs+/defs.bzli"), &repository)
+            .unwrap();
+        let info = Some(starpls_common::FileInfo::Bazel {
+            api_context: starpls_bazel::APIContext::Bzl,
+            is_external: false,
+        });
+        let file = analysis.file(&canonical, Dialect::Bazel, info).unwrap();
+        assert_eq!(file.is_external(), Some(true));
+        let alias = external.join("stubs+/defs.bzli");
+        let opened = analysis
+            .open_document(&alias, Dialect::Bazel, info, text.into(), 1)
+            .unwrap();
+        assert_eq!(file, opened);
+        assert_eq!(
+            analysis.document(&canonical).unwrap().path.as_std_path(),
+            alias
+        );
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Inspect resolution through the same implementation used by load queries.
+        let repository = loader.repository_for_path(&canonical).unwrap().unwrap();
+        assert_eq!(repository.name, "stubs+");
+        assert_eq!(
+            loader
+                .resolve_repository(&Label::parse("@dep//:defs.bzl").unwrap(), &repository)
+                .unwrap()
+                .root,
+            external.join("rules+")
+        );
+        assert_eq!(
+            loader
+                .resolve_repository(&Label::parse("@@wrong+//:defs.bzl").unwrap(), &repository)
+                .unwrap()
+                .root,
+            external.join("wrong+")
+        );
+        assert_eq!(
+            loader
+                .resolve_repository(&Label::parse("//:defs.bzl").unwrap(), &repository)
+                .unwrap()
+                .root,
+            stubs
+        );
+        assert_eq!(
+            super::package_for_path(&canonical, &repository.root).unwrap(),
+            stubs
+        );
+        let error = loader
+            .register_path(&canonical, &loader.main_repository())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting Bazel repositories"),
+            "{error}"
+        );
+        assert_eq!(
+            loader.repository_for_path(&canonical).unwrap().unwrap(),
+            repository
+        );
+        assert_eq!(
+            loader
+                .file_info(&canonical, &canonical, Dialect::Bazel, info)
+                .unwrap(),
+            file.info
+        );
+        drop(snapshot);
+        // An unsaved symlink buffer is also the configured physical stub.
+        analysis
+            .open_document(&alias, Dialect::Bazel, info, "value: Missing\n".into(), 2)
+            .unwrap();
+        analysis.sync_files(std::slice::from_ref(&alias)).unwrap();
+        let snapshot = analysis.snapshot();
+        assert_eq!(snapshot.open_file(&alias).unwrap(), Some(file));
+        assert!(!snapshot.diagnostics(file).unwrap().is_empty());
+        drop(snapshot);
+        assert_eq!(analysis.close_document(&alias).unwrap(), Some(file));
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Opening a second explicit repository spelling cannot reuse the first context.
+        std::os::unix::fs::symlink(&stubs, external.join("other+")).unwrap();
+        let error = analysis
+            .file(&external.join("other+/defs.bzli"), Dialect::Bazel, info)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting Bazel repositories"),
+            "{error}"
+        );
+        let new_alias = external.join("stubs+/new.bzl");
+        let new_physical = stubs.join("new.bzl");
+        let new_text = "load(\"@dep//:defs.bzl\", \"identity\")\nvalue = 1\n";
+        let new_file = analysis
+            .open_document(&new_alias, Dialect::Bazel, info, new_text.into(), 1)
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        assert_eq!(snapshot.path(new_file), new_physical);
+        let diagnostics = snapshot.diagnostics(new_file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(snapshot);
+        std::fs::write(&new_physical, "value = 0\n").unwrap();
+        analysis
+            .sync_files(std::slice::from_ref(&new_physical))
+            .unwrap();
+        assert_eq!(
+            analysis.file(&new_physical, Dialect::Bazel, info).unwrap(),
+            new_file
+        );
+        assert_eq!(analysis.document(&new_physical).unwrap().contents, new_text);
+        assert_eq!(
+            analysis.snapshot().source(new_file).unwrap().text.as_str(),
+            new_text
+        );
+        analysis.update_file(new_file, "value = 2\n".into());
+        assert_eq!(
+            analysis.document(&new_physical).unwrap().contents,
+            "value = 2\n"
+        );
+        assert_eq!(
+            analysis.document(&new_physical).unwrap().path.as_std_path(),
+            new_alias
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn opening_a_relative_dependency_invalidates_failed_resolution() {

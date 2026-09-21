@@ -219,6 +219,9 @@ impl Server {
                 for (file, ticket, diagnostics) in results {
                     let path = snapshot.path(file);
                     if self.diagnostics_manager.complete(&snapshot, file, ticket) {
+                        let path = snapshot
+                            .document(path)
+                            .map_or(path, |document| document.path.as_std_path());
                         let uri = lsp_types::Url::from_file_path(path).expect("absolute file path");
                         self.send_notification::<lsp_types::notification::PublishDiagnostics>(
                             lsp_types::PublishDiagnosticsParams {
@@ -504,6 +507,133 @@ mod tests {
             .unwrap();
         assert!(matches!(task, Task::DiagnosticsReady(_)), "{task:?}");
         server.handle_event(Event::Task(task)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_rejected_alias_open_preserves_the_server_and_buffer() {
+        let TestServer {
+            mut server,
+            client,
+            disk: _,
+            tasks,
+            debounced,
+        } = server();
+        let root =
+            std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join("editor-alias");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.star");
+        let alias = root.join("alias.star");
+        std::fs::write(&target, "value = 0\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let loader = DefaultFileLoader::new(
+            server.bazel_client.clone(),
+            root.clone(),
+            None,
+            root.join("external"),
+            tasks,
+            false,
+        );
+        server.analysis = Analysis::new(Arc::new(loader), Default::default()).unwrap();
+        server.workspace = root.clone();
+        let alias_uri = lsp_types::Url::from_file_path(&alias).unwrap();
+        for (path, value) in [(&alias, 1), (&target, 2)] {
+            server
+                .handle_event(
+                    notification::<lsp_types::notification::DidOpenTextDocument>(
+                        lsp_types::DidOpenTextDocumentParams {
+                            text_document: lsp_types::TextDocumentItem {
+                                uri: lsp_types::Url::from_file_path(path).unwrap(),
+                                language_id: "starlark".into(),
+                                version: value,
+                                text: format!("value = {value}\n"),
+                            },
+                        },
+                    ),
+                )
+                .unwrap();
+            if value == 1 {
+                analyze_requested_files(&mut server, &debounced);
+                let diagnostics = published(&client);
+                let [diagnostics] = diagnostics.as_slice() else {
+                    panic!("{diagnostics:?}")
+                };
+                assert_eq!(diagnostics.uri, alias_uri);
+            }
+        }
+        let message = client.receiver.try_recv().unwrap();
+        let lsp_server::Message::Notification(message) = message else {
+            panic!("{message:?}")
+        };
+        assert_eq!(message.method, "window/showMessage");
+        assert!(message.params["message"]
+            .as_str()
+            .unwrap()
+            .contains("already open"));
+        assert_eq!(
+            server.analysis.document(&alias).unwrap().contents,
+            "value = 1\n"
+        );
+        let rejected_uri = lsp_types::Url::from_file_path(&target).unwrap();
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidChangeTextDocument>(
+                    lsp_types::DidChangeTextDocumentParams {
+                        text_document: lsp_types::VersionedTextDocumentIdentifier {
+                            uri: rejected_uri.clone(),
+                            version: 3,
+                        },
+                        content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: "value = 3\n".into(),
+                        }],
+                    },
+                ),
+            )
+            .unwrap();
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidCloseTextDocument>(
+                    lsp_types::DidCloseTextDocumentParams {
+                        text_document: lsp_types::TextDocumentIdentifier { uri: rejected_uri },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            server.analysis.document(&alias).unwrap().contents,
+            "value = 1\n"
+        );
+        server
+            .handle_event(Event::Message(
+                lsp_server::Request::new(
+                    42.into(),
+                    "textDocument/hover".into(),
+                    serde_json::json!({
+                        "textDocument": {"uri": alias_uri},
+                        "position": {"line": 0, "character": 2}
+                    }),
+                )
+                .into(),
+            ))
+            .unwrap();
+        let response = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_event(Event::Task(response)).unwrap();
+        let message = client
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let lsp_server::Message::Response(response) = message else {
+            panic!("{message:?}")
+        };
+        assert_eq!(response.id, 42.into());
+        assert!(response.result.unwrap().to_string().contains("Literal[1]"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

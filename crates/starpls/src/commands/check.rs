@@ -56,17 +56,17 @@ impl CheckCommand {
             .map_err(|err| anyhow!("failed to initialize Bazel context: {}", err))?;
         let builtins = load_bazel_builtins();
         let (fetch_repo_sender, _) = crossbeam_channel::unbounded();
-        let loader = DefaultFileLoader::new(
+        let loader = Arc::new(DefaultFileLoader::new(
             bazel_client,
             bazel_cx.info.workspace.clone(),
             bazel_cx.info.workspace_name.clone(),
             bazel_cx.info.output_base.join("external"),
             fetch_repo_sender,
             bazel_cx.bzlmod_enabled,
-        );
+        ));
 
         let mut analysis = Analysis::new(
-            Arc::new(loader),
+            loader.clone(),
             starpls_ide::InferenceOptions {
                 infer_ctx_attributes: self.inference_options.infer_ctx_attributes,
                 use_code_flow_analysis: self.inference_options.use_code_flow_analysis,
@@ -76,7 +76,7 @@ impl CheckCommand {
 
         analysis.set_builtin_defs(builtins, bazel_cx.rules)?;
         self.type_interfaces
-            .install(&mut analysis, &bazel_cx.info.workspace)?;
+            .install(&mut analysis, &loader, &bazel_cx.info.workspace)?;
 
         // Strip off the leading "." from each of the specified extensions.
         // This works better when filtering against files with .extension().
@@ -96,6 +96,7 @@ impl CheckCommand {
             self.paths,
             self.ignore_patterns,
             &extensions,
+            loader,
         )?;
         checker.report_diagnostics()
     }
@@ -106,6 +107,7 @@ struct Checker {
     bazel_info: BazelInfo,
     files: indexmap::IndexSet<File>,
     ignored_files: HashSet<PathBuf>,
+    loader: Arc<DefaultFileLoader>,
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
@@ -126,12 +128,14 @@ impl Checker {
         paths: Vec<String>,
         ignore_patterns: Vec<String>,
         extensions: &[&str],
+        loader: Arc<DefaultFileLoader>,
     ) -> anyhow::Result<Self> {
         let mut checker = Self {
             analysis,
             bazel_info,
             files: Default::default(),
             ignored_files: Default::default(),
+            loader,
         };
 
         checker
@@ -161,7 +165,9 @@ impl Checker {
         is_explicit: bool,
         extensions: &[&str],
     ) -> anyhow::Result<()> {
-        let canonical_path = PathBuf::from(&path).canonicalize()?;
+        let path = std::path::absolute(path)?;
+        self.loader.repository_for_path(&path)?;
+        let canonical_path = path.canonicalize()?;
 
         let (dialect, api_context) = match document::dialect_and_api_context_for_workspace_path(
             &self.bazel_info.workspace,

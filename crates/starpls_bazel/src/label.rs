@@ -209,7 +209,7 @@ impl<'a, 'b> Parser<'a, 'b> {
         self.label.repo_start = self.pos;
         while let Some(c) = self.first() {
             match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '.' | '-' => {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '.' | '-' | '+' => {
                     self.bump();
                 }
                 '~' if self.pos > self.label.repo_start => {

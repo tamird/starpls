@@ -7,11 +7,14 @@ pub(crate) fn did_open_text_document(
     params: lsp_types::DidOpenTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    server.open_document(
+    if let Err(error) = server.open_document(
         &path,
         params.text_document.text,
         params.text_document.version,
-    )
+    ) {
+        server.send_error_message(&format!("{error:#}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn did_close_text_document(
@@ -19,6 +22,13 @@ pub(crate) fn did_close_text_document(
     params: lsp_types::DidCloseTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
+    if !server
+        .analysis
+        .document(&path)
+        .is_some_and(|document| document.path.as_std_path() == path)
+    {
+        return Ok(());
+    }
     if server.analysis.close_document(&path)?.is_some() {
         server.invalidate_diagnostics();
         server.send_notification::<lsp_types::notification::PublishDiagnostics>(
@@ -38,9 +48,14 @@ pub(crate) fn did_change_text_document(
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
     if let Some(document) = server.analysis.document(&path) {
+        if document.path.as_std_path() != path {
+            return Ok(());
+        }
         let contents =
             apply_document_content_changes(document.contents.clone(), params.content_changes);
-        server.open_document(&path, contents, params.text_document.version)?;
+        if let Err(error) = server.open_document(&path, contents, params.text_document.version) {
+            server.send_error_message(&format!("{error:#}"));
+        }
     }
     Ok(())
 }
@@ -50,7 +65,11 @@ pub(crate) fn did_save_text_document(
     params: lsp_types::DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    if server.analysis.document(&path).is_some() {
+    if server
+        .analysis
+        .document(&path)
+        .is_some_and(|document| document.path.as_std_path() == path)
+    {
         match path.file_name().and_then(|file_name| file_name.to_str()) {
             Some("MODULE.bazel" | "WORKSPACE" | "WORKSPACE.bazel" | "WORKSPACE.bzlmod") => {}
             Some(file_name) if file_name.ends_with(".MODULE.bazel") => {}

@@ -195,15 +195,23 @@ pub fn open_document(
     contents: String,
     version: i32,
 ) -> anyhow::Result<File> {
-    let path = system_path(path)?.to_path_buf();
-    db.source_system_mut()
-        .open(&path, contents, dialect, info, version);
+    let path = system_path(path)?;
+    let path = db
+        .source_system_mut()
+        .open(path, contents, dialect, info, version)?;
     ruff_db::files::File::sync_path(db, &path);
     File::from_path(db, path.as_std_path(), dialect, info)
 }
 
 pub fn update_file(db: &mut dyn Db, file: File, contents: String) {
     let path = file.path(db).to_path_buf();
+    let path = db
+        .source_system_mut()
+        .document(system_path(&path).expect("known file path"))
+        .map_or_else(
+            || path.clone(),
+            |document| document.path.as_std_path().to_path_buf(),
+        );
     open_document(db, &path, file.dialect, file.info, contents, 0).expect("known file path");
 }
 

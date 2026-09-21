@@ -24,6 +24,7 @@ use crate::FileInfo;
 
 #[derive(Clone, Debug)]
 pub struct OpenDocument {
+    pub path: SystemPathBuf,
     pub contents: String,
     pub version: i32,
     pub dialect: Dialect,
@@ -40,6 +41,7 @@ pub struct DocumentStamp {
 impl OpenDocument {
     pub fn stamp(&self) -> DocumentStamp {
         let Self {
+            path: _,
             contents: _,
             version,
             dialect: _,
@@ -80,9 +82,19 @@ impl SourceSystem {
         dialect: Dialect,
         info: Option<FileInfo>,
         version: i32,
-    ) {
+    ) -> Result<SystemPathBuf> {
+        let source = self.source_path(path)?;
+        let path = SystemPath::absolute(path, self.base.current_directory());
+        if let Some(document) = self.documents.get(&source) {
+            if document.path != path {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("file is already open at {}", document.path),
+                ));
+            }
+        }
         let Self {
-            base,
+            base: _,
             documents,
             virtual_sources: _,
             revision,
@@ -90,10 +102,10 @@ impl SourceSystem {
         *revision += 1;
         // Keep editor revisions separate from filesystem timestamp revisions.
         let file_revision = FileRevision::new((1 << 127) | u128::from(*revision));
-        let path = SystemPath::absolute(path, base.current_directory());
         documents.insert(
-            path,
+            source.clone(),
             OpenDocument {
+                path,
                 contents,
                 version,
                 dialect,
@@ -101,28 +113,66 @@ impl SourceSystem {
                 revision: file_revision,
             },
         );
+        Ok(source)
     }
 
     pub fn close(&mut self, path: &SystemPath) -> Option<OpenDocument> {
+        let path = self.source_path(path).ok()?;
         let Self {
-            base,
+            base: _,
             documents,
             virtual_sources: _,
             revision: _,
         } = self;
-        let path = SystemPath::absolute(path, base.current_directory());
         documents.remove(&path)
     }
 
     pub fn document(&self, path: &SystemPath) -> Option<&OpenDocument> {
+        let path = self.source_path(path).ok()?;
         let Self {
-            base,
+            base: _,
             documents,
             virtual_sources: _,
             revision: _,
         } = self;
-        let path = SystemPath::absolute(path, base.current_directory());
         documents.get(&path)
+    }
+
+    /// Editor and disk reads share physical identity while an open URI stays stable.
+    pub fn source_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
+        let path = SystemPath::absolute(path, self.base.current_directory());
+        if self.documents.contains_key(&path) {
+            return Ok(path);
+        }
+        if let Some((source, _)) = self
+            .documents
+            .iter()
+            .find(|(_, document)| document.path == path)
+        {
+            return Ok(source.clone());
+        }
+        let mut ancestor = path.as_path();
+        loop {
+            match self.base.canonicalize_path(ancestor) {
+                Ok(root) => {
+                    let suffix = path.strip_prefix(ancestor).expect("ancestor of path");
+                    return Ok(if suffix.as_str().is_empty() {
+                        root
+                    } else {
+                        root.join(suffix)
+                    });
+                }
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                    let Some(parent) = ancestor.parent() else {
+                        return Err(error);
+                    };
+                    ancestor = parent;
+                }
+            }
+        }
     }
 
     /// Replace an application-owned declaration input before syncing its Ruff file.
@@ -157,6 +207,7 @@ impl SourceSystem {
 impl System for SourceSystem {
     fn path_metadata(&self, path: &SystemPath) -> Result<Metadata> {
         if let Some(OpenDocument {
+            path: _,
             contents: _,
             version: _,
             dialect: _,
@@ -177,6 +228,7 @@ impl System for SourceSystem {
 
     fn read_to_string(&self, path: &SystemPath) -> Result<String> {
         if let Some(OpenDocument {
+            path: _,
             contents,
             version: _,
             dialect: _,
@@ -207,6 +259,10 @@ impl System for SourceSystem {
         }
     }
     fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
+        let source = self.source_path(path)?;
+        if self.documents.contains_key(&source) {
+            return Ok(source);
+        }
         let Self {
             base,
             documents: _,

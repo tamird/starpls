@@ -117,16 +117,16 @@ impl Server {
             Default::default()
         };
 
-        let loader = DefaultFileLoader::new(
+        let loader = Arc::new(DefaultFileLoader::new(
             bazel_client.clone(),
             bazel_cx.info.workspace.clone(),
             bazel_cx.info.workspace_name,
             bazel_cx.info.output_base.join("external"),
             task_pool_sender.clone(),
             bazel_cx.bzlmod_enabled,
-        );
+        ));
         let mut analysis = Analysis::new(
-            Arc::new(loader),
+            loader.clone(),
             InferenceOptions {
                 infer_ctx_attributes: config.args.inference_options.infer_ctx_attributes,
                 use_code_flow_analysis: config.args.inference_options.use_code_flow_analysis,
@@ -134,10 +134,11 @@ impl Server {
             },
         )?;
 
-        if let Err(error) = config
-            .args
-            .type_interfaces
-            .install(&mut analysis, &bazel_cx.info.workspace)
+        if let Err(error) =
+            config
+                .args
+                .type_interfaces
+                .install(&mut analysis, &loader, &bazel_cx.info.workspace)
         {
             connection.sender.send(
                 lsp_server::Notification::new(

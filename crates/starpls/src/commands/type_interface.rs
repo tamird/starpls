@@ -40,13 +40,25 @@ impl FromStr for TypeInterfaceMapping {
 }
 
 impl TypeInterfaceOptions {
-    pub(crate) fn install(&self, analysis: &mut Analysis, workspace: &Path) -> anyhow::Result<()> {
+    pub(crate) fn install(
+        &self,
+        analysis: &mut Analysis,
+        loader: &crate::document::DefaultFileLoader,
+        workspace: &Path,
+    ) -> anyhow::Result<()> {
         let mut mappings = Vec::with_capacity(self.mappings.len());
+        let resolve = |path: &Path| -> anyhow::Result<PathBuf> {
+            let path = workspace.join(path);
+            match loader.repository_for_path(&path)? {
+                Some(repository) => loader.register_path(&path, &repository),
+                None => Ok(path.canonicalize()?),
+            }
+        };
         for TypeInterfaceMapping { source, interface } in &self.mappings {
-            let source = workspace.join(source).canonicalize().with_context(|| {
+            let source = resolve(source).with_context(|| {
                 format!("cannot resolve type interface source {}", source.display())
             })?;
-            let interface = workspace.join(interface).canonicalize().with_context(|| {
+            let interface = resolve(interface).with_context(|| {
                 format!("cannot resolve type interface {}", interface.display())
             })?;
             let open = |path: &Path| {
@@ -107,16 +119,15 @@ mod tests {
         std::fs::write(&source, "def compute(): pass\n").unwrap();
         std::fs::write(&interface, "def compute(value: int): ...\n").unwrap();
         let (sender, _) = crossbeam_channel::unbounded();
-        let loader = crate::document::DefaultFileLoader::new(
+        let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
             std::sync::Arc::new(starpls_bazel::client::BazelCLI::default()),
             root.clone(),
             None,
             root.join("external"),
             sender,
             false,
-        );
-        let mut analysis =
-            starpls_ide::Analysis::new(std::sync::Arc::new(loader), Default::default()).unwrap();
+        ));
+        let mut analysis = starpls_ide::Analysis::new(loader.clone(), Default::default()).unwrap();
         let mapping = super::TypeInterfaceMapping {
             source: "source.bzl".into(),
             interface: "source.bzli".into(),
@@ -124,7 +135,7 @@ mod tests {
         super::TypeInterfaceOptions {
             mappings: vec![mapping.clone()],
         }
-        .install(&mut analysis, &root)
+        .install(&mut analysis, &loader, &root)
         .unwrap();
         let configured = analysis.type_interface_files();
         assert_eq!(configured.len(), 1);
@@ -156,7 +167,7 @@ mod tests {
             ),
         ] {
             let error = super::TypeInterfaceOptions { mappings }
-                .install(&mut analysis, &root)
+                .install(&mut analysis, &loader, &root)
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             assert_eq!(analysis.type_interface_files(), configured);
