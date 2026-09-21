@@ -77,6 +77,10 @@ pub(crate) fn document_symbols(db: &Database, file_id: File) -> Option<Vec<Docum
                             let target = assignment.target(&parsed);
                             (Some(SymbolKind::Variable), target.range())
                         }
+                        DefinitionKind::AnnotatedAssignment(assignment) => {
+                            let target = assignment.target(&parsed);
+                            (Some(SymbolKind::Variable), target.range())
+                        }
                         DefinitionKind::AugmentedAssignment(assignment) => {
                             let target = &assignment.node(&parsed).target;
                             (Some(SymbolKind::Variable), target.range())

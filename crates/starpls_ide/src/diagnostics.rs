@@ -108,6 +108,33 @@ answer = identity(1)
     }
 
     #[test]
+    fn native_assignments_check_initialization_and_reassignment() {
+        let source = "value: int = 1 # type: string\nvalue = 2\nvalues: list[int] = []\nvalues.append(value)\n";
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (statement, expected) in [
+            ("value: int = 'bad'", "invalid-assignment"),
+            ("value: int = 1\nvalue = 'bad'", "invalid-assignment"),
+            ("values: list[int] = ['bad']", "invalid-assignment"),
+            (
+                "values: list[int] = []\nvalues.append('bad')",
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(file, statement.to_owned());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].id().as_str(),
+                expected,
+                "{statement}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_annotations_keep_host_types_and_nominal_shadowing() {
         let source = r#"
 First = provider(fields=["value"])
@@ -146,7 +173,7 @@ label(Label("//:target"))
     }
 
     #[test]
-    fn native_function_annotations_remain_a_bzl_policy() {
+    fn native_annotations_remain_a_bzl_policy() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
         for (path, dialect, context) in [
@@ -179,7 +206,7 @@ label(Label("//:target"))
             let file = fixture.add_file_with_options(
                 &mut analysis.db,
                 path,
-                "def identity(value: int) -> int:\n    return value\n",
+                "value: int = 1\ndef identity(value: int) -> int:\n    return value\n",
                 dialect,
                 Some(starpls_common::FileInfo::Bazel {
                     api_context: context,

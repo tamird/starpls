@@ -145,9 +145,9 @@ impl File {
         )
     }
 
-    /// Native function annotations follow Bazel's ordinary `.bzl` syntax mode.
+    /// Native annotations follow Bazel's ordinary `.bzl` syntax mode.
     /// Prelude, `.scl`, and other Starlark hosts retain their existing grammar.
-    pub fn allows_function_annotations(self, db: &dyn Db) -> bool {
+    pub fn allows_native_annotations(self, db: &dyn Db) -> bool {
         self.dialect == Dialect::Bazel
             && matches!(self.api_context(), None | Some(APIContext::Bzl))
             && self
@@ -274,7 +274,7 @@ fn syntax_info_query(
     let excluded = starpls_syntax::validate(
         &contents,
         &parsed,
-        file.allows_function_annotations(db),
+        file.allows_native_annotations(db),
         &mut errors,
     );
     let comments = starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors);

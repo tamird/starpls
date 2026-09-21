@@ -630,6 +630,97 @@ identity(value=Info(value=1))
     }
 
     #[test]
+    fn native_assignment_exports_keep_editor_identity_after_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let original = "values: list[int] = [] # type: list[string]\nobserved = values\n";
+        let declaration = fixture.add_file(&mut analysis.db, "//:defs.bzl", original);
+        let caller = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            "load(\"//:defs.bzl\", \"values\")\nvalues.append('bad')\n",
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        for (source, expected) in [
+            (original.to_owned(), "list[int]"),
+            (
+                format!(
+                    "# moved declaration\n{}",
+                    original.replace("list[int]", "list[string]")
+                ),
+                "list[str]",
+            ),
+            (original.to_owned(), "list[int]"),
+        ] {
+            analysis.update_file(declaration, source.clone());
+            let snapshot = analysis.snapshot();
+            let position = crate::FilePosition {
+                file_id: declaration,
+                pos: u32::try_from(source.rfind("values").unwrap())
+                    .unwrap()
+                    .into(),
+            };
+            let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+            assert!(
+                hover.contents.value.contains(expected),
+                "{}",
+                hover.contents.value
+            );
+            let locations = snapshot
+                .goto_definition(position.clone(), true)
+                .unwrap()
+                .unwrap();
+            let [crate::LocationLink::Local {
+                origin_selection_range: _,
+                target_range: _,
+                target_file_id,
+                target_selection_range,
+            }] = locations.as_slice()
+            else {
+                panic!("expected annotated declaration: {locations:?}");
+            };
+            assert_eq!(*target_file_id, declaration.source);
+            assert_eq!(&source[*target_selection_range], "values");
+            assert_eq!(
+                usize::from(target_selection_range.start()),
+                source.find("values:").unwrap()
+            );
+            let references = snapshot.find_references(position).unwrap().unwrap();
+            assert_eq!(references.len(), 2, "{references:?}");
+            assert!(
+                references
+                    .iter()
+                    .all(|location| location.file_id == declaration
+                        && &source[location.range] == "values"),
+                "{references:?}"
+            );
+            let symbols = snapshot.document_symbols(declaration).unwrap().unwrap();
+            let [values, observed] = symbols.as_slice() else {
+                panic!("expected both global declarations: {symbols:?}");
+            };
+            assert_eq!((&*values.name, &*observed.name), ("values", "observed"));
+            assert_eq!(values.selection_range, *target_selection_range);
+            let diagnostics = snapshot.diagnostics(declaration).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let diagnostics = snapshot.diagnostics(caller).unwrap();
+            assert_eq!(
+                diagnostics.is_empty(),
+                expected == "list[str]",
+                "{diagnostics:?}"
+            );
+            if expected == "list[int]" {
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            }
+        }
+    }
+
+    #[test]
     fn recursive_recovery_preserves_syntax_diagnostics() {
         for diagnostics_first in [false, true] {
             let (analysis, fixture) = Analysis::from_single_file_fixture(
@@ -666,7 +757,7 @@ identity(value=Info(value=1))
         for invalid in [
             "while True:\n    value = 'bad'",
             "class value:\n    pass",
-            "value: str = 'bad'",
+            "value: str",
             "hidden = (value := 'bad')",
             "@unknown_decorator\ndef value():\n    return 'bad'",
             "async def value():\n    return 'bad'",

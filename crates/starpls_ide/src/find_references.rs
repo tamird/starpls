@@ -56,6 +56,7 @@ pub(crate) fn find_references(
                         definition.kind(db),
                         DefinitionKind::Function(_)
                             | DefinitionKind::Assignment(_)
+                            | DefinitionKind::AnnotatedAssignment(_)
                             | DefinitionKind::AugmentedAssignment(_)
                             | DefinitionKind::For(_)
                             | DefinitionKind::Comprehension(_)

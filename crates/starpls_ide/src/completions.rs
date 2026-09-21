@@ -572,7 +572,7 @@ impl<'a> CompletionContext<'a> {
         for node in cursor.ancestors() {
             // Recovered owners can contain suites that the host grammar omits.
             let suite = match node {
-                AnyNodeRef::StmtFunctionDef(function) => (!file.allows_function_annotations(db)
+                AnyNodeRef::StmtFunctionDef(function) => (!file.allows_native_annotations(db)
                     && offset > function.parameters.end())
                 .then_some((function.body.as_slice(), function.parameters.end())),
                 AnyNodeRef::StmtFor(statement) => (offset > statement.iter.end())
@@ -713,6 +713,7 @@ mod tests {
             ("def f(value: list[int | $0]): pass", types),
             ("def f(value: $0", types),
             ("def f(value: api.$0): pass", &["Info"][..]),
+            ("assignment: $0 = None", types),
         ] {
             let source =
                 format!("Info = provider(fields=[])\napi = struct(Info=Info)\n{expression}");
@@ -754,7 +755,10 @@ mod tests {
     fn excluded_statements_do_not_offer_completions() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         let file_id = fixture.main_file();
-        for source in ["@decorator\ndef f(param):\n    par$0", "value: int = par$0"] {
+        for source in [
+            "@decorator\ndef f(param):\n    par$0",
+            "obj.value: int = par$0",
+        ] {
             let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
             analysis.update_file(file_id, source.replace("$0", ""));
             assert!(

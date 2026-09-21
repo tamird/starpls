@@ -25,7 +25,7 @@ use crate::SyntaxError;
 pub fn validate(
     source: &str,
     parsed: &Parsed<py::ModModule>,
-    allow_function_annotations: bool,
+    allow_native_annotations: bool,
     errors: &mut dyn FnMut(SyntaxError),
 ) -> Vec<NodeIndex> {
     crate::lexical::validate(source, parsed.tokens(), errors);
@@ -35,7 +35,7 @@ pub fn validate(
         loads: Vec::new(),
         excluded: Vec::new(),
         statement_node: None,
-        allow_function_annotations,
+        allow_native_annotations,
         in_annotation: false,
     };
     let py::ModModule {
@@ -146,7 +146,7 @@ struct Validator<'a> {
     loads: Vec<TextRange>,
     excluded: Vec<NodeIndex>,
     statement_node: Option<NodeIndex>,
-    allow_function_annotations: bool,
+    allow_native_annotations: bool,
     in_annotation: bool,
 }
 
@@ -158,7 +158,7 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
-            allow_function_annotations: _,
+            allow_native_annotations: _,
             in_annotation: _,
         } = self;
         errors(SyntaxError {
@@ -181,7 +181,7 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
-            allow_function_annotations: _,
+            allow_native_annotations: _,
             in_annotation: _,
         } = self;
         let tokens = *tokens;
@@ -244,11 +244,11 @@ impl Validator<'_> {
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || (!self.allow_function_annotations && returns.is_some())
+                    || (!self.allow_native_annotations && returns.is_some())
                 {
                     self.error(
                         *range,
-                        if self.allow_function_annotations {
+                        if self.allow_native_annotations {
                             "Async functions, decorators, and type parameters are not supported in Starlark"
                         } else {
                             "Function annotations and decorators are not supported in Starlark"
@@ -258,9 +258,9 @@ impl Validator<'_> {
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || (!self.allow_function_annotations && returns.is_some())
+                    || (!self.allow_native_annotations && returns.is_some())
                     || !parameters.posonlyargs.is_empty()
-                    || (!self.allow_function_annotations
+                    || (!self.allow_native_annotations
                         && parameters
                             .iter()
                             .any(|parameter| parameter.as_parameter().annotation.is_some()))
@@ -271,7 +271,7 @@ impl Validator<'_> {
                 }
                 self.visit_identifier(name);
                 self.visit_parameters(parameters);
-                if self.allow_function_annotations {
+                if self.allow_native_annotations {
                     if let Some(annotation) = returns {
                         self.annotation(annotation);
                     }
@@ -315,6 +315,32 @@ impl Validator<'_> {
                 for target in targets {
                     self.visit_expr(target);
                 }
+                self.visit_expr(value);
+            }
+            Stmt::AnnAssign(stmt) => {
+                let py::StmtAnnAssign {
+                    node_index,
+                    range,
+                    target,
+                    annotation,
+                    value,
+                    simple,
+                } = stmt;
+                if !self.allow_native_annotations || !simple || !target.is_name_expr() {
+                    self.excluded.push(node_index.load());
+                    self.unsupported(*range);
+                    return;
+                }
+                let Some(value) = value else {
+                    self.excluded.push(node_index.load());
+                    self.error(
+                        *range,
+                        "Annotated declarations without a value are not supported",
+                    );
+                    return;
+                };
+                self.visit_expr(target);
+                self.annotation(annotation);
                 self.visit_expr(value);
             }
             Stmt::AugAssign(stmt) => {
@@ -510,7 +536,7 @@ impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
             annotation,
         } = parameter;
         if let Some(annotation) = annotation {
-            if self.allow_function_annotations {
+            if self.allow_native_annotations {
                 self.annotation(annotation);
             } else {
                 self.error(
@@ -564,15 +590,20 @@ impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn function_annotations_keep_host_expression_validation() {
+    fn annotations_keep_host_expression_validation() {
         for (source, valid) in [
             (
                 "def f(value: api.Info | None, items: tuple[int, ...]) -> list[string]: pass",
                 true,
             ),
             ("def f(value: int = ...): pass", false),
+            ("value: int", false),
+            ("obj.value: int = 1", false),
+            ("items[0]: int = 1", false),
+            ("(value): int = 1", false),
+            ("value: int = ...", false),
             ("def f(value: int ** str): pass", false),
-            ("def f(value: int):\n    result: int = 1", false),
+            ("def f(value: int):\n    result: int = 1", true),
             ("@decorator\ndef f(value: int): pass", false),
         ] {
             let parsed = ruff_python_parser::parse_unchecked_source(
