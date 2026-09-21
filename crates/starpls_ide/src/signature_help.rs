@@ -1,14 +1,5 @@
-use ruff_python_ast::find_node::covering_node;
-use ruff_python_ast::token::TokenKind;
-use ruff_python_ast::token::Tokens;
-use ruff_python_ast::AnyNodeRef;
-use ruff_python_ast::ArgOrKeyword;
-use ruff_python_ast::ExprCall;
-use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
-use ruff_text_size::TextRange;
-use ruff_text_size::TextSize;
-use starpls_syntax::source::expr_range;
+use ty_ide::call_at_offset;
 use ty_ide::Docstring;
 use ty_ide::DocstringFragment;
 use ty_ide::MarkupKind;
@@ -19,8 +10,6 @@ use ty_python_semantic::types::Type;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
-use crate::util::pick_source_token;
-use crate::util::CursorToken;
 use crate::Database;
 use crate::FilePosition;
 
@@ -53,12 +42,7 @@ pub(crate) fn signature_help(
     let program_file = db.starlark_program_file(file);
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let source = file.contents(db);
-    let (expr, active_arg) = call_at_cursor(
-        parsed.syntax(),
-        parsed.tokens(),
-        u32::from(pos).into(),
-        TextSize::of(&*source),
-    )?;
+    let (expr, active_arg) = call_at_offset(&parsed, &source, u32::from(pos).into())?;
     let model = SemanticModel::new(db, program_file);
     model.scope(expr.into())?;
     let callee_type = expr.func.inferred_type(&model);
@@ -139,105 +123,6 @@ pub(crate) fn signature_help(
     Some(SignatureHelp { signatures })
 }
 
-/// Select the call and argument using concrete tokens, including trivia that
-/// Ruff does not store in the AST. Commas inside an argument belong to it, even
-/// when they are not bracketed (for example, lambda parameters).
-fn call_at_cursor<'a>(
-    module: &'a ModModule,
-    tokens: &Tokens,
-    offset: TextSize,
-    source_len: TextSize,
-) -> Option<(&'a ExprCall, usize)> {
-    let selected = pick_source_token(tokens, offset, source_len, |token| {
-        let CursorToken::Token(token) = token else {
-            return 0;
-        };
-        match token.kind() {
-            TokenKind::Lpar => 0,
-            TokenKind::Rpar => 0,
-            TokenKind::Comma => 0,
-            TokenKind::Comment => 0,
-            TokenKind::NonLogicalNewline => 0,
-            TokenKind::Indent => 0,
-            _ => 1,
-        }
-    })?;
-    let node = covering_node(module.into(), selected.range());
-    let enclosing_call = |node: AnyNodeRef<'a>| match node {
-        AnyNodeRef::ExprCall(call) => Some(call),
-        _ => None,
-    };
-    let call = if let Some(call) = node.ancestors().find_map(enclosing_call) {
-        call
-    } else {
-        // A recovered call may end at its last argument, before trailing
-        // whitespace. Only an actually unmatched call can own that gap.
-        let CursorToken::Gap(gap) = selected else {
-            return None;
-        };
-        let previous = tokens
-            .before(gap.start())
-            .iter()
-            .rev()
-            .find(|token| !token.range().is_empty())?;
-        let node = covering_node(module.into(), previous.range());
-        let call = node.ancestors().filter_map(enclosing_call).find(|call| {
-            let mut depth = 0;
-            for token in tokens.in_range(TextRange::new(call.arguments.start(), gap.start())) {
-                match token.kind() {
-                    TokenKind::Lpar => depth += 1,
-                    TokenKind::Rpar => depth -= 1,
-                    _ => {}
-                }
-                if depth == 0 {
-                    return false;
-                }
-            }
-            depth > 0
-        })?;
-        call
-    };
-    if selected.start() < call.arguments.start() {
-        return None;
-    }
-    let ranges = call
-        .arguments
-        .iter_source_order()
-        .map(|arg| match arg {
-            ArgOrKeyword::Arg(expr) => expr_range(expr, (&call.arguments).into(), tokens),
-            ArgOrKeyword::Keyword(keyword) => TextRange::new(
-                keyword.start(),
-                expr_range(&keyword.value, keyword.into(), tokens).end(),
-            ),
-        })
-        .collect::<Vec<_>>();
-    if let Some(index) = ranges
-        .iter()
-        .position(|range| range.contains_range(selected.range()))
-    {
-        return Some((call, index));
-    }
-    let mut arguments = ranges.iter().peekable();
-    let commas = tokens
-        .in_range(call.arguments.range())
-        .iter()
-        .take_while(|token| token.start() <= selected.start())
-        .filter(|token| token.kind() == TokenKind::Comma)
-        .filter(|token| {
-            while arguments
-                .peek()
-                .is_some_and(|range| range.end() <= token.start())
-            {
-                arguments.next();
-            }
-            !arguments
-                .peek()
-                .is_some_and(|range| range.contains_range(token.range()))
-        })
-        .count();
-    Some((call, commas))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::Analysis;
@@ -245,24 +130,28 @@ mod tests {
 
     #[test]
     fn call_and_argument_cursor_boundaries() {
-        for (call, active) in [
-            ("f($0)", Some(0)),
-            ("f(0$0)", Some(0)),
-            ("f(0,$0)", Some(1)),
-            ("f(0,$0 )", Some(1)),
-            ("f(0,,$0)", Some(100)),
-            ("f(lambda x,$0 y: x, 0)", Some(0)),
-            ("f((0,$0 1), 0)", Some(0)),
-            ("f((0)$0, 1)", Some(1)),
-            ("f((0)$0 , 1)", Some(0)),
-            ("f(0, # type: in$0t\n 1)", Some(1)),
-            ("f(x=(0,$0 1), y=0)", Some(0)),
-            ("f(g() $0", Some(0)),
-            ("f(0, g$0())", None),
-            ("f$0()", None),
-            ("f()$0", Some(0)),
+        for (call, expected) in [
+            ("f($0)", Some(("f", 0))),
+            ("f(0$0)", Some(("f", 0))),
+            ("f(0,$0)", Some(("f", 1))),
+            ("f(0,$0 )", Some(("f", 1))),
+            ("f(0,,$0)", Some(("f", 100))),
+            ("f(lambda x,$0 y: x, 0)", Some(("f", 0))),
+            ("f((0,$0 1), 0)", Some(("f", 0))),
+            ("f((0)$0, 1)", Some(("f", 0))),
+            ("f((0)$0 , 1)", Some(("f", 0))),
+            ("f((0),$0 1)", Some(("f", 1))),
+            ("f(0, # type: in$0t\n 1)", Some(("f", 1))),
+            ("f(x=(0,$0 1), y=0)", Some(("f", 0))),
+            ("f(g() $0", Some(("f", 0))),
+            ("f(0, g$0())", Some(("g", 100))),
+            ("f(0, g()$0)", Some(("f", 1))),
+            ("f$0()", Some(("f", 0))),
+            ("f()$0", None),
             ("f()$0 ", None),
             ("f()\n$0", None),
+            ("def nested():\n    f(0, $0)", Some(("f", 1))),
+            ("while True:\n    f($0)", None),
         ] {
             let source = format!("def f(x, y): pass\ndef g(): pass\n{call}");
             let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
@@ -271,10 +160,18 @@ mod tests {
                 .snapshot()
                 .signature_help(FilePosition { file_id, pos })
                 .unwrap();
-            let actual = help
-                .as_ref()
-                .and_then(|help| help.signatures[0].active_parameter);
-            assert_eq!(actual, active, "{call}: {help:?}");
+            let actual = help.as_ref().map(|help| {
+                let [signature] = help.signatures.as_slice() else {
+                    panic!("{call}: {help:?}");
+                };
+                let (name, _) = signature.label.split_once('(').unwrap();
+                (
+                    name.strip_prefix("def ").unwrap(),
+                    signature.active_parameter,
+                )
+            });
+            let expected = expected.map(|(name, active)| (name, Some(active)));
+            assert_eq!(actual, expected, "{call}: {help:?}");
         }
     }
 
