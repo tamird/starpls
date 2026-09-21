@@ -2,13 +2,12 @@
 
 use std::collections::HashSet;
 
+use ruff_db::source::source_text;
 use ruff_python_ast::find_node::covering_node;
-use ruff_python_ast::find_node::CoveringNode;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
-use ruff_python_ast::ExprRef;
 use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
@@ -23,10 +22,11 @@ use starpls_syntax::source::string_value;
 use starpls_syntax::source::suite_range;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+use ty_ide::CompletionCursor;
+use ty_ide::CompletionTarget;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
 use ty_python_core::scope::FileScopeId;
-use ty_python_core::scope::NodeWithScopeRef;
 use ty_python_core::semantic_index;
 use ty_python_semantic::types::ide_support::call_signature_details;
 use ty_python_semantic::types::list_members::all_end_of_scope_members;
@@ -40,8 +40,6 @@ use crate::util::pick_source_token;
 use crate::util::CursorToken;
 use crate::Database;
 use crate::FilePosition;
-
-const COMPLETION_MARKER: &str = "__STARPLS_COMPLETION_MARKER";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompletionItem {
@@ -120,11 +118,10 @@ struct NameRefContext {
     is_in_def: bool,
     is_in_for: bool,
     is_lone_expr: bool,
-    is_loop_variable: bool,
 }
 
 enum StringContext {
-    // A recognized string context must not fall through to marker completion
+    // A recognized string context must not fall through to name completion
     // when its module, dictionary keys, or decoded value are unavailable.
     Unavailable,
     LoadModule {
@@ -164,7 +161,6 @@ pub(crate) fn completions(
             is_lone_expr,
             is_in_def,
             is_in_for,
-            is_loop_variable,
         }) => {
             for name in params {
                 items.push(CompletionItem {
@@ -176,13 +172,11 @@ pub(crate) fn completions(
                 });
             }
 
-            if !is_loop_variable {
-                add_globals(&mut items);
-                items.extend(names);
+            add_globals(&mut items);
+            items.extend(names);
 
-                if is_lone_expr {
-                    add_keywords(&mut items, is_in_def, is_in_for);
-                }
+            if is_lone_expr {
+                add_keywords(&mut items, is_in_def, is_in_for);
             }
         }
         CompletionAnalysis::Name(NameContext::Dot { receiver_ty }) => {
@@ -458,114 +452,6 @@ fn string_context(
     }
 }
 
-/// Completion's marker is not lowered. Follow the source positions represented
-/// by Starlark syntax, excluding Python-only children of otherwise valid nodes.
-fn marker_is_starlark(node: &CoveringNode<'_>, tokens: &Tokens) -> bool {
-    for (child, parent) in node.ancestors().zip(node.ancestors().skip(1)) {
-        if let Some(expr) = child.as_expr_ref() {
-            let wrapper = match expr {
-                ExprRef::Starred(_) => matches!(parent, AnyNodeRef::Arguments(_)),
-                ExprRef::Slice(_) => matches!(parent, AnyNodeRef::ExprSubscript(_)),
-                _ => false,
-            };
-            if !wrapper && !starpls_syntax::supports_expr(expr, tokens) {
-                return false;
-            }
-        }
-        let represented = match parent {
-            AnyNodeRef::StmtFunctionDef(def) => match child {
-                AnyNodeRef::Identifier(_) => true,
-                AnyNodeRef::Parameters(_) => true,
-                _ => suite_range(tokens, &def.body, def.parameters.end(), def.end(), None)
-                    .is_some_and(|range| range.contains_range(child.range())),
-            },
-            AnyNodeRef::StmtIf(stmt) => {
-                child.range() == stmt.test.range()
-                    || matches!(child, AnyNodeRef::ElifElseClause(_))
-                    || suite_range(
-                        tokens,
-                        &stmt.body,
-                        stmt.test.end(),
-                        stmt.end(),
-                        stmt.elif_else_clauses.first().map(Ranged::start),
-                    )
-                    .is_some_and(|range| range.contains_range(child.range()))
-            }
-            AnyNodeRef::ElifElseClause(clause) => {
-                clause
-                    .test
-                    .as_ref()
-                    .is_some_and(|test| test.range() == child.range())
-                    || suite_range(
-                        tokens,
-                        &clause.body,
-                        clause.test.as_ref().map_or(clause.start(), Ranged::end),
-                        clause.end(),
-                        None,
-                    )
-                    .is_some_and(|range| range.contains_range(child.range()))
-            }
-            AnyNodeRef::StmtFor(stmt) => {
-                child.range() == stmt.target.range()
-                    || child.range() == stmt.iter.range()
-                    || (stmt.body.iter().any(|stmt| stmt.range() == child.range())
-                        && suite_range(tokens, &stmt.body, stmt.iter.end(), stmt.end(), None)
-                            .is_some())
-            }
-            AnyNodeRef::StmtAssign(_) => true,
-            AnyNodeRef::StmtAugAssign(_) => true,
-            AnyNodeRef::StmtReturn(_) => true,
-            AnyNodeRef::StmtExpr(stmt) => {
-                if let Expr::Call(call) = stmt.value.as_ref() {
-                    if matches!(call.func.as_ref(), Expr::Name(name) if name.id == "load") {
-                        let alias = call.arguments.keywords.iter().any(|keyword| {
-                            keyword
-                                .arg
-                                .as_ref()
-                                .is_some_and(|arg| arg.range() == node.node().range())
-                        });
-                        if !alias {
-                            return false;
-                        }
-                    }
-                }
-                true
-            }
-            AnyNodeRef::Parameter(param) => !param
-                .annotation
-                .as_ref()
-                .is_some_and(|annotation| annotation.range() == child.range()),
-            AnyNodeRef::ExprDict(dict) => !dict
-                .items
-                .iter()
-                .any(|item| item.key.is_none() && item.value.range() == child.range()),
-            _ => !parent.is_statement(),
-        };
-        if !represented {
-            return false;
-        }
-    }
-    true
-}
-
-/// Reconnect an unaffected receiver or callee from the marker parse. Node
-/// indices are local to each parse, so only the canonical result may be used
-/// for semantic queries. Matching both range and kind rejects recovery changes.
-fn original_expr<'a>(
-    module: &'a ModModule,
-    modified: &Expr,
-    insertion: ruff_text_size::TextSize,
-) -> Option<ExprRef<'a>> {
-    if modified.end() > insertion {
-        return None;
-    }
-    let node = covering_node(module.into(), modified.range());
-    let original = node.ancestors().find(|node| {
-        node.range() == modified.range() && node.kind() == AnyNodeRef::from(modified).kind()
-    })?;
-    original.as_expr_ref()
-}
-
 fn lexical_item(name: String, ty: Option<Type<'_>>) -> CompletionItem {
     CompletionItem {
         label: name,
@@ -622,29 +508,14 @@ fn lexical_names(
     names.into_values().collect()
 }
 
-fn keyword_parameters(
-    model: &SemanticModel<'_>,
-    module: &ModModule,
-    modified: &ruff_python_ast::ExprCall,
-    insertion: ruff_text_size::TextSize,
-) -> Vec<String> {
-    let Some(callee) = original_expr(module, &modified.func, insertion) else {
-        return Vec::new();
-    };
-    let node = covering_node(module.into(), callee.range());
-    let Some(call) = node.ancestors().find_map(|node| match node {
-        AnyNodeRef::ExprCall(call) => (call.func.range() == callee.range()).then_some(call),
-        _ => None,
-    }) else {
-        return Vec::new();
-    };
+fn keyword_parameters(model: &SemanticModel<'_>, call: &ruff_python_ast::ExprCall) -> Vec<String> {
     let mut names = HashSet::new();
     for details in call_signature_details(model, call) {
         for parameter in details.parameters {
             if parameter.is_positional_only
                 || parameter.is_variadic
                 || parameter.is_keyword_variadic
-                || modified.arguments.keywords.iter().any(|keyword| {
+                || call.arguments.keywords.iter().any(|keyword| {
                     keyword
                         .arg
                         .as_ref()
@@ -659,86 +530,6 @@ fn keyword_parameters(
     names.into_iter().collect()
 }
 
-/// The marker parse recovers the cursor's syntactic owner, including trailing
-/// blank suites. Reconnect that owner to this revision's canonical AST before
-/// asking Ty for its scope; enumeration and binding remain in the semantic index.
-fn completion_scope(
-    db: &Database,
-    file: File,
-    module: &ModModule,
-    marker: &CoveringNode<'_>,
-    tokens: &Tokens,
-) -> Option<FileScopeId> {
-    let index = semantic_index(db, db.starlark_program_file(file));
-    let marker_range = marker.node().range();
-    // An existing partial name already has a canonical expression scope. The
-    // recovered owner path is needed only when insertion creates the expression.
-    let original_end = marker_range.end() - ruff_text_size::TextSize::of(COMPLETION_MARKER);
-    let original_range = ruff_text_size::TextRange::new(marker_range.start(), original_end);
-    if !original_range.is_empty() {
-        let node = covering_node(module.into(), original_range);
-        let expression = node.ancestors().find_map(|node| {
-            (node.range() == original_range)
-                .then(|| node.as_expr_ref())
-                .flatten()
-        });
-        if let Some(expression) = expression {
-            if let Some(scope) = index.try_expression_scope_id(&expression) {
-                return Some(scope);
-            }
-        }
-    }
-    for owner in marker.ancestors() {
-        let body = match owner {
-            AnyNodeRef::StmtFunctionDef(function) => suite_range(
-                tokens,
-                &function.body,
-                function.parameters.end(),
-                function.end(),
-                None,
-            )
-            .is_some_and(|range| range.contains_range(marker_range)),
-            AnyNodeRef::ExprLambda(lambda) => lambda.body.range().contains_range(marker_range),
-            AnyNodeRef::ExprListComp(comp) => !comp
-                .generators
-                .first()
-                .is_some_and(|generator| generator.iter.range().contains_range(marker_range)),
-            AnyNodeRef::ExprDictComp(comp) => !comp
-                .generators
-                .first()
-                .is_some_and(|generator| generator.iter.range().contains_range(marker_range)),
-            _ => false,
-        };
-        if !body {
-            continue;
-        }
-        let node = covering_node(
-            module.into(),
-            ruff_text_size::TextRange::empty(owner.start()),
-        );
-        let Some(original) = node
-            .ancestors()
-            .find(|original| original.start() == owner.start() && original.kind() == owner.kind())
-        else {
-            continue;
-        };
-        if index.is_excluded(original.range()) {
-            return None;
-        }
-        let scope_owner = match original {
-            AnyNodeRef::StmtFunctionDef(function) => NodeWithScopeRef::Function(function),
-            AnyNodeRef::ExprLambda(lambda) => NodeWithScopeRef::Lambda(lambda),
-            AnyNodeRef::ExprListComp(comp) => NodeWithScopeRef::ListComprehension(comp),
-            AnyNodeRef::ExprDictComp(comp) => NodeWithScopeRef::DictComprehension(comp),
-            _ => continue,
-        };
-        if let Some(scope) = index.try_node_scope(scope_owner) {
-            return Some(scope);
-        }
-    }
-    Some(FileScopeId::global())
-}
-
 impl<'a> CompletionContext<'a> {
     fn new(
         db: &'a Database,
@@ -746,11 +537,11 @@ impl<'a> CompletionContext<'a> {
         trigger_character: Option<String>,
     ) -> Option<Self> {
         let parsed = parsed_module(db, file).load(db);
-        let source = file.contents(db);
+        let program_file = db.starlark_program_file(file);
+        let source = source_text(db, program_file.file(db));
         let offset = u32::from(pos).into();
-        if semantic_index(db, db.starlark_program_file(file))
-            .is_excluded(ruff_text_size::TextRange::empty(offset))
-        {
+        let index = semantic_index(db, program_file);
+        if index.is_excluded(ruff_text_size::TextRange::empty(offset)) {
             return None;
         }
         if let Some(context) =
@@ -763,102 +554,82 @@ impl<'a> CompletionContext<'a> {
         if matches!(trigger_character.as_deref(), Some("/" | ":" | "@")) {
             return None;
         }
-        let mut text = source.to_string();
-        let insertion = usize::from(pos);
-        if !text.is_char_boundary(insertion) {
+        let cursor = CompletionCursor::new(&parsed, &source, offset)?;
+        if cursor.is_in_string()
+            || cursor
+                .ancestors()
+                .any(|node| index.is_excluded(node.range()))
+        {
             return None;
         }
-        text.insert_str(insertion, COMPLETION_MARKER);
-        let modified = ruff_python_parser::parse_unchecked_source(
-            &text,
-            ruff_python_ast::PySourceType::Python,
-        );
-        let CursorToken::Token(token) = pick_source_token(
-            modified.tokens(),
-            offset,
-            ruff_text_size::TextSize::of(&text),
-            |_| 0,
-        )?
-        else {
-            return None;
-        };
-        let node = covering_node(modified.syntax().into(), token.range());
-        if !marker_is_starlark(&node, modified.tokens()) {
-            return None;
-        }
-        let analysis = match node.node() {
-            AnyNodeRef::ExprName(name) => {
-                let call = match node.parent() {
-                    Some(AnyNodeRef::Arguments(args)) => {
-                        let direct = args.args.iter().any(|arg| {
-                            arg.range() == name.range()
-                                && expr_range(arg, args.into(), modified.tokens()) == name.range()
-                        });
-                        if direct {
-                            node.ancestors().find_map(|node| match node {
-                                AnyNodeRef::ExprCall(call) => Some(call),
-                                _ => None,
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                let model = SemanticModel::new(db, db.starlark_program_file(file));
-                let params = call.map_or_else(Vec::new, |call| {
-                    keyword_parameters(&model, parsed.syntax(), call, offset)
-                });
-                let mut is_in_def = false;
-                let mut is_in_for = false;
-                let mut is_loop_variable = false;
-                for ancestor in node.ancestors() {
-                    match ancestor {
-                        AnyNodeRef::StmtFunctionDef(_) => is_in_def = true,
-                        AnyNodeRef::StmtFor(stmt) => {
-                            is_in_for |= !is_in_def;
-                            is_loop_variable |= stmt.target.range().contains_range(name.range());
-                        }
-                        AnyNodeRef::Comprehension(comp) => {
-                            is_loop_variable |= comp.target.range().contains_range(name.range());
-                        }
-                        _ => {}
-                    }
+        let target = cursor.target()?;
+        for node in cursor.ancestors() {
+            // A recovered Python owner can include syntax that Starlark omits:
+            // function return annotations and for-else clauses.
+            let suite = match node {
+                AnyNodeRef::StmtFunctionDef(function) => (offset > function.parameters.end())
+                    .then_some((function.body.as_slice(), function.parameters.end())),
+                AnyNodeRef::StmtFor(statement) => (offset > statement.iter.end())
+                    .then_some((statement.body.as_slice(), statement.iter.end())),
+                _ => None,
+            };
+            if let Some((body, after)) = suite {
+                if !suite_range(parsed.tokens(), body, after, node.end().max(offset), None)
+                    .is_some_and(|range| range.contains_inclusive(offset))
+                {
+                    return None;
                 }
-                let is_lone_expr = match node.parent() {
-                    Some(AnyNodeRef::StmtExpr(stmt)) => {
-                        expr_range(&stmt.value, stmt.into(), modified.tokens()) == name.range()
-                    }
-                    _ => false,
-                };
-                CompletionAnalysis::NameRef(NameRefContext {
-                    names: lexical_names(
-                        db,
-                        file,
-                        &model,
-                        completion_scope(db, file, parsed.syntax(), &node, modified.tokens())?,
-                    ),
-                    params,
-                    is_in_def,
-                    is_in_for,
-                    is_lone_expr,
-                    is_loop_variable,
-                })
             }
-            AnyNodeRef::Identifier(_) => {
-                let context = match node.parent()? {
-                    AnyNodeRef::ExprAttribute(expr) => {
-                        let receiver = original_expr(parsed.syntax(), &expr.value, offset)?;
-                        let model = SemanticModel::new(db, db.starlark_program_file(file));
-                        NameContext::Dot {
-                            receiver_ty: receiver.inferred_type(&model)?,
+            // Load arguments declare opaque bindings. Only an alias name offers
+            // the empty definition-name completion response.
+            let AnyNodeRef::StmtExpr(statement) = node else {
+                continue;
+            };
+            let Expr::Call(call) = statement.value.as_ref() else {
+                continue;
+            };
+            if !matches!(call.func.as_ref(), Expr::Name(name) if name.id == "load") {
+                continue;
+            }
+            let alias = call.arguments.keywords.iter().any(|keyword| {
+                keyword
+                    .arg
+                    .as_ref()
+                    .is_some_and(|name| name.range().contains_inclusive(offset))
+            });
+            return alias.then_some(Self {
+                analysis: CompletionAnalysis::Name(NameContext::Def),
+            });
+        }
+        let model = SemanticModel::new(db, program_file);
+        let analysis = match target {
+            CompletionTarget::Attribute(attribute) => CompletionAnalysis::Name(NameContext::Dot {
+                receiver_ty: attribute.value.inferred_type(&model)?,
+            }),
+            CompletionTarget::Scoped(_) => {
+                if cursor.is_in_definition_place() {
+                    CompletionAnalysis::Name(NameContext::Def)
+                } else {
+                    let mut is_in_def = false;
+                    let mut is_in_for = false;
+                    for ancestor in cursor.ancestors() {
+                        match ancestor {
+                            AnyNodeRef::StmtFunctionDef(_) => is_in_def = true,
+                            AnyNodeRef::StmtFor(_) => is_in_for |= !is_in_def,
+                            _ => {}
                         }
                     }
-                    _ => NameContext::Def,
-                };
-                CompletionAnalysis::Name(context)
+                    CompletionAnalysis::NameRef(NameRefContext {
+                        names: lexical_names(db, file, &model, cursor.scope(&model)?),
+                        params: cursor
+                            .keyword_call()
+                            .map_or_else(Vec::new, |call| keyword_parameters(&model, call)),
+                        is_in_def,
+                        is_in_for,
+                        is_lone_expr: cursor.is_statement_start(),
+                    })
+                }
             }
-            _ => return None,
         };
         Some(Self { analysis })
     }
@@ -887,7 +658,7 @@ mod tests {
     use crate::FilePosition;
 
     #[test]
-    fn marker_argument_ownership() {
+    fn argument_completion_ownership() {
         for (call, parameters) in [
             ("f($0)", vec!["x=", "y="]),
             ("(f)($0)", vec!["x=", "y="]),
@@ -957,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_scope_reconnects_recovered_owners() {
+    fn lexical_scope_uses_canonical_cursor() {
         let cases: &[(&str, &[&str], &[&str])] = &[
             (
                 "a = 0\nb, c = 1, 2\n[d, e] = [3, 4]\n$0",
@@ -997,6 +768,11 @@ mod tests {
             ),
             ("def empty(param):\n    $0", &["param"], &[]),
             (
+                "global_value = 1\ndef f(param)\n    $0",
+                &["global_value", "f"],
+                &["param"],
+            ),
+            (
                 "global_value = 1\ndef f(param=$0):\n    local = 1\n",
                 &["global_value"],
                 &["param", "local"],
@@ -1033,7 +809,7 @@ mod tests {
                 .completions(FilePosition { file_id, pos }, None)
                 .unwrap()
                 .unwrap();
-            if source.contains("lambda param=$0") {
+            if source.contains("lambda param=$0") || source.contains("def f(param)\n") {
                 assert!(starpls_hir::diagnostics_for_file(&analysis.db, file_id)
                     .any(|diagnostic| diagnostic.is_invalid_syntax()));
             }
@@ -1165,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn original_receiver_follows_edits() {
+    fn canonical_receiver_follows_edits() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         analysis
             .set_builtin_defs(
@@ -1177,10 +953,15 @@ mod tests {
             )
             .unwrap();
         let file_id = fixture.main_file();
-        for (prefix, field) in [("", "first"), ("other = [1, 2]\n", "second"), ("", "first")] {
-            let source = format!("{prefix}obj = struct({field}=1)\n(obj).");
-            let pos = TextSize::try_from(source.len()).unwrap();
-            analysis.update_file(file_id, source);
+        for (prefix, field, member) in [
+            ("", "first", "$0"),
+            ("other = [1, 2]\n", "second", "se$0cond"),
+            ("", "first", "fi$0rst"),
+            ("", "first", "$0"),
+        ] {
+            let source = format!("{prefix}obj = struct({field}=1)\n(obj).{member}");
+            let pos = TextSize::try_from(source.find("$0").unwrap()).unwrap();
+            analysis.update_file(file_id, source.replace("$0", ""));
             let items = analysis
                 .snapshot()
                 .completions(FilePosition { file_id, pos }, None)
@@ -1218,7 +999,8 @@ d["\x$0"]"#,
     }
 
     #[test]
-    fn marker_excludes_ignored_source() {
+    fn cursor_excludes_ignored_source() {
+        let mut unexpected = Vec::new();
         for source in [
             "class C:\n    $0",
             "class C:\n    load(\"m\", al$0ias=\"x\")",
@@ -1228,7 +1010,6 @@ d["\x$0"]"#,
             "def f() -> $0: pass",
             "1 ** $0",
             "{**$0}",
-            "def f()\n    $0",
             "for x in []:\n    pass\nelse:\n    $0",
             "# comment $0",
             "# type: $0",
@@ -1239,19 +1020,31 @@ d["\x$0"]"#,
             let result = analysis
                 .snapshot()
                 .completions(FilePosition { file_id, pos }, None)
-                .unwrap();
-            assert!(result.is_none(), "{source}: {result:?}");
+                .unwrap()
+                .unwrap_or_default();
+            if !result.is_empty() {
+                unexpected.push((
+                    source,
+                    result
+                        .into_iter()
+                        .map(|item| item.label)
+                        .collect::<Vec<_>>(),
+                ));
+            }
         }
+        assert!(unexpected.is_empty(), "{unexpected:#?}");
     }
 
     #[test]
-    fn marker_preserves_names_and_keyword_contexts() {
+    fn cursor_preserves_names_and_keyword_contexts() {
         for (source, names, statements, flow) in [
             ("$0", true, true, vec![]),
             ("($0)", true, false, vec![]),
             ("xs[$0:]", true, false, vec![]),
             ("for $0 in []: pass", false, false, vec![]),
+            ("for first, se$0cond in []: pass", false, false, vec![]),
             ("[x for $0 in []]", false, false, vec![]),
+            ("[x for first, se$0cond in []]", false, false, vec![]),
             ("def f($0): pass", false, false, vec![]),
             (
                 "def f():\n    for x in []:\n        $0",
