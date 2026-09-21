@@ -787,6 +787,12 @@ mod source_tests {
         ) -> anyhow::Result<std::collections::HashMap<String, String>> {
             unimplemented!()
         }
+        fn selected_module(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<starpls_bazel::client::SelectedModule>> {
+            unimplemented!()
+        }
     }
 
     #[test]

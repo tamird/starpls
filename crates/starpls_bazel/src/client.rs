@@ -6,7 +6,9 @@ use std::str;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::Context;
 use parking_lot::RwLock;
+use serde::Deserialize;
 use serde_json::Deserializer;
 
 const DEFAULT_WORKSPACE_NAMES: &[&str] = &["__main__", "_main"];
@@ -18,6 +20,13 @@ pub struct BazelInfo {
     pub starlark_semantics: String,
     pub workspace: PathBuf,
     pub workspace_name: Option<String>,
+}
+
+/// The module selected by Bazel, with a version for registry releases.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelectedModule {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 pub trait BazelClient: Send + Sync + 'static {
@@ -34,6 +43,8 @@ pub trait BazelClient: Send + Sync + 'static {
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>>;
     fn fetch_repo(&self, repo: &str) -> anyhow::Result<()>;
     fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<HashMap<String, String>>;
+    /// Returns None when no module name is available (an extension or unnamed root).
+    fn selected_module(&self, canonical_repo: &str) -> anyhow::Result<Option<SelectedModule>>;
 }
 
 pub struct BazelCLI {
@@ -193,6 +204,118 @@ impl BazelClient for BazelCLI {
             .next()
             .ok_or_else(|| anyhow!("missing repo mapping for repository: {:?}", repo))??)
     }
+
+    fn selected_module(&self, canonical_repo: &str) -> anyhow::Result<Option<SelectedModule>> {
+        let graph = self.run_command([
+            "mod",
+            "graph",
+            &format!("--from=@@{canonical_repo}"),
+            "--depth=1",
+            "--output=json",
+        ]);
+        let graph_error = match graph {
+            Ok(output) => return selected_module_from_graph(&output, canonical_repo),
+            Err(error) => error,
+        };
+        if !canonical_repo.is_empty() {
+            // Extension repositories have no module graph node. Bazel 9's
+            // repository metadata can establish their extension provenance.
+            let output = self
+                .run_command([
+                    "mod",
+                    "show_repo",
+                    &format!("@@{canonical_repo}"),
+                    "--output=streamed_jsonproto",
+                ])
+                .with_context(|| {
+                    format!(
+                "cannot identify @@{canonical_repo}; module graph query failed: {graph_error:#}"
+            )
+                })?;
+            if is_extension_repository(&output, canonical_repo)? {
+                return Ok(None);
+            }
+        }
+        Err(graph_error).with_context(|| format!("cannot identify module for @@{canonical_repo}"))
+    }
+}
+
+fn selected_module_from_graph(
+    output: &[u8],
+    canonical_repo: &str,
+) -> anyhow::Result<Option<SelectedModule>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Graph {
+        key: String,
+        name: Option<String>,
+        dependencies: Vec<Module>,
+        indirect_dependencies: Vec<Module>,
+    }
+    #[derive(Deserialize)]
+    struct Module {
+        key: String,
+    }
+    let Graph {
+        key,
+        name,
+        mut dependencies,
+        indirect_dependencies,
+    } = serde_json::from_slice(output).context("invalid Bazel module graph JSON")?;
+    if key != "<root>" {
+        bail!("expected Bazel module graph root, got {key:?}");
+    }
+    if canonical_repo.is_empty() {
+        return Ok(name
+            .filter(|name| !name.is_empty())
+            .map(|name| SelectedModule {
+                name,
+                version: None,
+            }));
+    }
+    dependencies.extend(indirect_dependencies);
+    let [Module { key }] = dependencies.as_slice() else {
+        bail!("expected one selected module for @@{canonical_repo}");
+    };
+    let Some((name, version)) = key.split_once('@') else {
+        bail!("invalid Bazel module key {key:?}");
+    };
+    if name.is_empty() || version.is_empty() || version.contains('@') {
+        bail!("invalid Bazel module key {key:?}");
+    }
+    // Module keys mark non-registry overrides with `_`. The separate JSON
+    // version field may still contain the override's declared MODULE version.
+    Ok(Some(SelectedModule {
+        name: name.to_owned(),
+        version: (version != "_").then(|| version.to_owned()),
+    }))
+}
+
+fn is_extension_repository(output: &[u8], canonical_repo: &str) -> anyhow::Result<bool> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repository {
+        canonical_name: String,
+        original_name: Option<String>,
+    }
+    let repositories = Deserializer::from_slice(output)
+        .into_iter::<Repository>()
+        .collect::<Result<Vec<_>, _>>()
+        .context("invalid Bazel repository metadata JSON")?;
+    let [Repository {
+        canonical_name,
+        original_name,
+    }] = repositories.as_slice()
+    else {
+        if repositories.is_empty() {
+            return Ok(false);
+        }
+        bail!("expected one repository description for @@{canonical_repo}");
+    };
+    if canonical_name != canonical_repo {
+        bail!("expected repository @@{canonical_repo}, got @@{canonical_name}");
+    }
+    Ok(original_name.as_ref().is_some_and(|name| !name.is_empty()))
 }
 
 impl Default for BazelCLI {
@@ -201,5 +324,137 @@ impl Default for BazelCLI {
             executable: "bazel".into(),
             repo_mappings: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_extension_repository;
+    use super::selected_module_from_graph;
+    use super::SelectedModule;
+
+    #[test]
+    fn module_keys_identify_selected_releases_and_overrides() {
+        for (edge, key, expected) in [
+            ("dependencies", "rules_foo@1.4.1", Some("1.4.1")),
+            ("indirectDependencies", "rules_foo@1.4.1", Some("1.4.1")),
+            ("dependencies", "rules_foo@_", None),
+        ] {
+            let mut graph = serde_json::json!({
+                "key": "<root>", "dependencies": [], "indirectDependencies": []
+            });
+            // Older Bazel versions omit name/version when they agree with key;
+            // overrides can report a declared version different from the key.
+            graph[edge] = serde_json::json!([{"key": key, "version": "1.4.0"}]);
+            let output = serde_json::to_vec(&graph).unwrap();
+            assert_eq!(
+                selected_module_from_graph(&output, "canonical-name").unwrap(),
+                Some(SelectedModule {
+                    name: "rules_foo".to_owned(),
+                    version: expected.map(str::to_owned),
+                }),
+            );
+        }
+        let root = br#"{"key":"<root>","name":"main","version":"1.0.0","dependencies":[],"indirectDependencies":[]}"#;
+        assert_eq!(
+            selected_module_from_graph(root, "").unwrap(),
+            Some(SelectedModule {
+                name: "main".to_owned(),
+                version: None
+            }),
+        );
+        assert!(selected_module_from_graph(root, "missing").is_err());
+        assert!(selected_module_from_graph(b"{}", "missing").is_err());
+        let ambiguous = br#"{"key":"<root>","dependencies":[{"key":"one@1"},{"key":"two@2"}],"indirectDependencies":[]}"#;
+        assert!(selected_module_from_graph(ambiguous, "repo").is_err());
+    }
+
+    #[test]
+    fn nonmodules_require_positive_repository_provenance() {
+        assert!(is_extension_repository(
+            br#"{"canonicalName":"repo","originalName":"generated"}"#,
+            "repo"
+        )
+        .unwrap());
+        for output in [
+            b"".as_slice(),
+            br#"{"canonicalName":"repo"}"#,
+            br#"{"canonicalName":"repo","originalName":""}"#,
+        ] {
+            assert!(!is_extension_repository(output, "repo").unwrap());
+        }
+        for output in [
+            b"{}".as_slice(),
+            br#"{"canonicalName":"other","originalName":"generated"}"#,
+            b"{\"canonicalName\":\"repo\"}\n{\"canonicalName\":\"repo\"}",
+        ] {
+            assert!(is_extension_repository(output, "repo").is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_queries_do_not_imply_an_unversioned_repository() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::BazelCLI;
+        use super::BazelClient;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("selected-module-client");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("bazel");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+case "$2" in
+  graph) response=graph ;;
+  show_repo) response=repository ;;
+  *) exit 99 ;;
+esac
+cat "${0%/*}/$response.json"
+read status < "${0%/*}/$response.status"
+exit "$status"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let response = |name: &str, status: i32, body: &str| {
+            std::fs::write(root.join(format!("{name}.json")), body).unwrap();
+            std::fs::write(root.join(format!("{name}.status")), format!("{status}\n")).unwrap();
+        };
+        let client = BazelCLI::new(&executable);
+        response("graph", 1, "");
+        response(
+            "repository",
+            0,
+            r#"{"canonicalName":"repo","originalName":"extension"}"#,
+        );
+        assert_eq!(client.selected_module("repo").unwrap(), None);
+        response("repository", 0, r#"{"canonicalName":"repo"}"#);
+        assert!(client.selected_module("repo").is_err());
+        response("repository", 1, "");
+        assert!(client.selected_module("repo").is_err());
+        response("graph", 0, "malformed graph JSON");
+        response(
+            "repository",
+            0,
+            r#"{"canonicalName":"repo","originalName":"extension"}"#,
+        );
+        assert!(client.selected_module("repo").is_err());
+        response(
+            "graph",
+            0,
+            r#"{"key":"<root>","dependencies":[{"key":"rules@1.2.0"}],"indirectDependencies":[]}"#,
+        );
+        response("repository", 1, "");
+        assert_eq!(
+            client.selected_module("repo").unwrap(),
+            Some(SelectedModule {
+                name: "rules".to_owned(),
+                version: Some("1.2.0".to_owned()),
+            })
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
