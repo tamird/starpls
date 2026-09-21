@@ -64,6 +64,15 @@ static DEPRECATED_ARGUMENT: LintMetadata = lint(
     "Reports deprecated arguments to Starlark builtins.",
 );
 
+pub(super) static INVALID_STUB_IMPLEMENTATION: LintMetadata = lint(
+    "invalid-stub-implementation",
+    "Reports implementations incompatible with their stubs.",
+);
+pub(super) static INCOMPLETE_STUB_VALIDATION: LintMetadata = lint(
+    "incomplete-stub-validation",
+    "Reports stub contracts that could not be proved.",
+);
+
 pub(super) fn registry() -> &'static LintRegistry {
     static REGISTRY: LazyLock<LintRegistry> = LazyLock::new(|| {
         let mut builder =
@@ -73,6 +82,8 @@ pub(super) fn registry() -> &'static LintRegistry {
             &UNUSED_DEFINITION,
             &UNREACHABLE_CODE,
             &DEPRECATED_ARGUMENT,
+            &INVALID_STUB_IMPLEMENTATION,
+            &INCOMPLETE_STUB_VALIDATION,
         ] {
             builder.register_lint(lint);
         }
@@ -106,11 +117,36 @@ pub(super) fn rules(use_code_flow_analysis: bool) -> RuleSelection {
     rules
 }
 
+pub(super) fn validation_rules() -> RuleSelection {
+    let mut rules = rules(true);
+    for name in [
+        "unsound-return-statement",
+        "unsound-assignment",
+        "invalid-stub-implementation",
+        "incomplete-stub-validation",
+    ] {
+        rules.enable(
+            registry().get(name).expect("validation lint is registered"),
+            Severity::Error,
+            LintSource::Default,
+        );
+    }
+    rules
+}
+
 pub(crate) fn check(db: &Database, file: File) -> Vec<Diagnostic> {
+    check_with_diagnostics(db, file, Vec::new())
+}
+
+pub(super) fn check_with_diagnostics(
+    db: &Database,
+    file: File,
+    mut diagnostics: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
     let program_file = db.starlark_program_file(file);
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let options = db.environment().options(db);
-    let mut diagnostics = load::diagnostics(db, program_file);
+    diagnostics.extend(load::diagnostics(db, program_file));
     if !options.allow_unused_definitions {
         let index = semantic_index(db, program_file);
         for definition in unused_definitions(db, program_file) {

@@ -139,7 +139,7 @@ impl Database {
     }
 }
 
-fn export_definitions<'db>(
+pub(super) fn export_definitions<'db>(
     db: &'db Database,
     file: ProgramFile<'db>,
     name: &str,

@@ -22,6 +22,22 @@ when present and source inference otherwise. Annotations are resolved in the
 stub's scope. Stubs are trusted contracts; implementation validation is a
 separate check.
 
+## Implementation validation
+
+`starpls check --validate-stubs` checks the selected implementations against their
+stub exports. Missing function annotations come from the stub's scope. Source
+annotations, parameter names, parameter kinds, and defaults determine the
+implementation signature. Exported functions are followed through explicit
+reexports to check their bodies; variables use their inferred types.
+
+Missing exports and incompatible types are errors. Compatibility that depends on
+dynamic types and unsupported function correspondence produce an
+incomplete-validation error. Matching
+variadic parameters are supported. Generic, overloaded, and conflicting function
+contracts produce an incomplete result. `--ignore_pattern` selects implementation
+files and reexported bodies to exclude. Callers use the trusted stub contracts
+independently of validation results.
+
 ## Packaging
 
 Projects obtain source and stub repositories through Bazel dependencies and

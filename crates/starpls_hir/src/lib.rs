@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use starpls_bazel::Builtins;
 use starpls_common::Dialect;
 use starpls_common::File;
@@ -51,6 +52,16 @@ pub trait Db: starpls_common::Db {
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>>;
 }
 
+/// Syntax correspondence used by a synchronous stub validation pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StubValidation {
+    pub annotations: FxHashMap<
+        (ruff_db::files::File, ruff_python_ast::NodeIndex),
+        (File, ruff_python_ast::NodeIndex),
+    >,
+    pub files: FxHashSet<ruff_db::files::File>,
+}
+
 /// Inputs shared by semantic queries. Input identities remain stable when the
 /// host changes configuration or discovers previously unavailable modules.
 #[salsa::input(debug)]
@@ -69,6 +80,8 @@ pub struct Environment {
     pub load_revision: u64,
     #[returns(ref)]
     pub type_interfaces: FxHashMap<ruff_db::files::File, (File, File)>,
+    #[returns(ref)]
+    pub stub_validation: StubValidation,
 }
 
 impl Environment {
@@ -84,6 +97,7 @@ impl Environment {
             Arc::default(),
             0,
             FxHashMap::default(),
+            StubValidation::default(),
         )
     }
 

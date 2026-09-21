@@ -135,6 +135,13 @@ Names loaded from the mapped `.bzl` module use stub declarations when present an
 inference otherwise. Stubs may load provider types for use in annotations. Function bodies
 use `...` or `pass`, and optional defaults use `= ...`.
 
+Validate the registered implementations with `starpls check --validate-stubs`.
+The check borrows missing function annotations from each stub, checks the body,
+and compares exported types. Errors distinguish incompatible implementations
+from contracts that cannot be proved, including dynamic types and unsupported
+parameter correspondence. `--ignore_pattern` excludes matching implementation
+files or directories. Caller checking continues to use the selected stubs.
+
 ## Experimental features
 
 Starpls has a number of experimental features that can be enabled via command-line arguments:

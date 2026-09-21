@@ -1,0 +1,866 @@
+//! Check selected implementations with annotations borrowed from trusted stubs.
+
+use std::collections::hash_map::Entry;
+use std::panic::AssertUnwindSafe;
+
+use ruff_db::diagnostic::Annotation;
+use ruff_db::diagnostic::Diagnostic;
+use ruff_db::diagnostic::DiagnosticId;
+use ruff_db::diagnostic::Severity;
+use ruff_db::diagnostic::Span;
+use ruff_python_ast::name::Name;
+use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::Parameter;
+use ruff_python_ast::StmtFunctionDef;
+use ruff_text_size::TextRange;
+use rustc_hash::FxHashMap;
+use salsa::Setter;
+use starpls_common::File;
+use starpls_hir::Db as _;
+use starpls_hir::StubValidation;
+use ty_python_core::definition::Definition;
+use ty_python_core::definition::DefinitionKind;
+use ty_python_core::definition::DefinitionNodeKey;
+use ty_python_core::global_scope;
+use ty_python_core::place_table;
+use ty_python_core::semantic_index;
+use ty_python_core::use_def_map;
+use ty_python_core::ProgramFile;
+use ty_python_semantic::provided::ProvidedBindingValue;
+use ty_python_semantic::types::CallableTypeKind;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::types::TypeDefinition;
+use ty_python_semantic::SemanticModel;
+
+use super::diagnostics::INCOMPLETE_STUB_VALIDATION;
+use super::diagnostics::INVALID_STUB_IMPLEMENTATION;
+use super::interface::export_definitions;
+use crate::Analysis;
+use crate::Cancellable;
+use crate::Database;
+
+type Reports = FxHashMap<File, Vec<Diagnostic>>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Function {
+    file: File,
+    key: DefinitionNodeKey,
+}
+
+struct ValueContract {
+    source: File,
+    stub: File,
+    name: Name,
+    range: TextRange,
+}
+
+struct Contract {
+    source: Function,
+    stub: Function,
+    name: Name,
+    range: TextRange,
+}
+
+impl Analysis {
+    /// Validate selected registered implementations without changing caller contracts.
+    /// Syntax correspondence is scoped to this operation and rebuilt after every edit.
+    pub fn validate_stubs(
+        &mut self,
+        selected: impl Fn(&std::path::Path) -> bool,
+    ) -> Cancellable<Vec<(File, Vec<Diagnostic>)>> {
+        let Self { db } = self;
+        let environment = db.environment();
+        let interfaces = environment.type_interfaces(db).clone();
+        let previous = environment.stub_validation(db).clone();
+        let sources: Vec<_> = interfaces
+            .values()
+            .map(|(source, _)| *source)
+            .filter(|source| selected(source.path(db)))
+            .collect();
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            environment.set_type_interfaces(db).to(FxHashMap::default());
+            environment
+                .set_stub_validation(db)
+                .to(StubValidation::default());
+            let mut reports = Reports::default();
+            let mut contracts = Vec::new();
+            let mut values = Vec::new();
+            for source in &sources {
+                let Some(&(_, stub)) = interfaces.get(&source.source) else {
+                    continue;
+                };
+                reports.entry(*source).or_default();
+                reports.entry(stub).or_default();
+                discover(
+                    db,
+                    *source,
+                    stub,
+                    &selected,
+                    &mut contracts,
+                    &mut values,
+                    &mut reports,
+                );
+            }
+            let mut owners = FxHashMap::default();
+            for contract in &contracts {
+                match owners.entry(contract.source) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(Ok(contract.stub));
+                    }
+                    Entry::Occupied(mut entry) => {
+                        if *entry.get() != Ok(contract.stub) {
+                            *entry.get_mut() = Err("the same function has multiple stub contracts");
+                        }
+                    }
+                }
+            }
+            let mut validation = StubValidation::default();
+            for (&source, owner) in &mut owners {
+                if let Ok(stub) = *owner {
+                    if let Err(reason) = annotations(db, source, stub, &mut validation) {
+                        *owner = Err(reason);
+                    }
+                }
+            }
+            for contract in &contracts {
+                let Contract {
+                    source,
+                    stub,
+                    name,
+                    range,
+                } = contract;
+                reports.entry(source.file).or_default();
+                if let Err(reason) = owners[source] {
+                    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+                    if let Err(ContractError::Incompatible(message)) = compare_function(
+                        db,
+                        source.file,
+                        name,
+                        model.definition_type(function_definition(db, *source)),
+                        model.definition_type(function_definition(db, *stub)),
+                    ) {
+                        report(&mut reports, source.file, *range, false, message);
+                    }
+                    report(
+                        &mut reports,
+                        source.file,
+                        *range,
+                        true,
+                        format!("Cannot validate `{name}`: {reason}"),
+                    );
+                }
+            }
+            validation
+                .files
+                .extend(reports.keys().map(|file| file.source));
+            environment.set_stub_validation(db).to(validation);
+            // Infer exported values from source with the borrowed signatures installed.
+            // Keeping redirection disabled here avoids proving a reexport against itself.
+            for value in values {
+                let ValueContract {
+                    source,
+                    stub,
+                    name,
+                    range,
+                } = value;
+                let actual = ProvidedBindingValue::Export {
+                    file: db.starlark_program_file(source),
+                    name: name.clone(),
+                }
+                .resolve_type(db);
+                let expected = ProvidedBindingValue::Export {
+                    file: db.starlark_program_file(stub),
+                    name: name.clone(),
+                }
+                .resolve_type(db);
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    if let Err(error) = compare(db, stub, &name, actual, expected) {
+                        error.report(&mut reports, stub, range);
+                    }
+                } else {
+                    report(
+                        &mut reports,
+                        stub,
+                        range,
+                        true,
+                        format!("Cannot resolve the contract for `{name}`"),
+                    );
+                }
+            }
+            environment.set_type_interfaces(db).to(interfaces.clone());
+            for contract in contracts {
+                let Contract {
+                    source,
+                    stub,
+                    name,
+                    range,
+                } = contract;
+                if owners[&source].is_err() {
+                    continue;
+                }
+                let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+                let actual = model.definition_type(function_definition(db, source));
+                let expected = model.definition_type(function_definition(db, stub));
+                if let Err(error) = compare_function(db, source.file, &name, actual, expected) {
+                    error.report(&mut reports, source.file, range);
+                }
+            }
+            let mut reports: Vec<_> = reports
+                .into_iter()
+                .map(|(file, diagnostics)| {
+                    let mut checked: Vec<_> = starpls_hir::diagnostics_for_file(db, file)
+                        .take(128)
+                        .collect();
+                    checked.extend(super::diagnostics::check_with_diagnostics(
+                        db,
+                        file,
+                        diagnostics,
+                    ));
+                    (file, checked)
+                })
+                .collect();
+            reports.sort_by(|(left, _), (right, _)| left.path(db).cmp(right.path(db)));
+            reports
+        }));
+        environment.set_type_interfaces(db).to(interfaces);
+        environment.set_stub_validation(db).to(previous);
+        salsa::Cancelled::catch(AssertUnwindSafe(|| match result {
+            Ok(reports) => reports,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }))
+    }
+}
+
+fn discover(
+    db: &Database,
+    source: File,
+    stub: File,
+    selected: &impl Fn(&std::path::Path) -> bool,
+    contracts: &mut Vec<Contract>,
+    values: &mut Vec<ValueContract>,
+    reports: &mut Reports,
+) {
+    let stub_program = db.starlark_program_file(stub);
+    let source_program = db.starlark_program_file(source);
+    let table = place_table(db, global_scope(db, stub_program));
+    let model = SemanticModel::new(db, source_program);
+    for symbol in table.symbols() {
+        let name = symbol.name();
+        if name.starts_with('_') {
+            continue;
+        }
+        let definitions = export_definitions(db, stub_program, name);
+        let Some(declaration) = definitions.first() else {
+            continue;
+        };
+        let parsed = ruff_db::parsed::parsed_module(db, stub_program.python_file(db)).load(db);
+        let range = declaration.kind(db).target_range(&parsed);
+        let actual_definitions = export_definitions(db, source_program, name);
+        if actual_definitions.is_empty() {
+            report(
+                reports,
+                stub,
+                range,
+                false,
+                format!("Implementation does not export `{name}`"),
+            );
+            continue;
+        }
+        if !definitely_bound(db, source_program, name) {
+            report(
+                reports,
+                stub,
+                range,
+                true,
+                format!("Cannot validate `{name}`: the implementation may leave it undefined"),
+            );
+            continue;
+        }
+        let expected = ProvidedBindingValue::Export {
+            file: stub_program,
+            name: name.clone(),
+        }
+        .resolve_type(db);
+        let actual = ProvidedBindingValue::Export {
+            file: source_program,
+            name: name.clone(),
+        }
+        .resolve_type(db);
+        let (Some(actual), Some(expected)) = (actual, expected) else {
+            report(
+                reports,
+                stub,
+                range,
+                true,
+                format!("Cannot resolve the contract for `{name}`"),
+            );
+            continue;
+        };
+        if let Some(TypeDefinition::Function(stub_definition)) =
+            expected.definition(db, &model.program_environment())
+        {
+            let Some(TypeDefinition::Function(source_definition)) =
+                actual.definition(db, &model.program_environment())
+            else {
+                if let Err(ContractError::Incompatible(message)) =
+                    compare_function(db, stub, name, actual, expected)
+                {
+                    report(reports, stub, range, false, message);
+                }
+                report(
+                    reports,
+                    stub,
+                    range,
+                    true,
+                    format!("Cannot validate `{name}`: no single implementation function"),
+                );
+                continue;
+            };
+            let (Some(source_function), Some(stub_function)) = (
+                function(db, source_definition),
+                function(db, stub_definition),
+            ) else {
+                report(
+                    reports,
+                    stub,
+                    range,
+                    true,
+                    format!("Cannot validate `{name}`: function source is unavailable"),
+                );
+                continue;
+            };
+            if !selected(source_function.file.path(db)) {
+                continue;
+            }
+            let parsed =
+                ruff_db::parsed::parsed_module(db, source_definition.python_file(db)).load(db);
+            contracts.push(Contract {
+                source: source_function,
+                stub: stub_function,
+                name: name.clone(),
+                range: source_definition.kind(db).target_range(&parsed),
+            });
+        } else {
+            values.push(ValueContract {
+                source,
+                stub,
+                name: name.clone(),
+                range,
+            });
+        }
+    }
+}
+
+fn definitely_bound(db: &Database, file: ProgramFile<'_>, name: &str) -> bool {
+    let scope = global_scope(db, file);
+    let Some(symbol) = place_table(db, scope).symbol_id(name) else {
+        return false;
+    };
+    use_def_map(db, scope)
+        .end_of_scope_symbol_bindings(symbol)
+        .all(|binding| binding.binding.definition().is_some())
+}
+
+fn function(db: &Database, definition: Definition<'_>) -> Option<Function> {
+    let DefinitionKind::Function(kind) = definition.kind(db) else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    Some(Function {
+        file: db.starlark_file(definition.program_file(db))?,
+        key: kind.node(&parsed).into(),
+    })
+}
+
+fn function_definition(db: &Database, function: Function) -> Definition<'_> {
+    let Function { file, key } = function;
+    let [definition] = semantic_index(db, db.starlark_program_file(file)).definitions(key) else {
+        unreachable!("a function syntax node has one definition")
+    };
+    *definition
+}
+
+fn annotations(
+    db: &Database,
+    source: Function,
+    stub: Function,
+    validation: &mut StubValidation,
+) -> Result<(), &'static str> {
+    let source_definition = function_definition(db, source);
+    let stub_definition = function_definition(db, stub);
+    let DefinitionKind::Function(source_kind) = source_definition.kind(db) else {
+        unreachable!()
+    };
+    let DefinitionKind::Function(stub_kind) = stub_definition.kind(db) else {
+        unreachable!()
+    };
+    let source_parsed =
+        ruff_db::parsed::parsed_module(db, source_definition.python_file(db)).load(db);
+    let stub_parsed = ruff_db::parsed::parsed_module(db, stub_definition.python_file(db)).load(db);
+    let source_node = source_kind.node(&source_parsed);
+    let stub_node = stub_kind.node(&stub_parsed);
+    if source_node.type_params.is_some()
+        || stub_node.type_params.is_some()
+        || source_kind.has_decorators()
+        || stub_kind.has_decorators()
+    {
+        return Err("generic or decorated functions require a dedicated implementation contract");
+    }
+    let pairs = parameter_pairs(source_node, stub_node)?;
+    if stub_node.returns.is_some() {
+        validation.annotations.insert(
+            (source.file.source, source_node.node_index().load()),
+            (stub.file, stub_node.node_index().load()),
+        );
+    }
+    for (parameter, annotation) in pairs {
+        if annotation.annotation.is_none() {
+            continue;
+        }
+        validation.annotations.insert(
+            (source.file.source, parameter.node_index().load()),
+            (stub.file, annotation.node_index().load()),
+        );
+    }
+    Ok(())
+}
+
+fn parameter_pairs<'a>(
+    source: &'a StmtFunctionDef,
+    stub: &'a StmtFunctionDef,
+) -> Result<Vec<(&'a Parameter, &'a Parameter)>, &'static str> {
+    let source = &source.parameters;
+    let stub = &stub.parameters;
+    if source.posonlyargs.len() != stub.posonlyargs.len()
+        || source.args.len() != stub.args.len()
+        || source.kwonlyargs.len() != stub.kwonlyargs.len()
+        || source.vararg.is_some() != stub.vararg.is_some()
+        || source.kwarg.is_some() != stub.kwarg.is_some()
+    {
+        return Err("parameter layouts differ");
+    }
+    let mut pairs: Vec<_> = source
+        .posonlyargs
+        .iter()
+        .chain(&source.args)
+        .zip(stub.posonlyargs.iter().chain(&stub.args))
+        .map(|(source, stub)| (&source.parameter, &stub.parameter))
+        .collect();
+    for parameter in &source.kwonlyargs {
+        let Some(annotation) = stub
+            .kwonlyargs
+            .iter()
+            .find(|stub| stub.parameter.name == parameter.parameter.name)
+        else {
+            return Err("keyword-only parameter names differ");
+        };
+        pairs.push((&parameter.parameter, &annotation.parameter));
+    }
+    if let (Some(source), Some(stub)) = (&source.vararg, &stub.vararg) {
+        pairs.push((source, stub));
+    }
+    if let (Some(source), Some(stub)) = (&source.kwarg, &stub.kwarg) {
+        pairs.push((source, stub));
+    }
+    Ok(pairs)
+}
+
+enum ContractError {
+    Incompatible(String),
+    Incomplete(String),
+}
+
+impl ContractError {
+    fn report(self, reports: &mut Reports, file: File, range: TextRange) {
+        match self {
+            Self::Incompatible(message) => report(reports, file, range, false, message),
+            Self::Incomplete(message) => report(reports, file, range, true, message),
+        }
+    }
+}
+
+fn compare_function<'db>(
+    db: &'db Database,
+    file: File,
+    name: &str,
+    actual: Type<'db>,
+    expected: Type<'db>,
+) -> Result<(), ContractError> {
+    let model = SemanticModel::new(db, db.starlark_program_file(file));
+    let environment = model.program_environment();
+    // A stub function declares a callable contract, not a particular function object.
+    let signature = |ty: Type<'db>| {
+        ty.map_callable_signatures(
+            db,
+            &environment,
+            CallableTypeKind::FunctionLike,
+            std::convert::identity,
+        )
+        .unwrap_or(ty)
+    };
+    compare(db, file, name, signature(actual), signature(expected))
+}
+
+fn compare<'db>(
+    db: &'db Database,
+    file: File,
+    name: &str,
+    actual: Type<'db>,
+    expected: Type<'db>,
+) -> Result<(), ContractError> {
+    let model = SemanticModel::new(db, db.starlark_program_file(file));
+    let environment = model.program_environment();
+    if !actual.is_assignable_to(db, &environment, expected) {
+        Err(ContractError::Incompatible(format!(
+            "Implementation of `{name}` has type `{}`, which is not assignable to `{}`",
+            actual.display(db, &environment),
+            expected.display(db, &environment)
+        )))
+    } else if !actual.is_subtype_of(db, &environment, expected) {
+        Err(ContractError::Incomplete(format!(
+            "Cannot prove `{name}`: compatibility depends on dynamic or unresolved types"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn report(reports: &mut Reports, file: File, range: TextRange, incomplete: bool, message: String) {
+    let lint = if incomplete {
+        &INCOMPLETE_STUB_VALIDATION
+    } else {
+        &INVALID_STUB_IMPLEMENTATION
+    };
+    let mut diagnostic = Diagnostic::new(DiagnosticId::Lint(lint.name()), Severity::Error, message);
+    diagnostic.annotate(Annotation::primary(
+        Span::from(file.source).with_range(range),
+    ));
+    reports.entry(file).or_default().push(diagnostic);
+}
+
+#[cfg(test)]
+mod tests {
+    use starpls_hir::Db as _;
+    use starpls_hir::Fixture;
+
+    use crate::Analysis;
+
+    fn validate(source: &str, stub: &str) -> Vec<String> {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", source);
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", stub);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        let diagnostics: Vec<_> = reports
+            .into_iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .collect();
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.id().as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn borrowed_annotations_check_bodies_and_source_signatures() {
+        for (source, expected) in [
+            ("def compute(value):\n    return value + 1\n", None),
+            ("compute = 1\n", Some("invalid-stub-implementation")),
+            (
+                "def compute(value):\n    return 'bad'\n",
+                Some("invalid-return-type"),
+            ),
+            (
+                "def compute(value):\n    return value + 'bad'\n",
+                Some("unsupported-operator"),
+            ),
+            (
+                "def compute(value='bad'):\n    return value\n",
+                Some("invalid-parameter-default"),
+            ),
+            (
+                "def compute(renamed):\n    return renamed\n",
+                Some("invalid-stub-implementation"),
+            ),
+            (
+                "def compute(value: string) -> string:\n    return value\n",
+                Some("invalid-stub-implementation"),
+            ),
+            (
+                "def compute(*args, **kwargs):\n    return 1\n",
+                Some("incomplete-stub-validation"),
+            ),
+        ] {
+            let diagnostics = validate(source, "def compute(value: int) -> int: ...\n");
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+        let diagnostics = validate(
+            "compute = lambda value: 1\n",
+            "def compute(value: int) -> int: ...\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|id| id == "invalid-stub-implementation"),
+            "{diagnostics:?}"
+        );
+        assert!(validate(
+            "def compute(*args, **kwargs):\n    return len(args) + len(kwargs)\n",
+            "def compute(*args: int, **kwargs: string) -> int: ...\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn variable_contracts_and_unknown_evidence() {
+        for (source, stub, expected) in [
+            ("value = 1\n", "value: int\n", None),
+            ("def helper(value):\n    return value\nvalue = helper(1)\n", "def helper(value: int) -> int: ...\nvalue: int\n", None),
+            ("value = 'bad'\n", "value: int\n", Some("invalid-stub-implementation")),
+            ("other = 1\n", "value: int\n", Some("invalid-stub-implementation")),
+            ("def helper(value):\n    return value\nvalue = helper(1)\n", "value: int\n", Some("incomplete-stub-validation")),
+            ("def helper(value):\n    return value\ndef compute(value):\n    return helper(value)\n", "def compute(value: int) -> int: ...\n", Some("unsound-return-statement")),
+        ] {
+            let diagnostics = validate(source, stub);
+            if let Some(expected) = expected { assert!(diagnostics.iter().any(|id| id == expected), "{source}: {diagnostics:?}"); }
+            else { assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}"); }
+        }
+    }
+
+    #[test]
+    fn reexports_find_the_body_and_restore_caller_contracts() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let body = fixture.add_file(
+            &mut analysis.db,
+            "body.bzl",
+            "def compute(value):\n    return 'bad'\n",
+        );
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "load('body.bzl', _compute='compute')\ncompute = _compute\n",
+        );
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "def compute(value: int) -> int: ...\n",
+        );
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "caller.bzl",
+            "load('source.bzl', 'compute')\nvalue = compute('bad')\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        for (body_text, valid) in [
+            ("def compute(value):\n    return 'bad'\n", false),
+            ("def compute(value):\n    return value\n", true),
+        ] {
+            analysis.update_file(body, body_text.to_owned());
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let diagnostics: Vec<_> = reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .collect();
+            assert_eq!(diagnostics.is_empty(), valid, "{diagnostics:?}");
+            if !valid {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+                    "{diagnostics:?}"
+                );
+            }
+            assert!(analysis
+                .db
+                .environment()
+                .stub_validation(&analysis.db)
+                .annotations
+                .is_empty());
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+        }
+    }
+
+    #[test]
+    fn absent_annotations_remain_unproved() {
+        let diagnostics = validate(
+            "def compute(value):\n    return value\n",
+            "def compute(value): ...\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        let diagnostics = validate(
+            "def helper(value):\n    return value\nvalue = [helper(1)]\n",
+            "value: list[int]\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn stub_annotations_keep_their_nominal_scope() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "Info = provider(fields=[])\ndef consume(value):\n    return value\n",
+        );
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "load('source.bzl', Original='Info')\ndef consume(value: Original) -> Original: ...\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        assert!(
+            reports
+                .iter()
+                .all(|(_, diagnostics)| diagnostics.is_empty()),
+            "{reports:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_failures_and_excluded_bodies_preserve_contracts() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let body = fixture.add_file(
+            &mut analysis.db,
+            "body.bzl",
+            "def compute(value):\n    return 'bad'\n",
+        );
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "load('body.bzl', 'compute')\n",
+        );
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "def compute(value: int) -> int: ...\n",
+        );
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "caller.bzl",
+            "load('source.bzl', 'compute')\nvalue = compute(1)\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        assert!(
+            reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-stub-implementation"),
+            "{reports:?}"
+        );
+        analysis.update_file(
+            source,
+            "load('body.bzl', _compute='compute')\ncompute = _compute\n".to_owned(),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            analysis.validate_stubs(|path| {
+                assert_ne!(
+                    path.file_name().unwrap(),
+                    "body.bzl",
+                    "interrupt correspondence discovery"
+                );
+                true
+            })
+        }));
+        assert!(panic.is_err());
+        assert!(analysis.snapshot().diagnostics(caller).unwrap().is_empty());
+        assert!(analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .annotations
+            .is_empty());
+        analysis.update_file(
+            source,
+            "load('missing.bzl', _compute='compute')\ncompute = _compute\n".to_owned(),
+        );
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        assert!(
+            reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .any(|diagnostic| diagnostic.id().as_str() == "load-error"),
+            "{reports:?}"
+        );
+        analysis.update_file(
+            source,
+            "load('body.bzl', _compute='compute')\ncompute = _compute\n".to_owned(),
+        );
+        let reports = analysis
+            .validate_stubs(|path| path.file_name().unwrap() != "body.bzl")
+            .unwrap();
+        assert!(!reports.iter().any(|(file, _)| *file == body));
+        assert!(
+            reports
+                .iter()
+                .all(|(_, diagnostics)| diagnostics.is_empty()),
+            "{reports:?}"
+        );
+        assert!(analysis.snapshot().diagnostics(caller).unwrap().is_empty());
+        assert!(analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .annotations
+            .is_empty());
+    }
+
+    #[test]
+    fn ambiguous_contracts_do_not_choose_one_annotation() {
+        let diagnostics = validate("def implementation(value):\n    return value\nfirst = implementation\nsecond = implementation\n", "def first(value: int) -> int: ...\ndef second(value: string) -> string: ...\n");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|id| *id == "incomplete-stub-validation")
+                .count(),
+            2,
+            "{diagnostics:?}"
+        );
+    }
+}

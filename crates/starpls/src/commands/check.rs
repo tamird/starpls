@@ -8,6 +8,7 @@ use annotate_snippets::Renderer;
 use anyhow::anyhow;
 use anyhow::bail;
 use clap::Args;
+use ruff_db::diagnostic::Diagnostic;
 use ruff_db::diagnostic::DisplayDiagnosticConfig;
 use starpls_bazel::client::BazelCLI;
 use starpls_bazel::client::BazelInfo;
@@ -30,6 +31,10 @@ use crate::server::load_bazel_builtins;
 pub(crate) struct CheckCommand {
     /// Paths to typecheck.
     pub(crate) paths: Vec<String>,
+
+    /// Check registered implementations against their stubs, including function bodies.
+    #[clap(long)]
+    pub(crate) validate_stubs: bool,
 
     /// Path to the Bazel output base.
     #[clap(long = "output_base")]
@@ -90,7 +95,9 @@ impl CheckCommand {
             .chain(["star", "sky"])
             .collect::<Vec<_>>();
 
-        let checker = Checker::new(
+        let ignore_patterns = self.ignore_patterns.clone();
+
+        let mut checker = Checker::new(
             analysis,
             bazel_cx.info,
             self.paths,
@@ -98,7 +105,7 @@ impl CheckCommand {
             &extensions,
             loader,
         )?;
-        checker.report_diagnostics()
+        checker.report_diagnostics(self.validate_stubs, &ignore_patterns)
     }
 }
 
@@ -108,6 +115,10 @@ struct Checker {
     files: indexmap::IndexSet<File>,
     ignored_files: HashSet<PathBuf>,
     loader: Arc<DefaultFileLoader>,
+}
+
+fn is_ignored_name(name: &std::ffi::OsStr, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| name == pattern.as_str())
 }
 
 fn is_hidden(entry: &DirEntry) -> bool {
@@ -143,10 +154,7 @@ impl Checker {
             .extend(checker.analysis.type_interface_files());
         for path in paths {
             for entry in WalkDir::new(&path).into_iter().filter_entry(|e| {
-                !is_hidden(e)
-                    && !ignore_patterns
-                        .iter()
-                        .any(|pat| e.file_name().to_str().map(|s| s == pat).unwrap_or(false))
+                !is_hidden(e) && !is_ignored_name(e.file_name(), &ignore_patterns)
             }) {
                 let entry = entry?;
                 if entry.file_type().is_file() {
@@ -204,15 +212,13 @@ impl Checker {
     }
 
     fn report_diagnostics_for_file(
-        &self,
         snapshot: &AnalysisSnapshot,
-        file_id: File,
+        diagnostics: &[Diagnostic],
         num_errors: &mut usize,
         num_warnings: &mut usize,
         num_infos: &mut usize,
     ) -> anyhow::Result<()> {
-        let diagnostics = snapshot.diagnostics(file_id)?;
-        for diagnostic in &diagnostics {
+        for diagnostic in diagnostics {
             match diagnostic.severity() {
                 Severity::Info => *num_infos += 1,
                 Severity::Warning => *num_warnings += 1,
@@ -221,11 +227,25 @@ impl Checker {
             }
         }
         let config = DisplayDiagnosticConfig::new("starpls").color(true);
-        anstream::print!("{}", snapshot.render_diagnostics(&diagnostics, &config)?);
+        anstream::print!("{}", snapshot.render_diagnostics(diagnostics, &config)?);
         Ok(())
     }
 
-    fn report_diagnostics(&self) -> anyhow::Result<()> {
+    fn report_diagnostics(
+        &mut self,
+        validate_stubs: bool,
+        ignore_patterns: &[String],
+    ) -> anyhow::Result<()> {
+        let validated = if validate_stubs {
+            self.analysis.validate_stubs(|path| {
+                !path
+                    .components()
+                    .any(|component| is_ignored_name(component.as_os_str(), ignore_patterns))
+            })?
+        } else {
+            Vec::new()
+        };
+        let validated_files: HashSet<_> = validated.iter().map(|(file, _)| *file).collect();
         let snapshot = self.analysis.snapshot();
         let mut num_errors = 0;
         let mut num_warnings = 0;
@@ -245,9 +265,23 @@ impl Checker {
         }
 
         for file_id in &self.files {
-            self.report_diagnostics_for_file(
+            if validated_files.contains(file_id) {
+                continue;
+            }
+            let diagnostics = snapshot.diagnostics(*file_id)?;
+            Self::report_diagnostics_for_file(
                 &snapshot,
-                *file_id,
+                &diagnostics,
+                &mut num_errors,
+                &mut num_warnings,
+                &mut num_infos,
+            )?;
+        }
+
+        for (_, diagnostics) in validated {
+            Self::report_diagnostics_for_file(
+                &snapshot,
+                &diagnostics,
                 &mut num_errors,
                 &mut num_warnings,
                 &mut num_infos,

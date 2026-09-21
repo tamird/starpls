@@ -32,6 +32,7 @@ mod interface;
 mod load;
 mod native;
 mod support;
+mod validation;
 
 pub(crate) use diagnostics::check;
 pub(crate) use factory::Documentation;
@@ -41,6 +42,7 @@ pub(crate) struct SemanticSettings {
     program: ProgramSettings,
     rules: RuleSelection,
     rules_with_flow_diagnostics: RuleSelection,
+    validation_rules: RuleSelection,
     analysis: AnalysisSettings,
 }
 
@@ -53,6 +55,7 @@ impl SemanticSettings {
             program,
             rules: diagnostics::rules(false),
             rules_with_flow_diagnostics: diagnostics::rules(true),
+            validation_rules: diagnostics::validation_rules(),
             analysis: AnalysisSettings::default(),
         }
     }
@@ -395,13 +398,26 @@ impl ty_python_core::Db for Database {
         load::statements(self, file)
     }
 
-    fn provided_annotation(
-        &self,
-        file: ProgramFile<'_>,
+    fn provided_annotation<'db>(
+        &'db self,
+        file: ProgramFile<'db>,
         owner: ruff_python_ast::NodeIndex,
-    ) -> Option<ruff_text_size::TextRange> {
+    ) -> Option<ty_python_core::ProvidedAnnotation<'db>> {
         let file = self.starlark_file(file)?;
-        starpls_hir::Source::new(self).type_comment_annotation(file, owner)
+        starpls_hir::Source::new(self)
+            .type_comment_annotation(file, owner)
+            .map(ty_python_core::ProvidedAnnotation::Range)
+            .or_else(|| {
+                let &(target, owner) = self
+                    .environment()
+                    .stub_validation(self)
+                    .annotations
+                    .get(&(file.source, owner))?;
+                Some(ty_python_core::ProvidedAnnotation::External {
+                    file: self.starlark_program_file(target),
+                    owner,
+                })
+            })
     }
 }
 
@@ -463,8 +479,15 @@ impl ty_python_semantic::Db for Database {
         &self.semantic.program.python_version
     }
 
-    fn rule_selection(&self, _file: File) -> &RuleSelection {
-        if self.environment().options(self).use_code_flow_analysis {
+    fn rule_selection(&self, file: File) -> &RuleSelection {
+        if self
+            .environment()
+            .stub_validation(self)
+            .files
+            .contains(&file)
+        {
+            &self.semantic.validation_rules
+        } else if self.environment().options(self).use_code_flow_analysis {
             &self.semantic.rules_with_flow_diagnostics
         } else {
             &self.semantic.rules
