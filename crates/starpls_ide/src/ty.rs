@@ -125,7 +125,12 @@ impl Database {
             program.python_version(self),
             ruff_python_ast::PySourceType::Python,
         );
-        ProgramFile::from_python_file(self, python_file, program)
+        let kind = if file.is_type_interface(self) {
+            ty_python_core::ProgramFileKind::Stub
+        } else {
+            ty_python_core::ProgramFileKind::Source
+        };
+        ProgramFile::from_python_file_with_kind(self, python_file, program, kind)
     }
 
     pub(crate) fn starlark_file(&self, file: ProgramFile<'_>) -> Option<starpls_common::File> {
@@ -627,6 +632,52 @@ identity(value=Info(value=1))
                 );
             }
         }
+    }
+
+    #[test]
+    fn interface_declarations_use_the_canonical_stub_file() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let file = fixture.add_file(
+            &mut analysis.db,
+            "api.bzli",
+            "value: int\ndef compute(value: int = ...) -> string: ...\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let program_file = db.starlark_program_file(file);
+        assert!(program_file.is_stub(db));
+        let parsed = starpls_common::parsed_module(db, file);
+        assert!(std::ptr::eq(
+            parsed,
+            ruff_db::parsed::parsed_module(db, program_file.python_file(db)),
+        ));
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(snapshot);
+        analysis.update_file(file, "def compute(): return 1\n".to_owned());
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            "load(\"api.bzli\", \"compute\")\ncompute()\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-syntax"),
+            "{diagnostics:?}"
+        );
+        let diagnostics = snapshot.diagnostics(caller).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "unresolved-import"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

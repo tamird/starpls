@@ -579,7 +579,7 @@ pub(crate) fn dialect_and_api_context_for_workspace_path(
             (Dialect::Bazel, Some(APIContext::Cquery))
         }
         _ => match path.extension().and_then(|ext| ext.to_str()) {
-            Some("bzl") => (Dialect::Bazel, Some(APIContext::Bzl)),
+            Some("bzl" | "bzli") => (Dialect::Bazel, Some(APIContext::Bzl)),
             _ => {
                 if path == workspace.as_ref().join("tools/build_rules/prelude_bazel") {
                     (Dialect::Bazel, Some(APIContext::Prelude))

@@ -9,6 +9,7 @@ pub use crate::parser::TypeComment;
 pub use crate::syntax_kind::SyntaxKind;
 pub use crate::validation::supports_expr;
 pub use crate::validation::validate;
+pub use crate::validation::AnnotationMode;
 
 pub mod ast;
 mod lexical;

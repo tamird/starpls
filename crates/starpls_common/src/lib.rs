@@ -153,7 +153,16 @@ impl File {
             && self
                 .path(db)
                 .extension()
-                .is_some_and(|extension| extension == "bzl")
+                .is_some_and(|extension| matches!(extension.to_str(), Some("bzl" | "bzli")))
+    }
+
+    /// A `.bzli` is a declaration file, never an executable Starlark module.
+    pub fn is_type_interface(self, db: &dyn Db) -> bool {
+        self.allows_native_annotations(db)
+            && self
+                .path(db)
+                .extension()
+                .is_some_and(|extension| extension == "bzli")
     }
 
     pub fn is_external(self) -> Option<bool> {
@@ -274,7 +283,13 @@ fn syntax_info_query(
     let excluded = starpls_syntax::validate(
         &contents,
         &parsed,
-        file.allows_native_annotations(db),
+        if file.is_type_interface(db) {
+            starpls_syntax::AnnotationMode::Interface
+        } else if file.allows_native_annotations(db) {
+            starpls_syntax::AnnotationMode::Source
+        } else {
+            starpls_syntax::AnnotationMode::Disabled
+        },
         &mut errors,
     );
     let comments = starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors);

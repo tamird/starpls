@@ -19,13 +19,21 @@ use ruff_text_size::TextRange;
 
 use crate::SyntaxError;
 
+/// Annotation syntax admitted by the host for this file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationMode {
+    Disabled,
+    Source,
+    Interface,
+}
+
 /// Validate Starlark syntax and identify complete subtrees with no Starlark semantics.
 /// Invalid headers and unsupported container forms are recovered as opaque owners; valid
 /// siblings remain available to semantic analysis.
 pub fn validate(
     source: &str,
     parsed: &Parsed<py::ModModule>,
-    allow_native_annotations: bool,
+    annotation_mode: AnnotationMode,
     errors: &mut dyn FnMut(SyntaxError),
 ) -> Vec<NodeIndex> {
     crate::lexical::validate(source, parsed.tokens(), errors);
@@ -35,7 +43,7 @@ pub fn validate(
         loads: Vec::new(),
         excluded: Vec::new(),
         statement_node: None,
-        allow_native_annotations,
+        annotation_mode,
         in_annotation: false,
     };
     let py::ModModule {
@@ -146,7 +154,7 @@ struct Validator<'a> {
     loads: Vec<TextRange>,
     excluded: Vec<NodeIndex>,
     statement_node: Option<NodeIndex>,
-    allow_native_annotations: bool,
+    annotation_mode: AnnotationMode,
     in_annotation: bool,
 }
 
@@ -158,7 +166,7 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
-            allow_native_annotations: _,
+            annotation_mode: _,
             in_annotation: _,
         } = self;
         errors(SyntaxError {
@@ -181,7 +189,7 @@ impl Validator<'_> {
             loads: _,
             excluded: _,
             statement_node: _,
-            allow_native_annotations: _,
+            annotation_mode: _,
             in_annotation: _,
         } = self;
         let tokens = *tokens;
@@ -228,6 +236,14 @@ impl Validator<'_> {
     }
 
     fn statement(&mut self, stmt: &Stmt) {
+        if self.annotation_mode == AnnotationMode::Interface && !interface_statement(stmt) {
+            self.excluded.push(stmt.node_index().load());
+            self.error(
+                stmt.range(),
+                "Interfaces contain declarations, not executable statements",
+            );
+            return;
+        }
         match stmt {
             Stmt::FunctionDef(def) => {
                 let py::StmtFunctionDef {
@@ -244,11 +260,11 @@ impl Validator<'_> {
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || (!self.allow_native_annotations && returns.is_some())
+                    || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                 {
                     self.error(
                         *range,
-                        if self.allow_native_annotations {
+                        if self.annotation_mode != AnnotationMode::Disabled {
                             "Async functions, decorators, and type parameters are not supported in Starlark"
                         } else {
                             "Function annotations and decorators are not supported in Starlark"
@@ -258,9 +274,9 @@ impl Validator<'_> {
                 if *is_async
                     || !decorator_list.is_empty()
                     || type_params.is_some()
-                    || (!self.allow_native_annotations && returns.is_some())
+                    || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                     || !parameters.posonlyargs.is_empty()
-                    || (!self.allow_native_annotations
+                    || (self.annotation_mode == AnnotationMode::Disabled
                         && parameters
                             .iter()
                             .any(|parameter| parameter.as_parameter().annotation.is_some()))
@@ -271,7 +287,7 @@ impl Validator<'_> {
                 }
                 self.visit_identifier(name);
                 self.visit_parameters(parameters);
-                if self.allow_native_annotations {
+                if self.annotation_mode != AnnotationMode::Disabled {
                     if let Some(annotation) = returns {
                         self.annotation(annotation);
                     }
@@ -326,22 +342,25 @@ impl Validator<'_> {
                     value,
                     simple,
                 } = stmt;
-                if !self.allow_native_annotations || !simple || !target.is_name_expr() {
+                if self.annotation_mode == AnnotationMode::Disabled
+                    || !simple
+                    || !target.is_name_expr()
+                {
                     self.excluded.push(node_index.load());
                     self.unsupported(*range);
                     return;
                 }
-                let Some(value) = value else {
+                self.visit_expr(target);
+                self.annotation(annotation);
+                if let Some(value) = value {
+                    self.visit_expr(value);
+                } else if self.annotation_mode != AnnotationMode::Interface {
                     self.excluded.push(node_index.load());
                     self.error(
                         *range,
                         "Annotated declarations without a value are not supported",
                     );
-                    return;
-                };
-                self.visit_expr(target);
-                self.annotation(annotation);
-                self.visit_expr(value);
+                }
             }
             Stmt::AugAssign(stmt) => {
                 let py::StmtAugAssign {
@@ -425,7 +444,9 @@ impl Validator<'_> {
     fn expression(&mut self, expr: &Expr) {
         // Bazel's syntax-only mode accepts Starlark expressions in annotations,
         // with ellipsis additionally allowed for forms such as tuple[int, ...].
-        if self.in_annotation && matches!(expr, Expr::EllipsisLiteral(_)) {
+        if (self.in_annotation || self.annotation_mode == AnnotationMode::Interface)
+            && matches!(expr, Expr::EllipsisLiteral(_))
+        {
             return;
         }
         if !supports_expr(expr.into(), self.tokens) {
@@ -498,6 +519,46 @@ impl Validator<'_> {
     }
 }
 
+/// Declaration shape only; the ordinary visitor still validates names and annotations.
+fn interface_statement(statement: &Stmt) -> bool {
+    match statement {
+        Stmt::FunctionDef(function) => {
+            let mut body = function.body.as_slice();
+            if let [Stmt::Expr(doc), rest @ ..] = body {
+                if doc.value.is_string_literal_expr() {
+                    body = rest;
+                }
+            }
+            let placeholder = match body {
+                [Stmt::Pass(_)] => true,
+                [Stmt::Expr(statement)] => statement.value.is_ellipsis_literal_expr(),
+                _ => false,
+            };
+            placeholder
+                && function.parameters.iter().all(|parameter| {
+                    parameter
+                        .default()
+                        .is_none_or(Expr::is_ellipsis_literal_expr)
+                })
+        }
+        Stmt::AnnAssign(assignment) => assignment
+            .value
+            .as_deref()
+            .is_none_or(Expr::is_ellipsis_literal_expr),
+        Stmt::Expr(statement) => match statement.value.as_ref() {
+            Expr::StringLiteral(_) => true,
+            Expr::EllipsisLiteral(_) => true,
+            Expr::Call(call) => call
+                .func
+                .as_name_expr()
+                .is_some_and(|name| name.id == "load"),
+            _ => false,
+        },
+        Stmt::Pass(_) => true,
+        _ => false,
+    }
+}
+
 impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         let previous = self.statement_node.replace(stmt.node_index().load());
@@ -536,7 +597,7 @@ impl<'a> SourceOrderVisitor<'a> for Validator<'_> {
             annotation,
         } = parameter;
         if let Some(annotation) = annotation {
-            if self.allow_native_annotations {
+            if self.annotation_mode != AnnotationMode::Disabled {
                 self.annotation(annotation);
             } else {
                 self.error(
@@ -611,7 +672,47 @@ mod tests {
                 ruff_python_ast::PySourceType::Python,
             );
             let mut errors = Vec::new();
-            let excluded = super::validate(source, &parsed, true, &mut |error| errors.push(error));
+            let excluded = super::validate(
+                source,
+                &parsed,
+                super::AnnotationMode::Source,
+                &mut |error| errors.push(error),
+            );
+            assert_eq!(errors.is_empty(), valid, "{source}: {errors:?}");
+            assert_eq!(excluded.is_empty(), valid, "{source}");
+        }
+    }
+
+    #[test]
+    fn interfaces_admit_declarations_without_implementations() {
+        for (source, valid) in [
+            ("value: int", true),
+            ("value: int = ...", true),
+            ("def f(value, other: int = ...) -> string: ...", true),
+            ("def f():\n    \"Documentation\"\n    pass", true),
+            (
+                "load(\"types.bzl\", \"Info\")\ndef f(value: Info): ...",
+                true,
+            ),
+            ("value = provider(fields=[])", false),
+            ("value: int = 1", false),
+            ("def f(value=1): ...", false),
+            ("def f(): return 1", false),
+            ("def f():\n    load(\"types.bzl\", \"Info\")", false),
+            ("value += 1", false),
+            ("if True: pass", false),
+        ] {
+            let parsed = ruff_python_parser::parse_unchecked_source(
+                source,
+                ruff_python_ast::PySourceType::Python,
+            );
+            let mut errors = Vec::new();
+            let excluded = super::validate(
+                source,
+                &parsed,
+                super::AnnotationMode::Interface,
+                &mut |error| errors.push(error),
+            );
             assert_eq!(errors.is_empty(), valid, "{source}: {errors:?}");
             assert_eq!(excluded.is_empty(), valid, "{source}");
         }
@@ -627,9 +728,12 @@ mod tests {
         assert!(parsed.errors().iter().any(|error| error.error
             == ruff_python_parser::ParseErrorType::PositionalAfterKeywordArgument));
         let mut errors = Vec::new();
-        super::validate(source, &parsed, false, &mut |error| {
-            errors.push(error.message)
-        });
+        super::validate(
+            source,
+            &parsed,
+            super::AnnotationMode::Disabled,
+            &mut |error| errors.push(error.message),
+        );
         assert!(
             errors
                 .iter()
@@ -652,7 +756,12 @@ mod tests {
             ruff_python_ast::PySourceType::Python,
         );
         let mut errors = Vec::new();
-        super::validate(source, &parsed, false, &mut |error| errors.push(error));
+        super::validate(
+            source,
+            &parsed,
+            super::AnnotationMode::Disabled,
+            &mut |error| errors.push(error),
+        );
         assert_eq!(errors.len(), 3, "{errors:?}");
         assert!(
             errors
@@ -696,9 +805,12 @@ mod tests {
                 ruff_python_ast::PySourceType::Python,
             );
             let mut errors = Vec::new();
-            super::validate(source, &parsed, false, &mut |error| {
-                errors.push(error.message)
-            });
+            super::validate(
+                source,
+                &parsed,
+                super::AnnotationMode::Disabled,
+                &mut |error| errors.push(error.message),
+            );
             assert_eq!(errors, expected, "{source}");
         }
     }
@@ -711,7 +823,7 @@ mod dialect_tests {
             source,
             ruff_python_ast::PySourceType::Python,
         );
-        super::validate(source, &parsed, false, errors);
+        super::validate(source, &parsed, super::AnnotationMode::Disabled, errors);
     }
 
     #[test]

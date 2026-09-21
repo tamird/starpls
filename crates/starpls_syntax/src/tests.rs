@@ -12,7 +12,12 @@ fn check(input: &str, expected: ExpectFile) {
     let mut errors = Vec::new();
     let parsed =
         ruff_python_parser::parse_unchecked_source(input, ruff_python_ast::PySourceType::Python);
-    crate::validate(input, &parsed, false, &mut |error| errors.push(error));
+    crate::validate(
+        input,
+        &parsed,
+        crate::AnnotationMode::Disabled,
+        &mut |error| errors.push(error),
+    );
     let comments =
         crate::parse_type_comments(input, parsed.tokens(), &mut |error| errors.push(error));
     let mut buf = String::new();
