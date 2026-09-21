@@ -98,6 +98,14 @@ undefined.
 See the [stub specification](docs/type-interfaces.md) for declarations,
 package selection, conflict handling, and versioning.
 
+Select packages in `starpls.toml` at the Bazel workspace root. Batch checking
+and the language server read this configuration at startup:
+
+```toml
+[[stub-packages]]
+manifest = "@rules_foo_stubs//:stubs.toml"
+```
+
 Use a `.bzli` stub file to provide types for a `.bzl` module:
 
 ```starlark

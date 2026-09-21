@@ -2,6 +2,7 @@ use clap::Args;
 
 pub(crate) mod check;
 pub(crate) mod server;
+mod stub_package;
 pub(crate) mod type_interface;
 
 #[derive(Args, Default)]

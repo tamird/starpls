@@ -111,6 +111,29 @@ impl DefaultFileLoader {
         }
     }
 
+    pub(crate) fn fetch_repository(&self, repository: &Repository) -> anyhow::Result<()> {
+        if repository.name.is_empty() {
+            return Ok(());
+        }
+        if self.bzlmod_enabled {
+            self.bazel_client.fetch_repo(&repository.name)
+        } else {
+            self.bazel_client
+                .null_query_external_repo_targets(&repository.name)
+        }
+    }
+
+    pub(crate) fn selected_module(
+        &self,
+        repository: &Repository,
+    ) -> anyhow::Result<Option<starpls_bazel::client::SelectedModule>> {
+        if self.bzlmod_enabled {
+            self.bazel_client.selected_module(&repository.name)
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) fn resolve_repository(
         &self,
         label: &Label,

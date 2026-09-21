@@ -145,7 +145,7 @@ impl Server {
                     "window/showMessage".to_owned(),
                     lsp_types::ShowMessageParams {
                         typ: lsp_types::MessageType::ERROR,
-                        message: error.to_string(),
+                        message: format!("{error:#}"),
                     },
                 )
                 .into(),
