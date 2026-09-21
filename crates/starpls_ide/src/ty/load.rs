@@ -91,37 +91,11 @@ pub(super) fn resolve<'db>(
     db: &'db Database,
     definition: Definition<'db>,
 ) -> ProvidedBindingResolution<'db> {
-    let file = definition.program_file(db);
-    let Some(source_file) = db.starlark_file(file) else {
+    let Some((source_file, module_name, name)) = binding_names(db, definition) else {
         return ProvidedBindingValue::Unresolved.into();
     };
     let DefinitionKind::ProvidedBinding(binding) = definition.kind(db) else {
         unreachable!("only supplied load definitions reach the Starlark loader");
-    };
-    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
-    let statement = binding.statement(&parsed);
-    let call = load_call(&statement.value).expect("supplied statement is a load");
-    let source = source_file.contents(db);
-    let Some(module) = call.arguments.args.first() else {
-        return ProvidedBindingValue::Unresolved.into();
-    };
-    let Some((module_name, _)) = string_value(&source[module.range()]) else {
-        return ProvidedBindingValue::Unresolved.into();
-    };
-    let target = call
-        .arguments
-        .iter_source_order()
-        .find_map(|argument| match argument {
-            ArgOrKeyword::Arg(expr) => {
-                (expr.node_index().load() == binding.binding.target).then_some(expr)
-            }
-            ArgOrKeyword::Keyword(keyword) => {
-                (keyword.node_index().load() == binding.binding.target).then_some(&keyword.value)
-            }
-        })
-        .expect("load binding target belongs to its statement");
-    let Some((name, _)) = string_value(&source[target.range()]) else {
-        return ProvidedBindingValue::Unresolved.into();
     };
     let error = |message: String| {
         let mut diagnostic =
@@ -142,7 +116,7 @@ pub(super) fn resolve<'db>(
             if loaded.source == source_file.source {
                 return ProvidedBindingValue::Value(Type::unknown()).into();
             }
-            let loaded_file = db.starlark_program_file(loaded);
+            let loaded_file = db.load_export_file(source_file, loaded, &name);
             if is_loaded_alias(db, loaded_file, &name) {
                 return error(format!(
                     "Cannot load \"{name}\" from \"{module_name}\": loaded symbols are not exported"
@@ -158,6 +132,37 @@ pub(super) fn resolve<'db>(
         Ok(None) => ProvidedBindingValue::Value(Type::unknown()).into(),
         Err(_) => ProvidedBindingValue::Value(Type::unknown()).into(),
     }
+}
+
+pub(super) fn binding_names(
+    db: &Database,
+    definition: Definition<'_>,
+) -> Option<(starpls_common::File, Box<str>, Box<str>)> {
+    let file = definition.program_file(db);
+    let source_file = db.starlark_file(file)?;
+    let DefinitionKind::ProvidedBinding(binding) = definition.kind(db) else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let statement = binding.statement(&parsed);
+    let call = load_call(&statement.value).expect("supplied statement is a load");
+    let source = source_file.contents(db);
+    let module = call.arguments.args.first()?;
+    let (module_name, _) = string_value(&source[module.range()])?;
+    let target = call
+        .arguments
+        .iter_source_order()
+        .find_map(|argument| match argument {
+            ArgOrKeyword::Arg(expr) => {
+                (expr.node_index().load() == binding.binding.target).then_some(expr)
+            }
+            ArgOrKeyword::Keyword(keyword) => {
+                (keyword.node_index().load() == binding.binding.target).then_some(&keyword.value)
+            }
+        })
+        .expect("load binding target belongs to its statement");
+    let (name, _) = string_value(&source[target.range()])?;
+    Some((source_file, module_name, name))
 }
 
 /// A load introduces a local binding, but only a declaration or assignment exports it again.

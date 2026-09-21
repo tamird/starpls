@@ -152,7 +152,8 @@ pub(crate) fn completions(
     pos: FilePosition,
     trigger_character: Option<String>,
 ) -> Option<Vec<CompletionItem>> {
-    let model = SemanticModel::new(db, db.starlark_program_file(pos.file_id));
+    let file_id = pos.file_id;
+    let model = SemanticModel::new(db, db.starlark_program_file(file_id));
     let ctx = CompletionContext::new(db, pos, trigger_character.clone())?;
     let mut items = Vec::new();
 
@@ -255,9 +256,14 @@ pub(crate) fn completions(
         }
         CompletionAnalysis::String(StringContext::Unavailable) => return None,
         CompletionAnalysis::String(StringContext::LoadItem { loaded_file }) => {
-            let file = db.starlark_program_file(loaded_file);
             let mut names = FxHashMap::default();
-            for declaration in all_end_of_scope_members(db, global_scope(db, file)) {
+            let files = db
+                .type_interface(file_id, loaded_file)
+                .into_iter()
+                .chain([loaded_file]);
+            for declaration in files.flat_map(|file| {
+                all_end_of_scope_members(db, global_scope(db, db.starlark_program_file(file)))
+            }) {
                 let member = declaration.member;
                 if member.name.starts_with('_')
                     || member.is_type_check_only

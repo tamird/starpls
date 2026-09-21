@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use starpls_bazel::Builtins;
 use starpls_common::Dialect;
 use starpls_common::File;
@@ -66,13 +67,24 @@ pub struct Environment {
     pub all_workspace_targets: Arc<Vec<String>>,
     #[returns(clone)]
     pub load_revision: u64,
+    #[returns(ref)]
+    pub type_interfaces: FxHashMap<ruff_db::files::File, (File, File)>,
 }
 
 impl Environment {
     pub fn initialize(db: &dyn Db, options: InferenceOptions) -> Self {
         let standard = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
         let bazel = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
-        Self::new(db, options, standard, bazel, None, Arc::default(), 0)
+        Self::new(
+            db,
+            options,
+            standard,
+            bazel,
+            None,
+            Arc::default(),
+            0,
+            FxHashMap::default(),
+        )
     }
 
     pub fn builtin_defs(self, db: &dyn Db, dialect: Dialect) -> BuiltinDefs {

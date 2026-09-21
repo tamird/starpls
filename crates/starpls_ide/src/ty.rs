@@ -28,6 +28,7 @@ use crate::Database;
 mod context;
 mod diagnostics;
 mod factory;
+mod interface;
 mod load;
 mod native;
 mod support;

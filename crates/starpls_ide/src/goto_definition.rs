@@ -29,6 +29,7 @@ use crate::LocationLink;
 use crate::ResolvedPath;
 
 struct GotoDefinitionHandler<'a> {
+    db: &'a Database,
     sema: Source<'a>,
     model: SemanticModel<'a>,
     file: File,
@@ -39,6 +40,7 @@ struct GotoDefinitionHandler<'a> {
 impl<'db> GotoDefinitionHandler<'db> {
     fn handle(&self, selection: Selection<'_>, source: &str) -> Option<Vec<LocationLink>> {
         let Self {
+            db: _,
             sema,
             model,
             file,
@@ -155,30 +157,39 @@ impl<'db> GotoDefinitionHandler<'db> {
             return Vec::new();
         }
         let environment = ProgramEnvironment::from_file(definition.program_file(db));
-        resolve_definition(
-            db,
-            &environment,
-            definition,
-            None,
-            ImportAliasResolution::ResolveAliases,
-        )
-        .into_iter()
-        .filter(|resolved| resolved.definition() != Some(definition))
-        .flat_map(|resolved| {
-            if self.skip_re_exports {
-                if let Some(reexport) = resolved
-                    .definition()
-                    .and_then(|definition| self.reexported_binding(definition))
-                {
-                    let targets = self.load_definitions(reexport, visited);
-                    if !targets.is_empty() {
-                        return targets;
+        let implementation = self.db.interface_implementation(definition);
+        let definitions = if implementation.is_empty() {
+            resolve_definition(
+                db,
+                &environment,
+                definition,
+                None,
+                ImportAliasResolution::ResolveAliases,
+            )
+        } else {
+            implementation
+                .into_iter()
+                .map(ResolvedDefinition::Definition)
+                .collect()
+        };
+        definitions
+            .into_iter()
+            .filter(|resolved| resolved.definition() != Some(definition))
+            .flat_map(|resolved| {
+                if self.skip_re_exports {
+                    if let Some(reexport) = resolved
+                        .definition()
+                        .and_then(|definition| self.reexported_binding(definition))
+                    {
+                        let targets = self.load_definitions(reexport, visited);
+                        if !targets.is_empty() {
+                            return targets;
+                        }
                     }
                 }
-            }
-            vec![resolved]
-        })
-        .collect()
+                vec![resolved]
+            })
+            .collect()
     }
 
     /// The Starlark option follows a direct assignment of a loaded name. Shared
@@ -210,6 +221,7 @@ impl<'db> GotoDefinitionHandler<'db> {
 
     fn string_location(&self, value: &str) -> Option<Vec<LocationLink>> {
         let Self {
+            db: _,
             sema,
             model: _,
             file,
@@ -266,6 +278,7 @@ pub(crate) fn goto_definition(
     let node = covering_node(parsed.syntax().into(), token.range());
     let selection = crate::selection::classify(&node, token.range())?;
     GotoDefinitionHandler {
+        db,
         sema,
         model: SemanticModel::new(db, db.starlark_program_file(file)),
         file,
