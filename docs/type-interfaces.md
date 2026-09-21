@@ -1,0 +1,89 @@
+# Starlark stubs
+
+A *stub file* (`.bzli`) declares types for a Starlark module (`.bzl`). A *stub
+package* contains stub files and a manifest mapping them to source files.
+
+## Stub files
+
+```starlark
+DEFAULT_TIMEOUT: int
+
+def fetch(name: string, timeout: int = ...) -> list[string]: ...
+```
+
+A stub consists of variable annotations, function declarations, loads,
+docstrings, and placeholders. Variable initializers and parameter defaults are
+omitted or `...`. A function body consists of an optional docstring followed by
+`...` or `pass`. Variables and functions declared in the stub define its exports;
+loaded names are available in annotation expressions.
+
+For each name loaded from a mapped `.bzl` module, Starpls uses the stub declaration
+when present and source inference otherwise. Annotations are resolved in the
+stub's scope. Stubs are trusted contracts; implementation validation is a
+separate check.
+
+## Packaging
+
+Projects obtain source and stub repositories through Bazel dependencies and
+select stub packages in `starpls.toml` at the workspace root:
+
+```toml
+[[stub-packages]]
+manifest = "@rules_foo_stubs//:stubs.toml"
+```
+
+Manifest labels use the main repository's mapping. A local manifest can be
+specified by a path relative to the configuration file, such as
+`stubs/rules_foo/stubs.toml`.
+
+The package manifest defines the source repository, supported versions, and
+file mappings:
+
+```toml
+# stubs.toml
+format-version = 1
+
+[source]
+repository = "@rules_foo"
+module = "rules_foo"
+versions = ["1.4.0", "1.4.1"]
+
+[files]
+"foo/defs.bzl" = "foo/defs.bzli"
+```
+
+The package declares the Bazel dependencies referenced by its manifest and stub
+files. `source.repository` resolves in the package's repository mapping.
+`files` maps source paths, relative to the source repository root, to stub paths
+relative to the manifest directory. Each path must identify a file within its
+respective repository.
+
+## Resolution
+
+Registrations identify a canonical Bazel repository and source file. Each
+selected repository instance has its own registrations. Loads within a stub use
+its repository's mapping; a load of its mapped implementation resolves the
+source definitions.
+
+Each source file may have one registered stub. Packages covering different
+files compose. Multiple registrations for the same file are a configuration
+error, including identical mappings or stubs declaring different exports.
+This rule applies to package manifests and direct CLI mappings. The error
+identifies the source file and both registrations.
+
+## Version compatibility
+
+`format-version` identifies the manifest schema. Stub packages have independent
+Bazel release versions. `source.versions` is a nonempty list of accepted source
+module versions.
+
+Bazel's selected module name must equal `source.module`, and its selected
+version must appear in `source.versions`. Bazel dependency declarations specify
+minimum versions; compatibility is checked against the resolved module graph.
+
+For a source with no selected module version, a `stub-packages` entry may set
+`allow-unversioned = true`. Any available module name must match `source.module`.
+Otherwise, an unverifiable version is a configuration error.
+
+Incompatible versions, unsupported manifest schemas, unknown fields, unresolved
+repositories, unreadable files, and failed Bazel queries are configuration errors.
