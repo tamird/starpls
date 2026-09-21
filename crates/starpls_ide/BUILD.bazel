@@ -28,7 +28,11 @@ rust_test(
     aliases = {
         "@crates//:salsa": "salsa",
     },
-    compile_data = ["//crates/starpls:src/builtin/builtin.pb"],
+    compile_data = [
+        "//crates/starpls:src/builtin/builtin.pb",
+        "//stubs/bazel_skylib:rules/copy_file.bzli",
+        "//stubs/bazel_skylib:rules/write_file.bzli",
+    ],
     crate = ":starpls_ide",
     deps = all_crate_deps(normal_dev = True),
 )

@@ -31,6 +31,8 @@ mod factory;
 mod interface;
 mod load;
 mod native;
+#[cfg(test)]
+mod skylib_tests;
 mod support;
 mod validation;
 

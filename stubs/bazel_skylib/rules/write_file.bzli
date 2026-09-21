@@ -1,0 +1,10 @@
+def write_file(
+    name: string,
+    out: string,
+    content: Sequence[string] = ...,
+    is_executable: bool = ...,
+    newline: string = ...,
+    **kwargs: Unknown,
+) -> None:
+    """Write text lines using auto, unix, or windows line endings."""
+    ...

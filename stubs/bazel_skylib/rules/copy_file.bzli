@@ -1,0 +1,10 @@
+def copy_file(
+    name: string,
+    src: string | Label,
+    out: string,
+    is_executable: bool = ...,
+    allow_symlink: bool | None = ...,
+    **kwargs: Unknown,
+) -> None:
+    """Copy a file; symlinks default to allowed for non-executable outputs."""
+    ...
