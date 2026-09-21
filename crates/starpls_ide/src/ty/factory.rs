@@ -8,7 +8,6 @@ use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
-use rustc_hash::FxHashMap;
 use starpls_bazel::attr::AttributeKind;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -21,6 +20,8 @@ use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::CheckedArgument;
 use ty_python_semantic::types::CheckedCall;
+use ty_python_semantic::types::DictionaryItem;
+use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::KnownClass;
 use ty_python_semantic::types::Parameter;
 use ty_python_semantic::types::ParameterDefault;
@@ -242,31 +243,37 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             Some((name, parameter))
         })
         .collect::<Option<Vec<_>>>()?;
+    let mut complete = true;
     match call.argument("attrs") {
         CheckedArgument::Omitted => {}
         CheckedArgument::Indeterminate => return None,
-        CheckedArgument::Value { ty: _, expression } => {
-            let Expr::Dict(dictionary) = expression? else {
-                // Initializer provenance does not prove an alias's current mapping.
-                return None;
-            };
-            let mut sources = FxHashMap::default();
-            for item in &dictionary.items {
-                let key = item.key.as_ref()?;
-                let name = call.expression_type(key)?.string_literal_value(db)?;
-                let source = *sources
-                    .entry(name)
-                    .or_insert_with(|| FileRange::new(call.file().file(db), key.range()));
+        CheckedArgument::Value {
+            ty: _,
+            expression: _,
+        } => {
+            let DictionaryItems { items, is_complete } = call.dictionary_argument("attrs")?;
+            complete = is_complete;
+            for DictionaryItem {
+                name,
+                ty: value,
+                source,
+            } in items
+            {
+                let source = FileRange::new(call.file().file(db), source);
+                let name = name.as_str();
                 if name.starts_with('_') {
                     continue;
                 }
-                let value = call.expression_type(&item.value)?;
                 let attribute = value
                     .provided_data(db, &environment)
                     .and_then(|data| data.downcast_ref::<Attribute>());
                 let mut parameter =
                     Parameter::keyword_only(Name::new(name)).with_source_range(source);
-                if matches!(kind, RuleKind::Macro) && value == Type::none(db, &environment) {
+                if !complete {
+                    parameter = parameter
+                        .with_annotated_type(Type::unknown())
+                        .with_default_type(Type::unknown());
+                } else if matches!(kind, RuleKind::Macro) && value == Type::none(db, &environment) {
                     // A removed macro attribute can be omitted, but cannot accept a value.
                     parameter = parameter
                         .with_annotated_type(Type::Never)
@@ -310,8 +317,8 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         .into_iter()
         .map(|(_, parameter)| parameter)
         .collect();
-    if matches!(kind, RuleKind::Macro) {
-        // Macros may forward inherited attributes whose names are not declared locally.
+    if !complete || matches!(kind, RuleKind::Macro) {
+        // Partial mappings and inherited macro attributes can contain additional names.
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
     }
     let callable = Type::single_callable(
@@ -755,7 +762,7 @@ raw(field=1)
     }
 
     #[test]
-    fn alias_mapping_is_not_claimed_to_be_a_closed_rule_schema() {
+    fn observed_rule_attributes_are_optional_and_gradual() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
         analysis
@@ -773,21 +780,35 @@ raw(field=1)
             r#"
 def implementation(ctx): pass
 attrs = {"before": attr.string()}
-attrs["after"] = attr.int()
+attrs["after"] = attr.int(mandatory=True)
+attrs.update({"before": attr.int()})
 target = rule(implementation, attrs=attrs)
+target(name="empty")
+target(name="changed", before=1, after="unknown", extra=True)
 target($0)
 "#,
         );
         let (file_id, pos) = fixture.cursor_pos.unwrap();
-        let help = analysis
-            .snapshot()
+        let snapshot = analysis.snapshot();
+        let help = snapshot
             .signature_help(FilePosition { file_id, pos })
+            .unwrap()
             .unwrap();
-        if let Some(help) = help {
-            for signature in &help.signatures {
-                assert!(!signature.label.contains("before"), "{help:?}");
-                assert!(!signature.label.contains("after"), "{help:?}");
-            }
-        }
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert!(signature.label.contains("before: Unknown ="), "{help:?}");
+        assert!(signature.label.contains("after: Unknown ="), "{help:?}");
+        assert!(signature.label.contains("**kwargs"), "{help:?}");
+        let diagnostics = ty_python_semantic::check_file_unwrap(
+            &snapshot.db,
+            snapshot.db.starlark_program_file(file_id),
+        );
+        // The final incomplete call still requires the common name attribute.
+        let ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().to_string())
+            .collect();
+        assert_eq!(ids, ["missing-argument"], "{diagnostics:?}");
     }
 }

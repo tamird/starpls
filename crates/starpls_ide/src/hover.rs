@@ -754,6 +754,80 @@ example = {factory}(
     }
 
     #[test]
+    fn dictionary_attributes_offer_names_and_locations() {
+        for (setup, attrs, expected) in [
+            ("", "{'_tool': attr.label()}", "Target"),
+            (
+                "attrs = {'_tool': attr.label()}\nattrs.update({'_tool': attr.string()})\n",
+                "attrs",
+                "Unknown",
+            ),
+        ] {
+            let source = format!(
+                "def implementation(context):\n    context.attr._tool\n\n{setup}example = rule(implementation=implementation, attrs={attrs})\n"
+            );
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            install_native(&mut analysis);
+            analysis
+                .db
+                .environment()
+                .set_options(&mut analysis.db)
+                .to(crate::InferenceOptions {
+                    infer_ctx_attributes: true,
+                    use_code_flow_analysis: false,
+                    allow_unused_definitions: false,
+                });
+            let file_id = fixture.main_file();
+            let start = source.find("context.attr._tool").unwrap() + "context.attr.".len();
+            let position = FilePosition {
+                file_id,
+                pos: (start as u32 + 2).into(),
+            };
+            let snapshot = analysis.snapshot();
+            let hover = snapshot.hover(position.clone()).unwrap().unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("(field) _tool: {expected}\n")),
+                "{}",
+                hover.contents.value
+            );
+            let completions = snapshot
+                .completions(
+                    FilePosition {
+                        file_id,
+                        pos: (start as u32).into(),
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                completions.iter().any(|item| item.label == "_tool"),
+                "{completions:?}"
+            );
+            let locations = snapshot.goto_definition(position, false).unwrap().unwrap();
+            let [crate::LocationLink::Local {
+                target_file_id,
+                target_selection_range,
+                origin_selection_range: _,
+                target_range: _,
+            }] = locations.as_slice()
+            else {
+                panic!("expected one attribute definition: {locations:?}");
+            };
+            assert_eq!(*target_file_id, file_id.into());
+            assert_eq!(&source[*target_selection_range], "'_tool'");
+            let expected_start = source.find("'_tool'").unwrap();
+            assert_eq!(
+                u32::from(target_selection_range.start()) as usize,
+                expected_start
+            );
+        }
+    }
+
+    #[test]
     fn context_registration_requires_resolved_unambiguous_identity() {
         for (annotation, registration, expected) in [
             (

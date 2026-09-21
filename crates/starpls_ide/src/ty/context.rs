@@ -1,5 +1,6 @@
 //! Bazel's optional implementation-parameter contract, supplied to Ty's body binding.
 
+use ruff_db::files::FileRange;
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor;
@@ -20,6 +21,8 @@ use ty_python_semantic::provided::ProvidedField;
 use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
+use ty_python_semantic::types::DictionaryItem;
+use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::HasDefinition;
 use ty_python_semantic::HasType;
@@ -128,34 +131,42 @@ pub(super) fn parameter_type<'db>(
     let mut fields = common
         .iter()
         .map(|attribute| {
-            Some((
-                Name::new(&attribute.name),
-                attribute_type(&attribute.r#type)?,
-            ))
+            let ty = attribute_type(&attribute.r#type)?;
+            Some(ProvidedField {
+                name: Name::new(&attribute.name),
+                ty,
+                source: None,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
+    let mut complete = true;
     if let Some(attrs) = argument(call, &signature, "attrs").ok()? {
-        let Expr::Dict(dictionary) = attrs else {
-            // Mutable mapping aliases do not carry a proven current schema.
-            return None;
-        };
-        for item in &dictionary.items {
-            let name_type = item.key.as_ref()?.inferred_type(&model)?;
-            let name = name_type.string_literal_value(db)?;
-            let ty = item.value.inferred_type(&model)?;
-            let attribute = ty
-                .provided_data(db, &environment)?
-                .downcast_ref::<Attribute>()?;
-            let ty = attribute_type(&attribute.kind)?;
-            if let Some((_, existing)) = fields.iter_mut().find(|(field, _)| field.as_str() == name)
-            {
-                *existing = ty;
+        let DictionaryItems { items, is_complete } = model.dictionary_items(attrs)?;
+        complete = is_complete;
+        for DictionaryItem { name, ty, source } in items {
+            let ty = if complete {
+                let data = ty.provided_data(db, &environment)?;
+                let attribute = data.downcast_ref::<Attribute>()?;
+                attribute_type(&attribute.kind)?
             } else {
-                fields.push((Name::new(name), ty));
+                Type::unknown()
+            };
+            let field = ProvidedField {
+                name,
+                ty,
+                source: Some(FileRange::new(file.file(db), source)),
+            };
+            if let Some(existing) = fields
+                .iter_mut()
+                .find(|existing| existing.name == field.name)
+            {
+                *existing = field;
+            } else {
+                fields.push(field);
             }
         }
     }
-    let make_class = |name, base, fields: Box<[(Name, Type<'db>)]>| {
+    let make_class = |name, base, fields, has_dynamic_fields| {
         let class = model.provided_class_at_call(
             call,
             ProvidedClass {
@@ -163,28 +174,26 @@ pub(super) fn parameter_type<'db>(
                 bases: vec![factory::native_class(db, declarations, base)?].into_boxed_slice(),
                 class_members: Box::default(),
                 instance_fields: ProvidedInstanceFields {
-                    fields: fields
-                        .into_vec()
-                        .into_iter()
-                        .map(|(name, ty)| ProvidedField {
-                            name,
-                            ty,
-                            source: None,
-                        })
-                        .collect(),
-                    has_dynamic_fields: false,
+                    fields,
+                    has_dynamic_fields,
                     data: None,
                 },
             },
         )?;
         class.to_instance_approximation(db, &environment)
     };
-    let attrs = make_class("attributes", "struct", fields.into_boxed_slice())?;
+    let attrs = make_class("attributes", "struct", fields.into_boxed_slice(), !complete)?;
     let name = if repository { "repository_ctx" } else { "ctx" };
     make_class(
         name,
         name,
-        vec![(Name::new("attr"), attrs)].into_boxed_slice(),
+        vec![ProvidedField {
+            name: Name::new("attr"),
+            ty: attrs,
+            source: None,
+        }]
+        .into_boxed_slice(),
+        false,
     )
 }
 

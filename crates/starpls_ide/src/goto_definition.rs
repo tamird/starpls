@@ -487,8 +487,8 @@ info.fo$0o
             (
                 r#"value = rule(attrs = {
     "foo": None,
-    #^^^^
     "foo": attr.string(),
+    #^^^^
 })
 "#,
                 "alias(fo$0o = 1)",
