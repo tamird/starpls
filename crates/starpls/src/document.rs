@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -39,6 +40,30 @@ macro_rules! try_opt {
     };
 }
 
+pub(crate) const DEPENDENCY_FILES: [&str; 7] = [
+    "MODULE.bazel",
+    "MODULE.bazel.lock",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "WORKSPACE.bzlmod",
+    ".bazelrc",
+    ".bazelversion",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepositoryFetch {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepositoryContext {
+    Resolved(Repository),
+    Unknown,
+    Displaced,
+}
+
 pub(crate) struct DefaultFileLoader {
     bazel_client: Arc<dyn BazelClient>,
     workspace: PathBuf,
@@ -46,7 +71,11 @@ pub(crate) struct DefaultFileLoader {
     external_output_base: PathBuf,
     fetch_repo_sender: Sender<Task>,
     bzlmod_enabled: bool,
-    repositories: RwLock<HashMap<PathBuf, Option<Repository>>>,
+    repositories: RwLock<HashMap<PathBuf, RepositoryContext>>,
+    configuration_inputs: RwLock<HashMap<PathBuf, Option<Vec<u8>>>>,
+    repository_roots: RwLock<HashSet<PathBuf>>,
+    configuration_revision: Option<u64>,
+    repository_fetches: RwLock<HashMap<String, RepositoryFetch>>,
 }
 
 impl DefaultFileLoader {
@@ -58,7 +87,7 @@ impl DefaultFileLoader {
         fetch_repo_sender: Sender<Task>,
         bzlmod_enabled: bool,
     ) -> Self {
-        Self {
+        let loader = Self {
             bazel_client,
             workspace,
             workspace_name,
@@ -66,7 +95,186 @@ impl DefaultFileLoader {
             fetch_repo_sender,
             bzlmod_enabled,
             repositories: Default::default(),
+            configuration_inputs: Default::default(),
+            repository_roots: Default::default(),
+            configuration_revision: None,
+            repository_fetches: Default::default(),
+        };
+        loader.watch_repository(&loader.workspace);
+        loader
+    }
+
+    pub(crate) fn fresh(&self, revision: u64) -> Self {
+        let mut loader = Self::new(
+            self.bazel_client.clone(),
+            self.workspace.clone(),
+            self.workspace_name.clone(),
+            self.external_output_base.clone(),
+            self.fetch_repo_sender.clone(),
+            self.bzlmod_enabled,
+        );
+        loader.configuration_revision = Some(revision);
+        loader
+    }
+
+    fn watch_repository(&self, root: &Path) {
+        if self.repository_roots.write().insert(root.to_path_buf()) {
+            for name in DEPENDENCY_FILES {
+                self.watch_manifest(&root.join(name));
+                if let Ok(canonical) = root.canonicalize() {
+                    self.watch_manifest(&canonical.join(name));
+                }
+            }
         }
+    }
+
+    pub(crate) fn watch_manifest(&self, path: &Path) {
+        self.configuration_inputs
+            .write()
+            .insert(path.to_path_buf(), fs::read(path).ok());
+    }
+
+    pub(crate) fn configuration_paths(&self) -> Vec<PathBuf> {
+        self.configuration_inputs.read().keys().cloned().collect()
+    }
+
+    pub(crate) fn read_manifest(&self, path: &Path) -> std::io::Result<String> {
+        let contents = fs::read(path);
+        self.configuration_inputs
+            .write()
+            .insert(path.to_path_buf(), contents.as_ref().ok().cloned());
+        let contents = contents?;
+        String::from_utf8(contents)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) fn configuration_inputs(&self) -> HashMap<PathBuf, Option<Vec<u8>>> {
+        self.configuration_inputs.read().clone()
+    }
+
+    pub(crate) fn repository_roots(&self) -> anyhow::Result<Vec<PathBuf>> {
+        self.repository_roots
+            .read()
+            .iter()
+            .map(|root| match root.canonicalize() {
+                Ok(root) => Ok(root),
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(root.clone())
+                    } else {
+                        Err(error)
+                            .with_context(|| format!("cannot watch repository {}", root.display()))
+                    }
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn begin_fetch(&self, repository: String) -> bool {
+        match self.repository_fetches.write().entry(repository) {
+            Entry::Vacant(entry) => {
+                entry.insert(RepositoryFetch::Pending);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    pub(crate) fn finish_fetch(
+        &self,
+        repositories: impl IntoIterator<Item = String>,
+        success: bool,
+    ) {
+        let state = if success {
+            RepositoryFetch::Ready
+        } else {
+            RepositoryFetch::Failed
+        };
+        self.repository_fetches
+            .write()
+            .extend(repositories.into_iter().map(|name| (name, state)));
+    }
+
+    fn document_context(
+        &self,
+        previous: &Self,
+        original: &Path,
+        source: &Path,
+    ) -> anyhow::Result<Option<Repository>> {
+        let old = match previous.repositories.read().get(source) {
+            Some(RepositoryContext::Resolved(repository)) => Some(repository.clone()),
+            Some(RepositoryContext::Unknown) => return Ok(None),
+            Some(RepositoryContext::Displaced) => bail!(
+                "repository context for open file {} changed; close and reopen it",
+                original.display()
+            ),
+            None => None,
+        };
+        let target = match original.canonicalize() {
+            Ok(target) => target,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).with_context(|| {
+                        format!("cannot resolve open file {}", original.display())
+                    });
+                }
+                source.to_path_buf()
+            }
+        };
+        let repository_moved = if let Some(repository) = &old {
+            if repository.name.is_empty() {
+                false
+            } else {
+                match self
+                    .external_output_base
+                    .join(&repository.name)
+                    .canonicalize()
+                {
+                    Ok(root) => root != repository.root,
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            return Err(error).context("cannot resolve the open file's repository");
+                        }
+                        true
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if target != source || repository_moved {
+            bail!("open file {} refers to {} after the dependency change (buffer: {}); close and reopen it to use the new repository", original.display(), target.display(), source.display());
+        }
+        Ok(old)
+    }
+
+    pub(crate) fn restore_document_context(
+        &self,
+        previous: &Self,
+        original: &Path,
+        source: &Path,
+    ) -> anyhow::Result<()> {
+        let admission = self
+            .document_context(previous, original, source)
+            .and_then(|repository| self.record_repository(source, repository));
+        match admission {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Admission precedes publication. A refusal also replaces any
+                // prepared context that would reinterpret this open buffer.
+                self.repositories
+                    .write()
+                    .insert(source.to_path_buf(), RepositoryContext::Displaced);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn open_repository_changed(&self, original: &Path, source: &Path) -> bool {
+        if self.repositories.read().get(source) == Some(&RepositoryContext::Displaced) {
+            return false;
+        }
+        self.document_context(self, original, source).is_err()
     }
 }
 
@@ -90,6 +298,7 @@ impl DefaultFileLoader {
     ) -> anyhow::Result<Option<ResolvedLabel>> {
         let from_path = from.path(db);
         let repository = try_opt!(self.repository_for_source(from_path, from_path)?);
+        self.ensure_repository(&repository)?;
         let repository = self.resolve_repository(label, &repository)?;
         let resolved_path = if label.is_relative() {
             package_for_path(from_path, &repository.root)?
@@ -112,15 +321,18 @@ impl DefaultFileLoader {
     }
 
     pub(crate) fn fetch_repository(&self, repository: &Repository) -> anyhow::Result<()> {
+        self.watch_repository(&repository.root);
         if repository.name.is_empty() {
             return Ok(());
         }
         if self.bzlmod_enabled {
-            self.bazel_client.fetch_repo(&repository.name)
+            self.bazel_client.fetch_repo(&repository.name)?;
         } else {
             self.bazel_client
-                .null_query_external_repo_targets(&repository.name)
+                .null_query_external_repo_targets(&repository.name)?;
         }
+        self.finish_fetch([repository.name.clone()], true);
+        Ok(())
     }
 
     pub(crate) fn selected_module(
@@ -139,6 +351,7 @@ impl DefaultFileLoader {
         label: &Label,
         from: &Repository,
     ) -> anyhow::Result<Repository> {
+        self.watch_repository(&from.root);
         let name = match label.kind() {
             RepoKind::Current => return Ok(from.clone()),
             RepoKind::Canonical => label.repo().to_owned(),
@@ -168,6 +381,7 @@ impl DefaultFileLoader {
         } else {
             self.external_output_base.join(&name)
         };
+        self.watch_repository(&root);
         Ok(Repository { name, root })
     }
 
@@ -189,6 +403,10 @@ impl DefaultFileLoader {
     }
 
     fn record_repository(&self, path: &Path, repository: Option<Repository>) -> anyhow::Result<()> {
+        if let Some(repository) = &repository {
+            self.watch_repository(&repository.root);
+        }
+        let repository = repository.map_or(RepositoryContext::Unknown, RepositoryContext::Resolved);
         match self.repositories.write().entry(path.to_path_buf()) {
             Entry::Vacant(entry) => {
                 entry.insert(repository);
@@ -217,10 +435,16 @@ impl DefaultFileLoader {
         path: &Path,
         canonical: &Path,
     ) -> anyhow::Result<Option<Repository>> {
-        if !path.starts_with(&self.external_output_base) {
-            if let Some(repository) = self.repositories.read().get(canonical) {
-                return Ok(repository.clone());
+        match self.repositories.read().get(canonical) {
+            Some(RepositoryContext::Unknown) => return Ok(None),
+            Some(RepositoryContext::Displaced) => return Ok(None),
+            Some(RepositoryContext::Resolved(repository)) => {
+                let repository = repository.clone();
+                if !path.starts_with(&self.external_output_base) {
+                    return Ok(Some(repository));
+                }
             }
+            None => {}
         }
         let repository = if let Ok(relative) = path.strip_prefix(&self.external_output_base) {
             let name = relative
@@ -261,6 +485,25 @@ impl DefaultFileLoader {
         Ok(repository)
     }
 
+    fn ensure_repository(&self, repository: &Repository) -> anyhow::Result<()> {
+        if !repository.name.is_empty()
+            && self.configuration_revision.is_some()
+            && self.repository_fetches.read().get(&repository.name) != Some(&RepositoryFetch::Ready)
+        {
+            let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
+                FetchExternalRepoRequest {
+                    repo: repository.name.clone(),
+                    revision: self.configuration_revision.unwrap_or(0),
+                },
+            ));
+            bail!(
+                "repository @@{} must be fetched after the dependency change",
+                repository.name
+            );
+        }
+        Ok(())
+    }
+
     fn read_file(
         &self,
         db: &dyn Db,
@@ -270,6 +513,9 @@ impl DefaultFileLoader {
         repository: Option<Repository>,
     ) -> anyhow::Result<File> {
         let result = (|| {
+            if let Some(repository) = &repository {
+                self.ensure_repository(repository)?;
+            }
             let system_path = starpls_common::system_path(&path)?;
             let canonical = match db.system().canonicalize_path(system_path) {
                 Ok(path) => path,
@@ -303,15 +549,16 @@ impl DefaultFileLoader {
             }) = repository
             {
                 if !canonical_repo.is_empty()
-                    && !self
+                    && (!self
                         .external_output_base
                         .join(&canonical_repo)
                         .try_exists()
-                        .unwrap_or(false)
+                        .unwrap_or(false))
                 {
                     let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
                         FetchExternalRepoRequest {
                             repo: canonical_repo,
+                            revision: self.configuration_revision.unwrap_or(0),
                         },
                     ));
                 }
@@ -362,6 +609,7 @@ impl FileLoader for DefaultFileLoader {
         };
 
         let resolved_label = try_opt!(self.resolve_label(db, &label, from)?);
+        self.ensure_repository(&resolved_label.repository)?;
         let res = if fs::metadata(&resolved_label.resolved_path)
             .ok()
             .map(|metadata| metadata.is_file())
@@ -499,6 +747,7 @@ impl FileLoader for DefaultFileLoader {
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
                 };
                 let repository = try_opt!(self.repository_for_source(&from_path, &from_path)?);
+                self.ensure_repository(&repository)?;
 
                 if !label.has_leading_slashes()
                     && !label.is_relative()
@@ -540,6 +789,7 @@ impl FileLoader for DefaultFileLoader {
                 }
 
                 let repository = self.resolve_repository(&label, &repository)?;
+                self.ensure_repository(&repository)?;
                 let root = repository.root;
                 let package = if label.is_relative() {
                     package_for_path(&from_path, &root)?
@@ -746,7 +996,7 @@ pub(crate) fn dialect_and_api_context_for_workspace_path(
 }
 
 #[cfg(test)]
-mod source_tests {
+pub(crate) mod source_tests {
     use std::path::Path;
     use std::sync::Arc;
 
@@ -761,7 +1011,9 @@ mod source_tests {
     use super::DefaultFileLoader;
 
     #[derive(Default)]
-    pub(crate) struct TestBazelClient;
+    pub(crate) struct TestBazelClient {
+        pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
+    }
 
     impl starpls_bazel::client::BazelClient for TestBazelClient {
         fn build_language(&self) -> anyhow::Result<Vec<u8>> {
@@ -792,8 +1044,8 @@ mod source_tests {
             ))
         }
         fn clear_repo_mappings(&self) {}
-        fn null_query_external_repo_targets(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
+        fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()> {
+            self.fetch_repo(repo)
         }
         fn repo_mapping_keys(&self, from: &str) -> anyhow::Result<Vec<String>> {
             Ok(vec![from.to_owned()])
@@ -801,8 +1053,19 @@ mod source_tests {
         fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
             unimplemented!()
         }
-        fn fetch_repo(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
+        fn fetch_repo(&self, repo: &str) -> anyhow::Result<()> {
+            if repo == "rules+" {
+                if let Some((link, target)) = self.retarget.lock().unwrap().take() {
+                    #[cfg(unix)]
+                    {
+                        std::fs::remove_file(&link)?;
+                        std::os::unix::fs::symlink(target, link)?;
+                    }
+                    #[cfg(not(unix))]
+                    unreachable!("Unix fixture: {link:?} {target:?}");
+                }
+            }
+            Ok(())
         }
         fn dump_repo_mapping(
             &self,
@@ -840,7 +1103,7 @@ mod source_tests {
         std::os::unix::fs::symlink(&stubs, external.join("stubs+")).unwrap();
         let (sender, _) = crossbeam_channel::unbounded();
         let loader = Arc::new(DefaultFileLoader::new(
-            Arc::new(TestBazelClient),
+            Arc::new(TestBazelClient::default()),
             workspace.clone(),
             None,
             external.clone(),
@@ -975,6 +1238,21 @@ mod source_tests {
             analysis.document(&new_physical).unwrap().path.as_std_path(),
             new_alias
         );
+        let fresh = loader.fresh(1);
+        fresh
+            .register_path(&canonical, &fresh.main_repository())
+            .unwrap();
+        assert!(fresh
+            .restore_document_context(&loader, &canonical, &canonical)
+            .is_err());
+        assert_eq!(fresh.repository_for_path(&canonical).unwrap(), None);
+        let unassociated = root.join("unassociated.bzl");
+        std::fs::write(&unassociated, "value = 1\n").unwrap();
+        assert_eq!(loader.repository_for_path(&unassociated).unwrap(), None);
+        fresh
+            .restore_document_context(&loader, &unassociated, &unassociated)
+            .unwrap();
+        assert_eq!(fresh.repository_for_path(&unassociated).unwrap(), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 

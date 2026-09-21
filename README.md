@@ -106,6 +106,11 @@ and the language server read this configuration at startup:
 manifest = "@rules_foo_stubs//:stubs.toml"
 ```
 
+The language server reloads saved configuration, selected manifests, and Bazel module
+and workspace inputs. It watches Starlark files in discovered repositories; saving a
+`.bzl` file revalidates selected packages. Restart the server after changes to
+`.bazelrc`, `.bazelversion`, or other files read by repository extensions.
+
 Use a `.bzli` stub file to provide types for a `.bzl` module:
 
 ```starlark

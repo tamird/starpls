@@ -30,6 +30,9 @@ pub(crate) fn did_close_text_document(
         return Ok(());
     }
     if server.analysis.close_document(&path)?.is_some() {
+        if server.configuration.needs_reopen {
+            server.reload_configuration()?;
+        }
         server.invalidate_diagnostics();
         server.send_notification::<lsp_types::notification::PublishDiagnostics>(
             lsp_types::PublishDiagnosticsParams {
@@ -65,25 +68,13 @@ pub(crate) fn did_save_text_document(
     params: lsp_types::DidSaveTextDocumentParams,
 ) -> anyhow::Result<()> {
     let path = convert::path_buf_from_url(&params.text_document.uri)?;
-    if server
-        .analysis
-        .document(&path)
-        .is_some_and(|document| document.path.as_std_path() == path)
-    {
-        match path.file_name().and_then(|file_name| file_name.to_str()) {
-            Some("MODULE.bazel" | "WORKSPACE" | "WORKSPACE.bazel" | "WORKSPACE.bzlmod") => {}
-            Some(file_name) if file_name.ends_with(".MODULE.bazel") => {}
-            Some("BUILD" | "BUILD.bazel") => {
-                server.refresh_all_workspace_targets();
-                return Ok(());
-            }
-            _ => return Ok(()),
-        }
-        server.bazel_client.clear_repo_mappings();
-        server.fetched_repos.clear();
-        server.analysis.invalidate_loads();
-        server.invalidate_diagnostics();
+    if matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("BUILD" | "BUILD.bazel")
+    ) {
+        server.refresh_all_workspace_targets();
     }
+    server.configuration_changed(&[path])?;
     Ok(())
 }
 
@@ -96,6 +87,7 @@ pub(crate) fn did_change_watched_files(
         .into_iter()
         .map(|event| convert::path_buf_from_url(&event.uri))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    server.configuration_changed(&paths)?;
     server.analysis.sync_files(&paths)?;
     server.invalidate_diagnostics();
     Ok(())

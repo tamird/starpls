@@ -37,11 +37,11 @@ impl<'a> RequestDispatcher<'a> {
             let res = panic::catch_unwind(|| f(&snapshot, params));
             let response = match res {
                 Ok(res) => match res {
-                    Ok(res) => lsp_server::Response::new_ok(req.id, res),
+                    Ok(res) => lsp_server::Response::new_ok(req.id.clone(), res),
                     Err(err) => match err.downcast::<Cancelled>() {
                         Ok(_) => return Task::Retry(req),
                         Err(err) => lsp_server::Response::new_err(
-                            req.id,
+                            req.id.clone(),
                             lsp_server::ErrorCode::RequestFailed as i32,
                             err.to_string(),
                         ),
@@ -53,7 +53,7 @@ impl<'a> RequestDispatcher<'a> {
                         .map(String::as_str)
                         .or_else(|| err.downcast_ref::<&str>().copied());
                     lsp_server::Response::new_err(
-                        req.id,
+                        req.id.clone(),
                         lsp_server::ErrorCode::RequestFailed as i32,
                         format!(
                             "request handler panicked: {}",
@@ -63,7 +63,11 @@ impl<'a> RequestDispatcher<'a> {
                 }
             };
 
-            Task::ResponseReady(response)
+            Task::ResponseReady {
+                revision: snapshot.configuration_revision,
+                request: req,
+                response,
+            }
         });
 
         self
@@ -75,12 +79,18 @@ impl<'a> RequestDispatcher<'a> {
             None => return,
         };
 
+        let revision = self.server.configuration.revision;
         self.server.task_pool_handle.spawn(move || {
-            Task::ResponseReady(lsp_server::Response::new_err(
-                req.id,
+            let response = lsp_server::Response::new_err(
+                req.id.clone(),
                 lsp_server::ErrorCode::MethodNotFound as i32,
                 format!("method not found: {}", req.method),
-            ))
+            );
+            Task::ResponseReady {
+                revision,
+                request: req,
+                response,
+            }
         });
     }
 

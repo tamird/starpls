@@ -40,6 +40,7 @@ struct Source {
     versions: Vec<String>,
 }
 
+#[derive(Debug)]
 pub(super) struct Registration {
     pub(super) source: PathBuf,
     pub(super) interface: PathBuf,
@@ -51,7 +52,8 @@ pub(super) fn load(
     workspace: &Path,
 ) -> anyhow::Result<Vec<Registration>> {
     let path = workspace.join("starpls.toml");
-    let contents = match std::fs::read_to_string(&path) {
+    loader.watch_manifest(&path);
+    let contents = match loader.read_manifest(&path) {
         Ok(contents) => contents,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -97,8 +99,11 @@ fn load_package(
             }
             (workspace.join(&manifest), main)
         };
+    loader.watch_manifest(&path);
     let path = contained_file(&path, &repository.root)?;
-    let contents = std::fs::read_to_string(&path)
+    loader.watch_manifest(&path);
+    let contents = loader
+        .read_manifest(&path)
         .with_context(|| format!("cannot read manifest {}", path.display()))?;
     let Manifest {
         format_version,

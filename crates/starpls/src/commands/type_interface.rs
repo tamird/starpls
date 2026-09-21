@@ -13,7 +13,7 @@ use starpls_ide::Analysis;
 
 use super::stub_package::Registration;
 
-#[derive(Args, Default)]
+#[derive(Args, Clone, Default)]
 pub(crate) struct TypeInterfaceOptions {
     /// Trust declarations in INTERFACE for exports of SOURCE; repeat for more files.
     #[clap(long = "type_interface", value_name = "SOURCE=INTERFACE")]
@@ -44,12 +44,24 @@ impl FromStr for TypeInterfaceMapping {
 }
 
 impl TypeInterfaceOptions {
+    pub(crate) fn is_configured(&self) -> bool {
+        !self.mappings.is_empty()
+    }
     pub(crate) fn install(
         &self,
         analysis: &mut Analysis,
         loader: &crate::document::DefaultFileLoader,
         workspace: &Path,
     ) -> anyhow::Result<()> {
+        self.prepare(loader, workspace)?
+            .install(analysis, workspace)
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        loader: &crate::document::DefaultFileLoader,
+        workspace: &Path,
+    ) -> anyhow::Result<PreparedInterfaces> {
         let mut registrations = super::stub_package::load(loader, workspace)?;
         let resolve = |path: &Path| -> anyhow::Result<PathBuf> {
             let path = workspace.join(path);
@@ -77,12 +89,11 @@ impl TypeInterfaceOptions {
             });
         }
         let mut origins = HashMap::new();
-        let mut mappings = Vec::with_capacity(registrations.len());
         for Registration {
             source,
-            interface,
+            interface: _,
             origin,
-        } in registrations
+        } in &registrations
         {
             match origins.entry(source.clone()) {
                 Entry::Vacant(entry) => {
@@ -97,6 +108,26 @@ impl TypeInterfaceOptions {
                     );
                 }
             }
+        }
+        Ok(PreparedInterfaces { registrations })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedInterfaces {
+    registrations: Vec<Registration>,
+}
+
+impl PreparedInterfaces {
+    pub(crate) fn install(self, analysis: &mut Analysis, workspace: &Path) -> anyhow::Result<()> {
+        let Self { registrations } = self;
+        let mut mappings = Vec::with_capacity(registrations.len());
+        for Registration {
+            source,
+            interface,
+            origin: _,
+        } in registrations
+        {
             let open = |path: &Path| {
                 analysis.file(
                     path,

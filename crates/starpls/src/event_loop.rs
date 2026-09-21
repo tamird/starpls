@@ -32,18 +32,26 @@ macro_rules! match_notification {
 #[derive(Debug)]
 pub(crate) enum FetchExternalReposProgress {
     Begin(FxHashSet<String>),
-    End(Vec<String>),
+    End {
+        revision: u64,
+        fetched: Vec<String>,
+        failed: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) struct FetchExternalRepoRequest {
     pub(crate) repo: String,
+    pub(crate) revision: u64,
 }
 
 #[derive(Debug)]
 pub(crate) enum RefreshAllWorkspaceTargetsProgress {
     Begin,
-    End(Option<Vec<String>>),
+    End {
+        revision: u64,
+        targets: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -58,7 +66,12 @@ pub(crate) enum Task {
         )>,
     ),
     /// A request has been evaluated and its response is ready.
-    ResponseReady(lsp_server::Response),
+    ResponseReady {
+        revision: u64,
+        request: lsp_server::Request,
+        response: lsp_server::Response,
+    },
+    ConfigurationReady(crate::server::ConfigurationReady),
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
     Retry(lsp_server::Request),
     /// Events from fetching external repositories.
@@ -138,6 +151,16 @@ impl Server {
             }
         };
 
+        if let Err(error) = self.watch_type_interfaces() {
+            self.send_error_message(&format!("{error:#}"));
+        }
+        if self.configuration.refreshing {
+            return Ok(());
+        }
+        for request in std::mem::take(&mut self.configuration.deferred_requests) {
+            self.handle_request(request);
+        }
+
         if !self.pending_repos.is_empty() && !self.is_fetching_repos {
             self.fetch_bazel_external_repos();
         }
@@ -185,6 +208,10 @@ impl Server {
     }
 
     fn handle_request(&mut self, req: lsp_server::Request) {
+        if self.configuration.refreshing {
+            self.configuration.deferred_requests.push(req);
+            return;
+        }
         RequestDispatcher::new(req, self)
             .on::<extensions::ShowSyntaxTree>(requests::show_syntax_tree)
             .on::<extensions::ShowHir>(requests::show_hir)
@@ -233,9 +260,18 @@ impl Server {
                     }
                 }
             }
-            Task::ResponseReady(resp) => {
-                self.respond(resp);
+            Task::ResponseReady {
+                revision,
+                request,
+                response,
+            } => {
+                if revision == self.configuration.revision {
+                    self.respond(response);
+                } else {
+                    self.handle_request(request);
+                }
             }
+            Task::ConfigurationReady(ready) => self.finish_configuration_refresh(ready),
             Task::Retry(req) => self.handle_request(req),
             Task::FetchExternalRepos(progress) => {
                 let token = "FetchExternalRepos".to_string();
@@ -265,10 +301,23 @@ impl Server {
                             ..Default::default()
                         })
                     }
-                    FetchExternalReposProgress::End(failed_repos) => {
+                    FetchExternalReposProgress::End {
+                        revision,
+                        fetched,
+                        failed: failed_repos,
+                    } => {
                         self.is_fetching_repos = false;
-                        self.analysis.invalidate_loads();
-                        self.invalidate_diagnostics();
+                        if revision == self.configuration.revision {
+                            self.loader.finish_fetch(fetched, true);
+                            self.loader.finish_fetch(failed_repos.clone(), false);
+                            if self.open_repository_changed() {
+                                if let Err(error) = self.reload_configuration() {
+                                    self.send_error_message(&format!("{error:#}"));
+                                }
+                            }
+                            self.analysis.invalidate_loads();
+                            self.invalidate_diagnostics();
+                        }
 
                         // Fetching external repositories with `bazel query`, as in the case when bzlmod is disabled, often
                         // results in a non-zero exit code because of errors that we don't really care about. Therefore, to
@@ -294,8 +343,9 @@ impl Server {
                     },
                 );
             }
-            Task::FetchExternalRepoRequest(FetchExternalRepoRequest { repo }) => {
-                if !self.fetched_repos.contains(&repo) {
+            Task::FetchExternalRepoRequest(FetchExternalRepoRequest { repo, revision }) => {
+                if revision == self.configuration.revision && self.loader.begin_fetch(repo.clone())
+                {
                     self.pending_repos.insert(repo);
                 }
             }
@@ -314,11 +364,20 @@ impl Server {
                             ..Default::default()
                         })
                     }
-                    RefreshAllWorkspaceTargetsProgress::End(targets) => {
+                    RefreshAllWorkspaceTargetsProgress::End { revision, targets } => {
                         self.is_refreshing_all_workspace_targets = false;
-                        if let Some(targets) = targets {
-                            self.analysis.set_all_workspace_targets(targets);
-                            self.invalidate_diagnostics();
+                        if revision == self.configuration.revision {
+                            if self.open_repository_changed() {
+                                if let Err(error) = self.reload_configuration() {
+                                    self.send_error_message(&format!("{error:#}"));
+                                }
+                            } else if let Some(targets) = targets {
+                                self.analysis.set_all_workspace_targets(targets);
+                                self.analysis.invalidate_loads();
+                                self.invalidate_diagnostics();
+                            }
+                        } else {
+                            self.refresh_all_workspace_targets();
                         }
 
                         lsp_types::WorkDoneProgress::End(lsp_types::WorkDoneProgressEnd {
@@ -429,7 +488,8 @@ mod tests {
         let disk = InMemorySystem::default();
         disk.create_directory_all(SystemPath::new("/workspace"))
             .unwrap();
-        let analysis = Analysis::with_system(Arc::new(loader), Default::default(), disk.clone());
+        let loader = Arc::new(loader);
+        let analysis = Analysis::with_system(loader.clone(), Default::default(), disk.clone());
         let server = Server {
             config: Arc::new(ServerConfig {
                 args: Default::default(),
@@ -450,10 +510,11 @@ mod tests {
             analysis_requested_for_files: None,
             bazel_client,
             pending_repos: Default::default(),
-            fetched_repos: Default::default(),
             is_fetching_repos: false,
             is_refreshing_all_workspace_targets: false,
             bzlmod_enabled: false,
+            loader,
+            configuration: Default::default(),
         };
         TestServer {
             server,
@@ -509,6 +570,455 @@ mod tests {
         server.handle_event(Event::Task(task)).unwrap();
     }
 
+    fn finish_reload(server: &mut Server) {
+        loop {
+            let task = server
+                .task_pool_handle
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let done = matches!(task, Task::ConfigurationReady(_));
+            server.handle_task(task);
+            if done {
+                break;
+            }
+        }
+    }
+
+    fn finish_fetch(server: &mut Server) {
+        while let Ok(task) = server.task_pool_handle.receiver.try_recv() {
+            server.handle_task(task);
+        }
+        assert!(
+            server.pending_repos.contains("rules+"),
+            "{}: {:?}",
+            server.workspace.display(),
+            server.pending_repos
+        );
+        server.fetch_bazel_external_repos();
+        loop {
+            let task = server
+                .task_pool_handle
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let done = matches!(
+                task,
+                Task::FetchExternalRepos(FetchExternalReposProgress::End { .. })
+            );
+            server.handle_task(task);
+            if done {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transitive_watches_and_retargeted_open_repositories() {
+        for (physical, during_fetch) in [(false, false), (true, false), (true, true)] {
+            let TestServer {
+                mut server,
+                client,
+                disk: _,
+                tasks,
+                debounced: _,
+            } = server();
+            let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+                .join(format!("reload-repositories-{physical}-{during_fetch}"));
+            let workspace = root.join("workspace");
+            let external = root.join("external");
+            let old = root.join("old");
+            let new = root.join("new");
+            let helper = root.join("helper");
+            for directory in [&workspace, &external, &old, &new, &helper] {
+                std::fs::create_dir_all(directory).unwrap();
+                std::fs::write(directory.join("BUILD"), "").unwrap();
+            }
+            let text = "load(\"@@helper+//:defs.bzl\", \"helper_value\")\nvalue = helper_value\n";
+            std::fs::write(old.join("defs.bzl"), text).unwrap();
+            std::fs::write(new.join("defs.bzl"), "value = 2\n").unwrap();
+            std::fs::write(helper.join("defs.bzl"), "helper_value = 1\n").unwrap();
+            std::os::unix::fs::symlink(&old, external.join("rules+")).unwrap();
+            std::os::unix::fs::symlink(&helper, external.join("helper+")).unwrap();
+            server.bazel_client = Arc::new(crate::document::source_tests::TestBazelClient {
+                retarget: std::sync::Mutex::new(
+                    during_fetch.then(|| (external.join("rules+"), new.clone())),
+                ),
+            });
+            server.loader = Arc::new(DefaultFileLoader::new(
+                server.bazel_client.clone(),
+                workspace.clone(),
+                None,
+                external.clone(),
+                tasks,
+                false,
+            ));
+            server.analysis = Analysis::new(server.loader.clone(), Default::default()).unwrap();
+            server.workspace = workspace.clone();
+            let caller = workspace.join("caller.bzl");
+            server
+                .open_document(
+                    &caller,
+                    "load(\"@@rules+//:defs.bzl\", \"value\")\nresult = value\n".into(),
+                    1,
+                )
+                .unwrap();
+            let file = server
+                .analysis
+                .snapshot()
+                .open_file(&caller)
+                .unwrap()
+                .unwrap();
+            let diagnostics = collect_diagnostics(&server.snapshot(), file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert!(server.loader.repository_roots().unwrap().contains(&helper));
+            Arc::get_mut(&mut server.config).unwrap().caps.workspace =
+                Some(lsp_types::WorkspaceClientCapabilities {
+                    did_change_watched_files: Some(
+                        lsp_types::DidChangeWatchedFilesClientCapabilities {
+                            dynamic_registration: Some(true),
+                            relative_pattern_support: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                });
+            server.watch_type_interfaces().unwrap();
+            let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
+                panic!("watch request")
+            };
+            assert!(
+                request.params.to_string().contains(
+                    lsp_types::Url::from_directory_path(&helper)
+                        .unwrap()
+                        .as_str()
+                ),
+                "{request:?}"
+            );
+            let alias = if physical {
+                old.join("defs.bzl")
+            } else {
+                external.join("rules+/defs.bzl")
+            };
+            server
+                .open_document(&alias, format!("{text}unsaved = 42\n"), 7)
+                .unwrap();
+            if !during_fetch {
+                std::fs::remove_file(external.join("rules+")).unwrap();
+                std::os::unix::fs::symlink(&new, external.join("rules+")).unwrap();
+            }
+            server.reload_configuration().unwrap();
+            finish_reload(&mut server);
+            if during_fetch {
+                assert!(!server.configuration.needs_reopen);
+                server.analysis.close_document(&caller).unwrap();
+                let external_file = server
+                    .analysis
+                    .snapshot()
+                    .open_file(&alias)
+                    .unwrap()
+                    .unwrap();
+                assert!(!collect_diagnostics(&server.snapshot(), external_file)
+                    .unwrap()
+                    .is_empty());
+                finish_fetch(&mut server);
+                assert!(server.configuration.refreshing);
+                finish_reload(&mut server);
+            }
+            assert!(server.configuration.needs_reopen);
+            assert!(server
+                .analysis
+                .document(&alias)
+                .unwrap()
+                .contents
+                .contains("unsaved = 42"));
+            assert!(!collect_diagnostics(&server.snapshot(), file)
+                .unwrap()
+                .is_empty());
+            assert!(client.receiver.try_iter().any(|message| match message {
+                lsp_server::Message::Notification(message) =>
+                    message.params.to_string().contains("close and reopen"),
+                _ => false,
+            }));
+            server
+                .open_document(&alias, format!("{text}unsaved = 43\n"), 8)
+                .unwrap();
+            assert_eq!(server.analysis.document(&alias).unwrap().version, 8);
+            server.reload_configuration().unwrap();
+            finish_reload(&mut server);
+            assert!(server.configuration.needs_reopen);
+            assert_eq!(server.analysis.document(&alias).unwrap().version, 8);
+            assert_eq!(
+                server
+                    .loader
+                    .repository_for_path(&old.join("defs.bzl"))
+                    .unwrap(),
+                None
+            );
+
+            crate::handlers::notifications::did_close_text_document(
+                &mut server,
+                lsp_types::DidCloseTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: lsp_types::Url::from_file_path(&alias).unwrap(),
+                    },
+                },
+            )
+            .unwrap();
+            finish_reload(&mut server);
+            assert!(!server.configuration.needs_reopen);
+            if during_fetch {
+                server
+                    .open_document(
+                        &caller,
+                        "load(\"@@rules+//:defs.bzl\", \"value\")\nresult = value\n".into(),
+                        2,
+                    )
+                    .unwrap();
+            }
+            let _ = collect_diagnostics(&server.snapshot(), file);
+            // Existing directories are fetched for the new dependency snapshot too.
+            finish_fetch(&mut server);
+            let diagnostics = collect_diagnostics(&server.snapshot(), file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn saved_configuration_replaces_stubs_and_recovers() {
+        let TestServer {
+            mut server,
+            client,
+            disk: _,
+            tasks,
+            debounced: _,
+        } = server();
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("configuration-reload");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("BUILD"), "").unwrap();
+        std::fs::write(root.join("source.bzl"), "def f(value): pass\n").unwrap();
+        std::fs::write(root.join("source.bzli"), "def f(value: int): ...\n").unwrap();
+        let manifest = "format-version = 1\n[source]\nrepository = '@'\nmodule = 'local'\nversions = ['1']\n[files]\n'source.bzl' = 'source.bzli'\n";
+        std::fs::write(root.join("stubs.toml"), manifest).unwrap();
+        server.loader = Arc::new(DefaultFileLoader::new(
+            server.bazel_client.clone(),
+            root.clone(),
+            None,
+            root.join("external"),
+            tasks,
+            false,
+        ));
+        server.analysis = Analysis::new(server.loader.clone(), Default::default()).unwrap();
+        server.workspace = root.clone();
+        let caller = root.join("caller.bzl");
+        server
+            .open_document(
+                &caller,
+                "load(\"//:source.bzl\", \"f\")\nf(\"wrong\")\n".into(),
+                7,
+            )
+            .unwrap();
+        let file = server
+            .analysis
+            .snapshot()
+            .open_file(&caller)
+            .unwrap()
+            .unwrap();
+        assert!(collect_diagnostics(&server.snapshot(), file)
+            .unwrap()
+            .is_empty());
+        let old = captured_diagnostics(&mut server, file);
+        let request = lsp_server::Request::new(
+            51.into(),
+            "textDocument/hover".into(),
+            serde_json::json!({
+                "textDocument": { "uri": lsp_types::Url::from_file_path(&caller).unwrap() },
+                "position": { "line": 1, "character": 0 },
+            }),
+        );
+        server.req_queue.incoming.register(request.id.clone(), ());
+        let old_response = Task::ResponseReady {
+            revision: server.configuration.revision,
+            response: lsp_server::Response::new_ok(request.id.clone(), "stale"),
+            request,
+        };
+        std::fs::write(
+            root.join("starpls.toml"),
+            "[[stub-packages]]\nmanifest = 'stubs.toml'\nallow-unversioned = true\n",
+        )
+        .unwrap();
+        let changed = |path: &std::path::Path| lsp_types::DidChangeWatchedFilesParams {
+            changes: vec![lsp_types::FileEvent {
+                uri: lsp_types::Url::from_file_path(path).unwrap(),
+                typ: lsp_types::FileChangeType::CHANGED,
+            }],
+        };
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("starpls.toml")),
+        )
+        .unwrap();
+        server.handle_task(old);
+        server.handle_task(old_response);
+        assert_eq!(server.configuration.deferred_requests.len(), 1);
+        assert!(published(&client).is_empty());
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(ready, Task::ConfigurationReady(_)), "{ready:?}");
+        // A second save arrives while a prepared result is waiting in the queue.
+        std::fs::write(
+            root.join("starpls.toml"),
+            "[[stub-packages]]\nmanifest = 'stubs.toml'\nallow-unversioned = true\n# second save\n",
+        )
+        .unwrap();
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("starpls.toml")),
+        )
+        .unwrap();
+        server.handle_task(ready);
+        assert!(server.analysis.type_interface_files().is_empty());
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(ready);
+        for request in std::mem::take(&mut server.configuration.deferred_requests) {
+            server.handle_request(request);
+        }
+        let response = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(response);
+        assert!(client.receiver.try_iter().any(|message| match message {
+            lsp_server::Message::Response(response) =>
+                response.id == 51.into() && !response.result.unwrap().to_string().contains("stale"),
+            _ => false,
+        }));
+        assert_eq!(server.analysis.type_interface_files().len(), 1);
+        assert!(!collect_diagnostics(&server.snapshot(), file)
+            .unwrap()
+            .is_empty());
+
+        // Unsaved interfaces remain authoritative across a valid dependency reload.
+        server
+            .open_document(
+                &root.join("source.bzli"),
+                "def f(value: str): ...\n".into(),
+                3,
+            )
+            .unwrap();
+        std::fs::write(root.join("MODULE.bazel.lock"), "{}").unwrap();
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("MODULE.bazel.lock")),
+        )
+        .unwrap();
+        assert!(server.analysis.type_interface_files().is_empty());
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(ready);
+        assert!(collect_diagnostics(&server.snapshot(), file)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            server
+                .analysis
+                .document(&root.join("source.bzli"))
+                .unwrap()
+                .version,
+            3
+        );
+        let revision = server.configuration.revision;
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("MODULE.bazel.lock")),
+        )
+        .unwrap();
+        assert_eq!(
+            server.configuration.revision, revision,
+            "unchanged lock notification must settle"
+        );
+
+        std::fs::write(root.join("stubs.toml"), "invalid = true\n").unwrap();
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("stubs.toml")),
+        )
+        .unwrap();
+        assert!(server.analysis.type_interface_files().is_empty());
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(ready);
+        assert!(server.analysis.type_interface_files().is_empty());
+        assert_eq!(server.analysis.document(&caller).unwrap().version, 7);
+        assert!(client.receiver.try_iter().any(|message| match message {
+            lsp_server::Message::Notification(message) =>
+                message.method == "window/showMessage"
+                    && message.params.to_string().contains("invalid manifest"),
+            _ => false,
+        }));
+        // Repair the selected manifest alone; the failed attempt retained its watch input.
+        std::fs::write(root.join("stubs.toml"), manifest).unwrap();
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join("stubs.toml")),
+        )
+        .unwrap();
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(ready);
+        assert_eq!(server.analysis.type_interface_files().len(), 1);
+        std::fs::remove_file(root.join("starpls.toml")).unwrap();
+        crate::handlers::notifications::did_save_text_document(
+            &mut server,
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::from_file_path(root.join("starpls.toml")).unwrap(),
+                },
+                text: None,
+            },
+        )
+        .unwrap();
+        let ready = server
+            .task_pool_handle
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        server.handle_task(ready);
+        assert!(server.analysis.type_interface_files().is_empty());
+        std::fs::write(root.join(".bazelrc"), "common --enable_bzlmod\n").unwrap();
+        crate::handlers::notifications::did_change_watched_files(
+            &mut server,
+            changed(&root.join(".bazelrc")),
+        )
+        .unwrap();
+        assert!(!server.configuration.refreshing);
+        assert!(client.receiver.try_iter().any(|message| match message {
+            lsp_server::Message::Notification(message) =>
+                message.params.to_string().contains("Restart Starpls"),
+            _ => false,
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_rejected_alias_open_preserves_the_server_and_buffer() {
@@ -534,7 +1044,8 @@ mod tests {
             tasks,
             false,
         );
-        server.analysis = Analysis::new(Arc::new(loader), Default::default()).unwrap();
+        server.loader = Arc::new(loader);
+        server.analysis = Analysis::new(server.loader.clone(), Default::default()).unwrap();
         server.workspace = root.clone();
         let alias_uri = lsp_types::Url::from_file_path(&alias).unwrap();
         for (path, value) in [(&alias, 1), (&target, 2)] {
@@ -734,7 +1245,11 @@ mod tests {
         tasks.send(old).unwrap();
         server
             .handle_event(Event::Task(Task::FetchExternalRepos(
-                FetchExternalReposProgress::End(Vec::new()),
+                FetchExternalReposProgress::End {
+                    revision: server.configuration.revision,
+                    fetched: Vec::new(),
+                    failed: Vec::new(),
+                },
             )))
             .unwrap();
         assert!(published(&client).is_empty());
@@ -751,7 +1266,10 @@ mod tests {
         tasks.send(old).unwrap();
         server
             .handle_event(Event::Task(Task::RefreshAllWorkspaceTargets(
-                RefreshAllWorkspaceTargetsProgress::End(Some(vec!["//:target".into()])),
+                RefreshAllWorkspaceTargetsProgress::End {
+                    revision: server.configuration.revision,
+                    targets: Some(vec!["//:target".into()]),
+                },
             )))
             .unwrap();
         assert!(published(&client).is_empty());
@@ -913,6 +1431,7 @@ mod tests {
             }),
             ..Default::default()
         });
+        server.configuration = Default::default();
         server.watch_type_interfaces().unwrap();
         let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
             panic!("expected watch registration")
@@ -924,21 +1443,31 @@ mod tests {
         };
         let options: lsp_types::DidChangeWatchedFilesRegistrationOptions =
             serde_json::from_value(registration.register_options.clone().unwrap()).unwrap();
-        let [workspace, external] = options.watchers.as_slice() else {
-            panic!("expected workspace glob and one external file: {options:?}")
-        };
-        assert_eq!(
-            workspace.glob_pattern,
-            lsp_types::GlobPattern::String("**/*.{bzl,bzli}".to_owned())
+        assert!(
+            options
+                .watchers
+                .iter()
+                .any(|watcher| match &watcher.glob_pattern {
+                    lsp_types::GlobPattern::String(pattern) =>
+                        pattern.contains("starpls.toml") && pattern.contains("*.bzli"),
+                    lsp_types::GlobPattern::Relative(_) => false,
+                }),
+            "{options:?}"
         );
-        assert_eq!(
-            external.glob_pattern,
-            lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
-                base_uri: lsp_types::OneOf::Right(
-                    lsp_types::Url::from_directory_path("/contracts").unwrap(),
-                ),
-                pattern: "source.bzli".to_owned(),
-            })
+        assert!(
+            options
+                .watchers
+                .iter()
+                .any(|watcher| match &watcher.glob_pattern {
+                    lsp_types::GlobPattern::Relative(pattern) =>
+                        pattern.base_uri
+                            == lsp_types::OneOf::Right(
+                                lsp_types::Url::from_directory_path("/contracts").unwrap()
+                            )
+                            && pattern.pattern.contains("*.bzli"),
+                    lsp_types::GlobPattern::String(_) => false,
+                }),
+            "{options:?}"
         );
         disk.write_file(SystemPath::new("/contracts/source.bzli"), int_contract)
             .unwrap();
@@ -953,6 +1482,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        server.configuration = Default::default();
         server.watch_type_interfaces().unwrap();
         let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
             panic!("expected watch registration")
@@ -983,6 +1513,7 @@ mod tests {
             .sender
             .send(lsp_server::Notification::new("exit".to_owned(), ()).into())
             .unwrap();
+        server.configuration = Default::default();
         server.run().unwrap();
         assert_eq!(debounced.try_recv().unwrap(), vec![interface]);
         let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {

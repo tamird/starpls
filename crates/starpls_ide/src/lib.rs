@@ -368,6 +368,29 @@ impl Analysis {
         environment.set_load_revision(db).to(revision);
     }
 
+    /// Replace host resolution only after all snapshots using the old host drain.
+    pub fn replace_loader(&mut self, loader: Arc<dyn FileLoader>) -> anyhow::Result<()> {
+        let Self { db } = self;
+        salsa::Database::trigger_cancellation(db);
+        db.loader = loader;
+        let mut error = None;
+        for (source, document) in db.system.documents() {
+            if let Err(admission) = db.loader.file_info(
+                document.path.as_std_path(),
+                source.as_std_path(),
+                document.dialect,
+                document.info,
+            ) {
+                error.get_or_insert(admission);
+            }
+        }
+        self.invalidate_loads();
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     pub fn snapshot(&self) -> AnalysisSnapshot {
         let Self { db } = self;
         AnalysisSnapshot { db: db.clone() }

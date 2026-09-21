@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem;
 use std::panic;
 use std::path::Path;
@@ -41,7 +42,7 @@ const BAZEL_INIT_ERR_MESSAGE: &str = "Failed to fetch Bazel configuration! Pleas
 
 pub(crate) enum OutgoingRequest {
     Other,
-    RegisterFileWatchers,
+    RegisterFileWatchers(u64),
 }
 
 pub(crate) struct Server {
@@ -57,15 +58,45 @@ pub(crate) struct Server {
     pub(crate) analysis_requested_for_files: Option<Vec<File>>,
     pub(crate) bazel_client: Arc<dyn BazelClient>,
     pub(crate) pending_repos: FxHashSet<String>,
-    pub(crate) fetched_repos: FxHashSet<String>,
     pub(crate) is_fetching_repos: bool,
     pub(crate) is_refreshing_all_workspace_targets: bool,
     pub(crate) bzlmod_enabled: bool,
+    pub(crate) loader: Arc<DefaultFileLoader>,
+    pub(crate) configuration: ConfigurationState,
 }
 
 pub(crate) struct ServerSnapshot {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) analysis_snapshot: AnalysisSnapshot,
+    pub(crate) configuration_revision: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct ConfigurationState {
+    pub(crate) revision: u64,
+    pub(crate) refreshing: bool,
+    pub(crate) pending: bool,
+    pub(crate) deferred_requests: Vec<lsp_server::Request>,
+    pub(crate) needs_reopen: bool,
+    restart_required: bool,
+    inputs: HashMap<PathBuf, Option<Vec<u8>>>,
+    watched: FxHashSet<PathBuf>,
+    watcher_id: u64,
+}
+
+pub(crate) struct ConfigurationReady {
+    pub(crate) revision: u64,
+    pub(crate) loader: Arc<DefaultFileLoader>,
+    pub(crate) interfaces: anyhow::Result<crate::commands::type_interface::PreparedInterfaces>,
+}
+
+impl std::fmt::Debug for ConfigurationReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigurationReady")
+            .field("revision", &self.revision)
+            .field("interfaces", &self.interfaces)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Server {
@@ -150,7 +181,6 @@ impl Server {
                 )
                 .into(),
             )?;
-            return Err(error);
         }
         analysis.set_all_workspace_targets(targets);
         analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules)?;
@@ -174,7 +204,7 @@ impl Server {
         }
 
         let analysis_debounce_interval = config.args.analysis_debounce_interval;
-        let server = Server {
+        let mut server = Server {
             config: Arc::new(config),
             connection,
             req_queue: Default::default(),
@@ -190,11 +220,14 @@ impl Server {
             analysis_requested_for_files: None,
             bazel_client,
             pending_repos: Default::default(),
-            fetched_repos: Default::default(),
             is_fetching_repos: false,
             is_refreshing_all_workspace_targets: false,
             bzlmod_enabled: bazel_cx.bzlmod_enabled,
+            loader,
+            configuration: Default::default(),
         };
+
+        server.configuration.inputs = server.loader.configuration_inputs();
 
         if has_bazel_init_err {
             server.send_error_message(BAZEL_INIT_ERR_MESSAGE);
@@ -207,6 +240,7 @@ impl Server {
         ServerSnapshot {
             config: self.config.clone(),
             analysis_snapshot: self.analysis.snapshot(),
+            configuration_revision: self.configuration.revision,
         }
     }
 
@@ -251,12 +285,19 @@ impl Server {
     }
 
     pub(crate) fn complete_request(&mut self, resp: lsp_server::Response) {
-        if let Some(OutgoingRequest::RegisterFileWatchers) =
+        if let Some(OutgoingRequest::RegisterFileWatchers(id)) =
             self.req_queue.outgoing.complete(resp.id)
         {
+            if id != self.configuration.watcher_id {
+                return;
+            }
             if let Some(error) = resp.error {
                 self.send_error_message(&format!("Cannot watch type interfaces: {}. Changes to closed files will not be reported.", error.message));
             } else {
+                let paths: Vec<_> = self.configuration.inputs.keys().cloned().collect();
+                if let Err(error) = self.configuration_changed(&paths) {
+                    self.send_error_message(&format!("{error:#}"));
+                }
                 // Reconcile changes made between initial reads and watcher activation.
                 self.analysis.invalidate_loads();
                 self.invalidate_diagnostics();
@@ -265,8 +306,30 @@ impl Server {
     }
 
     pub(crate) fn watch_type_interfaces(&mut self) -> anyhow::Result<()> {
-        let interfaces = self.analysis.type_interface_files();
-        if interfaces.is_empty() {
+        let mut paths: FxHashSet<_> = self.loader.repository_roots()?.into_iter().collect();
+        paths.insert(self.workspace.clone());
+        for (path, contents) in self.loader.configuration_inputs() {
+            self.configuration.inputs.entry(path).or_insert(contents);
+        }
+        let manifests = self.loader.configuration_paths();
+        paths.extend(manifests.iter().cloned());
+        let snapshot = self.analysis.snapshot();
+        for file in self
+            .analysis
+            .type_interface_files()
+            .into_iter()
+            .chain(self.analysis.type_interface_sources())
+        {
+            let path = snapshot.path(file);
+            if !paths.iter().any(|root| path.starts_with(root)) {
+                paths.insert(
+                    path.parent()
+                        .expect("absolute configured path")
+                        .to_path_buf(),
+                );
+            }
+        }
+        if paths == self.configuration.watched {
             return Ok(());
         }
         let capability = self
@@ -279,55 +342,64 @@ impl Server {
             .and_then(|watching| watching.dynamic_registration)
             .unwrap_or(false)
         {
-            self.send_error_message("The client cannot watch type interfaces. Changes to closed files require restarting the server.");
+            if self.configuration.watched.is_empty() {
+                self.send_error_message("The client cannot watch Starpls dependencies. Changes to closed files require restarting the server.");
+            }
+            self.configuration.watched = paths;
             return Ok(());
         }
         let relative_patterns = capability
             .and_then(|watching| watching.relative_pattern_support)
             .unwrap_or(false);
-        let snapshot = self.analysis.snapshot();
-        let mut watchers = vec![lsp_types::FileSystemWatcher {
-            glob_pattern: lsp_types::GlobPattern::String("**/*.{bzl,bzli}".to_owned()),
-            kind: None,
-        }];
-        let mut external_paths = FxHashSet::default();
-        for file in interfaces
-            .into_iter()
-            .chain(self.analysis.type_interface_sources())
-        {
-            let path = snapshot.path(file);
-            if path.starts_with(&self.workspace) || !external_paths.insert(path) {
-                continue;
-            }
-            if !relative_patterns {
-                self.send_error_message("The client cannot watch type interfaces outside the workspace without relative-pattern support. Changes to closed files require restarting the server.");
-                return Ok(());
-            }
-            let name = path
-                .file_name()
-                .expect("configured file has a name")
-                .to_string_lossy();
-            let pattern: String = name
-                .chars()
-                .flat_map(|character| match character {
-                    '*' | '?' | '[' | ']' | '{' | '}' => vec!['[', character, ']'],
-                    character => vec![character],
-                })
-                .collect();
-            let parent = path.parent().expect("configured file is absolute");
-            let base_uri =
-                lsp_types::Url::from_directory_path(parent).expect("absolute directory URI");
-            watchers.push(lsp_types::FileSystemWatcher {
-                glob_pattern: lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
-                    base_uri: lsp_types::OneOf::Right(base_uri),
+        let mut watchers = Vec::new();
+        for path in &paths {
+            let pattern = if manifests.contains(path) {
+                let name = path
+                    .file_name()
+                    .expect("manifest filename")
+                    .to_string_lossy();
+                escape_glob(&name)
+            } else {
+                "**/{*.bzl,*.bzli,BUILD,BUILD.bazel,MODULE.bazel,MODULE.bazel.lock,*.MODULE.bazel,WORKSPACE,WORKSPACE.bazel,WORKSPACE.bzlmod,starpls.toml,.bazelrc,.bazelversion}".to_owned()
+            };
+            let base = if manifests.contains(path) {
+                path.parent().expect("absolute manifest")
+            } else {
+                path.as_path()
+            };
+            let glob_pattern = if base == self.workspace {
+                lsp_types::GlobPattern::String(pattern)
+            } else if relative_patterns {
+                lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
+                    base_uri: lsp_types::OneOf::Right(
+                        lsp_types::Url::from_directory_path(base).expect("absolute directory"),
+                    ),
                     pattern,
-                }),
+                })
+            } else {
+                self.send_error_message("The client cannot watch external Starpls dependencies without relative-pattern support. Changes to closed files require restarting the server.");
+                continue;
+            };
+            watchers.push(lsp_types::FileSystemWatcher {
+                glob_pattern,
                 kind: None,
             });
         }
+        if self.configuration.watcher_id != 0 {
+            self.send_request::<lsp_types::request::UnregisterCapability>(
+                lsp_types::UnregistrationParams {
+                    unregisterations: vec![lsp_types::Unregistration {
+                        id: format!("starpls-dependencies-{}", self.configuration.watcher_id),
+                        method: lsp_types::notification::DidChangeWatchedFiles::METHOD.to_owned(),
+                    }],
+                },
+            );
+        }
+        self.configuration.watcher_id += 1;
+        self.configuration.watched = paths;
         let params = lsp_types::RegistrationParams {
             registrations: vec![lsp_types::Registration {
-                id: "starpls-type-interfaces".to_owned(),
+                id: format!("starpls-dependencies-{}", self.configuration.watcher_id),
                 method: lsp_types::notification::DidChangeWatchedFiles::METHOD.to_owned(),
                 register_options: Some(serde_json::to_value(
                     lsp_types::DidChangeWatchedFilesRegistrationOptions { watchers },
@@ -337,10 +409,155 @@ impl Server {
         let request = self.req_queue.outgoing.register(
             lsp_types::request::RegisterCapability::METHOD.to_owned(),
             params,
-            OutgoingRequest::RegisterFileWatchers,
+            OutgoingRequest::RegisterFileWatchers(self.configuration.watcher_id),
         );
         self.send(request.into());
         Ok(())
+    }
+
+    pub(crate) fn configuration_changed(&mut self, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let mut changed = false;
+        let inputs = self.loader.configuration_inputs();
+        let configured = self.config.args.type_interfaces.is_configured()
+            || inputs
+                .get(&self.workspace.join("starpls.toml"))
+                .is_some_and(Option::is_some);
+        for path in paths {
+            let metadata = is_bazel_dependency(path)
+                || (configured && path.extension().is_some_and(|extension| extension == "bzl"))
+                || path == &self.workspace.join("starpls.toml")
+                || inputs.contains_key(path);
+            if !metadata {
+                continue;
+            }
+            let contents = std::fs::read(path).ok();
+            if self.configuration.inputs.get(path) != Some(&contents) {
+                self.configuration.inputs.insert(path.clone(), contents);
+                if path == &self.workspace.join(".bazelrc")
+                    || path == &self.workspace.join(".bazelversion")
+                {
+                    self.configuration.restart_required = true;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.reload_configuration()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reload_configuration(&mut self) -> anyhow::Result<()> {
+        self.configuration.revision += 1;
+        self.configuration.pending = true;
+        let snapshot = self.analysis.snapshot();
+        for file in self.analysis.type_interface_files() {
+            let path = snapshot.path(file);
+            if snapshot.document(path).is_none() {
+                self.send_notification::<lsp_types::notification::PublishDiagnostics>(
+                    lsp_types::PublishDiagnosticsParams {
+                        uri: lsp_types::Url::from_file_path(path).expect("absolute interface"),
+                        diagnostics: Vec::new(),
+                        version: None,
+                    },
+                );
+            }
+        }
+        drop(snapshot);
+        self.analysis.set_type_interfaces(Vec::new())?;
+        self.analysis.set_all_workspace_targets(Vec::new());
+        self.invalidate_diagnostics();
+        self.pending_repos.clear();
+        if self.configuration.restart_required {
+            self.configuration.pending = false;
+            self.send_error_message("Bazel startup configuration changed. Restart Starpls to reload the Bazel environment; trusted stub registrations have been removed.");
+        } else {
+            self.start_configuration_refresh();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn start_configuration_refresh(&mut self) {
+        if self.configuration.refreshing || !self.configuration.pending {
+            return;
+        }
+        self.configuration.pending = false;
+        self.configuration.refreshing = true;
+        let revision = self.configuration.revision;
+        let loader = Arc::new(self.loader.fresh(revision));
+        let workspace = self.workspace.clone();
+        let options = self.config.args.type_interfaces.clone();
+        let client = self.bazel_client.clone();
+        self.task_pool_handle.spawn(move || {
+            client.clear_repo_mappings();
+            let interfaces = options.prepare(&loader, &workspace);
+            Task::ConfigurationReady(ConfigurationReady {
+                revision,
+                loader,
+                interfaces,
+            })
+        });
+    }
+
+    pub(crate) fn finish_configuration_refresh(&mut self, ready: ConfigurationReady) {
+        let ConfigurationReady {
+            revision,
+            loader,
+            interfaces,
+        } = ready;
+        self.configuration.refreshing = false;
+        if revision != self.configuration.revision {
+            self.start_configuration_refresh();
+            return;
+        }
+        let changed: Vec<_> = loader
+            .configuration_inputs()
+            .into_iter()
+            .filter_map(|(path, contents)| (std::fs::read(&path).ok() != contents).then_some(path))
+            .collect();
+        if !changed.is_empty() {
+            self.configuration.pending = true;
+            self.start_configuration_refresh();
+            return;
+        }
+        let snapshot = self.analysis.snapshot();
+        let mut admission = Ok(());
+        self.configuration.needs_reopen = false;
+        for file in self.analysis.open_files() {
+            let source = snapshot.path(file);
+            let document = snapshot.document(source).expect("open file");
+            if let Err(error) =
+                loader.restore_document_context(&self.loader, document.path.as_std_path(), source)
+            {
+                self.send_error_message(&format!("{error:#}"));
+                admission = Err(error);
+                self.configuration.needs_reopen = true;
+            }
+        }
+        drop(snapshot);
+        self.loader = loader;
+        let replacement = self.analysis.replace_loader(self.loader.clone());
+        let result = admission
+            .and(replacement)
+            .and_then(|()| interfaces?.install(&mut self.analysis, &self.workspace));
+        if let Err(error) = result {
+            self.send_error_message(&format!("Cannot reload Starpls configuration: {error:#}"));
+        }
+        self.configuration
+            .inputs
+            .extend(self.loader.configuration_inputs());
+        self.refresh_all_workspace_targets();
+        self.invalidate_diagnostics();
+    }
+
+    pub(crate) fn open_repository_changed(&self) -> bool {
+        let snapshot = self.analysis.snapshot();
+        self.analysis.open_files().into_iter().any(|file| {
+            let source = snapshot.path(file);
+            let document = snapshot.document(source).expect("open file");
+            self.loader
+                .open_repository_changed(document.path.as_std_path(), source)
+        })
     }
 
     pub(crate) fn send_notification<N: lsp_types::notification::Notification>(
@@ -368,9 +585,9 @@ impl Server {
         let repos = mem::take(&mut self.pending_repos);
         let bazel_client = self.bazel_client.clone();
         let bzlmod_enabled = self.bzlmod_enabled;
+        let revision = self.configuration.revision;
 
         self.is_fetching_repos = true;
-        self.fetched_repos.extend(repos.clone());
         self.task_pool_handle.spawn_with_sender(move |sender| {
             sender
                 .send(Task::FetchExternalRepos(FetchExternalReposProgress::Begin(
@@ -396,9 +613,14 @@ impl Server {
             }
 
             sender
-                .send(Task::FetchExternalRepos(FetchExternalReposProgress::End(
-                    failed_repos,
-                )))
+                .send(Task::FetchExternalRepos(FetchExternalReposProgress::End {
+                    revision,
+                    fetched: repos
+                        .into_iter()
+                        .filter(|repo| !failed_repos.contains(repo))
+                        .collect(),
+                    failed: failed_repos,
+                }))
                 .unwrap();
         });
     }
@@ -409,6 +631,7 @@ impl Server {
         }
 
         let bazel_client = self.bazel_client.clone();
+        let revision = self.configuration.revision;
 
         self.is_refreshing_all_workspace_targets = true;
         self.task_pool_handle.spawn_with_sender(move |sender| {
@@ -428,7 +651,7 @@ impl Server {
 
             sender
                 .send(Task::RefreshAllWorkspaceTargets(
-                    RefreshAllWorkspaceTargetsProgress::End(targets),
+                    RefreshAllWorkspaceTargetsProgress::End { revision, targets },
                 ))
                 .unwrap();
         });
@@ -447,4 +670,21 @@ pub(crate) fn load_bazel_builtins() -> Builtins {
 pub(crate) fn load_bazel_build_language(client: &dyn BazelClient) -> anyhow::Result<Builtins> {
     let build_language_output = client.build_language()?;
     decode_rules(&build_language_output)
+}
+
+pub(crate) fn is_bazel_dependency(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            crate::document::DEPENDENCY_FILES.contains(&name) || name.ends_with(".MODULE.bazel")
+        })
+}
+
+fn escape_glob(name: &str) -> String {
+    name.chars()
+        .flat_map(|character| match character {
+            '*' | '?' | '[' | ']' | '{' | '}' => vec!['[', character, ']'],
+            character => vec![character],
+        })
+        .collect()
 }
