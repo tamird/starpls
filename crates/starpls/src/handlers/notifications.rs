@@ -67,3 +67,17 @@ pub(crate) fn did_save_text_document(
     }
     Ok(())
 }
+
+pub(crate) fn did_change_watched_files(
+    server: &mut Server,
+    params: lsp_types::DidChangeWatchedFilesParams,
+) -> anyhow::Result<()> {
+    let paths = params
+        .changes
+        .into_iter()
+        .map(|event| convert::path_buf_from_url(&event.uri))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    server.analysis.sync_files(&paths)?;
+    server.invalidate_diagnostics();
+    Ok(())
+}

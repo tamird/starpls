@@ -2,6 +2,7 @@ use clap::Args;
 
 pub(crate) mod check;
 pub(crate) mod server;
+pub(crate) mod type_interface;
 
 #[derive(Args, Default)]
 pub(crate) struct InferenceOptions {

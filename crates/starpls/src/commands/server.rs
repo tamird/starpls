@@ -44,6 +44,9 @@ pub(crate) struct ServerCommand {
 
     #[command(flatten)]
     pub(crate) inference_options: InferenceOptions,
+
+    #[command(flatten)]
+    pub(crate) type_interfaces: super::type_interface::TypeInterfaceOptions,
 }
 
 impl ServerCommand {

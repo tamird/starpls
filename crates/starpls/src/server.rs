@@ -10,6 +10,8 @@ use log::error;
 use log::info;
 use lsp_server::Connection;
 use lsp_server::ReqQueue;
+use lsp_types::notification::Notification;
+use lsp_types::request::Request;
 use rustc_hash::FxHashSet;
 use starpls_bazel::build_language::decode_rules;
 use starpls_bazel::client::BazelCLI;
@@ -37,10 +39,15 @@ use crate::task_pool::TaskPoolHandle;
 
 const BAZEL_INIT_ERR_MESSAGE: &str = "Failed to fetch Bazel configuration! Please check the language server logs for more details. Certain features may not work correctly until the underlying issue is fixed.";
 
+pub(crate) enum OutgoingRequest {
+    Other,
+    RegisterFileWatchers,
+}
+
 pub(crate) struct Server {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) connection: Connection,
-    pub(crate) req_queue: ReqQueue<(), ()>,
+    pub(crate) req_queue: ReqQueue<(), OutgoingRequest>,
     pub(crate) task_pool_handle: TaskPoolHandle<Task>,
     pub(crate) workspace: PathBuf,
     pub(crate) analysis_changed: bool,
@@ -127,6 +134,23 @@ impl Server {
             },
         )?;
 
+        if let Err(error) = config
+            .args
+            .type_interfaces
+            .install(&mut analysis, &bazel_cx.info.workspace)
+        {
+            connection.sender.send(
+                lsp_server::Notification::new(
+                    "window/showMessage".to_owned(),
+                    lsp_types::ShowMessageParams {
+                        typ: lsp_types::MessageType::ERROR,
+                        message: error.to_string(),
+                    },
+                )
+                .into(),
+            )?;
+            return Err(error);
+        }
         analysis.set_all_workspace_targets(targets);
         analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules)?;
 
@@ -155,7 +179,7 @@ impl Server {
             req_queue: Default::default(),
             task_pool_handle,
             workspace: bazel_cx.info.workspace,
-            analysis_changed: false,
+            analysis_changed: !analysis.type_interface_files().is_empty(),
             diagnostics_manager: Default::default(),
             analysis,
             analysis_debouncer: AnalysisDebouncer::new(
@@ -218,15 +242,104 @@ impl Server {
     }
 
     pub(crate) fn send_request<R: lsp_types::request::Request>(&mut self, params: R::Params) {
-        let req = self
-            .req_queue
-            .outgoing
-            .register(R::METHOD.to_string(), params, ());
+        let req =
+            self.req_queue
+                .outgoing
+                .register(R::METHOD.to_string(), params, OutgoingRequest::Other);
         self.send(req.into());
     }
 
     pub(crate) fn complete_request(&mut self, resp: lsp_server::Response) {
-        self.req_queue.outgoing.complete(resp.id);
+        if let Some(OutgoingRequest::RegisterFileWatchers) =
+            self.req_queue.outgoing.complete(resp.id)
+        {
+            if let Some(error) = resp.error {
+                self.send_error_message(&format!("Cannot watch type interfaces: {}. Changes to closed files will not be reported.", error.message));
+            } else {
+                // Reconcile changes made between initial reads and watcher activation.
+                self.analysis.invalidate_loads();
+                self.invalidate_diagnostics();
+            }
+        }
+    }
+
+    pub(crate) fn watch_type_interfaces(&mut self) -> anyhow::Result<()> {
+        let interfaces = self.analysis.type_interface_files();
+        if interfaces.is_empty() {
+            return Ok(());
+        }
+        let capability = self
+            .config
+            .caps
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref());
+        if !capability
+            .and_then(|watching| watching.dynamic_registration)
+            .unwrap_or(false)
+        {
+            self.send_error_message("The client cannot watch type interfaces. Changes to closed files require restarting the server.");
+            return Ok(());
+        }
+        let relative_patterns = capability
+            .and_then(|watching| watching.relative_pattern_support)
+            .unwrap_or(false);
+        let snapshot = self.analysis.snapshot();
+        let mut watchers = vec![lsp_types::FileSystemWatcher {
+            glob_pattern: lsp_types::GlobPattern::String("**/*.{bzl,bzli}".to_owned()),
+            kind: None,
+        }];
+        let mut external_paths = FxHashSet::default();
+        for file in interfaces
+            .into_iter()
+            .chain(self.analysis.type_interface_sources())
+        {
+            let path = snapshot.path(file);
+            if path.starts_with(&self.workspace) || !external_paths.insert(path) {
+                continue;
+            }
+            if !relative_patterns {
+                self.send_error_message("The client cannot watch type interfaces outside the workspace without relative-pattern support. Changes to closed files require restarting the server.");
+                return Ok(());
+            }
+            let name = path
+                .file_name()
+                .expect("configured file has a name")
+                .to_string_lossy();
+            let pattern: String = name
+                .chars()
+                .flat_map(|character| match character {
+                    '*' | '?' | '[' | ']' | '{' | '}' => vec!['[', character, ']'],
+                    character => vec![character],
+                })
+                .collect();
+            let parent = path.parent().expect("configured file is absolute");
+            let base_uri =
+                lsp_types::Url::from_directory_path(parent).expect("absolute directory URI");
+            watchers.push(lsp_types::FileSystemWatcher {
+                glob_pattern: lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
+                    base_uri: lsp_types::OneOf::Right(base_uri),
+                    pattern,
+                }),
+                kind: None,
+            });
+        }
+        let params = lsp_types::RegistrationParams {
+            registrations: vec![lsp_types::Registration {
+                id: "starpls-type-interfaces".to_owned(),
+                method: lsp_types::notification::DidChangeWatchedFiles::METHOD.to_owned(),
+                register_options: Some(serde_json::to_value(
+                    lsp_types::DidChangeWatchedFilesRegistrationOptions { watchers },
+                )?),
+            }],
+        };
+        let request = self.req_queue.outgoing.register(
+            lsp_types::request::RegisterCapability::METHOD.to_owned(),
+            params,
+            OutgoingRequest::RegisterFileWatchers,
+        );
+        self.send(request.into());
+        Ok(())
     }
 
     pub(crate) fn send_notification<N: lsp_types::notification::Notification>(

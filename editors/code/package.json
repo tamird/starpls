@@ -51,7 +51,8 @@
         ],
         "extensions": [
           ".sky",
-          ".star"
+          ".star",
+          ".bzli"
         ],
         "configuration": "./syntaxes/starlark.configuration.json"
       }

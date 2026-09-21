@@ -315,6 +315,31 @@ impl Analysis {
             .collect()
     }
 
+    /// Open documents and explicitly configured contracts are diagnostic roots.
+    pub fn diagnostic_files(&self) -> Vec<File> {
+        let mut files = self.open_files();
+        for interface in self.type_interface_files() {
+            if !files.iter().any(|file| file.source == interface.source) {
+                files.push(interface);
+            }
+        }
+        files
+    }
+
+    /// Refresh only paths named by the host's filesystem notifications.
+    pub fn sync_files(&mut self, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let Self { db } = self;
+        salsa::Database::trigger_cancellation(db);
+        for path in paths {
+            let path = starpls_common::system_path(path)?;
+            ruff_db::files::File::sync_path(db, path);
+        }
+        let environment = db.environment();
+        let revision = environment.load_revision(db) + 1;
+        environment.set_load_revision(db).to(revision);
+        Ok(())
+    }
+
     pub fn update_file(&mut self, file: File, contents: String) {
         let Self { db } = self;
         starpls_common::update_file(db, file, contents);
@@ -397,6 +422,18 @@ impl AnalysisSnapshot {
                 .document(starpls_common::system_path(path).ok()?)?;
             File::from_path(db, path, document.dialect, document.info).ok()
         })
+    }
+
+    pub fn is_type_interface_root(&self, file: File) -> bool {
+        let Self { db } = self;
+        db.environment()
+            .type_interfaces(db)
+            .values()
+            .any(|(_, interface)| interface.source == file.source)
+    }
+
+    pub fn file_revision(&self, file: File) -> Cancellable<ruff_db::file_revision::FileRevision> {
+        self.query(|db| file.source.revision(db))
     }
 
     pub fn completions(

@@ -44,6 +44,9 @@ pub(crate) struct CheckCommand {
 
     #[command(flatten)]
     pub(crate) inference_options: InferenceOptions,
+
+    #[command(flatten)]
+    pub(crate) type_interfaces: super::type_interface::TypeInterfaceOptions,
 }
 
 impl CheckCommand {
@@ -72,6 +75,8 @@ impl CheckCommand {
         )?;
 
         analysis.set_builtin_defs(builtins, bazel_cx.rules)?;
+        self.type_interfaces
+            .install(&mut analysis, &bazel_cx.info.workspace)?;
 
         // Strip off the leading "." from each of the specified extensions.
         // This works better when filtering against files with .extension().
@@ -129,6 +134,9 @@ impl Checker {
             ignored_files: Default::default(),
         };
 
+        checker
+            .files
+            .extend(checker.analysis.type_interface_files());
         for path in paths {
             for entry in WalkDir::new(&path).into_iter().filter_entry(|e| {
                 !is_hidden(e)

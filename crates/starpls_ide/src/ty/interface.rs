@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::Entry;
 
+use ruff_db::Db as _;
 use rustc_hash::FxHashMap;
 use salsa::Setter;
 use starpls_common::File;
@@ -61,6 +62,16 @@ impl Analysis {
         Ok(())
     }
 
+    /// Physical inputs whose declarations may be referenced by trusted interfaces.
+    pub fn type_interface_sources(&self) -> Vec<File> {
+        let Self { db } = self;
+        db.environment()
+            .type_interfaces(db)
+            .values()
+            .map(|(source, _)| *source)
+            .collect()
+    }
+
     pub fn type_interface_files(&self) -> Vec<File> {
         let Self { db } = self;
         let mut files: Vec<_> = db
@@ -77,10 +88,16 @@ impl Analysis {
 
 impl Database {
     pub(crate) fn type_interface(&self, from: File, source: File) -> Option<File> {
-        let (_, interface) = self
-            .environment()
-            .type_interfaces(self)
-            .get(&source.source)?;
+        let mappings = self.environment().type_interfaces(self);
+        if mappings.is_empty() {
+            return None;
+        }
+        let (_, interface) = mappings.get(&source.source).or_else(|| {
+            let path = starpls_common::system_path(source.path(self)).ok()?;
+            let canonical = self.system().canonicalize_path(path).ok()?;
+            let source = ruff_db::files::system_path_to_file(self, &canonical).ok()?;
+            mappings.get(&source)
+        })?;
         // An interface may import the implementation's existing nominal providers.
         // It must not resolve that import back to its own declaration of the name.
         (interface.source != from.source).then_some(*interface)

@@ -7,7 +7,8 @@ use starpls_ide::AnalysisSnapshot;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticTicket {
     job: u64,
-    pub(crate) document: DocumentStamp,
+    pub(crate) document: Option<DocumentStamp>,
+    revision: ruff_db::file_revision::FileRevision,
 }
 
 /// Owns outstanding diagnostic jobs. Completed results are sent immediately;
@@ -27,8 +28,12 @@ impl DiagnosticsManager {
         let path = snapshot.path(file);
         // A fetch may have been requested while interpreting an open query
         // file as an imported module. Publish its editor interpretation.
-        let file = snapshot.open_file(path).ok()??;
-        let document = snapshot.document(path)?.stamp();
+        let file = snapshot
+            .open_file(path)
+            .ok()?
+            .or_else(|| snapshot.is_type_interface_root(file).then_some(file))?;
+        let document = snapshot.document(path).map(|document| document.stamp());
+        let revision = snapshot.file_revision(file).ok()?;
         let Self {
             next_job,
             requested,
@@ -37,6 +42,7 @@ impl DiagnosticsManager {
         let ticket = DiagnosticTicket {
             job: *next_job,
             document,
+            revision,
         };
         requested.insert(file, ticket);
         Some((file, ticket))
@@ -52,15 +58,21 @@ impl DiagnosticsManager {
 
     pub(crate) fn complete(
         &mut self,
+        snapshot: &AnalysisSnapshot,
         file: File,
         ticket: DiagnosticTicket,
-        current: Option<DocumentStamp>,
     ) -> bool {
         let Self {
             next_job: _,
             requested,
         } = self;
-        if current != Some(ticket.document) || requested.get(&file) != Some(&ticket) {
+        let current = snapshot
+            .document(snapshot.path(file))
+            .map(|document| document.stamp());
+        if current != ticket.document
+            || snapshot.file_revision(file).ok() != Some(ticket.revision)
+            || requested.get(&file) != Some(&ticket)
+        {
             return false;
         }
         requested.remove(&file);
@@ -104,7 +116,6 @@ mod tests {
             .open_document(path, Dialect::Standard, None, "value = 1\n".into(), 1)
             .unwrap();
         let mut jobs = DiagnosticsManager::default();
-        let stamp = analysis.document(path).unwrap().stamp();
         let imported = analysis
             .file(
                 path,
@@ -119,30 +130,30 @@ mod tests {
         assert_eq!(editor_file, file);
         let (_, first) = jobs.request(&analysis.snapshot(), file).unwrap();
         let (_, second) = jobs.request(&analysis.snapshot(), file).unwrap();
-        assert!(!jobs.complete(file, first, Some(stamp)));
-        assert!(jobs.complete(file, second, Some(stamp)));
-        assert!(!jobs.complete(file, second, Some(stamp)));
+        assert!(!jobs.complete(&analysis.snapshot(), file, first));
+        assert!(jobs.complete(&analysis.snapshot(), file, second));
+        assert!(!jobs.complete(&analysis.snapshot(), file, second));
 
         let (_, old) = jobs.request(&analysis.snapshot(), file).unwrap();
         analysis
             .open_document(path, Dialect::Standard, None, "value = 2\n".into(), 2)
             .unwrap();
         let edited = analysis.document(path).unwrap().stamp();
-        assert!(!jobs.complete(file, old, Some(edited)));
+        assert!(!jobs.complete(&analysis.snapshot(), file, old));
         let (_, current) = jobs.request(&analysis.snapshot(), file).unwrap();
-        assert_eq!(current.document.version, 2);
-        assert!(jobs.complete(file, current, Some(edited)));
+        assert_eq!(current.document.unwrap().version, 2);
+        assert!(jobs.complete(&analysis.snapshot(), file, current));
 
         let (_, before_close) = jobs.request(&analysis.snapshot(), file).unwrap();
         analysis.close_document(path).unwrap();
-        assert!(!jobs.complete(file, before_close, None));
+        assert!(!jobs.complete(&analysis.snapshot(), file, before_close));
         analysis
             .open_document(path, Dialect::Standard, None, "value = 2\n".into(), 2)
             .unwrap();
         let reopened = analysis.document(path).unwrap().stamp();
         assert_ne!(edited, reopened);
-        assert!(!jobs.complete(file, before_close, Some(reopened)));
+        assert!(!jobs.complete(&analysis.snapshot(), file, before_close));
         let (_, current) = jobs.request(&analysis.snapshot(), file).unwrap();
-        assert!(jobs.complete(file, current, Some(reopened)));
+        assert!(jobs.complete(&analysis.snapshot(), file, current));
     }
 }

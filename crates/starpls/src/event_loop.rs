@@ -91,6 +91,13 @@ pub fn process_connection(
 
 impl Server {
     fn run(mut self) -> anyhow::Result<()> {
+        // Connection::initialize has already consumed the initialized notification.
+        self.watch_type_interfaces()?;
+        if std::mem::take(&mut self.analysis_changed) {
+            self.analysis_debouncer
+                .sender
+                .send(self.analysis.diagnostic_files())?;
+        }
         while let Some(event) = self.next_event() {
             if let Event::Message(lsp_server::Message::Request(ref req)) = event {
                 if self.connection.handle_shutdown(req)? {
@@ -142,7 +149,7 @@ impl Server {
             self.analysis_requested_for_files = None;
             self.analysis_debouncer
                 .sender
-                .send(self.analysis.open_files())
+                .send(self.analysis.diagnostic_files())
                 .unwrap();
         } else if let Some(file_ids) = self.analysis_requested_for_files.take() {
             self.update_diagnostics(file_ids);
@@ -198,6 +205,7 @@ impl Server {
                 if lsp_types::notification::DidCloseTextDocument as params => notifications::did_close_text_document(self, params),
                 if lsp_types::notification::DidChangeTextDocument as params => notifications::did_change_text_document(self, params),
                 if lsp_types::notification::DidSaveTextDocument as params => notifications::did_save_text_document(self, params),
+                if lsp_types::notification::DidChangeWatchedFiles as params => notifications::did_change_watched_files(self, params),
                 _ => Ok(())
             }
         }
@@ -210,14 +218,13 @@ impl Server {
                 let snapshot = self.analysis.snapshot();
                 for (file, ticket, diagnostics) in results {
                     let path = snapshot.path(file);
-                    let stamp = snapshot.document(path).map(|document| document.stamp());
-                    if self.diagnostics_manager.complete(file, ticket, stamp) {
+                    if self.diagnostics_manager.complete(&snapshot, file, ticket) {
                         let uri = lsp_types::Url::from_file_path(path).expect("absolute file path");
                         self.send_notification::<lsp_types::notification::PublishDiagnostics>(
                             lsp_types::PublishDiagnosticsParams {
                                 uri,
                                 diagnostics,
-                                version: Some(ticket.document.version),
+                                version: ticket.document.map(|document| document.version),
                             },
                         );
                     }
@@ -624,5 +631,233 @@ mod tests {
         assert_eq!(updates[0].uri, caller_uri);
         assert!(updates[0].diagnostics.is_empty());
         assert_eq!(updates[0].version, Some(7));
+    }
+    #[test]
+    fn closed_interfaces_remain_live_diagnostic_roots() {
+        let TestServer {
+            mut server,
+            client,
+            disk,
+            tasks: _,
+            debounced,
+        } = server();
+        let source_path = Path::new("/workspace/source.bzl");
+        let interface_path = Path::new("/contracts/source.bzli");
+        let interface_uri = lsp_types::Url::from_file_path(interface_path).unwrap();
+        disk.create_directory_all(SystemPath::new("/contracts"))
+            .unwrap();
+        disk.write_file(SystemPath::new("/workspace/source.bzl"), "def f(): pass\n")
+            .unwrap();
+        let int_contract = "def f(value: int) -> None: ...\n";
+        let str_contract = "def f(value: string) -> None: ...\n";
+        disk.write_file(SystemPath::new("/contracts/source.bzli"), int_contract)
+            .unwrap();
+        let source = server
+            .analysis
+            .file(source_path, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        let interface = server
+            .analysis
+            .file(interface_path, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        server
+            .analysis
+            .set_type_interfaces([(source, interface)])
+            .unwrap();
+        server
+            .open_document(
+                Path::new("/workspace/BUILD"),
+                "load(\"@//:source.bzl\", \"f\")\nf('text')\n".to_owned(),
+                4,
+            )
+            .unwrap();
+        let caller = server
+            .analysis
+            .snapshot()
+            .open_file(Path::new("/workspace/BUILD"))
+            .unwrap()
+            .unwrap();
+        let old = captured_diagnostics(&mut server, caller);
+        assert!(!collect_diagnostics(&server.snapshot(), caller)
+            .unwrap()
+            .is_empty());
+        disk.write_file(SystemPath::new("/contracts/source.bzli"), str_contract)
+            .unwrap();
+        let changed = || {
+            notification::<lsp_types::notification::DidChangeWatchedFiles>(
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![lsp_types::FileEvent {
+                        uri: interface_uri.clone(),
+                        typ: lsp_types::FileChangeType::CHANGED,
+                    }],
+                },
+            )
+        };
+        server.handle_event(changed()).unwrap();
+        server.handle_event(Event::Task(old)).unwrap();
+        assert!(published(&client).is_empty());
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert!(
+            updates.iter().all(|update| update.diagnostics.is_empty()),
+            "{updates:?}"
+        );
+        let closed = updates
+            .iter()
+            .find(|update| update.uri == interface_uri)
+            .unwrap();
+        assert_eq!(closed.version, None);
+
+        server
+            .open_document(interface_path, int_contract.to_owned(), 9)
+            .unwrap();
+        server.handle_event(changed()).unwrap();
+        assert_eq!(server.analysis.diagnostic_files().len(), 2);
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        let open = updates
+            .iter()
+            .find(|update| update.uri == interface_uri)
+            .unwrap();
+        assert_eq!(open.version, Some(9));
+        assert!(!collect_diagnostics(&server.snapshot(), caller)
+            .unwrap()
+            .is_empty());
+
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidCloseTextDocument>(
+                    lsp_types::DidCloseTextDocumentParams {
+                        text_document: lsp_types::TextDocumentIdentifier {
+                            uri: interface_uri.clone(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        published(&client);
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert_eq!(updates.len(), 2, "{updates:?}");
+        assert!(
+            updates.iter().all(|update| update.diagnostics.is_empty()),
+            "{updates:?}"
+        );
+        assert!(updates
+            .iter()
+            .any(|update| update.uri == interface_uri && update.version.is_none()));
+
+        disk.fs()
+            .remove_file(SystemPath::new("/contracts/source.bzli"))
+            .unwrap();
+        server.handle_event(changed()).unwrap();
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        let closed = updates
+            .iter()
+            .find(|update| update.uri == interface_uri)
+            .unwrap();
+        assert!(
+            closed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("cannot read")),
+            "{closed:?}"
+        );
+        disk.write_file(SystemPath::new("/contracts/source.bzli"), str_contract)
+            .unwrap();
+        server.handle_event(changed()).unwrap();
+        analyze_requested_files(&mut server, &debounced);
+        let updates = published(&client);
+        assert!(
+            updates.iter().all(|update| update.diagnostics.is_empty()),
+            "{updates:?}"
+        );
+
+        let config = std::sync::Arc::get_mut(&mut server.config).unwrap();
+        config.caps.workspace = Some(lsp_types::WorkspaceClientCapabilities {
+            did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
+            }),
+            ..Default::default()
+        });
+        server.watch_type_interfaces().unwrap();
+        let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
+            panic!("expected watch registration")
+        };
+        let registration: lsp_types::RegistrationParams =
+            serde_json::from_value(request.params).unwrap();
+        let [registration] = registration.registrations.as_slice() else {
+            panic!("expected one watch registration: {registration:?}")
+        };
+        let options: lsp_types::DidChangeWatchedFilesRegistrationOptions =
+            serde_json::from_value(registration.register_options.clone().unwrap()).unwrap();
+        let [workspace, external] = options.watchers.as_slice() else {
+            panic!("expected workspace glob and one external file: {options:?}")
+        };
+        assert_eq!(
+            workspace.glob_pattern,
+            lsp_types::GlobPattern::String("**/*.{bzl,bzli}".to_owned())
+        );
+        assert_eq!(
+            external.glob_pattern,
+            lsp_types::GlobPattern::Relative(lsp_types::RelativePattern {
+                base_uri: lsp_types::OneOf::Right(
+                    lsp_types::Url::from_directory_path("/contracts").unwrap(),
+                ),
+                pattern: "source.bzli".to_owned(),
+            })
+        );
+        disk.write_file(SystemPath::new("/contracts/source.bzli"), int_contract)
+            .unwrap();
+        server
+            .handle_event(Event::Message(
+                lsp_server::Response::new_ok(request.id, ()).into(),
+            ))
+            .unwrap();
+        analyze_requested_files(&mut server, &debounced);
+        published(&client);
+        assert!(!collect_diagnostics(&server.snapshot(), caller)
+            .unwrap()
+            .is_empty());
+
+        server.watch_type_interfaces().unwrap();
+        let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
+            panic!("expected watch registration")
+        };
+        server.complete_request(lsp_server::Response::new_err(
+            request.id,
+            -32601,
+            "watching rejected".to_owned(),
+        ));
+        let lsp_server::Message::Notification(message) = client.receiver.try_recv().unwrap() else {
+            panic!("expected watch error")
+        };
+        assert_eq!(message.method, "window/showMessage");
+        assert!(message.params.to_string().contains("watching rejected"));
+
+        // The handshake consumes initialized before run starts. Registration must
+        // happen even when the client's first event is a shutdown request.
+        server
+            .analysis
+            .close_document(Path::new("/workspace/BUILD"))
+            .unwrap();
+        server.analysis_changed = true;
+        client
+            .sender
+            .send(lsp_server::Request::new(99.into(), "shutdown".to_owned(), ()).into())
+            .unwrap();
+        client
+            .sender
+            .send(lsp_server::Notification::new("exit".to_owned(), ()).into())
+            .unwrap();
+        server.run().unwrap();
+        assert_eq!(debounced.try_recv().unwrap(), vec![interface]);
+        let lsp_server::Message::Request(request) = client.receiver.try_recv().unwrap() else {
+            panic!("expected startup watch registration")
+        };
+        assert_eq!(request.method, "client/registerCapability");
     }
 }

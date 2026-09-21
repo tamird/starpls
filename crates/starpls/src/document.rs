@@ -81,7 +81,9 @@ impl DefaultFileLoader {
         let (root, package) = match &repo_kind {
             RepoKind::Apparent if self.bzlmod_enabled => {
                 let from_path = from.path(db).to_path_buf();
-                let from_repo = try_opt!(self.repo_for_path(&from_path));
+                let from_repo = try_opt!(self
+                    .repo_for_path(&from_path)
+                    .or_else(|| from.is_type_interface(db).then_some("")));
                 let canonical_repo = self
                     .bazel_client
                     .resolve_repo_from_mapping(label.repo(), from_repo)?;
@@ -121,10 +123,17 @@ impl DefaultFileLoader {
             RepoKind::Current => {
                 // Find the Bazel workspace root.
                 let from_path = from.path(db).to_path_buf();
-                match starpls_bazel::resolve_workspace(from_path)? {
-                    Some(root) => root,
-                    None => {
-                        bail!("not in a Bazel workspace")
+                if from.is_type_interface(db)
+                    && !label.is_relative()
+                    && self.repo_for_path(&from_path).is_none()
+                {
+                    (self.workspace.clone(), PathBuf::new())
+                } else {
+                    match starpls_bazel::resolve_workspace(from_path)? {
+                        Some(root) => root,
+                        None => {
+                            bail!("not in a Bazel workspace")
+                        }
                     }
                 }
             }
@@ -348,12 +357,19 @@ impl FileLoader for DefaultFileLoader {
                 Ok(Some(candidates))
             }
             Dialect::Bazel => {
-                // Determine the loading file's workspace root and package.
-                let (mut root, package) =
-                    try_opt!(starpls_bazel::resolve_workspace(from.path(db),)?);
                 let (label, err) = match Label::parse(path) {
                     Ok(label) => (label, None),
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
+                };
+                // External interfaces use the main workspace for qualified labels.
+                // Relative labels still require the file's physical package.
+                let (mut root, package) = if from.is_type_interface(db)
+                    && !label.is_relative()
+                    && self.repo_for_path(&from_path).is_none()
+                {
+                    (self.workspace.clone(), PathBuf::new())
+                } else {
+                    try_opt!(starpls_bazel::resolve_workspace(from.path(db))?)
                 };
 
                 if !label.has_leading_slashes()
@@ -396,7 +412,9 @@ impl FileLoader for DefaultFileLoader {
                 match label.kind() {
                     RepoKind::Apparent | RepoKind::Canonical => {
                         root = if self.bzlmod_enabled {
-                            let from_repo = try_opt!(self.repo_for_path(&from_path));
+                            let from_repo = try_opt!(self
+                                .repo_for_path(&from_path)
+                                .or_else(|| from.is_type_interface(db).then_some("")));
                             let canonical_repo = try_opt!(self
                                 .bazel_client
                                 .resolve_repo_from_mapping(label.repo(), from_repo)?);

@@ -93,6 +93,43 @@ Python-only syntax is diagnosed and its containing statement is omitted from ana
 neighboring statements are still checked; names introduced only by an omitted statement remain
 undefined.
 
+## Trusted type interfaces
+
+Use a `.bzli` file to provide types for a `.bzl` module you cannot edit:
+
+```starlark
+# types/vendor.bzli
+DEFAULT_TIMEOUT: int
+
+def fetch(name: string, timeout: int = ...) -> list[string]:
+    """Fetch the named resources."""
+    ...
+```
+
+Configure the same mapping for batch checking or the language server:
+
+```sh
+starpls check --type_interface third_party/vendor.bzl=types/vendor.bzli BUILD.bazel
+starpls server --type_interface third_party/vendor.bzl=types/vendor.bzli
+```
+
+Repeat `--type_interface SOURCE=INTERFACE` for additional modules. Relative paths use the main
+Bazel workspace root; both files must exist and be readable. Duplicate source mappings are errors.
+Callers keep their original `.bzl` load paths. Interface declarations override the named exports;
+exports omitted from the interface retain their source types. An interface can `load` existing
+provider types, but cannot define runtime factories or executable function bodies. Declaration
+bodies use `...` or `pass`, and optional defaults use `= ...`.
+
+These contracts are trusted. The implementation's annotations, parameter names, defaults, or
+body errors do not constrain the interface. Implementation validation is not yet available.
+The implementation is checked independently when selected as a check input or opened in the
+editor; ordinary module-load diagnostics still apply. Navigation prefers an existing source
+export and falls back to the interface; parameter navigation follows the interface signature.
+
+Configured interfaces are checked even when closed in the editor. The server registers file
+watchers and reports failures; watching files outside the workspace requires the client's LSP
+relative-pattern support. Unsaved editor contents take precedence over disk changes.
+
 ## Experimental features
 
 Starpls has a number of experimental features that can be enabled via command-line arguments:
