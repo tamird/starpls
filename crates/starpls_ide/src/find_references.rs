@@ -1,72 +1,20 @@
 use ruff_python_ast::find_node::covering_node;
-use ruff_python_ast::find_node::CoveringNode;
-use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
-use ruff_python_ast::visitor::source_order::TraversalSignal;
-use ruff_python_ast::AnyNodeRef;
-use ruff_python_ast::ExprName;
-use ruff_python_ast::StmtFunctionDef;
 use ruff_text_size::Ranged;
 use starpls_common::parsed_module;
-use starpls_common::File;
-use ty_python_core::definition::Definition;
+use ty_ide::references_in_file;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_semantic::types::ide_support::definitions_for_name;
 use ty_python_semantic::types::ide_support::ImportAliasResolution;
 use ty_python_semantic::HasDefinition;
+use ty_python_semantic::ResolvedDefinition;
 use ty_python_semantic::SemanticModel;
 
+use crate::selection::Selection;
 use crate::util::navigation_token;
 use crate::util::text_range;
 use crate::Database;
 use crate::FilePosition;
 use crate::Location;
-
-enum NameNode<'a> {
-    Reference(&'a ExprName),
-    Definition(&'a StmtFunctionDef),
-}
-
-impl<'a> NameNode<'a> {
-    fn at(node: &CoveringNode<'a>, range: ruff_text_size::TextRange) -> Option<Self> {
-        match node.node() {
-            AnyNodeRef::ExprName(name) => Some(Self::Reference(name)),
-            AnyNodeRef::Identifier(_) => {
-                let AnyNodeRef::StmtFunctionDef(def) = node.parent()? else {
-                    return None;
-                };
-                (def.name.range() == range).then_some(Self::Definition(def))
-            }
-            _ => None,
-        }
-    }
-
-    fn name(&self) -> &str {
-        match self {
-            Self::Reference(name) => name.id.as_str(),
-            Self::Definition(def) => def.name.as_str(),
-        }
-    }
-
-    fn definitions<'db>(&self, model: &SemanticModel<'db>) -> Vec<Definition<'db>> {
-        match self {
-            Self::Reference(name) => definitions_for_name(
-                model,
-                self.name(),
-                (*name).into(),
-                ImportAliasResolution::PreserveAliases,
-            )
-            .into_iter()
-            .filter_map(|definition| definition.definition())
-            .collect(),
-            Self::Definition(def) => {
-                if model.scope((*def).into()).is_none() {
-                    return Vec::new();
-                }
-                vec![def.definition(model)]
-            }
-        }
-    }
-}
 
 pub(crate) fn find_references(
     db: &Database,
@@ -77,77 +25,57 @@ pub(crate) fn find_references(
     let source = file.contents(db);
     let token = navigation_token(&source, parsed.tokens(), u32::from(pos).into())?;
     let node = covering_node(parsed.syntax().into(), token.range());
-    let selected = NameNode::at(&node, token.range())?;
-    let name = selected.name();
-    let definitions = selected
-        .definitions(&model)
+    let (name, definitions) = match crate::selection::classify(&node, token.range())? {
+        Selection::Reference(name) => {
+            model.scope(name.into())?;
+            (
+                name.id.as_str(),
+                definitions_for_name(
+                    &model,
+                    name.id.as_str(),
+                    name.into(),
+                    ImportAliasResolution::PreserveAliases,
+                ),
+            )
+        }
+        Selection::Definition(function) => {
+            model.scope(function.into())?;
+            (
+                function.name.as_str(),
+                vec![ResolvedDefinition::Definition(function.definition(&model))],
+            )
+        }
+        _ => return None,
+    };
+    let definitions = definitions
         .into_iter()
-        .filter(|definition| {
-            definition.program_file(db) == model.program_file()
-                && matches!(
-                    definition.kind(db),
-                    DefinitionKind::Function(_)
-                        | DefinitionKind::Assignment(_)
-                        | DefinitionKind::AugmentedAssignment(_)
-                        | DefinitionKind::For(_)
-                        | DefinitionKind::Comprehension(_)
-                )
+        .filter(|resolved| {
+            resolved.definition().is_some_and(|definition| {
+                definition.program_file(db) == model.program_file()
+                    && matches!(
+                        definition.kind(db),
+                        DefinitionKind::Function(_)
+                            | DefinitionKind::Assignment(_)
+                            | DefinitionKind::AugmentedAssignment(_)
+                            | DefinitionKind::For(_)
+                            | DefinitionKind::Comprehension(_)
+                    )
+            })
         })
         .collect::<Vec<_>>();
     if definitions.is_empty() {
         return None;
     }
 
-    let mut visitor = ReferenceVisitor {
-        model: &model,
-        file,
-        name,
-        definitions: &definitions,
-        locations: Vec::new(),
-    };
-    visitor.visit_body(&parsed.syntax().body);
-    Some(visitor.locations)
-}
-
-struct ReferenceVisitor<'db, 'request> {
-    model: &'request SemanticModel<'db>,
-    file: File,
-    name: &'request str,
-    definitions: &'request [Definition<'db>],
-    locations: Vec<Location>,
-}
-
-impl<'ast> SourceOrderVisitor<'ast> for ReferenceVisitor<'_, '_> {
-    fn enter_node(&mut self, node: AnyNodeRef<'ast>) -> TraversalSignal {
-        let candidate = match node {
-            AnyNodeRef::ExprName(name) => NameNode::Reference(name),
-            AnyNodeRef::StmtFunctionDef(def) => NameNode::Definition(def),
-            _ => return TraversalSignal::Traverse,
-        };
-        let Self {
-            model,
-            file,
-            name,
-            definitions,
-            locations,
-        } = self;
-        if candidate.name() == *name
-            && candidate
-                .definitions(model)
-                .iter()
-                .any(|def| definitions.contains(def))
-        {
-            let range = match candidate {
-                NameNode::Reference(name) => name.range(),
-                NameNode::Definition(def) => def.name.range(),
-            };
-            locations.push(Location {
-                file_id: *file,
-                range: text_range(range),
-            });
-        }
-        TraversalSignal::Traverse
-    }
+    Some(
+        references_in_file(db, model.program_file(), name, &definitions)
+            .into_iter()
+            .map(|reference| Location {
+                file_id: file,
+                range: text_range(reference.range()),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -157,6 +85,10 @@ mod tests {
 
     fn check_find_references(fixture: &str) {
         let (analysis, fixture) = Analysis::from_single_file_fixture(fixture);
+        check_find_references_from_fixture(analysis, fixture);
+    }
+
+    fn check_find_references_from_fixture(analysis: Analysis, fixture: starpls_hir::Fixture) {
         let references = analysis
             .snapshot()
             .find_references(
@@ -252,6 +184,41 @@ value = 3
     }
 
     #[test]
+    fn local_alias_references_stay_in_the_selected_file() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "defs.bzl", "def local(): pass\nlocal()\n");
+        let main = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            r#"
+load("defs.bzl", imported="local")
+local = imported
+#^^^^
+loc$0al()
+#^^^^
+"#,
+        );
+        fixture.add_file(
+            &mut analysis.db,
+            "consumer.bzl",
+            "load(\"main.bzl\", \"local\")\nlocal()\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+
+        let imported = main.contents(&analysis.db).rfind("imported").unwrap();
+        assert!(analysis
+            .snapshot()
+            .find_references(FilePosition {
+                file_id: main,
+                pos: u32::try_from(imported).unwrap().into(),
+            })
+            .unwrap()
+            .is_none());
+        check_find_references_from_fixture(analysis, fixture);
+    }
+
+    #[test]
     fn test_variable() {
         check_find_references(
             r#"
@@ -317,6 +284,10 @@ def foo():
     pass
 foo
 #^^
+while True:
+    def foo():
+        pass
+    foo
 foo = "abc"
 #^^
 f$0oo
