@@ -131,6 +131,50 @@ pub(crate) fn lsp_semantic_tokens(
     result
 }
 
+pub(crate) fn lsp_folding_range(
+    fold: starpls_ide::FoldingRange,
+    source: &Source,
+    line_only: bool,
+) -> Option<lsp_types::FoldingRange> {
+    let starpls_ide::FoldingRange { range, kind } = fold;
+    let end_offset = usize::from(range.end());
+    let range = TextRange::new(
+        u32::from(range.start()).into(),
+        u32::from(range.end()).into(),
+    );
+    let range = lsp_range_from_text_range(range, source)?;
+    let mut end_line = range.end.line;
+    if line_only {
+        // Ty ends a collection fold before its closing delimiter. When only
+        // indentation precedes that endpoint, keep the closing line visible.
+        let line = source.index.line_range(
+            OneIndexed::from_zero_indexed(end_line as usize),
+            &source.text,
+        );
+        if source.text[usize::from(line.start())..end_offset]
+            .trim()
+            .is_empty()
+        {
+            end_line = end_line.checked_sub(1)?;
+        }
+        if end_line <= range.start.line {
+            return None;
+        }
+    }
+    Some(lsp_types::FoldingRange {
+        start_line: range.start.line,
+        start_character: (!line_only).then_some(range.start.character),
+        end_line,
+        end_character: (!line_only).then_some(range.end.character),
+        kind: kind.map(|kind| match kind {
+            starpls_ide::FoldingRangeKind::Comment => lsp_types::FoldingRangeKind::Comment,
+            starpls_ide::FoldingRangeKind::Imports => lsp_types::FoldingRangeKind::Imports,
+            starpls_ide::FoldingRangeKind::Region => lsp_types::FoldingRangeKind::Region,
+        }),
+        collapsed_text: None,
+    })
+}
+
 fn lsp_position_from_offset(
     text: &str,
     index: &LineIndex,
@@ -360,6 +404,25 @@ mod tests {
             actual[3].token_modifiers_bitset,
             starpls_ide::SemanticTokenModifier::READONLY.bits()
         );
+    }
+
+    #[test]
+    fn line_folds_preserve_closing_delimiters() {
+        for indent in ["", "    "] {
+            let text = format!("rule(\n    name = \"😀\",\n{indent})\nafter()\n");
+            let (source, _) = source(&text);
+            let end = u32::try_from(text.find(')').unwrap()).unwrap();
+            let fold = starpls_ide::FoldingRange {
+                range: (5.into()..end.into()).into(),
+                kind: None,
+            };
+            let columns = super::lsp_folding_range(fold.clone(), &source, false).unwrap();
+            assert_eq!(columns.end_line, 2);
+            assert_eq!(columns.end_character, Some(indent.len() as u32));
+            let lines = super::lsp_folding_range(fold, &source, true).unwrap();
+            assert_eq!(lines.end_line, 1);
+            assert_eq!(lines.end_character, None);
+        }
     }
 
     #[test]

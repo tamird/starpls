@@ -156,6 +156,59 @@ pub(crate) fn document_highlights(
     }))
 }
 
+pub(crate) fn selection_ranges(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::SelectionRangeParams,
+) -> anyhow::Result<Option<Vec<lsp_types::SelectionRange>>> {
+    let path = path_buf_from_url(&params.text_document.uri)?;
+    let file_id = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let source = snapshot.analysis_snapshot.source(file_id)?;
+    let mut selections = Vec::with_capacity(params.positions.len());
+    for position in params.positions {
+        let pos = try_opt!(convert::offset_from_lsp_position(
+            &source.text,
+            &source.index,
+            position
+        ));
+        let ranges = snapshot
+            .analysis_snapshot
+            .selection_ranges(FilePosition { file_id, pos })?;
+        let mut parent = None;
+        for range in ranges {
+            parent = Some(lsp_types::SelectionRange {
+                range: try_opt!(convert::lsp_range_from_text_range(range, &source)),
+                parent: parent.map(Box::new),
+            });
+        }
+        selections.push(try_opt!(parent));
+    }
+    Ok(Some(selections))
+}
+
+pub(crate) fn folding_ranges(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::FoldingRangeParams,
+) -> anyhow::Result<Option<Vec<lsp_types::FoldingRange>>> {
+    let path = path_buf_from_url(&params.text_document.uri)?;
+    let file = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let source = snapshot.analysis_snapshot.source(file)?;
+    let line_only = snapshot
+        .config
+        .caps
+        .text_document
+        .as_ref()
+        .and_then(|caps| caps.folding_range.as_ref())
+        .and_then(|caps| caps.line_folding_only)
+        .unwrap_or(false);
+    let ranges = snapshot.analysis_snapshot.folding_ranges(file)?;
+    Ok(Some(
+        ranges
+            .into_iter()
+            .filter_map(|fold| convert::lsp_folding_range(fold, &source, line_only))
+            .collect(),
+    ))
+}
+
 pub(crate) fn completion(
     snapshot: &ServerSnapshot,
     params: lsp_types::CompletionParams,

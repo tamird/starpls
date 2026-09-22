@@ -221,6 +221,8 @@ impl Server {
             .on::<lsp_types::request::GotoDeclaration>(requests::goto_declaration)
             .on::<lsp_types::request::HoverRequest>(requests::hover)
             .on::<lsp_types::request::DocumentHighlightRequest>(requests::document_highlights)
+            .on::<lsp_types::request::SelectionRangeRequest>(requests::selection_ranges)
+            .on::<lsp_types::request::FoldingRangeRequest>(requests::folding_ranges)
             .on::<lsp_types::request::References>(requests::find_references)
             .on::<lsp_types::request::SemanticTokensFullRequest>(requests::semantic_tokens)
             .on::<lsp_types::request::SemanticTokensRangeRequest>(requests::semantic_tokens_range)

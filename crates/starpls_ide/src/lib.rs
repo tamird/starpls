@@ -26,6 +26,8 @@ use starpls_hir::Fixture;
 pub use starpls_hir::InferenceOptions;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+pub use ty_ide::FoldingRange;
+pub use ty_ide::FoldingRangeKind;
 pub use ty_ide::ReferenceKind;
 pub use ty_ide::ReferenceTarget;
 pub use ty_ide::SemanticToken;
@@ -564,6 +566,22 @@ impl AnalysisSnapshot {
         range: Option<TextRange>,
     ) -> Cancellable<SemanticTokens> {
         self.query(|db| semantic_tokens::semantic_tokens(db, file, range))
+    }
+
+    pub fn selection_ranges(&self, pos: FilePosition) -> Cancellable<Vec<TextRange>> {
+        self.query(|db| {
+            let file = db.starlark_program_file(pos.file_id).python_file(db);
+            ty_ide::selection_range(db, file, u32::from(pos.pos).into())
+                .into_iter()
+                .map(util::text_range)
+                .collect()
+        })
+    }
+
+    pub fn folding_ranges(&self, file: File) -> Cancellable<Vec<FoldingRange>> {
+        self.query(|db| {
+            ty_ide::folding_ranges(db, db.starlark_program_file(file).python_file(db), None)
+        })
     }
 
     /// Helper method to handle Salsa cancellations.
