@@ -121,6 +121,32 @@ Python-only syntax is diagnosed and its containing statement is omitted from ana
 neighboring statements are still checked; names introduced only by an omitted statement remain
 undefined.
 
+## Batch checking
+
+Run `starpls check` from the Bazel workspace with source files or directories:
+
+```sh
+starpls check --bazel-only --files-from files.txt --progress --report coverage.json
+```
+
+`--files-from` reads one path per line; `-` reads standard input. Relative
+paths use the current directory. `--bazel-only` selects recognized Bazel
+sources and `.bzli` interfaces and records other inputs as exclusions.
+Recursive discovery stops at nested repository roots. Explicit paths use
+their existing repository context, including Bazel's external directory.
+
+`--progress` reports load discovery, repository mapping batches, and file
+checking on stderr. The JSON report separates selected files, completed
+checks, loaded dependencies, exclusions, input failures, and unresolved
+loads. Configured implementation validation adds its checked source files
+to the completed checks. Repository names are canonical; the empty name
+denotes the main repository, and `null` denotes a source without a known
+Bazel repository context.
+
+`complete` means every selected file was checked and every discovered load
+resolved. Deliberate scope exclusions appear separately. Type errors,
+failed input paths, and unresolved loads produce a failing exit status.
+
 ## Stub files
 
 See the [stub specification](docs/type-interfaces.md) for declarations,
