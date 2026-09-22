@@ -426,6 +426,13 @@ impl ty_python_core::Db for Database {
 
 #[salsa::db]
 impl ty_python_semantic::Db for Database {
+    fn provided_return_type<'db>(
+        &'db self,
+        definition: Definition<'db>,
+    ) -> Option<ty_python_semantic::provided::ProvidedReturnType<'db>> {
+        validation::provider_return_type(self, definition)
+    }
+
     fn provided_parameter_type<'db>(
         &'db self,
         definition: Definition<'db>,

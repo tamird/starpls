@@ -59,7 +59,16 @@ pub struct StubValidation {
         (ruff_db::files::File, ruff_python_ast::NodeIndex),
         (File, ruff_python_ast::NodeIndex),
     >,
+    pub provider_returns:
+        FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
     pub files: FxHashSet<ruff_db::files::File>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderContract {
+    pub stub: File,
+    pub class: ruff_python_ast::NodeIndex,
+    pub allowed_fields: Box<[ruff_python_ast::name::Name]>,
 }
 
 /// Inputs shared by semantic queries. Input identities remain stable when the

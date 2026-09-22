@@ -302,8 +302,12 @@ fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definiti
             let [implementation] = implementations.as_slice() else {
                 continue;
             };
-            let Some(origin) = provider_origin(db, *implementation, &mut FxHashSet::default())
-            else {
+            let Some(origin) = provider_origin(
+                db,
+                *implementation,
+                ProviderPart::Constructor,
+                &mut FxHashSet::default(),
+            ) else {
                 continue;
             };
             let definitions = pairs.entry(origin).or_default();
@@ -318,6 +322,7 @@ fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definiti
 fn provider_origin<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
+    part: ProviderPart,
     visited: &mut FxHashSet<Definition<'db>>,
 ) -> Option<(ProgramFile<'db>, u32)> {
     if !visited.insert(definition) {
@@ -339,9 +344,18 @@ fn provider_origin<'db>(
                     let [Expr::Tuple(tuple)] = parent.targets.as_slice() else {
                         return None;
                     };
-                    if tuple.elts.first()?.range() != assignment.target(&parsed).range() {
+                    let [constructor, raw] = tuple.elts.as_slice() else {
+                        return None;
+                    };
+                    let target = match part {
+                        ProviderPart::Constructor => constructor,
+                        ProviderPart::Raw => raw,
+                    };
+                    if target.range() != assignment.target(&parsed).range() {
                         return None;
                     }
+                } else if matches!(part, ProviderPart::Raw) {
+                    return None;
                 }
                 Some((file, call.node_index().load().as_u32()?))
             }
@@ -356,7 +370,7 @@ fn provider_origin<'db>(
                 let [definition] = definitions.as_slice() else {
                     return None;
                 };
-                provider_origin(db, definition.definition()?, visited)
+                provider_origin(db, definition.definition()?, part, visited)
             }
             _ => None,
         },
@@ -367,10 +381,49 @@ fn provider_origin<'db>(
             let [definition] = definitions.as_slice() else {
                 return None;
             };
-            provider_origin(db, *definition, visited)
+            provider_origin(db, *definition, part, visited)
         }
         _ => None,
     }
+}
+
+pub(super) fn provider_implementation<'db>(
+    db: &'db Database,
+    source: File,
+    class: Type<'db>,
+) -> Option<(ProgramFile<'db>, FileRange)> {
+    let environment = ProgramEnvironment::from_file(db.starlark_program_file(source));
+    let TypeDefinition::StaticClass(class) = class.definition(db, &environment)? else {
+        return None;
+    };
+    provider_export_origin(db, source, &class.name(db)?, ProviderPart::Constructor)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ProviderPart {
+    Constructor,
+    Raw,
+}
+
+pub(super) fn provider_export_origin<'db>(
+    db: &'db dyn Db,
+    source: File,
+    name: &str,
+    part: ProviderPart,
+) -> Option<(ProgramFile<'db>, FileRange)> {
+    let definitions = export_definitions(db, db.starlark_program_file(source), name);
+    let [definition] = definitions.as_slice() else {
+        return None;
+    };
+    let (program, node) = provider_origin(db, *definition, part, &mut FxHashSet::default())?;
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    Some((
+        program,
+        FileRange::new(
+            program.file(db),
+            parsed.get_by_index(NodeIndex::from(node)).range(),
+        ),
+    ))
 }
 
 /// Read annotation types and origins from Ty's class scope, including recursive fields.
@@ -679,6 +732,18 @@ mod tests {
                 .count(),
             2,
             "{diagnostics:?}"
+        );
+        let reports = analysis
+            .validate_stubs(|path| path.file_name().unwrap() == "source.bzl")
+            .unwrap();
+        assert_eq!(
+            reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .filter(|diagnostic| diagnostic.id().as_str() == "invalid-provider-interface")
+                .count(),
+            2,
+            "{reports:?}"
         );
         analysis.update_file(interface, class.into());
         for text in [

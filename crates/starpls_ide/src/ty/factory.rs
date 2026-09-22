@@ -162,12 +162,33 @@ pub(crate) struct Documentation {
     pub(crate) parameters: Vec<(Name, Box<str>)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(super) struct ProviderData {
+    pub(super) documentation: Documentation,
+    /// None denotes an unrestricted field namespace.
+    pub(super) fields: Option<Box<[Name]>>,
+    pub(super) initializer: ProviderInitializer,
+    pub(super) origin: FileRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(super) enum ProviderInitializer {
+    None,
+    Expression(FileRange),
+    Unknown,
+}
+
 impl Documentation {
     pub(crate) fn from_data(data: &ProvidedData) -> Option<&Self> {
-        data.downcast_ref::<Self>().or_else(|| {
-            data.downcast_ref::<RuleData>()
-                .map(|rule| &rule.documentation)
-        })
+        data.downcast_ref::<Self>()
+            .or_else(|| {
+                data.downcast_ref::<RuleData>()
+                    .map(|rule| &rule.documentation)
+            })
+            .or_else(|| {
+                data.downcast_ref::<ProviderData>()
+                    .map(|provider| &provider.documentation)
+            })
     }
 }
 
@@ -1194,6 +1215,27 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             ),
         )
     };
+    let data = ProviderData {
+        origin: FileRange::new(call.file().file(db), call.call().range()),
+        documentation: documentation.clone(),
+        fields: (!open).then(|| fields.iter().map(|field| field.name.clone()).collect()),
+        initializer: match call.argument("init") {
+            CheckedArgument::Value { ty, expression } => {
+                if ty.is_none(db) {
+                    ProviderInitializer::None
+                } else {
+                    expression.map_or(ProviderInitializer::Unknown, |expression| {
+                        ProviderInitializer::Expression(FileRange::new(
+                            call.file().file(db),
+                            expression.range(),
+                        ))
+                    })
+                }
+            }
+            CheckedArgument::Omitted => ProviderInitializer::None,
+            CheckedArgument::Indeterminate => return None,
+        },
+    };
     let class = call.class_type(
         db,
         ProvidedClass {
@@ -1203,7 +1245,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             instance_fields: ProvidedInstanceFields {
                 fields: fields.into_boxed_slice(),
                 has_dynamic_fields: open,
-                data: Some(ProvidedData::new(documentation.clone())),
+                data: Some(ProvidedData::new(data.clone())),
             },
         },
     );
@@ -1213,7 +1255,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             db,
             Signature::new(Parameters::standard(parameters), instance),
         )
-        .with_callable_data(db, ProvidedData::new(documentation))?;
+        .with_callable_data(db, ProvidedData::new(data))?;
         Some(Type::heterogeneous_tuple(db, &environment, [class, raw]))
     } else {
         Some(class)

@@ -79,6 +79,21 @@ contracts produce an incomplete result. `--ignore_pattern` selects implementatio
 files and reexported bodies to exclude. Callers use the trusted stub contracts
 independently of validation results.
 
+Provider validation checks the original source's allowed fields and constructor
+inputs. A constructor that stores fields directly must require every declared
+field and accept only keywords; unrestricted source schemas also accept keyword
+variadic parameters. Initializer parameters borrow missing annotations from
+`__init__`, and Ty checks every return against the required field mapping.
+Known source-only fields are permitted in that mapping.
+
+An initializer proof requires static expression and called-function types, and
+nominal field contracts composed through containers and unions. Structural
+contracts, dynamic evidence, explicit source return annotations, unrestricted
+initializer schemas, and ambiguous correspondence produce an incomplete result.
+Exported provider instances also produce an incomplete result when the original
+source inference lacks evidence for their stored values. Ordinary body errors
+and constructor errors are reported alongside these results.
+
 ## Packaging
 
 Projects obtain source and stub repositories through Bazel dependencies and

@@ -10,13 +10,16 @@ use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Parameter;
 use ruff_python_ast::StmtFunctionDef;
+use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
 use salsa::Setter;
 use starpls_common::File;
 use starpls_hir::Db as _;
+use starpls_hir::ProviderContract;
 use starpls_hir::StubValidation;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -28,8 +31,11 @@ use ty_python_core::use_def_map;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::types::CallableTypeKind;
+use ty_python_semantic::types::ParameterKind;
+use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::TypeDefinition;
+use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
 use super::diagnostics::INCOMPLETE_STUB_VALIDATION;
@@ -59,6 +65,7 @@ struct Contract {
     stub: Function,
     name: Name,
     range: TextRange,
+    provider: Option<ProviderContract>,
 }
 
 impl Analysis {
@@ -81,11 +88,11 @@ impl Analysis {
             return Ok(Vec::new());
         }
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut reports = Reports::default();
             environment.set_type_interfaces(db).to(FxHashMap::default());
             environment
                 .set_stub_validation(db)
                 .to(StubValidation::default());
-            let mut reports = Reports::default();
             let mut contracts = Vec::new();
             let mut values = Vec::new();
             for source in &sources {
@@ -120,7 +127,11 @@ impl Analysis {
             let mut validation = StubValidation::default();
             for (&source, owner) in &mut owners {
                 if let Ok(stub) = *owner {
-                    if let Err(reason) = annotations(db, source, stub, &mut validation) {
+                    let provider = contracts
+                        .iter()
+                        .find(|contract| contract.source == source && contract.stub == stub)
+                        .and_then(|contract| contract.provider.as_ref());
+                    if let Err(reason) = annotations(db, source, stub, provider, &mut validation) {
                         *owner = Err(reason);
                     }
                 }
@@ -131,6 +142,7 @@ impl Analysis {
                     stub,
                     name,
                     range,
+                    provider: _,
                 } = contract;
                 reports.entry(source.file).or_default();
                 if let Err(reason) = owners[source] {
@@ -177,7 +189,44 @@ impl Analysis {
                 }
                 .resolve_type(db);
                 if let (Some(actual), Some(expected)) = (actual, expected) {
-                    if let Err(error) = compare(db, stub, &name, actual, expected) {
+                    let environment = ty_python_semantic::ProgramEnvironment::from_file(
+                        db.starlark_program_file(stub),
+                    );
+                    let result = if matches!(expected, Type::ClassLiteral(_))
+                        && matches!(
+                            expected.definition(db, &environment),
+                            Some(TypeDefinition::StaticClass(_))
+                        ) {
+                        compare_provider(db, source, stub, &name, actual, expected, None)
+                    } else if matches!(actual, Type::NominalInstance(_))
+                        && actual.provided_data(db, &environment).is_some_and(|data| {
+                            data.downcast_ref::<super::factory::ProviderData>()
+                                .is_some()
+                        })
+                    {
+                        let origin =
+                            super::interface::provider_implementation(db, source, expected);
+                        let data = actual
+                            .provided_data(db, &environment)
+                            .and_then(|data| data.downcast_ref::<super::factory::ProviderData>())
+                            .expect("provider instance metadata checked above");
+                        if origin.is_some_and(|(_, origin)| origin == data.origin) {
+                            Err(ContractError::Incomplete(format!("Cannot prove `{name}`: original provider instances do not retain field-value evidence")))
+                        } else {
+                            compare(db, stub, &name, actual, expected)
+                        }
+                    } else if actual.provided_data(db, &environment).is_some_and(|data| {
+                        data.downcast_ref::<super::factory::ProviderData>()
+                            .is_some()
+                    }) {
+                        match callable_signature(db, &environment, expected) {
+                            Some(signature) => compare_provider(db, source, stub, &name, actual, signature.return_type(), Some(signature)),
+                            None => Err(ContractError::Incomplete(format!("Cannot validate `{name}`: raw constructor has no single callable contract"))),
+                        }
+                    } else {
+                        compare(db, stub, &name, actual, expected)
+                    };
+                    if let Err(error) = result {
                         error.report(&mut reports, stub, range);
                     }
                 } else {
@@ -197,6 +246,7 @@ impl Analysis {
                     stub,
                     name,
                     range,
+                    provider,
                 } = contract;
                 if owners[&source].is_err() {
                     continue;
@@ -204,7 +254,17 @@ impl Analysis {
                 let model = SemanticModel::new(db, db.starlark_program_file(source.file));
                 let actual = model.definition_type(function_definition(db, source));
                 let expected = model.definition_type(function_definition(db, stub));
-                if let Err(error) = compare_function(db, source.file, &name, actual, expected) {
+                let result = if let Some(ProviderContract {
+                    stub: file,
+                    class,
+                    allowed_fields: _,
+                }) = provider
+                {
+                    compare_initializer(db, source, stub, &name, file, class)
+                } else {
+                    compare_function(db, source.file, &name, actual, expected)
+                };
+                if let Err(error) = result {
                     error.report(&mut reports, source.file, range);
                 }
             }
@@ -299,7 +359,37 @@ fn discover(
             );
             continue;
         };
-        if let Some(TypeDefinition::Function(stub_definition)) =
+        if matches!(expected, Type::ClassLiteral(_))
+            && matches!(
+                expected.definition(db, &model.program_environment()),
+                Some(TypeDefinition::StaticClass(_))
+            )
+        {
+            match provider_initializer(db, source, stub, name, actual, expected) {
+                Ok(Some(contract)) => {
+                    if selected(contract.source.file.path(db)) {
+                        contracts.push(contract);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => error.report(reports, stub, range),
+            }
+        }
+        let raw_provider = matches!(actual, Type::Callable(_))
+            && actual
+                .provided_data(db, &model.program_environment())
+                .is_some_and(|data| {
+                    data.downcast_ref::<super::factory::ProviderData>()
+                        .is_some()
+                });
+        if raw_provider {
+            values.push(ValueContract {
+                source,
+                stub,
+                name: name.clone(),
+                range,
+            });
+        } else if let Some(TypeDefinition::Function(stub_definition)) =
             expected.definition(db, &model.program_environment())
         {
             let Some(TypeDefinition::Function(source_definition)) =
@@ -342,6 +432,7 @@ fn discover(
                 stub: stub_function,
                 name: name.clone(),
                 range: source_definition.kind(db).target_range(&parsed),
+                provider: None,
             });
         } else {
             values.push(ValueContract {
@@ -364,6 +455,85 @@ fn definitely_bound(db: &Database, file: ProgramFile<'_>, name: &str) -> bool {
         .all(|binding| binding.binding.definition().is_some())
 }
 
+fn provider_initializer(
+    db: &Database,
+    source: File,
+    stub: File,
+    name: &str,
+    actual: Type<'_>,
+    expected: Type<'_>,
+) -> Result<Option<Contract>, ContractError> {
+    let model = SemanticModel::new(db, db.starlark_program_file(source));
+    let environment = model.program_environment();
+    let Some(data) = actual
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<super::factory::ProviderData>())
+    else {
+        return Ok(None);
+    };
+    let super::factory::ProviderInitializer::Expression(expression) = data.initializer else {
+        return Ok(None);
+    };
+    let incomplete =
+        |reason: &str| ContractError::Incomplete(format!("Cannot validate `{name}`: {reason}"));
+    let allowed = data
+        .fields
+        .clone()
+        .ok_or_else(|| incomplete("initializer has an unrestricted field schema"))?;
+    let (program, _) = super::interface::provider_implementation(db, source, expected)
+        .ok_or_else(|| incomplete("provider source is unavailable"))?;
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let expression =
+        ruff_python_ast::find_node::covering_node(parsed.syntax().into(), expression.range())
+            .node()
+            .as_expr_ref()
+            .ok_or_else(|| incomplete("initializer source is unavailable"))?;
+    let model = SemanticModel::new(db, program);
+    let ty = expression
+        .inferred_type(&model)
+        .ok_or_else(|| incomplete("initializer type is unavailable"))?;
+    let Some(TypeDefinition::Function(definition)) = ty.definition(db, &environment) else {
+        return Err(incomplete("initializer is not a single source function"));
+    };
+    let source =
+        function(db, definition).ok_or_else(|| incomplete("initializer source is unavailable"))?;
+    let Some(TypeDefinition::StaticClass(class)) = expected.definition(db, &environment) else {
+        return Err(incomplete("provider contract is not a class"));
+    };
+    let DefinitionKind::Class(class_kind) = class.kind(db) else {
+        unreachable!();
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, class.python_file(db)).load(db);
+    let class_node = class_kind.node(&parsed);
+    let constructor = class_node
+        .body
+        .iter()
+        .find_map(|statement| {
+            let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
+                return None;
+            };
+            (function.name.as_str() == "__init__").then_some(function)
+        })
+        .ok_or_else(|| incomplete("provider class has no constructor declaration"))?;
+    let constructor = Function {
+        file: stub,
+        key: constructor.into(),
+    };
+    Ok(Some(Contract {
+        source,
+        stub: constructor,
+        name: name.into(),
+        range: definition
+            .kind(db)
+            .target_range(&ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db)),
+        provider: Some(ProviderContract {
+            stub,
+            class: class_node.node_index().load(),
+            allowed_fields: allowed,
+        }),
+    }))
+}
+
 fn function(db: &Database, definition: Definition<'_>) -> Option<Function> {
     let DefinitionKind::Function(kind) = definition.kind(db) else {
         return None;
@@ -383,10 +553,76 @@ fn function_definition(db: &Database, function: Function) -> Definition<'_> {
     *definition
 }
 
+pub(super) fn provider_return_type<'db>(
+    db: &'db Database,
+    definition: Definition<'db>,
+) -> Option<ty_python_semantic::provided::ProvidedReturnType<'db>> {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    let node = function.node(&parsed);
+    let ProviderContract {
+        stub,
+        class: owner,
+        allowed_fields: allowed,
+    } = db
+        .environment()
+        .stub_validation(db)
+        .provider_returns
+        .get(&(definition.file(db), node.node_index().load()))?;
+    let program = db.starlark_program_file(*stub);
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let ruff_python_ast::AnyRootNodeRef::Stmt(ruff_python_ast::Stmt::ClassDef(class)) =
+        parsed.get_by_index(*owner)
+    else {
+        return None;
+    };
+    let [definition] = semantic_index(db, program).definitions(class) else {
+        return None;
+    };
+    let model = SemanticModel::new(db, program);
+    let fields = super::interface::provider_fields(
+        db,
+        model.definition_type(*definition),
+        &model.program_environment(),
+    )?;
+    let mut schema: ty_python_semantic::types::TypedDictSchema = fields
+        .into_iter()
+        .map(|field| {
+            (
+                field.name,
+                ty_python_semantic::types::TypedDictFieldBuilder::new(field.ty)
+                    .required(true)
+                    .build(),
+            )
+        })
+        .collect();
+    let object =
+        ty_python_semantic::types::KnownClass::Object.to_instance(db, &model.program_environment());
+    for name in allowed {
+        schema.entry(name.clone()).or_insert_with(|| {
+            ty_python_semantic::types::TypedDictFieldBuilder::new(object)
+                .required(false)
+                .build()
+        });
+    }
+    Some(ty_python_semantic::provided::ProvidedReturnType {
+        ty: Type::TypedDict(ty_python_semantic::types::TypedDictType::from_schema_items(
+            db, schema,
+        )),
+        source: Some(ruff_db::files::FileRange::new(
+            stub.source,
+            class.name.range,
+        )),
+    })
+}
+
 fn annotations(
     db: &Database,
     source: Function,
     stub: Function,
+    provider: Option<&ProviderContract>,
     validation: &mut StubValidation,
 ) -> Result<(), &'static str> {
     let source_definition = function_definition(db, source);
@@ -409,8 +645,13 @@ fn annotations(
     {
         return Err("generic or decorated functions require a dedicated implementation contract");
     }
-    let pairs = parameter_pairs(source_node, stub_node)?;
-    if stub_node.returns.is_some() {
+    let pairs = parameter_pairs_with_receiver(source_node, stub_node, provider.is_some())?;
+    if let Some(provider) = provider {
+        validation.provider_returns.insert(
+            (source.file.source, source_node.node_index().load()),
+            provider.clone(),
+        );
+    } else if stub_node.returns.is_some() {
         validation.annotations.insert(
             (source.file.source, source_node.node_index().load()),
             (stub.file, stub_node.node_index().load()),
@@ -432,10 +673,19 @@ pub(crate) fn parameter_pairs<'a>(
     source: &'a StmtFunctionDef,
     stub: &'a StmtFunctionDef,
 ) -> Result<Vec<(&'a Parameter, &'a Parameter)>, &'static str> {
+    parameter_pairs_with_receiver(source, stub, false)
+}
+
+fn parameter_pairs_with_receiver<'a>(
+    source: &'a StmtFunctionDef,
+    stub: &'a StmtFunctionDef,
+    receiver: bool,
+) -> Result<Vec<(&'a Parameter, &'a Parameter)>, &'static str> {
     let source = &source.parameters;
     let stub = &stub.parameters;
+    let skip = usize::from(receiver);
     if source.posonlyargs.len() != stub.posonlyargs.len()
-        || source.args.len() != stub.args.len()
+        || source.args.len() + skip != stub.args.len()
         || source.kwonlyargs.len() != stub.kwonlyargs.len()
         || source.vararg.is_some() != stub.vararg.is_some()
         || source.kwarg.is_some() != stub.kwarg.is_some()
@@ -446,7 +696,7 @@ pub(crate) fn parameter_pairs<'a>(
         .posonlyargs
         .iter()
         .chain(&source.args)
-        .zip(stub.posonlyargs.iter().chain(&stub.args))
+        .zip(stub.posonlyargs.iter().chain(stub.args.iter().skip(skip)))
         .map(|(source, stub)| (&source.parameter, &stub.parameter))
         .collect();
     for parameter in &source.kwonlyargs {
@@ -471,6 +721,290 @@ pub(crate) fn parameter_pairs<'a>(
 enum ContractError {
     Incompatible(String),
     Incomplete(String),
+}
+
+fn callable_signature<'db>(
+    db: &'db Database,
+    environment: &ty_python_semantic::ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Option<Signature<'db>> {
+    let mut signatures = Vec::new();
+    ty.map_callable_signatures(
+        db,
+        environment,
+        CallableTypeKind::FunctionLike,
+        |signature| {
+            signatures.push(signature.clone());
+            signature
+        },
+    )?;
+    let [signature] = signatures.as_slice() else {
+        return None;
+    };
+    Some(signature.clone())
+}
+
+fn compare_provider<'db>(
+    db: &'db Database,
+    source: File,
+    file: File,
+    name: &str,
+    actual: Type<'db>,
+    expected: Type<'db>,
+    raw_signature: Option<Signature<'db>>,
+) -> Result<(), ContractError> {
+    let environment =
+        ty_python_semantic::ProgramEnvironment::from_file(db.starlark_program_file(file));
+    let incomplete = || {
+        ContractError::Incomplete(format!(
+            "Cannot validate `{name}`: no unique provider declaration"
+        ))
+    };
+    let data = actual
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<super::factory::ProviderData>())
+        .ok_or_else(|| {
+            ContractError::Incomplete(format!(
+                "Cannot validate `{name}`: original provider schema is unavailable ({})",
+                actual.display(db, &environment)
+            ))
+        })?;
+    let (_, origin) =
+        super::interface::provider_implementation(db, source, expected).ok_or_else(|| {
+            ContractError::Incomplete(format!(
+                "Cannot validate `{name}`: source export has no unique provider origin"
+            ))
+        })?;
+    if raw_signature.is_some()
+        && !super::interface::provider_export_origin(
+            db,
+            source,
+            name,
+            super::interface::ProviderPart::Raw,
+        )
+        .is_some_and(|(_, raw_origin)| raw_origin == data.origin)
+    {
+        return Err(ContractError::Incomplete(format!(
+            "Cannot validate `{name}`: raw constructor has no unique provider origin"
+        )));
+    }
+    if origin != data.origin {
+        return Err(ContractError::Incomplete(format!(
+            "Cannot validate `{name}`: source export does not directly identify its provider declaration"
+        )));
+    }
+    let fields =
+        super::interface::provider_fields(db, expected, &environment).ok_or_else(incomplete)?;
+    if let Some(allowed) = &data.fields {
+        for field in &fields {
+            if !allowed.contains(&field.name) {
+                return Err(ContractError::Incompatible(format!(
+                    "Provider `{name}` does not allow field `{}`",
+                    field.name
+                )));
+            }
+        }
+    }
+    match data.initializer {
+        super::factory::ProviderInitializer::None => {}
+        super::factory::ProviderInitializer::Expression(_) => {
+            if raw_signature.is_none() {
+                return Ok(());
+            }
+        }
+        super::factory::ProviderInitializer::Unknown => return Err(incomplete()),
+    }
+    let signature = raw_signature
+        .or_else(|| callable_signature(db, &environment, expected))
+        .ok_or_else(|| {
+            ContractError::Incomplete(format!(
+                "Cannot validate `{name}`: constructor has no single callable signature"
+            ))
+        })?;
+    for parameter in signature.parameters().iter() {
+        if matches!(parameter.kind(), ParameterKind::KeywordVariadic { name: _ })
+            && data.fields.is_none()
+        {
+            continue;
+        }
+        let ParameterKind::KeywordOnly {
+            name: parameter_name,
+            default_type: _,
+        } = parameter.kind()
+        else {
+            return Err(ContractError::Incompatible(format!(
+                "Provider `{name}` accepts only keyword field arguments"
+            )));
+        };
+        if data
+            .fields
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(parameter_name))
+        {
+            return Err(ContractError::Incompatible(format!(
+                "Provider `{name}` does not accept constructor argument `{parameter_name}`"
+            )));
+        }
+    }
+    for field in fields {
+        let parameter = signature.parameters().iter().find(|parameter| matches!(parameter.kind(), ParameterKind::KeywordOnly { name, default_type: None } if name == &field.name));
+        let Some(parameter) = parameter else {
+            return Err(ContractError::Incompatible(format!(
+                "Constructor for `{name}` can omit field `{}`",
+                field.name
+            )));
+        };
+        compare(
+            db,
+            file,
+            &format!("{name}.{}", field.name),
+            parameter.annotated_type(),
+            field.ty,
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_initializer<'db>(
+    db: &'db Database,
+    source: Function,
+    stub: Function,
+    name: &str,
+    class_file: File,
+    class_node: NodeIndex,
+) -> Result<(), ContractError> {
+    use ruff_python_ast::visitor::Visitor;
+    use ruff_python_ast::visitor::{self};
+
+    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+    let environment = model.program_environment();
+    let definition = function_definition(db, source);
+    let actual = model.definition_type(definition);
+    let expected = model.definition_type(function_definition(db, stub));
+    let inputs = |ty: Type<'db>, receiver: bool| {
+        ty.map_callable_signatures(
+            db,
+            &environment,
+            CallableTypeKind::FunctionLike,
+            |signature| {
+                let parameters = ty_python_semantic::types::Parameters::from_annotation(
+                    db,
+                    signature
+                        .parameters()
+                        .iter()
+                        .skip(usize::from(receiver))
+                        .cloned(),
+                );
+                signature
+                    .with_parameters(parameters)
+                    .with_return_type(Type::none(db, &environment))
+            },
+        )
+        .unwrap_or(ty)
+    };
+    compare(
+        db,
+        source.file,
+        name,
+        inputs(actual, false),
+        inputs(expected, true),
+    )?;
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        unreachable!();
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    let function = function.node(&parsed);
+    if function.returns.is_some()
+        || starpls_hir::Source::new(db)
+            .type_comment_annotation(source.file, function.node_index().load())
+            .is_some()
+    {
+        return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer return annotation does not establish required field presence")));
+    }
+    let program = db.starlark_program_file(class_file);
+    let parsed_class = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let ruff_python_ast::AnyRootNodeRef::Stmt(ruff_python_ast::Stmt::ClassDef(class)) =
+        parsed_class.get_by_index(class_node)
+    else {
+        unreachable!("provider contracts originate in a class declaration");
+    };
+    let [class] = semantic_index(db, program).definitions(class) else {
+        unreachable!("a class declaration has one definition");
+    };
+    let fields = super::interface::provider_fields(db, model.definition_type(*class), &environment)
+        .expect("a provider contract is a static class");
+    for field in fields {
+        // Contextual return checking can hide gradual evidence in structural
+        // contracts. Restrict proof to nominal values and their containers;
+        // ordinary Ty diagnostics still check every initializer below.
+        if !field.ty.is_fully_static(db, &environment)
+            || ty_python_semantic::types::any_over_type(db, &environment, field.ty, false, |ty| {
+                !matches!(
+                    ty,
+                    Type::NominalInstance(_)
+                        | Type::ClassLiteral(_)
+                        | Type::GenericAlias(_)
+                        | Type::Union(_)
+                        | Type::LiteralValue(_)
+                        | Type::Never
+                )
+            })
+        {
+            return Err(ContractError::Incomplete(format!(
+                "Cannot prove `{name}`: field `{}` requires a structural or unresolved contract",
+                field.name
+            )));
+        }
+    }
+    struct Evidence<'a, 'db> {
+        model: &'a SemanticModel<'db>,
+        complete: bool,
+    }
+    impl<'a> Visitor<'a> for Evidence<'_, '_> {
+        fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
+            let model = self.model;
+            if !expression.inferred_type(model).is_some_and(|ty| {
+                let environment = model.program_environment();
+                ty.is_fully_static(model.db(), &environment)
+            }) {
+                self.complete = false;
+            }
+            if let ruff_python_ast::Expr::Call(call) = expression {
+                let environment = model.program_environment();
+                let signature = call.func.inferred_type(model).and_then(|ty| {
+                    ty.map_callable_signatures(
+                        model.db(),
+                        &environment,
+                        CallableTypeKind::FunctionLike,
+                        std::convert::identity,
+                    )
+                });
+                if !signature.is_some_and(|ty| ty.is_fully_static(model.db(), &environment)) {
+                    self.complete = false;
+                }
+            }
+            visitor::walk_expr(self, expression);
+        }
+        fn visit_stmt(&mut self, statement: &'a ruff_python_ast::Stmt) {
+            if matches!(
+                statement,
+                ruff_python_ast::Stmt::FunctionDef(_) | ruff_python_ast::Stmt::ClassDef(_)
+            ) {
+                self.complete = false;
+                return;
+            }
+            visitor::walk_stmt(self, statement);
+        }
+    }
+    let mut evidence = Evidence {
+        model: &model,
+        complete: true,
+    };
+    evidence.visit_body(&function.body);
+    if !evidence.complete {
+        return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer contains dynamic or unavailable expression types")));
+    }
+    Ok(())
 }
 
 impl ContractError {
@@ -554,6 +1088,15 @@ mod tests {
         let source = fixture.add_file(&mut analysis.db, "source.bzl", source);
         let stub = fixture.add_file(&mut analysis.db, "source.bzli", stub);
         loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
         analysis.set_type_interfaces([(source, stub)]).unwrap();
         let reports = analysis.validate_stubs(|_| true).unwrap();
         let diagnostics: Vec<_> = reports
@@ -564,6 +1107,171 @@ mod tests {
             .into_iter()
             .map(|diagnostic| diagnostic.id().as_str().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn provider_contracts_check_storage_and_constructor_inputs() {
+        let stub = "class Info:\n    value: Final[str]\n    def __init__(self, *, value: str) -> None: ...\n";
+        for source in [
+            "Info = provider(fields=['value'])\n",
+            "Info = provider(fields=['value', 'hidden'])\n",
+            "Info = provider()\n",
+            "_Info = provider(fields=['value'])\nInfo = _Info\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+        let open = stub.replace("value: str) -> None", "value: str, **kwargs: Any) -> None");
+        assert!(validate("Info = provider()\n", &open).is_empty());
+        for (source, stub, expected) in [
+            (
+                "Info = provider(fields=['other'])\n",
+                stub.to_owned(),
+                "invalid-stub-implementation",
+            ),
+            (
+                "names = ['value']\nInfo = provider(fields=names)\n",
+                stub.to_owned(),
+                "incomplete-stub-validation",
+            ),
+            (
+                "Info = provider(fields=['value'])\n",
+                stub.replace("*, value: str", "value: str"),
+                "invalid-stub-implementation",
+            ),
+            (
+                "Info = provider(fields=['value'])\n",
+                stub.replace("*, value: str", "*, value: str = ..."),
+                "invalid-stub-implementation",
+            ),
+            (
+                "Info = provider(fields=['value'])\n",
+                stub.replace("*, value: str", "*, value: int"),
+                "invalid-stub-implementation",
+            ),
+        ] {
+            let diagnostics = validate(source, &stub);
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{source}\n{stub}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_instance_exports_require_storage_evidence() {
+        let stub = "class Info:\n    value: Final[str]\n    def __init__(self, *, value: str) -> None: ...\nitem: Info\n";
+        for (construction, expected) in [
+            ("Info(value='ok')", "incomplete-stub-validation"),
+            ("Other(value='ok')", "invalid-stub-implementation"),
+            ("Info(value=42)", "invalid-argument-type"),
+        ] {
+            let source = format!("Info = provider(fields=['value'])\nOther = provider(fields=['value'])\nitem = {construction}\n");
+            let diagnostics = validate(&source, stub);
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{source}: {diagnostics:?}"
+            );
+            if construction == "Info(value='ok')" {
+                assert!(
+                    !diagnostics
+                        .iter()
+                        .any(|id| id == "invalid-stub-implementation"),
+                    "{diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_initializers_and_raw_constructors_have_separate_contracts() {
+        let stub = "class Info:\n    value: Final[str]\n    def __init__(self, value: str) -> None: ...\ndef raw(*, value: str) -> Info: ...\n";
+        let source = "def _init(value):\n    return {'value': value}\nInfo, raw = provider(fields=['value'], init=_init)\n";
+        let diagnostics = validate(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for source in [
+            source.replace("{'value': value}", "{'value': 42}"),
+            source.replace("{'value': value}", "{}"),
+            source.replace(
+                "return {'value': value}",
+                "if value:\n        return {'value': value}",
+            ),
+        ] {
+            let diagnostics = validate(&source, stub);
+            assert!(!diagnostics.is_empty(), "{source}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id != "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+        let dynamic = source.replace("_init(value)", "_init(value: Any)");
+        let diagnostics = validate(&dynamic, stub);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        for raw in [
+            "def raw(value: str) -> Info: ...",
+            "def raw(*, value: str = ...) -> Info: ...",
+            "def raw(*, value: int) -> Info: ...",
+        ] {
+            let stub = stub.replace("def raw(*, value: str) -> Info: ...", raw);
+            let diagnostics = validate(source, &stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "invalid-stub-implementation"),
+                "{stub}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_initializer_proof_tracks_gradual_evidence() {
+        let stub = "class Info:\n    value: Final[list[int]]\n    def __init__(self, xs: list[int]) -> None: ...\n";
+        for source in [
+            "def _init(xs):\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _typed(xs: list[int]) -> list[int]:\n    return xs\ndef _init(xs):\n    return {'value': _typed(xs)}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+        let diagnostics = validate(
+            "def _init(files):\n    return {'files': depset(files)}\nFilesInfo, _ = provider(fields=['files'], init=_init)\n",
+            "class FilesInfo:\n    files: Final[depset[File]]\n    def __init__(self, files: list[File]) -> None: ...\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for source in [
+            "def _init(xs: list[Any]):\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _unknown() -> Any: ...\ndef _init(xs):\n    return {'value': [_unknown()]}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _unknown() -> Any: ...\ndef _init(xs):\n    return {**_unknown(), 'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _mutate(xs) -> None:\n    xs.append('bad')\ndef _init(xs):\n    _mutate(xs)\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _init(xs) -> dict[str, list[int]]:\n    return {}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            "def _init(xs): # type: (list[int]) -> dict[str, list[int]]\n    return {}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(diagnostics.iter().any(|id| id == "incomplete-stub-validation"), "{source}: {diagnostics:?}");
+        }
+        for (field, returned) in [
+            ("Callable[[int], int]", "_helper"),
+            ("list[Callable[[int], int]]", "[_helper]"),
+        ] {
+            let stub = format!(
+                "class Info:\n    value: Final[{field}]\n    def __init__(self) -> None: ...\n"
+            );
+            let source = format!("def _helper(value):\n    return value\ndef _init():\n    return {{'value': {returned}}}\nInfo, _ = provider(fields=['value'], init=_init)\n");
+            let diagnostics = validate(&source, &stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]
