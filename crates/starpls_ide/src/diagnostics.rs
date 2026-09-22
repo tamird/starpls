@@ -329,6 +329,49 @@ child(name="child", value="value")
     }
 
     #[test]
+    fn targets_expose_labels_and_typed_provider_lookup() {
+        let source = r#"
+Info = provider(fields=["message"])
+def inspect(target):
+    # type: (Target) -> None
+    label = target.label # type: Label
+    info = target[DefaultInfo] # type: DefaultInfo
+    cc = target[CcInfo] # type: CcInfo
+    coverage = target[InstrumentedFilesInfo] # type: InstrumentedFilesInfo
+    custom = target[Info] # type: Info
+    for key in [DefaultInfo, CcInfo, InstrumentedFilesInfo, Info]:
+        if key in target:
+            print(target[key])
+    print(label, info, cc, coverage, custom)
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for statement in [
+            "    wrong = target[DefaultInfo] # type: CcInfo",
+            "    wrong = target[InstrumentedFilesInfo] # type: CcInfo",
+            "    wrong = target[Info] # type: DefaultInfo",
+            "    target[42]",
+            "    42 in target",
+        ] {
+            analysis.update_file(file, format!("{source}{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.id().as_str(),
+                        "invalid-assignment" | "invalid-argument-type" | "unsupported-operator"
+                    ) && diagnostic
+                        .range()
+                        .is_some_and(|range| range.start().to_usize() >= source.len())
+                }),
+                "{statement}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn qualified_provider_comments_keep_nominal_identity() {
         let source = r#"
 First = provider(fields=["value"])

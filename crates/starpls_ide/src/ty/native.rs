@@ -217,6 +217,11 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                 body,
                 "    class struct(_starpls_typing.Generic[_StructField]):"
             )?;
+        } else if class.name == "Provider" {
+            writeln!(
+                body,
+                "    class Provider(_starpls_typing.Generic[_ProviderValue]):"
+            )?;
         } else {
             writeln!(body, "    class {}:", class.name)?;
         }
@@ -235,15 +240,28 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                 "        def __getattr__(self, name: _starpls_builtins.str) -> _StructField: ..."
             )?;
         }
+        let mut names = BTreeSet::new();
+        if class.name == "Target" {
+            names.extend(["label", "__getitem__", "__contains__"]);
+            writeln!(body, "        label: _starpls_types.Label")?;
+            writeln!(
+                body,
+                "        def __getitem__(self, key: _starpls_types.Provider[_ProviderValue] | _starpls_typing.Callable[..., _ProviderValue]) -> _ProviderValue: ..."
+            )?;
+            writeln!(
+                body,
+                "        def __contains__(self, key: _starpls_types.Provider[_starpls_typing.Any] | _starpls_typing.Callable[..., _starpls_typing.Any]) -> _starpls_builtins.bool: ..."
+            )?;
+        }
         if matches!(class.name.as_str(), "rule" | "macro") {
+            names.insert("__call__");
             writeln!(
                 body,
                 "        def __call__(self, **kwargs: _starpls_typing.Any) -> None: ..."
             )?;
         }
-        let mut names = BTreeSet::new();
         for field in &class.field {
-            if !names.insert(&field.name) {
+            if !names.insert(field.name.as_str()) {
                 continue;
             }
             match &field.callable {
@@ -272,14 +290,9 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     } else {
                         None
                     };
-                    let field_type = field_type.map(str::to_owned).unwrap_or_else(|| {
-                        annotation(
-                            &field.r#type,
-                            false,
-                            &declared_classes,
-                            AnnotationUse::Value,
-                        )
-                    });
+                    let field_type = field_type
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value_annotation(field, &declared_classes));
                     writeln!(body, "        {}: {field_type}", field.name)?;
                     if !field.doc.is_empty() {
                         writeln!(
@@ -324,12 +337,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     exports,
                     "    {}: {}",
                     value.name,
-                    annotation(
-                        &value.r#type,
-                        false,
-                        &declared_classes,
-                        AnnotationUse::Value
-                    )
+                    value_annotation(value, &declared_classes)
                 )?,
             }
         }
@@ -345,7 +353,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -356,6 +364,15 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
     output.push('\n');
     output.push_str(include_str!("starlark.pyi"));
     Ok(output)
+}
+
+fn value_annotation(value: &Value, classes: &BTreeSet<String>) -> String {
+    let annotation = annotation(&value.r#type, false, classes, AnnotationUse::Value);
+    if starpls_bazel::KNOWN_PROVIDER_TYPES.contains(&value.name.as_str()) {
+        format!("_starpls_types.Provider[{annotation}]")
+    } else {
+        annotation
+    }
 }
 
 fn write_function(
