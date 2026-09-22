@@ -22,9 +22,10 @@ pub(super) struct DeclarationSource {
     pub(super) contents: String,
 }
 
-enum CallableKind {
+#[derive(Clone, Copy)]
+enum CallableKind<'a> {
     Function,
-    Method,
+    Method(&'a str),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,15 +213,18 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
     for class in classes.values() {
-        if class.name == "struct" {
+        let parameter = match class.name.as_str() {
+            "struct" => Some("_StructField"),
+            "Provider" => Some("_ProviderValue"),
+            "depset" => Some("_DepsetElement"),
+            "DefaultInfo" => Some("_DefaultInfoFiles"),
+            _ => None,
+        };
+        if let Some(parameter) = parameter {
             writeln!(
                 body,
-                "    class struct(_starpls_typing.Generic[_StructField]):"
-            )?;
-        } else if class.name == "Provider" {
-            writeln!(
-                body,
-                "    class Provider(_starpls_typing.Generic[_ProviderValue]):"
+                "    class {}(_starpls_typing.Generic[{parameter}]):",
+                class.name
             )?;
         } else {
             writeln!(body, "    class {}:", class.name)?;
@@ -244,6 +248,14 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         if class.name == "Target" {
             names.extend(["label", "__getitem__", "__contains__"]);
             writeln!(body, "        label: _starpls_types.Label")?;
+            // Target access normalizes DefaultInfo.files even when the raw
+            // provider constructor omitted it.
+            writeln!(body, "        @_starpls_typing.overload")?;
+            writeln!(
+                body,
+                "        def __getitem__(self, key: _starpls_typing.Callable[..., _starpls_types.DefaultInfo]) -> _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File]]: ..."
+            )?;
+            writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
                 body,
                 "        def __getitem__(self, key: _starpls_types.Provider[_ProviderValue] | _starpls_typing.Callable[..., _ProviderValue]) -> _ProviderValue: ..."
@@ -270,7 +282,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     "        ",
                     field,
                     callable,
-                    CallableKind::Method,
+                    CallableKind::Method(&class.name),
                     if class.name == "native" && rule_names.contains(field.name.as_str()) {
                         AnnotationUse::AttributeInput
                     } else {
@@ -287,6 +299,8 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                             "files" => Some("_starpls_types.struct[_starpls_builtins.list[_starpls_types.File]]"),
                             _ => None,
                         }
+                    } else if class.name == "DefaultInfo" && field.name == "files" {
+                        Some("_DefaultInfoFiles")
                     } else {
                         None
                     };
@@ -353,7 +367,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -380,7 +394,7 @@ fn write_function(
     indent: &str,
     value: &Value,
     callable: &Callable,
-    kind: CallableKind,
+    kind: CallableKind<'_>,
     input: AnnotationUse,
     classes: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
@@ -408,7 +422,14 @@ fn write_function(
         // This inventory omits parameter kinds. A required parameter after an
         // optional one proves a keyword-only boundary, but optional tails do
         // not. Preserve explicit variadics and avoid inventing other boundaries.
-        if *is_mandatory && optional && !keyword_only && !is_star_arg && !is_star_star_arg {
+        let transitive = matches!(kind, CallableKind::Function)
+            && value.name == "depset"
+            && name == "transitive";
+        if ((*is_mandatory && optional) || transitive)
+            && !keyword_only
+            && !is_star_arg
+            && !is_star_star_arg
+        {
             output.push_str("*, ");
             keyword_only = true;
         }
@@ -424,11 +445,20 @@ fn write_function(
         } else if *is_star_arg {
             output.push('*');
         }
-        write!(
-            output,
-            "{name}: {}",
+        let parameter_type = match (kind, value.name.as_str(), name) {
+            (CallableKind::Function, "depset", "direct") => {
+                Some("_starpls_typing.Sequence[_DepsetElement] | None")
+            }
+            (CallableKind::Function, "depset", "transitive") => {
+                Some("_starpls_typing.Sequence[_starpls_types.depset[_DepsetElement]] | None")
+            }
+            (CallableKind::Function, "DefaultInfo", "files") => Some("_DefaultInfoFiles"),
+            _ => None,
+        };
+        let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
             annotation(r#type, *is_star_arg || *is_star_star_arg, classes, input)
-        )?;
+        });
+        write!(output, "{name}: {parameter_type}")?;
         if !is_star_arg && !is_star_star_arg && !is_mandatory {
             optional = true;
             let default = if default_value.is_empty() || default_value == "unbound" {
@@ -439,12 +469,20 @@ fn write_function(
             write!(output, " = {default}")?;
         }
     }
-    let return_type = &callable.return_type;
-    writeln!(
-        output,
-        ") -> {}:",
-        annotation(return_type, false, classes, AnnotationUse::Value)
-    )?;
+    let return_type = match (kind, value.name.as_str()) {
+        (CallableKind::Function, "depset") => Some("_starpls_types.depset[_DepsetElement]"),
+        (CallableKind::Function, "DefaultInfo") => {
+            Some("_starpls_types.DefaultInfo[_DefaultInfoFiles]")
+        }
+        (CallableKind::Method("depset"), "to_list") => {
+            Some("_starpls_builtins.list[_DepsetElement]")
+        }
+        _ => None,
+    };
+    let return_type = return_type
+        .map(str::to_owned)
+        .unwrap_or_else(|| annotation(&callable.return_type, false, classes, AnnotationUse::Value));
+    writeln!(output, ") -> {return_type}:")?;
     let mut documentation = env::normalize_doc(&value.doc, false);
     let mut documented_parameters = callable
         .param

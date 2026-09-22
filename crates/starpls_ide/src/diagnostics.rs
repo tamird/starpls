@@ -335,6 +335,60 @@ child(name="child", value="value")
     }
 
     #[test]
+    fn depsets_preserve_element_types_and_target_defaults() {
+        let source = r#"
+def inspect(target, artifact):
+    # type: (Target, File) -> None
+    files = target[DefaultInfo].files.to_list() # type: list[File]
+    inputs = [artifact]
+    direct = depset(inputs)
+    tuple_direct = depset((artifact,))
+    children = [direct]
+    transitive = depset(transitive=children)
+    combined = depset([artifact], transitive=[transitive])
+    for values in [direct, tuple_direct, transitive, combined]:
+        checked = values.to_list() # type: list[File]
+        print(checked)
+    raw = DefaultInfo(files=direct).files.to_list() # type: list[File]
+    strings = depset(["value"]).to_list() # type: list[str]
+    print(files, raw, strings)
+def unknown(target, key, values):
+    # type: (Target, Unknown, Unknown) -> None
+    gradual = target[key] # type: int
+    elements = depset(values).to_list() # type: list[int]
+    empty = depset().to_list()
+    print(gradual, elements, empty)
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for expression in [
+            "depset([\"value\"]).to_list().append(1)",
+            "DefaultInfo(files=depset([\"value\"]))",
+            "DefaultInfo(files=depset(transitive=[depset([\"value\"])]))",
+            "DefaultInfo().files.to_list()",
+            "DefaultInfo(files=None).files.to_list()",
+            "depset(transitive=[[1]])",
+            "depset(\"value\")",
+            "list(depset([1]))",
+            "depset([], \"default\", [])",
+            "def invalid_target(target):\n    # type: (Target) -> None\n    target[DefaultInfo].files.to_list().append(\"bad\")",
+            "def invalid_raw(info):\n    # type: (DefaultInfo) -> None\n    info.files.to_list()",
+        ] {
+            analysis.update_file(file, format!("{source}\n{expression}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(!diagnostics.is_empty(), "{expression}");
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic
+                    .range()
+                    .is_some_and(|range| range.start().to_usize() >= source.len())),
+                "{expression}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn targets_expose_labels_and_typed_provider_lookup() {
         let source = r#"
 Info = provider(fields=["message"])
