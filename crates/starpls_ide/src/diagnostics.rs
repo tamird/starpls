@@ -432,6 +432,145 @@ mutable(name="ok", observed="unproved")
     }
 
     #[test]
+    fn selects_preserve_alternatives_and_deferred_operations() {
+        let source = r#"
+strings = {"//:condition": ["a"], "//conditions:default": []}
+labels = {Label("//:condition"): ["a"]}
+mixed_keys = {"//:condition": ["a"], Label("//:other"): ["b"]}
+values = select(strings)
+known_values = select({"//:condition": ["a"]})
+known_mixed = known_values + [42]
+known_empty = known_values + []
+known_empty_left = [] + known_values
+unknown_elements = [] # type: list[Unknown]
+gradual_elements = known_values + unknown_elements
+def add_unknown(other):
+    gradual_operand = known_values + other
+    return gradual_operand
+declared_values = known_values # type: select[list[str]]
+declared_mixed = declared_values + [42]
+nullable_values = select({"//:condition": ["a"], "//conditions:default": None})
+nullable_mixed = nullable_values + [42]
+nullable_empty = nullable_values + []
+mapping_empty = select({"//:condition": {"a": 1}}) | {}
+mapping_empty_left = {} | select({"//:condition": {"a": 1}})
+select(labels)
+select(mixed_keys)
+right = values + ["b"] # type: select[list[str]]
+left = ["b"] + values # type: select[list[str]]
+pair = values + select({"//:condition": ["b"]}) # type: select[list[str]]
+tuple_values = select({"//:condition": ("a",)}) + ["b"] # type: select[list[str]]
+range_values = select({"//:condition": range(3)}) + [4] # type: select[list[int]]
+mixed_values = select({"//:condition": ["a"], "//conditions:default": [42]}) + [] # type: select[list[str | int]]
+defaulted = select({"//:condition": ["a"], "//conditions:default": None}) # type: select[list[str] | None]
+defaulted_right = defaulted + ["b"] # type: select[list[str] | None]
+defaulted_left = ["b"] + defaulted # type: select[list[str] | None]
+defaulted_text = "b" + select({"//:condition": "a", "//conditions:default": None}) # type: select[str | None]
+defaulted_mapping = {"a": 1} | select({"//:condition": {"b": "c"}, "//conditions:default": None}) # type: select[dict[str, int | str] | None]
+text = select({"//:condition": "a"}) + "b" # type: select[str]
+text_before = "b" + select({"//:condition": "a"}) # type: select[str]
+mapping = select({"//:condition": {"a": 1}}) | {"b": "c"} # type: select[dict[str, int | str]]
+mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[dict[str, int | str]]
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        for (name, expected) in [
+            ("known_mixed", "select[list[str | int]]"),
+            ("declared_mixed", "select[list[str | int]]"),
+            ("nullable_mixed", "select[list[str | int] | None]"),
+            ("known_empty", "select[list[str | Unknown]]"),
+            ("known_empty_left", "select[list[str | Unknown]]"),
+            ("nullable_empty", "select[list[str | Unknown] | None]"),
+            (
+                "mapping_empty",
+                "select[dict[str | Unknown, int | Unknown]]",
+            ),
+            (
+                "mapping_empty_left",
+                "select[dict[str | Unknown, int | Unknown]]",
+            ),
+            ("gradual_elements", "select[list[str | Unknown]]"),
+            ("gradual_operand", "Unknown"),
+        ] {
+            let hover = analysis
+                .snapshot()
+                .hover(crate::FilePosition {
+                    file_id: file,
+                    pos: (source.find(name).unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("{name}: {expected}\n")),
+                "{}",
+                hover.contents.value
+            );
+        }
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (statement, expected) in [
+            (
+                "bad = values # type: select[list[int]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = known_empty # type: select[list[int]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = known_mixed # type: select[list[str]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = known_mixed # type: select[list[int]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = mapping_empty # type: select[dict[str, str]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = mixed_values # type: select[list[str]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = mapping # type: select[dict[str, str]]",
+                "invalid-assignment",
+            ),
+            ("select({42: ['a']})", "invalid-argument-type"),
+            ("values[0]", "not-subscriptable"),
+            ("list(values)", "invalid-argument-type"),
+            ("values.append('a')", "unresolved-attribute"),
+            ("values + 'a'", "unsupported-operator"),
+            (
+                "bad = defaulted_right # type: select[list[str]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = defaulted_left # type: select[list[str]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = defaulted_text # type: select[str]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = defaulted_mapping # type: select[dict[str, int | str]]",
+                "invalid-assignment",
+            ),
+            ("select({'//:condition': 1}) + 2", "unsupported-operator"),
+        ] {
+            analysis.update_file(file, format!("{source}\n{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), expected, "{statement}");
+        }
+    }
+
+    #[test]
     fn depsets_preserve_element_types_and_target_defaults() {
         let source = r#"
 def inspect(target, artifact):

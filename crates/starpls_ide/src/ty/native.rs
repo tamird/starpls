@@ -217,6 +217,13 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             ..Default::default()
         });
     }
+    if dialect == Dialect::Bazel {
+        classes.entry("select".to_owned()).or_insert_with(|| Type {
+            name: "select".to_owned(),
+            doc: "Deferred configuration-dependent alternatives.".to_owned(),
+            ..Default::default()
+        });
+    }
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
     for class in classes.values() {
@@ -224,6 +231,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             "struct" => Some("_StructField"),
             "Provider" => Some("_ProviderValue"),
             "depset" => Some("_DepsetElement"),
+            "select" => Some("_SelectValue"),
             "DefaultInfo" => Some("_DefaultInfoFiles"),
             _ => None,
         };
@@ -252,6 +260,10 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             )?;
         }
         let mut names = BTreeSet::new();
+        if class.name == "select" {
+            names.extend(["__add__", "__radd__", "__or__", "__ror__"]);
+            write_select_operators(&mut body)?;
+        }
         if class.name == "Target" {
             names.extend(["label", "__getitem__", "__contains__"]);
             writeln!(body, "        label: _starpls_types.Label")?;
@@ -411,7 +423,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -423,6 +435,33 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
     output.push('\n');
     output.push_str(include_str!("starlark.pyi"));
     Ok(output)
+}
+
+// Selector concatenation is deferred until attribute conversion. Only strings,
+// lists, and dictionaries support that conversion in Bazel.
+// Nullable overloads preserve default markers but cannot model the first-branch
+// runtime kind that Bazel uses to accept or reject a concatenation.
+fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
+    for (methods, signatures) in [
+        (["__add__", "__radd__"], &[
+            ("_starpls_builtins.str", "_starpls_builtins.str", "_starpls_builtins.str"),
+            ("_starpls_typing.Sequence[_SelectLeft]", "_starpls_typing.Sequence[_SelectRight]", "_starpls_builtins.list[_SelectLeft | _SelectRight]"),
+        ][..]),
+        (["__or__", "__ror__"], &[
+            ("_starpls_typing.Mapping[_SelectKeyLeft, _SelectLeft]", "_starpls_typing.Mapping[_SelectKeyRight, _SelectRight]", "_starpls_builtins.dict[_SelectKeyLeft | _SelectKeyRight, _SelectLeft | _SelectRight]"),
+        ][..]),
+    ] {
+        for method in methods {
+            for nullable in ["", " | None"] {
+                for (receiver, operand, result) in signatures {
+                    writeln!(output, "        @_starpls_typing.overload")?;
+                    writeln!(output, "        @_starpls_typing.type_check_only")?;
+                    writeln!(output, "        def {method}(self: _starpls_types.select[{receiver}{nullable}], other: {operand} | _starpls_types.select[{operand}{nullable}], /) -> _starpls_types.select[{result}{nullable}]: ...")?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn rule_type(name: &str) -> String {
@@ -503,6 +542,7 @@ fn write_function(
             output.push('*');
         }
         let parameter_type = match (kind, value.name.as_str(), name) {
+            (CallableKind::Function, "select", "x") => Some("_starpls_typing.Mapping[_SelectCondition, _SelectValue]"),
             (CallableKind::Function, "depset", "direct") => {
                 Some("_starpls_typing.Sequence[_DepsetElement] | None")
             }
@@ -528,6 +568,7 @@ fn write_function(
         }
     }
     let return_type = match (kind, value.name.as_str()) {
+        (CallableKind::Function, "select") => Some("_starpls_types.select[_SelectValue]"),
         (CallableKind::Function, "depset") => Some("_starpls_types.depset[_DepsetElement]"),
         (CallableKind::Function, "DefaultInfo") => {
             Some("_starpls_types.DefaultInfo[_DefaultInfoFiles]")
