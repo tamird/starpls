@@ -940,7 +940,7 @@ mod tests {
                     "../../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let file = fixture.add_file(
@@ -1021,7 +1021,7 @@ shadow = shadowed()
                     "../../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         fixture.add_file(
@@ -1076,7 +1076,7 @@ raw(field=1)
                     "../../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         fixture.add_file(

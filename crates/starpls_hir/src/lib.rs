@@ -30,7 +30,7 @@ pub struct BuiltinDefs {
     #[returns(ref)]
     pub builtins: Builtins,
     #[returns(ref)]
-    pub rules: Builtins,
+    pub rules: starpls_bazel::build::BuildLanguage,
 }
 
 #[salsa::db]
@@ -41,7 +41,7 @@ pub trait Db: starpls_common::Db {
         &mut self,
         dialect: Dialect,
         builtins: Builtins,
-        rules: Builtins,
+        rules: starpls_bazel::build::BuildLanguage,
     ) -> anyhow::Result<()>;
 
     fn get_builtin_defs(&self, dialect: &Dialect) -> BuiltinDefs;
@@ -86,8 +86,8 @@ pub struct Environment {
 
 impl Environment {
     pub fn initialize(db: &dyn Db, options: InferenceOptions) -> Self {
-        let standard = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
-        let bazel = BuiltinDefs::new(db, Builtins::default(), Builtins::default());
+        let standard = BuiltinDefs::new(db, Builtins::default(), Default::default());
+        let bazel = BuiltinDefs::new(db, Builtins::default(), Default::default());
         Self::new(
             db,
             options,

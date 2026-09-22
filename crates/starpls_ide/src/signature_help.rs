@@ -185,7 +185,7 @@ mod tests {
                     "../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");
@@ -313,7 +313,7 @@ fallback = unknown({{}})
                     "../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");

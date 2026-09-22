@@ -378,7 +378,7 @@ mod tests {
                     "../../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         analysis.set_type_interfaces([(source, interface)]).unwrap();

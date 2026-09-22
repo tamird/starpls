@@ -68,7 +68,7 @@ impl Database {
         &mut self,
         dialect: Dialect,
         builtins: &starpls_bazel::Builtins,
-        rules: &starpls_bazel::Builtins,
+        rules: &starpls_bazel::build::BuildLanguage,
     ) -> anyhow::Result<()> {
         use starpls_common::Db;
 
@@ -573,7 +573,7 @@ identity(value=Info(value=1))
                     "../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         for (source, expected) in [

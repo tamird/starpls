@@ -195,7 +195,7 @@ impl starpls_hir::Db for Database {
         &mut self,
         dialect: Dialect,
         builtins: Builtins,
-        rules: Builtins,
+        rules: starpls_bazel::build::BuildLanguage,
     ) -> anyhow::Result<()> {
         self.set_native_metadata(dialect, &builtins, &rules)?;
         let defs = self.environment().builtin_defs(self, dialect);
@@ -272,7 +272,7 @@ impl Analysis {
         }
         db.environment = Some(Environment::initialize(&db, options));
         for dialect in [Dialect::Standard, Dialect::Bazel] {
-            db.set_builtin_defs(dialect, Builtins::default(), Builtins::default())
+            db.set_builtin_defs(dialect, Builtins::default(), Default::default())
                 .expect("bundled native declarations are valid");
         }
         Self { db }
@@ -420,7 +420,11 @@ impl Analysis {
         AnalysisSnapshot { db: db.clone() }
     }
 
-    pub fn set_builtin_defs(&mut self, builtins: Builtins, rules: Builtins) -> anyhow::Result<()> {
+    pub fn set_builtin_defs(
+        &mut self,
+        builtins: Builtins,
+        rules: starpls_bazel::build::BuildLanguage,
+    ) -> anyhow::Result<()> {
         let Self { db } = self;
         db.set_builtin_defs(Dialect::Bazel, builtins, rules)
     }

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use rustc_hash::FxHashMap;
 use starpls_bazel::APIContext;
-use starpls_bazel::Builtins;
 use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::FileInfo;
@@ -41,7 +40,7 @@ impl Fixture {
         db.set_builtin_defs(
             Dialect::Bazel,
             make_test_builtins(functions, globals, types),
-            Builtins::default(),
+            Default::default(),
         )
         .expect("test builtin metadata is valid");
 

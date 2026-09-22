@@ -6,51 +6,33 @@ use crate::build::RuleDefinition;
 use crate::builtin::Callable;
 use crate::builtin::Param;
 use crate::builtin::Value;
-use crate::Builtins;
 
-pub fn decode_rules(build_language_output: &[u8]) -> anyhow::Result<Builtins> {
-    let build_language = BuildLanguage::decode(build_language_output)?;
-    Ok(Builtins {
-        global: build_language
-            .rule
-            .into_iter()
-            .map(
-                |RuleDefinition {
-                     name,
-                     documentation,
-                     attribute,
-                     ..
-                 }| {
-                    Value {
-                        name,
-                        doc: documentation.unwrap_or_else(String::new),
-                        callable: Some(Callable {
-                            param: attribute
-                                .into_iter()
-                                .filter(|attr| !attr.name.starts_with(['$', ':']))
-                                .map(|attr| {
-                                    let doc = attr.documentation().to_string();
-                                    let is_mandatory = attr.mandatory();
-                                    let r#type =
-                                        attribute_type_string_from_discriminator(attr.r#type());
-                                    Param {
-                                        name: attr.name,
-                                        r#type,
-                                        doc,
-                                        is_mandatory,
-                                        ..Default::default()
-                                    }
-                                })
-                                .collect(),
-                            return_type: "None".to_string(),
-                        }),
-                        ..Default::default()
-                    }
-                },
-            )
-            .collect(),
+pub fn decode_rules(build_language_output: &[u8]) -> anyhow::Result<BuildLanguage> {
+    Ok(BuildLanguage::decode(build_language_output)?)
+}
+
+/// Project a native rule into the callable inventory used by editor declarations.
+pub fn rule_value(rule: &RuleDefinition) -> Value {
+    Value {
+        name: rule.name.clone(),
+        doc: rule.documentation.clone().unwrap_or_default(),
+        callable: Some(Callable {
+            param: rule
+                .attribute
+                .iter()
+                .filter(|attribute| !attribute.name.starts_with(['$', ':']))
+                .map(|attribute| Param {
+                    name: attribute.name.clone(),
+                    r#type: attribute_type_string_from_discriminator(attribute.r#type()),
+                    doc: attribute.documentation().to_owned(),
+                    is_mandatory: attribute.mandatory(),
+                    ..Default::default()
+                })
+                .collect(),
+            return_type: "None".to_owned(),
+        }),
         ..Default::default()
-    })
+    }
 }
 
 pub fn attribute_type_string_from_discriminator(value: Discriminator) -> String {
@@ -66,10 +48,8 @@ pub fn attribute_type_string_from_discriminator(value: Discriminator) -> String 
         IntegerList => "List of ints",
         LabelListDict => "Dict of Labels",
         StringDict => "Dict of strings",
-        // TODO(withered-magic): Handle StringListDict.
-        StringListDict => "Unknown",
-        // TODO(withered-magic): Handle LabelKeyedStringDict.
-        LabelKeyedStringDict => "Unknown",
+        StringListDict => "Dictionary: string -> list of strings",
+        LabelKeyedStringDict => "Dictionary: Label -> string",
         _ => "Unknown",
     }
     .to_string()
@@ -77,38 +57,32 @@ pub fn attribute_type_string_from_discriminator(value: Discriminator) -> String 
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
-
-    use super::decode_rules;
+    use super::rule_value;
     use crate::build::attribute::Discriminator;
     use crate::build::AttributeDefinition;
-    use crate::build::BuildLanguage;
     use crate::build::RuleDefinition;
 
     #[test]
     fn rule_attributes_preserve_requiredness() {
-        let language = BuildLanguage {
-            rule: vec![RuleDefinition {
-                name: "example".to_owned(),
-                attribute: [None, Some(false), Some(true)]
-                    .into_iter()
-                    .map(|mandatory| AttributeDefinition {
-                        name: "value".to_owned(),
-                        r#type: Discriminator::String as i32,
-                        mandatory,
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
-            }],
+        let rule = RuleDefinition {
+            name: "example".to_owned(),
+            attribute: [None, Some(false), Some(true)]
+                .into_iter()
+                .map(|mandatory| AttributeDefinition {
+                    name: "value".to_owned(),
+                    r#type: Discriminator::String as i32,
+                    mandatory,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
         };
-        let definitions = decode_rules(&language.encode_to_vec()).unwrap();
-        let [crate::builtin::Value {
+        let crate::builtin::Value {
             callable: Some(callable),
             ..
-        }] = definitions.global.as_slice()
+        } = rule_value(&rule)
         else {
-            panic!("expected one callable rule");
+            panic!("expected a callable");
         };
         assert_eq!(
             callable

@@ -38,7 +38,7 @@ mod tests {
                     "../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);

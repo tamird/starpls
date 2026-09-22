@@ -101,7 +101,7 @@ impl crate::Db for TestDatabase {
         &mut self,
         dialect: Dialect,
         builtins: Builtins,
-        rules: Builtins,
+        rules: starpls_bazel::build::BuildLanguage,
     ) -> anyhow::Result<()> {
         let defs = self.environment().builtin_defs(self, dialect);
         defs.set_builtins(self).to(builtins);

@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use ruff_db::system::SystemVirtualPathBuf;
+use starpls_bazel::build::BuildLanguage;
+use starpls_bazel::build_language::rule_value;
 use starpls_bazel::builtin::Callable;
 use starpls_bazel::builtin::Param;
 use starpls_bazel::builtin::Type;
@@ -50,7 +52,7 @@ pub(super) fn export_name(context: APIContext, name: &str) -> String {
 pub(super) fn generate(
     dialect: Dialect,
     builtins: &Builtins,
-    rules: &Builtins,
+    rules: &BuildLanguage,
 ) -> anyhow::Result<DeclarationSource> {
     let contents = declarations(dialect, builtins, rules)?;
     ruff_python_parser::parse_module(&contents).map_err(|error| {
@@ -73,24 +75,20 @@ pub(super) fn globals(
     dialect: Dialect,
     context: APIContext,
     builtins: &Builtins,
-    rules: &Builtins,
+    rules: &BuildLanguage,
 ) -> BTreeMap<String, Value> {
     let mut globals = BTreeMap::new();
-    let mut add_globals = |values: &[Value]| {
-        for value in values {
-            if value.name.is_empty() {
+    let mut add_globals = |values: Vec<Value>| {
+        for mut value in values {
+            if value.name.is_empty() || BUILTINS_VALUES_DENY_LIST.contains(&value.name.as_str()) {
                 continue;
             }
-            if BUILTINS_VALUES_DENY_LIST.contains(&value.name.as_str()) {
-                continue;
-            }
-            let mut value = value.clone();
             refine_builtin_signature(&mut value);
             globals.insert(value.name.clone(), value);
         }
     };
     match dialect {
-        Dialect::Standard => add_globals(&builtins.global),
+        Dialect::Standard => add_globals(builtins.global.clone()),
         Dialect::Bazel => {
             let extra = match context {
                 APIContext::Bzl => env::make_bzl_builtins(),
@@ -102,14 +100,14 @@ pub(super) fn globals(
                 APIContext::Cquery => env::make_cquery_builtins(),
                 APIContext::Vendor => env::make_vendor_builtins(),
             };
-            add_globals(&extra.global);
+            add_globals(extra.global);
             if matches!(
                 context,
                 APIContext::Bzl | APIContext::Build | APIContext::Prelude
             ) {
-                add_globals(&env::make_build_builtins().global);
-                add_globals(&builtins.global);
-                add_globals(&rules.global);
+                add_globals(env::make_build_builtins().global);
+                add_globals(builtins.global.clone());
+                add_globals(rules.rule.iter().map(rule_value).collect());
             }
         }
     }
@@ -136,9 +134,13 @@ fn refine_builtin_signature(value: &mut Value) {
     }
 }
 
-fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyhow::Result<String> {
-    let rule_names: BTreeSet<_> = rules
-        .global
+fn declarations(
+    dialect: Dialect,
+    builtins: &Builtins,
+    rules: &BuildLanguage,
+) -> anyhow::Result<String> {
+    let rule_values: Vec<_> = rules.rule.iter().map(rule_value).collect();
+    let rule_names: BTreeSet<_> = rule_values
         .iter()
         .filter(|_| dialect == Dialect::Bazel)
         .map(|rule| rule.name.as_str())
@@ -199,7 +201,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             refine_builtin_signature(field);
         }
         let workspace = env::make_workspace_builtins();
-        for field in rules.global.iter().chain(workspace.global.iter()) {
+        for field in rule_values.iter().chain(workspace.global.iter()) {
             if field.name != "workspace"
                 && !native
                     .field
@@ -344,7 +346,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         }
     }
     let mut rule_declarations = String::new();
-    for value in rules.global.iter().filter(|_| dialect == Dialect::Bazel) {
+    for value in rule_values.iter().filter(|_| dialect == Dialect::Bazel) {
         let Some(callable) = &value.callable else {
             continue;
         };
@@ -767,6 +769,9 @@ mod tests {
     use std::path::Path;
 
     use ruff_python_ast::Stmt;
+    use starpls_bazel::build::attribute::Discriminator;
+    use starpls_bazel::build::AttributeDefinition;
+    use starpls_bazel::build::RuleDefinition;
     use starpls_hir::Db;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
@@ -783,7 +788,7 @@ mod tests {
         .unwrap();
         let (mut analysis, _) = Analysis::new_for_test();
         analysis
-            .set_builtin_defs(builtins, Builtins::default())
+            .set_builtin_defs(builtins, Default::default())
             .unwrap();
         let source = "label = Label(\"//pkg:target\")\nrelative = label.relative(\":other\")\n";
         let file = analysis
@@ -831,7 +836,7 @@ mod tests {
             .unwrap();
             let (mut analysis, _) = Analysis::new_for_test();
             analysis
-                .set_builtin_defs(builtins, Builtins::default())
+                .set_builtin_defs(builtins, Default::default())
                 .unwrap();
             let source = format!(
                 "files = {glob}([\"*.rs\"])\ncombined = files + [\"extra.rs\"]\nfiles.append(\"other.rs\")\nfiles.append(1)\n"
@@ -876,13 +881,24 @@ mod tests {
         analysis
             .set_builtin_defs(
                 builtins,
-                Builtins {
-                    global: vec![
-                        function("label_rule", "List of Labels"),
-                        function("mapping_rule", "Dictionary: string -> list of strings"),
-                        function("keyed_rule", "Dictionary: Label -> string"),
-                    ],
-                    ..Default::default()
+                BuildLanguage {
+                    rule: [
+                        ("label_rule", Discriminator::LabelList),
+                        ("mapping_rule", Discriminator::StringListDict),
+                        ("keyed_rule", Discriminator::LabelKeyedStringDict),
+                    ]
+                    .into_iter()
+                    .map(|(name, kind)| RuleDefinition {
+                        name: name.to_owned(),
+                        attribute: vec![AttributeDefinition {
+                            name: "srcs".to_owned(),
+                            r#type: kind as i32,
+                            mandatory: Some(true),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .collect(),
                 },
             )
             .unwrap();
@@ -957,39 +973,35 @@ strict_labels(labels)
             "../../../starpls/src/builtin/builtin.pb"
         ))
         .unwrap();
-        let rules = Builtins {
-            global: vec![Value {
+        let rules = BuildLanguage {
+            rule: vec![RuleDefinition {
                 name: "sources".to_owned(),
-                doc: "A rule with source files.".to_owned(),
-                callable: Some(Callable {
-                    param: std::iter::once(Param {
-                        name: "srcs".to_owned(),
-                        r#type: "List of Labels".to_owned(),
-                        doc: "Source file labels.".to_owned(),
-                        is_mandatory: true,
+                documentation: Some("A rule with source files.".to_owned()),
+                attribute: std::iter::once(AttributeDefinition {
+                    name: "srcs".to_owned(),
+                    r#type: Discriminator::LabelList as i32,
+                    documentation: Some("Source file labels.".to_owned()),
+                    mandatory: Some(true),
+                    ..Default::default()
+                })
+                .chain(
+                    [
+                        "generator_name",
+                        "generator_function",
+                        "generator_location",
+                        "generator_custom",
+                        "_private",
+                    ]
+                    .into_iter()
+                    .map(|name| AttributeDefinition {
+                        name: name.to_owned(),
+                        r#type: Discriminator::String as i32,
                         ..Default::default()
-                    })
-                    .chain(
-                        [
-                            "generator_name",
-                            "generator_function",
-                            "generator_location",
-                            "generator_custom",
-                            "_private",
-                        ]
-                        .into_iter()
-                        .map(|name| Param {
-                            name: name.to_owned(),
-                            r#type: "String".to_owned(),
-                            ..Default::default()
-                        }),
-                    )
-                    .collect(),
-                    return_type: "None".to_owned(),
-                }),
+                    }),
+                )
+                .collect(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let (mut analysis, _) = Analysis::new_for_test();
         analysis.set_builtin_defs(builtins, rules).unwrap();
@@ -1139,7 +1151,7 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
         });
         let (mut analysis, _) = Analysis::new_for_test();
         analysis
-            .set_builtin_defs(builtins, Builtins::default())
+            .set_builtin_defs(builtins, Default::default())
             .unwrap();
         for context in [
             APIContext::Bzl,
@@ -1230,17 +1242,13 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
             ..Default::default()
         };
         analysis
-            .set_builtin_defs(metadata("string"), Builtins::default())
+            .set_builtin_defs(metadata("string"), Default::default())
             .unwrap();
         let mut identity = None;
         for standard_ty in ["int", "float"] {
             analysis
                 .db
-                .set_builtin_defs(
-                    Dialect::Standard,
-                    metadata(standard_ty),
-                    Builtins::default(),
-                )
+                .set_builtin_defs(Dialect::Standard, metadata(standard_ty), Default::default())
                 .unwrap();
             let native_file = analysis
                 .db
@@ -1290,7 +1298,7 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
         let mut malformed = metadata("int");
         malformed.global[0].name = "not a name".to_owned();
         assert!(analysis
-            .set_builtin_defs(malformed, Builtins::default())
+            .set_builtin_defs(malformed, Default::default())
             .is_err());
         let help = analysis
             .snapshot()
@@ -1344,9 +1352,17 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
         analysis
             .set_builtin_defs(
                 builtins,
-                Builtins {
-                    global: vec![function("boolean_rule", "None")],
-                    ..Default::default()
+                BuildLanguage {
+                    rule: vec![RuleDefinition {
+                        name: "boolean_rule".to_owned(),
+                        attribute: vec![AttributeDefinition {
+                            name: "flag".to_owned(),
+                            r#type: Discriminator::Boolean as i32,
+                            mandatory: Some(true),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
                 },
             )
             .unwrap();
@@ -1437,7 +1453,7 @@ strict_bool(False)
                     }],
                     ..Default::default()
                 },
-                Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let source = "consume([1])\nvalues = [1]\nconsume(values)\n";
@@ -1466,7 +1482,7 @@ strict_bool(False)
                     "../../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         fixture.add_file(

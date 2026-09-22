@@ -273,12 +273,12 @@ fn builtin_changes_update_existing_query_dependencies() {
     let builtins = original.builtins(&analysis.db).clone();
     let original_hover = hover_value(&analysis, fixture.main_file());
     analysis
-        .set_builtin_defs(Builtins::default(), Builtins::default())
+        .set_builtin_defs(Builtins::default(), Default::default())
         .unwrap();
     let empty_hover = hover_value(&analysis, fixture.main_file());
     assert_ne!(empty_hover, original_hover);
     analysis
-        .set_builtin_defs(builtins, Builtins::default())
+        .set_builtin_defs(builtins, Default::default())
         .unwrap();
     assert_eq!(hover_value(&analysis, fixture.main_file()), original_hover);
 }

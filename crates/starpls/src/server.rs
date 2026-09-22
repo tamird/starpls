@@ -95,7 +95,7 @@ pub(crate) struct ConfigurationReady {
 
 pub(crate) struct PreparedConfiguration {
     loader: Box<DefaultFileLoader>,
-    rules: Option<Builtins>,
+    rules: Option<starpls_bazel::build::BuildLanguage>,
     interfaces: anyhow::Result<crate::commands::type_interface::PreparedInterfaces>,
 }
 
@@ -145,7 +145,7 @@ impl Server {
                 ..Default::default()
             },
         )?;
-        analysis.set_builtin_defs(load_bazel_builtins(), Builtins::default())?;
+        analysis.set_builtin_defs(load_bazel_builtins(), Default::default())?;
         let prelude = workspace.join("tools/build_rules/prelude_bazel");
         if let Ok(file) = analysis.file(
             &prelude,
@@ -779,7 +779,9 @@ pub(crate) fn load_bazel_builtins() -> Builtins {
     decode_builtins(&data[..]).expect("bug: invalid builtin.pb")
 }
 
-pub(crate) fn load_bazel_build_language(client: &dyn BazelClient) -> anyhow::Result<Builtins> {
+pub(crate) fn load_bazel_build_language(
+    client: &dyn BazelClient,
+) -> anyhow::Result<starpls_bazel::build::BuildLanguage> {
     let build_language_output = client.build_language()?;
     decode_rules(&build_language_output)
 }

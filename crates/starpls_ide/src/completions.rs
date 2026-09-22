@@ -735,7 +735,7 @@ mod tests {
                         "../../starpls/src/builtin/builtin.pb"
                     ))
                     .unwrap(),
-                    starpls_bazel::Builtins::default(),
+                    Default::default(),
                 )
                 .unwrap();
             let (file_id, pos) = fixture.cursor_pos.unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
                     "../../starpls/src/builtin/builtin.pb"
                 ))
                 .unwrap(),
-                starpls_bazel::Builtins::default(),
+                Default::default(),
             )
             .unwrap();
         let file_id = fixture.main_file();

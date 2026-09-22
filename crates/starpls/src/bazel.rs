@@ -3,7 +3,6 @@ use log::debug;
 use log::info;
 use starpls_bazel::client::BazelClient;
 use starpls_bazel::client::BazelInfo;
-use starpls_bazel::Builtins;
 
 use crate::server::load_bazel_build_language;
 
@@ -12,7 +11,7 @@ use crate::server::load_bazel_build_language;
 #[derive(Default)]
 pub(crate) struct BazelContext {
     pub(crate) info: BazelInfo,
-    pub(crate) rules: Builtins,
+    pub(crate) rules: starpls_bazel::build::BuildLanguage,
     pub(crate) bzlmod_enabled: bool,
     pub(crate) main_repo_mapping: std::collections::HashMap<String, String>,
 }
