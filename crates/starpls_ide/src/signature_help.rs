@@ -49,7 +49,7 @@ pub(crate) fn signature_help(
     let constructor = matches!(callee_type, Some(Type::ClassLiteral(_)));
     let provided_documentation = callee_type
         .and_then(|ty| ty.provided_data(db, &model.program_environment()))
-        .and_then(|data| data.downcast_ref::<crate::ty::Documentation>());
+        .and_then(crate::ty::Documentation::from_data);
     let signatures = call_signature_details(&model, expr)
         .into_iter()
         .map(|details| {

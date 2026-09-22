@@ -9,6 +9,7 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use starpls_bazel::attr::AttributeKind;
+use starpls_hir::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::ProgramFile;
@@ -34,7 +35,7 @@ use ty_python_semantic::ProgramEnvironment;
 
 use crate::Database;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Attribute {
     pub(super) kind: AttributeKind,
     pub(super) single_file: Option<bool>,
@@ -43,7 +44,79 @@ pub(super) struct Attribute {
     configurability: Configurability,
     mandatory: bool,
     default: Option<FileRange>,
+    default_value: DefaultValue,
     documentation: Option<Box<str>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DefaultValue {
+    None,
+    NonNone,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(super) struct RuleData {
+    documentation: Documentation,
+    attributes: Box<[(Name, Attribute)]>,
+}
+
+impl RuleData {
+    pub(super) fn parameter_type<'db>(
+        &self,
+        db: &'db Database,
+        environment: &ProgramEnvironment<'db>,
+        declarations: ProgramFile<'db>,
+        name: &str,
+    ) -> Option<Type<'db>> {
+        let (_, attribute) = self.attributes.iter().find(|(key, _)| key == name)?;
+        let none = Type::none(db, environment);
+        if name.starts_with('_') && attribute.default_value == DefaultValue::None {
+            return Some(none);
+        }
+        let value = attribute_value_type(
+            db,
+            environment,
+            declarations,
+            &attribute.kind,
+            AttributeUse::MacroContext,
+        )?;
+        let selected = || {
+            // A selected None branch survives conversion into a macro body.
+            let alternatives = if name.starts_with('_') {
+                value
+            } else {
+                UnionType::from_elements(db, environment, [value, none])
+            };
+            select_type(db, environment, declarations, alternatives)
+        };
+        let value = match attribute.configurable() {
+            Some(configurable) => {
+                if configurable {
+                    selected()?
+                } else {
+                    value
+                }
+            }
+            None => {
+                let selected = selected()?;
+                UnionType::from_elements(db, environment, [value, selected])
+            }
+        };
+        Some(
+            if !attribute.mandatory && attribute.default_value != DefaultValue::NonNone {
+                UnionType::from_elements(db, environment, [value, none])
+            } else {
+                value
+            },
+        )
+    }
+}
+
+struct RuleAttribute<'db> {
+    name: Name,
+    parameter: Option<Parameter<'db>>,
+    descriptor: Option<Attribute>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +159,15 @@ impl get_size2::GetSize for Attribute {
 pub(crate) struct Documentation {
     pub(crate) text: Option<Box<str>>,
     pub(crate) parameters: Vec<(Name, Box<str>)>,
+}
+
+impl Documentation {
+    pub(crate) fn from_data(data: &ProvidedData) -> Option<&Self> {
+        data.downcast_ref::<Self>().or_else(|| {
+            data.downcast_ref::<RuleData>()
+                .map(|rule| &rule.documentation)
+        })
+    }
 }
 
 fn doc_string(db: &Database, call: &CheckedCall<'_, '_>) -> Option<Box<str>> {
@@ -211,6 +293,7 @@ fn attribute<'db>(
     call: &CheckedCall<'_, 'db>,
     kind: AttributeKind,
 ) -> Option<Type<'db>> {
+    let environment = ProgramEnvironment::from_file(call.file());
     let mandatory = match call.argument("mandatory") {
         CheckedArgument::Omitted => false,
         CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal()?,
@@ -222,20 +305,45 @@ fn attribute<'db>(
         AttributeKind::OutputList => CheckedArgument::Omitted,
         _ => call.argument("default"),
     };
-    let default = match default {
-        CheckedArgument::Omitted => None,
-        CheckedArgument::Value { ty: _, expression } => {
+    let (default, default_value) = match default {
+        CheckedArgument::Omitted => (
+            None,
+            if matches!(kind, AttributeKind::Label | AttributeKind::Output) {
+                DefaultValue::None
+            } else {
+                DefaultValue::NonNone
+            },
+        ),
+        CheckedArgument::Value { ty, expression } => {
             let expression = expression?;
             let file = call.file();
             let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
-            Some(FileRange::new(
+            let source = FileRange::new(
                 file.file(db),
                 starpls_syntax::source::expr_range(expression, call.call().into(), parsed.tokens()),
-            ))
+            );
+            let declaration = call.declaration()?;
+            let input = attribute_value_type(
+                db,
+                &environment,
+                declaration.program_file(db),
+                &kind,
+                AttributeUse::Input,
+            )?;
+            let default_value = if ty.is_none(db) {
+                DefaultValue::None
+            } else if Type::none(db, &environment).is_assignable_to(db, &environment, ty) {
+                DefaultValue::Unknown
+            } else if ty.is_assignable_to(db, &environment, input) {
+                DefaultValue::NonNone
+            } else {
+                // Computed and late-bound defaults do not expose their value here.
+                DefaultValue::Unknown
+            };
+            (Some(source), default_value)
         }
         CheckedArgument::Indeterminate => return None,
     };
-    let environment = ProgramEnvironment::from_file(call.file());
     let flag = |name| match call.argument(name) {
         CheckedArgument::Omitted => Some(false),
         CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal(),
@@ -305,6 +413,7 @@ fn attribute<'db>(
                     configurability,
                     mandatory,
                     default,
+                    default_value,
                     documentation: doc_string(db, call),
                 })),
             },
@@ -347,7 +456,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             })
             .collect(),
     };
-    let mut parameters = common
+    let mut attributes = common
         .into_iter()
         .map(|attribute| {
             let ty = attribute_type(db, call, &attribute.r#type)?;
@@ -356,7 +465,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             } else {
                 ty
             };
-            let name = Name::new(attribute.name);
+            let name = Name::new(&attribute.name);
             let parameter = Parameter::keyword_only(name.clone()).with_annotated_type(ty);
             let parameter = if attribute.is_mandatory {
                 parameter
@@ -369,13 +478,34 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                     parameter
                 }
             };
-            Some((name, parameter))
+            Some(RuleAttribute {
+                name,
+                parameter: Some(parameter),
+                descriptor: Some(Attribute {
+                    kind: attribute.r#type,
+                    single_file: Some(false),
+                    executable: Some(false),
+                    configuration: AttributeConfiguration::Ordinary,
+                    configurability: Configurability::Explicit(attribute.configurable),
+                    mandatory: attribute.is_mandatory,
+                    default: None,
+                    default_value: if matches!(kind, RuleKind::Macro)
+                        && !attribute.is_mandatory
+                        && attribute.name != "visibility"
+                    {
+                        DefaultValue::None
+                    } else {
+                        DefaultValue::NonNone
+                    },
+                    documentation: Some(attribute.doc.into_boxed_str()),
+                }),
+            })
         })
         .collect::<Option<Vec<_>>>()?;
     let mut complete = !matches!(kind, RuleKind::Macro)
         || inherit_common
-        || inherit_macro_attributes(db, call, &mut parameters, &mut documentation);
-    let attributes = match call.argument("attrs") {
+        || inherit_macro_attributes(db, call, &mut attributes, &mut documentation);
+    let own_attributes = match call.argument("attrs") {
         CheckedArgument::Omitted => Some(DictionaryItems {
             items: Box::default(),
             is_complete: true,
@@ -386,19 +516,26 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         } => call.dictionary_argument("attrs"),
         CheckedArgument::Indeterminate => None,
     };
-    let DictionaryItems { items, is_complete } = attributes.unwrap_or(DictionaryItems {
+    let DictionaryItems { items, is_complete } = own_attributes.unwrap_or(DictionaryItems {
         items: Box::default(),
         is_complete: false,
     });
     complete &= is_complete;
     if matches!(kind, RuleKind::Macro) && !is_complete {
         // Unknown own attributes can override or remove any inherited contract.
-        for (name, parameter) in &mut parameters {
+        for RuleAttribute {
+            name,
+            parameter,
+            descriptor,
+        } in &mut attributes
+        {
             if !matches!(name.as_str(), "name" | "visibility") {
-                *parameter = parameter
-                    .clone()
-                    .with_annotated_type(Type::unknown())
-                    .with_default_type(Type::unknown());
+                *parameter = parameter.clone().map(|parameter| {
+                    parameter
+                        .with_annotated_type(Type::unknown())
+                        .with_default_type(Type::unknown())
+                });
+                *descriptor = None;
             }
         }
     }
@@ -410,16 +547,14 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     {
         let source = FileRange::new(call.file().file(db), source);
         let name = name.as_str();
-        if name.starts_with('_')
-            || (matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility"))
-        {
+        if matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility") {
             continue;
         }
         documentation
             .parameters
             .retain(|(existing, _)| existing.as_str() != name);
         if complete && matches!(kind, RuleKind::Macro) && value.is_none(db) {
-            parameters.retain(|(existing, _)| existing.as_str() != name);
+            attributes.retain(|attribute| attribute.name.as_str() != name);
             continue;
         }
         let attribute = value
@@ -462,19 +597,47 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             // invalid descriptor supplies no type or requiredness contract.
             parameter = parameter.with_default_type(Type::unknown());
         }
-        if let Some(existing) = parameters
-            .iter()
-            .position(|(existing, _)| existing.as_str() == name)
-        {
-            parameters[existing].1 = parameter;
+        let parameter = if name.starts_with('_') {
+            // An own private macro keyword may explicitly omit its value.
+            matches!(kind, RuleKind::Macro).then(|| {
+                parameter
+                    .with_annotated_type(Type::none(db, &environment))
+                    .with_default_type(Type::none(db, &environment))
+            })
         } else {
-            parameters.push((Name::new(name), parameter));
+            Some(parameter)
+        };
+        let attribute = RuleAttribute {
+            name: Name::new(name),
+            parameter,
+            descriptor: if is_complete {
+                attribute.cloned()
+            } else {
+                None
+            },
+        };
+        if let Some(existing) = attributes
+            .iter_mut()
+            .find(|attribute| attribute.name.as_str() == name)
+        {
+            *existing = attribute;
+        } else {
+            attributes.push(attribute);
         }
     }
-    let mut parameters: Vec<_> = parameters
-        .into_iter()
-        .map(|(_, parameter)| parameter)
-        .collect();
+    let mut parameters = Vec::new();
+    let mut descriptors = Vec::new();
+    for RuleAttribute {
+        name,
+        parameter,
+        descriptor,
+    } in attributes
+    {
+        parameters.extend(parameter);
+        if let Some(descriptor) = descriptor {
+            descriptors.push((name, descriptor));
+        }
+    }
     if !complete {
         // Partial mappings and unknown parents can contain additional names.
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
@@ -503,7 +666,10 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             instance_fields: ProvidedInstanceFields {
                 fields: Box::default(),
                 has_dynamic_fields: false,
-                data: Some(ProvidedData::new(documentation)),
+                data: Some(ProvidedData::new(RuleData {
+                    documentation,
+                    attributes: descriptors.into_boxed_slice(),
+                })),
             },
         },
     )
@@ -514,7 +680,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
 fn inherit_macro_attributes<'db>(
     db: &'db Database,
     call: &CheckedCall<'_, 'db>,
-    parameters: &mut Vec<(Name, Parameter<'db>)>,
+    attributes: &mut Vec<RuleAttribute<'db>>,
     documentation: &mut Documentation,
 ) -> bool {
     let parent = match call.argument("inherit_attrs") {
@@ -545,7 +711,10 @@ fn inherit_macro_attributes<'db>(
     };
     let parent_documentation = parent
         .provided_data(db, &environment)
-        .and_then(|data| data.downcast_ref::<Documentation>());
+        .and_then(Documentation::from_data);
+    let parent_data = parent
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<RuleData>());
     let definition = parent
         .definition(db, &environment)
         .and_then(|definition| definition.definition());
@@ -601,7 +770,21 @@ fn inherit_macro_attributes<'db>(
         if let Some(doc) = doc {
             documentation.parameters.push((name.clone(), doc));
         }
-        parameters.push((name.clone(), parameter));
+        let mut descriptor = parent_data
+            .and_then(|data| data.attributes.iter().find(|(key, _)| key == name))
+            .map(|(_, attribute)| attribute.clone())
+            .or_else(|| inherited_native_attribute(db, definition?, name.as_str()));
+        if let Some(descriptor) = &mut descriptor {
+            if !descriptor.mandatory {
+                descriptor.default = None;
+                descriptor.default_value = DefaultValue::None;
+            }
+        }
+        attributes.push(RuleAttribute {
+            name: name.clone(),
+            parameter: Some(parameter),
+            descriptor,
+        });
     }
     complete
 }
@@ -621,6 +804,68 @@ fn optional_attribute<'db>(
         environment,
         [ty, Type::none(db, environment)],
     ))
+}
+
+fn inherited_native_attribute(
+    db: &Database,
+    definition: Definition<'_>,
+    name: &str,
+) -> Option<Attribute> {
+    let file = definition.program_file(db);
+    let FilePath::SystemVirtual(path) = file.file(db).path(db) else {
+        return None;
+    };
+    if !path.as_str().starts_with("starpls-native:") {
+        return None;
+    }
+    let DefinitionKind::Class(class) = definition.kind(db) else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let class = class.node(&parsed);
+    // Native rule classes are generated at module scope; the similarly named
+    // nested rule base is only a fallback with no attribute schema.
+    if !parsed.suite().iter().any(|statement| matches!(statement, Stmt::ClassDef(candidate) if candidate.range() == class.range())) { return None; }
+    let rules = db
+        .get_builtin_defs(&starpls_common::Dialect::Bazel)
+        .rules(db);
+    let rule = rules
+        .rule
+        .iter()
+        .find(|rule| rule.name == class.name.as_str())?;
+    let attribute = rule
+        .attribute
+        .iter()
+        .find(|attribute| attribute.name == name)?;
+    use starpls_bazel::build::attribute::Discriminator;
+    let kind = match attribute.r#type() {
+        Discriminator::Boolean => AttributeKind::Bool,
+        Discriminator::Integer => AttributeKind::Int,
+        Discriminator::IntegerList => AttributeKind::IntList,
+        Discriminator::String => AttributeKind::String,
+        Discriminator::StringList => AttributeKind::StringList,
+        Discriminator::StringDict => AttributeKind::StringDict,
+        Discriminator::StringListDict => AttributeKind::StringListDict,
+        Discriminator::Label => AttributeKind::Label,
+        Discriminator::LabelList => AttributeKind::LabelList,
+        Discriminator::LabelKeyedStringDict => AttributeKind::LabelKeyedStringDict,
+        Discriminator::Output => AttributeKind::Output,
+        Discriminator::OutputList => AttributeKind::OutputList,
+        _ => return None,
+    };
+    Some(Attribute {
+        kind,
+        single_file: None,
+        executable: None,
+        configuration: AttributeConfiguration::Unknown,
+        configurability: attribute
+            .configurable
+            .map_or(Configurability::Unknown, Configurability::Explicit),
+        mandatory: attribute.mandatory(),
+        default: None,
+        default_value: DefaultValue::Unknown,
+        documentation: attribute.documentation.as_deref().map(Into::into),
+    })
 }
 
 fn configurable_input<'db>(
@@ -673,6 +918,7 @@ pub(super) enum AttributeUse {
     Input,
     BuildContext,
     RepositoryContext,
+    MacroContext,
 }
 
 pub(super) fn attribute_value_type<'db>(
@@ -690,6 +936,7 @@ pub(super) fn attribute_value_type<'db>(
             AttributeUse::Input => KnownClass::Iterable,
             AttributeUse::BuildContext => KnownClass::List,
             AttributeUse::RepositoryContext => KnownClass::List,
+            AttributeUse::MacroContext => KnownClass::List,
         };
         class.to_specialized_instance(db, environment, &[element])
     };
@@ -698,6 +945,7 @@ pub(super) fn attribute_value_type<'db>(
             AttributeUse::Input => KnownClass::Mapping,
             AttributeUse::BuildContext => KnownClass::Dict,
             AttributeUse::RepositoryContext => KnownClass::Dict,
+            AttributeUse::MacroContext => KnownClass::Dict,
         };
         class.to_specialized_instance(db, environment, &[key, value])
     };
@@ -706,6 +954,7 @@ pub(super) fn attribute_value_type<'db>(
             AttributeUse::Input => "Label",
             AttributeUse::BuildContext => "Target",
             AttributeUse::RepositoryContext => "Label",
+            AttributeUse::MacroContext => "Label",
         };
         let declaration = native_class(db, declarations, name)?;
         let label = declaration.to_instance_approximation(db, environment)?;
@@ -713,6 +962,7 @@ pub(super) fn attribute_value_type<'db>(
             AttributeUse::Input => UnionType::from_elements(db, environment, [label, string]),
             AttributeUse::BuildContext => label,
             AttributeUse::RepositoryContext => label,
+            AttributeUse::MacroContext => label,
         })
     };
     let output = || match usage {
@@ -722,6 +972,7 @@ pub(super) fn attribute_value_type<'db>(
             class.to_instance_approximation(db, environment)
         }
         AttributeUse::RepositoryContext => Some(Type::unknown()),
+        AttributeUse::MacroContext => label(),
     };
     Some(match kind {
         AttributeKind::Bool => {
@@ -735,6 +986,7 @@ pub(super) fn attribute_value_type<'db>(
                 ),
                 AttributeUse::BuildContext => boolean,
                 AttributeUse::RepositoryContext => boolean,
+                AttributeUse::MacroContext => boolean,
             }
         }
         AttributeKind::Int => int,
@@ -750,6 +1002,7 @@ pub(super) fn attribute_value_type<'db>(
                     UnionType::from_elements(db, environment, [label, Type::none(db, environment)])
                 }
                 AttributeUse::Input => label,
+                AttributeUse::MacroContext => label,
                 AttributeUse::RepositoryContext => {
                     UnionType::from_elements(db, environment, [label, Type::none(db, environment)])
                 }
@@ -773,7 +1026,9 @@ pub(super) fn attribute_value_type<'db>(
                         ],
                     )
                 }
-                AttributeUse::BuildContext | AttributeUse::RepositoryContext => dict(keys, string),
+                AttributeUse::BuildContext => dict(keys, string),
+                AttributeUse::RepositoryContext => dict(keys, string),
+                AttributeUse::MacroContext => dict(keys, string),
             }
         }
         AttributeKind::StringKeyedLabelDict => dict(string, label()?),
@@ -785,6 +1040,7 @@ pub(super) fn attribute_value_type<'db>(
                 }
                 AttributeUse::Input => output,
                 AttributeUse::RepositoryContext => output,
+                AttributeUse::MacroContext => output,
             }
         }
         AttributeKind::OutputList => list(output()?),

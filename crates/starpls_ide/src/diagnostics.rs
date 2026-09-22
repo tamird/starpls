@@ -432,6 +432,83 @@ mutable(name="ok", observed="unproved")
     }
 
     #[test]
+    fn macro_implementation_parameters_use_converted_attributes() {
+        let source = r#"
+def rule_impl(ctx):
+    pass
+base = rule(implementation=rule_impl, attrs={"inherited": attr.string()})
+def implementation(name, visibility, srcs, tool, optional, inherited, _private, _private_list, out, **kwargs):
+    checked_name = name # type: str
+    checked_visibility = visibility # type: list[Label]
+    checked_srcs = srcs # type: select[list[Label] | None]
+    combined = srcs + []
+    checked_tool = tool # type: Label
+    checked_optional = optional # type: select[Label | None] | None
+    checked_inherited = inherited # type: select[str | None] | None
+    checked_private = _private # type: select[int]
+    combined_private = _private_list + [] # type: select[list[Label]]
+    checked_out = out # type: Label | None
+    base(name=name, inherited=inherited)
+    # EXTRA
+    return None if srcs else None
+example = macro(implementation=implementation, inherit_attrs=base, attrs={
+    "srcs": attr.label_list(),
+    "tool": attr.label(mandatory=True, configurable=False),
+    "optional": attr.label(),
+    "_private": attr.int(default=3),
+    "_private_list": attr.label_list(default=["//:private"]),
+    "out": attr.output(),
+})
+example(name="ok", tool="//:tool", srcs=["//:source"])
+example(name="omitted", tool="//:tool", _private=None)
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        analysis
+            .db
+            .environment()
+            .set_options(&mut analysis.db)
+            .to(crate::InferenceOptions {
+                infer_ctx_attributes: true,
+                use_code_flow_analysis: false,
+                allow_unused_definitions: true,
+            });
+        let file = fixture.main_file();
+        for _ in 0..2 {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        for (statement, expected) in [
+            ("bad = srcs # type: list[Label]", "invalid-assignment"),
+            (
+                "bad = combined # type: select[list[int] | None]",
+                "invalid-assignment",
+            ),
+            ("bad = tool # type: str", "invalid-assignment"),
+            ("bad = visibility # type: list[str]", "invalid-assignment"),
+            (
+                "bad = inherited # type: select[str | None]",
+                "invalid-assignment",
+            ),
+            ("bad = _private # type: int", "invalid-assignment"),
+            ("srcs[0]", "not-subscriptable"),
+        ] {
+            analysis.update_file(file, source.replace("# EXTRA", statement));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), expected, "{statement}");
+        }
+        for statement in [
+            "example(name='bad', tool='//:tool', _private=3)",
+            "attr.label_list(default=[42])",
+        ] {
+            analysis.update_file(file, format!("{source}\n{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+        }
+    }
+
+    #[test]
     fn configurable_attributes_check_select_alternatives() {
         let source = r#"
 def rule_impl(ctx):

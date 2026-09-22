@@ -561,6 +561,16 @@ fn write_function(
             _ => None,
         };
         let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
+            let input = if matches!(kind, CallableKind::Method("attr"))
+                && name == "default"
+                && matches!(
+                    value.name.as_str(),
+                    "label" | "label_list" | "label_keyed_string_dict" | "string_keyed_label_dict"
+                ) {
+                AnnotationUse::AttributeInput
+            } else {
+                input
+            };
             annotation(r#type, *is_star_arg || *is_star_star_arg, classes, input)
         });
         let parameter_type = if let CallableKind::Rule(rule) = kind {

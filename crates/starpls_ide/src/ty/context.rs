@@ -65,12 +65,6 @@ pub(super) fn parameter_type<'db>(
             AnyNodeRef::StmtFunctionDef(function) => Some(function),
             _ => None,
         })?;
-    if function.parameters.iter_non_variadic_params().count() != 1
-        || function.parameters.vararg.is_some()
-        || function.parameters.kwarg.is_some()
-    {
-        return None;
-    }
     let model = SemanticModel::new(db, file);
     let implementation = function.definition(&model);
     let environment = model.program_environment();
@@ -89,9 +83,9 @@ pub(super) fn parameter_type<'db>(
         let Some(factory) = factory::declaration(db, declaration) else {
             continue;
         };
-        let Factory::Rule { repository } = factory else {
+        if !matches!(factory, Factory::Rule { repository: _ } | Factory::Macro) {
             continue;
-        };
+        }
         // An unknown expansion could register this callback a second time;
         // uncertainty here prevents a unique schema for the entire module.
         let Some(argument) = argument(call, &signature, "implementation").ok()? else {
@@ -111,10 +105,30 @@ pub(super) fn parameter_type<'db>(
             // A callback used with more than one schema has no unique body contract.
             return None;
         }
-        registration = Some((call, signature, declaration, repository));
+        registration = Some((call, signature, declaration, factory));
     }
-    let (call, signature, declaration, repository) = registration?;
+    let (call, signature, declaration, factory) = registration?;
     let declarations = declaration.program_file(db);
+    let repository = match factory {
+        Factory::Macro => {
+            let result = call.inferred_type(&model)?;
+            let data = result
+                .provided_data(db, &environment)?
+                .downcast_ref::<factory::RuleData>()?;
+            return data.parameter_type(db, &environment, declarations, parameter.name().as_str());
+        }
+        Factory::Rule { repository } => repository,
+        Factory::Attribute(_) => return None,
+        Factory::Struct => return None,
+        Factory::Provider => return None,
+        Factory::Transition => return None,
+    };
+    if function.parameters.iter_non_variadic_params().count() != 1
+        || function.parameters.vararg.is_some()
+        || function.parameters.kwarg.is_some()
+    {
+        return None;
+    }
     let common = starpls_bazel::attr::make_common_attributes();
     let common = if repository {
         common.repository
@@ -539,6 +553,129 @@ mod tests {
             assert_eq!(*target_file_id, file.source);
             assert_eq!(&source[*target_selection_range], key);
         }
+    }
+
+    #[test]
+    fn macro_defaults_and_registration_follow_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        // The default expression's range and the public callable are unchanged.
+        // Only raw metadata for the private callback parameter changes.
+        for (default, expected, errors) in [
+            ("None         ", "None", 1),
+            ("Label('//:x')", "Label", 0),
+            ("None         ", "None", 1),
+        ] {
+            let source = format!(
+                r#"DEFAULT = {default}
+def implementation(name, visibility, _value):
+    _value.name
+example = macro(implementation=implementation, attrs={{
+    "_value": attr.label(default=DEFAULT, configurable=False),
+}})
+"#
+            );
+            analysis.update_file(file, source.clone());
+            for _ in 0..2 {
+                let snapshot = analysis.snapshot();
+                check_field(&snapshot, file, &source, "    _value", expected, "");
+                let diagnostics = snapshot.diagnostics(file).unwrap();
+                assert_eq!(diagnostics.len(), errors, "{diagnostics:?}");
+                if let Some(diagnostic) = diagnostics.first() {
+                    assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+                }
+            }
+        }
+        for (parameter, annotation, registrations, expected) in [
+            ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.string(configurable=False)})", "str"),
+            ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.int(configurable=False)})", "int"),
+            ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.string(configurable=False)})", "str"),
+            ("value", "", "first = macro(implementation=implementation, attrs={'value': attr.string()})\nsecond = macro(implementation=implementation, attrs={'value': attr.int()})", "Unknown"),
+            ("value", "    # type: (str, list[Label], Unknown) -> None\n", "example = macro(implementation=implementation, attrs={'value': attr.string()})", "Unknown"),
+            ("value=42", "", "example = macro(implementation=implementation, attrs={'value': attr.string()})", "Unknown | Literal[42]"),
+        ] {
+            let source = format!("def implementation(name, visibility, {parameter}):\n{annotation}    value\n{registrations}\n");
+            analysis.update_file(file, source.clone());
+            check_field(&analysis.snapshot(), file, &source, "    value", expected, "");
+        }
+        // Invalid non-None macro returns still need stable body inference during
+        // editing. Resolving this return re-enters the registration expression.
+        let source = "def implementation(name, visibility, value):\n    return value\nexample = macro(implementation=implementation, attrs={'value': attr.string(configurable=False)})\n";
+        analysis.update_file(file, source.to_owned());
+        for _ in 0..2 {
+            check_field(
+                &analysis.snapshot(),
+                file,
+                source,
+                "return value",
+                "str",
+                "",
+            );
+        }
+    }
+
+    #[test]
+    fn macro_callbacks_inherit_native_attribute_metadata() {
+        use starpls_bazel::build::attribute::Discriminator;
+        let source = r#"def implementation(name, visibility, srcs, optional, **kwargs):
+    srcs
+    optional
+    native.example(srcs=srcs, optional=optional)
+example = macro(implementation=implementation, inherit_attrs=native.example)
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let builtins = analysis
+            .db
+            .get_builtin_defs(&starpls_common::Dialect::Bazel)
+            .builtins(&analysis.db)
+            .clone();
+        analysis
+            .set_builtin_defs(
+                builtins,
+                starpls_bazel::build::BuildLanguage {
+                    rule: vec![starpls_bazel::build::RuleDefinition {
+                        name: "example".to_owned(),
+                        attribute: [
+                            ("srcs", Discriminator::LabelList, true, false),
+                            ("optional", Discriminator::Boolean, false, true),
+                        ]
+                        .into_iter()
+                        .map(|(name, kind, mandatory, configurable)| {
+                            starpls_bazel::build::AttributeDefinition {
+                                name: name.to_owned(),
+                                r#type: kind as i32,
+                                mandatory: Some(mandatory),
+                                configurable: Some(configurable),
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                        ..Default::default()
+                    }],
+                },
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(fixture.main_file()).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        check_field(
+            &snapshot,
+            fixture.main_file(),
+            source,
+            "    srcs",
+            "list[Label]",
+            "",
+        );
+        check_field(
+            &snapshot,
+            fixture.main_file(),
+            source,
+            "    optional",
+            "select[bool | None] | None",
+            "",
+        );
     }
 
     #[test]

@@ -99,7 +99,7 @@ pub(crate) fn hover(
             let receiver = expr.value.inferred_type(&model)?;
             let documentation = receiver
                 .provided_data(db, &model.program_environment())
-                .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+                .and_then(crate::ty::Documentation::from_data)
                 .and_then(|docs| {
                     docs.parameters.iter().find_map(|(name, text)| {
                         (name.as_str() == expr.attr.as_str()).then(|| text.to_string())
@@ -163,7 +163,7 @@ pub(crate) fn hover(
             let callee = call.func.inferred_type(&model)?;
             let documentation = callee
                 .provided_data(db, &model.program_environment())
-                .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+                .and_then(crate::ty::Documentation::from_data)
                 .and_then(|docs| {
                     docs.parameters.iter().find_map(|(parameter, text)| {
                         (parameter.as_str() == name)
@@ -350,7 +350,7 @@ fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<
     let environment = model.program_environment();
     if let Some(doc) = ty
         .provided_data(db, &environment)
-        .and_then(|data| data.downcast_ref::<crate::ty::Documentation>())
+        .and_then(crate::ty::Documentation::from_data)
         .and_then(|docs| docs.text.as_deref())
     {
         return Some(Docstring::new(doc.to_owned()));
