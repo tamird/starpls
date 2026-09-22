@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
@@ -32,13 +33,31 @@ pub(crate) fn lsp_diagnostic_from_native(
         u32::from(range.start()).into(),
         u32::from(range.end()).into(),
     );
+    let mut message = diagnostic.concise_message().to_string();
+    for (index, hint) in diagnostic
+        .sub_diagnostics()
+        .iter()
+        .filter(|hint| hint.primary_annotation().is_none())
+        .enumerate()
+    {
+        if index == 0 {
+            message.push('\n');
+        }
+        write!(message, "\n{}: {}", hint.severity(), hint.concise_message()).unwrap();
+    }
     Some(lsp_types::Diagnostic {
         range: lsp_range_from_text_range(range, source)?,
         severity: Some(lsp_severity_from_native(diagnostic.severity())),
-        code: None,
-        code_description: None,
+        code: Some(lsp_types::NumberOrString::String(
+            diagnostic.id().to_string(),
+        )),
+        code_description: diagnostic.documentation_url().and_then(|url| {
+            Some(lsp_types::CodeDescription {
+                href: lsp_types::Url::parse(url).ok()?,
+            })
+        }),
         source: Some("starpls".to_string()),
-        message: diagnostic.headline_message().to_owned(),
+        message,
         related_information: None,
         tags: diagnostic
             .primary_tags()
@@ -352,7 +371,7 @@ mod tests {
                 Some(2),
             ),
         ] {
-            let diagnostic = starpls_common::diagnostic(
+            let mut diagnostic = starpls_common::diagnostic(
                 file,
                 starpls_common::DiagnosticId::lint("type-check"),
                 severity,
@@ -360,12 +379,18 @@ mod tests {
                 "message",
                 tag,
             );
+            diagnostic
+                .primary_annotation_mut()
+                .unwrap()
+                .set_message("Expected int, found str");
+            diagnostic.info("The parameter is declared as int");
             let converted = super::lsp_diagnostic_from_native(diagnostic, &source).unwrap();
             let mut expected = serde_json::json!({
                 "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 3}},
                 "severity": severity_number,
                 "source": "starpls",
-                "message": "message",
+                "code": "type-check",
+                "message": "message: Expected int, found str\n\ninfo: The parameter is declared as int",
             });
             if let Some(tag) = tag_number {
                 expected["tags"] = serde_json::json!([tag]);
