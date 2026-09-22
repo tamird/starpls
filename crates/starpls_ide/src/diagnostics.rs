@@ -294,6 +294,41 @@ def shadowed():
     }
 
     #[test]
+    fn macro_inheritance_requires_nominal_rules() {
+        let source = r#"
+def implementation(**kwargs):
+    pass
+precise = rule(implementation=implementation, attrs={"value": attr.string()})
+def unknown_rule(attributes):
+    return rule(implementation=implementation, attrs=attributes)
+fallback = unknown_rule({})
+parent = macro(implementation=implementation, attrs={})
+child = macro(implementation=implementation, inherit_attrs=precise)
+macro(implementation=implementation, inherit_attrs=fallback)
+macro(implementation=implementation, inherit_attrs=parent)
+precise(name="ok", value="value")
+fallback(name="unknown", arbitrary=1)
+child(name="child", value="value")
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for call in [
+            "macro(implementation=implementation, inherit_attrs=implementation)",
+            "macro(implementation=implementation, inherit_attrs=42)",
+            "macro(implementation=implementation, inherit_attrs=repository_rule(implementation=implementation, attrs={}))",
+            "precise(name=\"bad\", value=42)",
+        ] {
+            analysis.update_file(file, format!("{source}\n{call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            assert!(diagnostics[0].range().unwrap().start().to_usize() >= source.len());
+        }
+    }
+
+    #[test]
     fn qualified_provider_comments_keep_nominal_identity() {
         let source = r#"
 First = provider(fields=["value"])

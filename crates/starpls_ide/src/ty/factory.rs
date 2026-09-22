@@ -406,14 +406,35 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         // Partial mappings and inherited macro attributes can contain additional names.
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
     }
-    let callable = Type::single_callable(
+    let callable = Type::function_like_callable(
         db,
         Signature::new(
-            Parameters::standard(parameters),
+            Parameters::standard(
+                std::iter::once(Parameter::positional_only(Some(Name::new("self"))))
+                    .chain(parameters),
+            ),
             Type::none(db, &environment),
         ),
     );
-    callable.with_callable_data(db, ProvidedData::new(documentation))
+    let name = match kind {
+        RuleKind::Build => "rule",
+        RuleKind::Repository => "repository_rule",
+        RuleKind::Macro => "macro",
+    };
+    call.class_type(
+        db,
+        ProvidedClass {
+            name: Name::new(name),
+            bases: declared_base(db, call, name),
+            class_members: Box::from([(Name::new("__call__"), callable)]),
+            instance_fields: ProvidedInstanceFields {
+                fields: Box::default(),
+                has_dynamic_fields: false,
+                data: Some(ProvidedData::new(documentation)),
+            },
+        },
+    )
+    .to_instance_approximation(db, &environment)
 }
 
 fn attribute_type<'db>(

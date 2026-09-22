@@ -71,7 +71,7 @@ pub(crate) fn signature_help(
                 .as_ref()
                 .map(Docstring::parameter_documentation)
                 .unwrap_or_default();
-            let name = if constructor {
+            let name = if constructor || matches!(callee_type, Some(Type::NominalInstance(_))) {
                 None
             } else {
                 definition.and_then(|definition| definition.name(db))
@@ -189,11 +189,8 @@ mod tests {
             )
             .unwrap();
         let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");
-        fixture.add_file(
-            &mut analysis.db,
-            "main.bzl",
-            "load(\"defs.bzl\", \"r\")\nr(fo$0o = \"\")",
-        );
+        let caller = "load(\"defs.bzl\", \"r\", \"fallback\")\nr(fo$0o = \"\")\nrules = struct(r=r)\nrules.r\nfallback()";
+        fixture.add_file(&mut analysis.db, "main.bzl", caller);
         loader.add_files_from_fixture(&fixture);
         let (file_id, pos) = fixture.cursor_pos.unwrap();
         for default in ["\"é\"", "(\"日本語\")", "\"é\""] {
@@ -211,9 +208,54 @@ Args:
     if True:
         value = 1
     ```
-""", default = {default})}})"#
+""", default = {default})}})
+def unknown(attrs):
+    return rule(attrs=attrs)
+fallback = unknown({{}})
+"#
                 ),
             );
+            let rule_hover = analysis
+                .snapshot()
+                .hover(FilePosition {
+                    file_id,
+                    pos: (u32::from(pos) - 3).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(rule_hover.contents.value.contains("(function)"));
+            assert!(rule_hover
+                .contents
+                .value
+                .contains(&format!("foo: str = {default}")));
+            assert!(rule_hover.contents.value.contains("Rule documentation."));
+            let field_hover = analysis
+                .snapshot()
+                .hover(FilePosition {
+                    file_id,
+                    pos: u32::try_from(caller.replace("$0", "").rfind("rules.r").unwrap() + 6)
+                        .unwrap()
+                        .into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(field_hover
+                .contents
+                .value
+                .contains(&format!("foo: str = {default}")));
+            let fallback_help = analysis
+                .snapshot()
+                .signature_help(FilePosition {
+                    file_id,
+                    pos: u32::try_from(caller.replace("$0", "").rfind("fallback(").unwrap() + 9)
+                        .unwrap()
+                        .into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(fallback_help.signatures[0]
+                .label
+                .starts_with("def fallback("));
             let help = analysis
                 .snapshot()
                 .signature_help(FilePosition { file_id, pos })

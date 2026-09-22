@@ -191,8 +191,9 @@ pub(crate) fn completions(
                 items.push(CompletionItem {
                     label: member.name.to_string(),
                     kind: if member.ty.is_some_and(|ty| {
-                        crate::hover::is_function_type(ty)
-                            || matches!(ty, Type::ClassLiteral(_) | Type::GenericAlias(_))
+                        crate::hover::is_function_type(crate::hover::callable_display_type(
+                            &model, ty,
+                        )) || matches!(ty, Type::ClassLiteral(_) | Type::GenericAlias(_))
                     }) {
                         CompletionItemKind::Function
                     } else {
@@ -274,9 +275,9 @@ pub(crate) fn completions(
                 {
                     continue;
                 }
-                names
-                    .entry(member.name.to_string())
-                    .or_insert_with(|| lexical_item(member.name.to_string(), Some(member.ty)));
+                names.entry(member.name.to_string()).or_insert_with(|| {
+                    lexical_item(&model, member.name.to_string(), Some(member.ty))
+                });
             }
             items.extend(names.into_values());
         }
@@ -463,11 +464,15 @@ fn string_context(
     }
 }
 
-fn lexical_item(name: String, ty: Option<Type<'_>>) -> CompletionItem {
+fn lexical_item<'db>(
+    model: &SemanticModel<'db>,
+    name: String,
+    ty: Option<Type<'db>>,
+) -> CompletionItem {
     CompletionItem {
         label: name,
         kind: if ty.is_some_and(|ty| {
-            crate::hover::is_function_type(ty)
+            crate::hover::is_function_type(crate::hover::callable_display_type(model, ty))
                 || matches!(ty, Type::ClassLiteral(_) | Type::GenericAlias(_))
         }) {
             CompletionItemKind::Function
@@ -491,9 +496,9 @@ fn lexical_names(
     let mut add_lexical = |model: &SemanticModel<'_>, scope| {
         for completion in model.lexical_completions(scope) {
             if !completion.is_type_check_only || matches!(usage, BuiltinUsage::Annotation) {
-                names
-                    .entry(completion.name.to_string())
-                    .or_insert_with(|| lexical_item(completion.name.to_string(), completion.ty));
+                names.entry(completion.name.to_string()).or_insert_with(|| {
+                    lexical_item(model, completion.name.to_string(), completion.ty)
+                });
             }
         }
     };

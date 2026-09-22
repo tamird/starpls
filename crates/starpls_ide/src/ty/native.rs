@@ -126,6 +126,8 @@ fn refine_builtin_signature(value: &mut Value) {
                 input.r#type = "string; or Label".to_owned();
             }
         }
+        // Rule values are callable objects with a nominal inheritance contract.
+        "rule" => callable.return_type = "rule".to_owned(),
         // Bazel documents a mutable list, which the inventory calls a sequence.
         "glob" => callable.return_type = "list of strings".to_owned(),
         _ => {}
@@ -231,6 +233,12 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             writeln!(
                 body,
                 "        def __getattr__(self, name: _starpls_builtins.str) -> _StructField: ..."
+            )?;
+        }
+        if matches!(class.name.as_str(), "rule" | "macro") {
+            writeln!(
+                body,
+                "        def __call__(self, **kwargs: _starpls_typing.Any) -> None: ..."
             )?;
         }
         let mut names = BTreeSet::new();

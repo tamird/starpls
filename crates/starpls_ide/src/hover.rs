@@ -22,6 +22,7 @@ use ty_ide::DocstringFragment;
 use ty_ide::MarkupKind;
 use ty_python_semantic::types::ide_support::definitions_for_attribute;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
+use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::HasDefinition;
 use ty_python_semantic::HasType;
@@ -82,8 +83,9 @@ pub(crate) fn hover(
         }
         Selection::Attribute(expr) => {
             let field_ty = expr.inferred_type(&model)?;
+            let display_ty = callable_display_type(&model, field_ty);
             let mut text = String::from("```python\n");
-            if is_function_type(field_ty) {
+            if is_function_type(display_ty) {
                 text.push_str("(method) ");
             } else {
                 write!(text, "(field) {}: ", expr.attr).ok()?;
@@ -91,7 +93,7 @@ pub(crate) fn hover(
             writeln!(
                 text,
                 "{}\n```",
-                field_ty.display(db, &model.program_environment())
+                display_ty.display(db, &model.program_environment())
             )
             .ok()?;
             let receiver = expr.value.inferred_type(&model)?;
@@ -302,13 +304,28 @@ pub(crate) fn is_function_type(ty: Type<'_>) -> bool {
     )
 }
 
+pub(crate) fn callable_display_type<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Type<'db> {
+    if matches!(ty, Type::NominalInstance(_)) {
+        ty.map_callable_signatures(
+            model.db(),
+            &model.program_environment(),
+            CallableTypeKind::Regular,
+            std::convert::identity,
+        )
+        .unwrap_or(ty)
+    } else {
+        ty
+    }
+}
+
 fn format_for_name<'db>(model: &SemanticModel<'db>, name: &str, ty: Type<'db>) -> String {
     let db = model.db();
     let environment = model.program_environment();
     let mut text = String::from("```python\n");
 
-    // Handle special `def` formatting for function types.
-    if is_function_type(ty) {
+    let display_ty = callable_display_type(model, ty);
+    // Callable objects retain their call signatures in name hovers.
+    if is_function_type(display_ty) {
         text.push_str("(function) ");
     } else {
         text.push_str("(variable) ");
@@ -316,7 +333,7 @@ fn format_for_name<'db>(model: &SemanticModel<'db>, name: &str, ty: Type<'db>) -
         text.push_str(": ");
     }
 
-    write!(&mut text, "{}", ty.display(db, &environment)).unwrap();
+    write!(&mut text, "{}", display_ty.display(db, &environment)).unwrap();
     text.push_str("\n```\n");
 
     let doc = type_documentation(model, ty);
