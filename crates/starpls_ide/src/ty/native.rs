@@ -26,6 +26,7 @@ pub(super) struct DeclarationSource {
 enum CallableKind<'a> {
     Function,
     Method(&'a str),
+    Rule,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -210,6 +211,12 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         }
     }
 
+    if !rule_names.is_empty() {
+        classes.entry("rule".to_owned()).or_insert_with(|| Type {
+            name: "rule".to_owned(),
+            ..Default::default()
+        });
+    }
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
     for class in classes.values() {
@@ -276,6 +283,15 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             if !names.insert(field.name.as_str()) {
                 continue;
             }
+            if class.name == "native" && rule_names.contains(field.name.as_str()) {
+                writeln!(body, "        {}: {}", field.name, rule_type(&field.name))?;
+                writeln!(
+                    body,
+                    "        {}",
+                    quoted(&env::normalize_doc(&field.doc, false))
+                )?;
+                continue;
+            }
             match &field.callable {
                 Some(callable) => write_function(
                     &mut body,
@@ -283,11 +299,7 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
                     field,
                     callable,
                     CallableKind::Method(&class.name),
-                    if class.name == "native" && rule_names.contains(field.name.as_str()) {
-                        AnnotationUse::AttributeInput
-                    } else {
-                        AnnotationUse::Value
-                    },
+                    AnnotationUse::Value,
                     &declared_classes,
                 )?,
                 None => {
@@ -319,6 +331,34 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             }
         }
     }
+    let mut rule_declarations = String::new();
+    for value in rules.global.iter().filter(|_| dialect == Dialect::Bazel) {
+        let Some(callable) = &value.callable else {
+            continue;
+        };
+        writeln!(
+            rule_declarations,
+            "class {}(_starpls_types.rule):",
+            value.name
+        )?;
+        let documentation = callable_documentation(value, callable)?;
+        writeln!(rule_declarations, "    {}", quoted(&documentation))?;
+        write_function(
+            &mut rule_declarations,
+            "    ",
+            value,
+            callable,
+            CallableKind::Rule,
+            AnnotationUse::AttributeInput,
+            &declared_classes,
+        )?;
+        writeln!(
+            rule_declarations,
+            "{} = {}",
+            rule_type(&value.name),
+            value.name
+        )?;
+    }
     let mut exports = String::new();
     let mut emitted: BTreeMap<String, Vec<(Value, AnnotationUse, String)>> = BTreeMap::new();
     for (context, globals) in contexts {
@@ -341,6 +381,10 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
             } else {
                 AnnotationUse::Value
             };
+            if matches!(input, AnnotationUse::AttributeInput) {
+                writeln!(exports, "{export}: {}", rule_type(&value.name))?;
+                continue;
+            }
             let previous = emitted.entry(value.name.clone()).or_default();
             if let Some((_, _, alias)) = previous
                 .iter()
@@ -374,10 +418,15 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
     for name in classes.keys() {
         writeln!(output, "_starpls_annotation_{name} = _starpls_types.{name}")?;
     }
+    output.push_str(&rule_declarations);
     output.push_str(&exports);
     output.push('\n');
     output.push_str(include_str!("starlark.pyi"));
     Ok(output)
+}
+
+fn rule_type(name: &str) -> String {
+    format!("_starpls_rule_{name}")
 }
 
 fn value_annotation(value: &Value, classes: &BTreeSet<String>) -> String {
@@ -398,14 +447,22 @@ fn write_function(
     input: AnnotationUse,
     classes: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    write!(output, "{indent}def {}(", value.name)?;
+    let name = if matches!(kind, CallableKind::Rule) {
+        "__call__"
+    } else {
+        &value.name
+    };
+    write!(output, "{indent}def {name}(")?;
     let mut separator = "";
     if !matches!(kind, CallableKind::Function) {
         output.push_str("_starpls_self");
         separator = ", ";
     }
     let mut optional = false;
-    let mut keyword_only = false;
+    let mut keyword_only = matches!(kind, CallableKind::Rule) && !callable.param.is_empty();
+    if keyword_only {
+        output.push_str(", *");
+    }
     for parameter in &callable.param {
         output.push_str(separator);
         separator = ", ";
@@ -483,6 +540,13 @@ fn write_function(
         .map(str::to_owned)
         .unwrap_or_else(|| annotation(&callable.return_type, false, classes, AnnotationUse::Value));
     writeln!(output, ") -> {return_type}:")?;
+    let documentation = callable_documentation(value, callable)?;
+    writeln!(output, "{indent}    {}", quoted(&documentation))?;
+    writeln!(output, "{indent}    ...")?;
+    Ok(())
+}
+
+fn callable_documentation(value: &Value, callable: &Callable) -> anyhow::Result<String> {
     let mut documentation = env::normalize_doc(&value.doc, false);
     let mut documented_parameters = callable
         .param
@@ -506,9 +570,7 @@ fn write_function(
             write!(documentation, "\n        {line}")?;
         }
     }
-    writeln!(output, "{indent}    {}", quoted(&documentation))?;
-    writeln!(output, "{indent}    ...")?;
-    Ok(())
+    Ok(documentation)
 }
 
 /// Decode the inventory's prose vocabulary, not arbitrary annotation source.
@@ -848,6 +910,127 @@ strict_labels(labels)
     }
 
     #[test]
+    fn native_rules_are_nominal_keyword_callables() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let rules = Builtins {
+            global: vec![Value {
+                name: "sources".to_owned(),
+                doc: "A rule with source files.".to_owned(),
+                callable: Some(Callable {
+                    param: vec![Param {
+                        name: "srcs".to_owned(),
+                        r#type: "List of Labels".to_owned(),
+                        doc: "Source file labels.".to_owned(),
+                        is_mandatory: true,
+                        ..Default::default()
+                    }],
+                    return_type: "None".to_owned(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis.set_builtin_defs(builtins, rules).unwrap();
+        let source = r#"
+def implementation(**kwargs):
+    pass
+sources(srcs=["//:input"])
+native.sources(srcs=["//:input"])
+alias = native.sources
+alias(srcs=["//:input"])
+macro(implementation=implementation, inherit_attrs=native.sources)
+macro(implementation=implementation, inherit_attrs=sources)
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let hover = analysis
+            .snapshot()
+            .hover(FilePosition {
+                file_id: file,
+                pos: u32::try_from(source.find("native.sources").unwrap() + 8)
+                    .unwrap()
+                    .into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains("srcs:"),
+            "{}",
+            hover.contents.value
+        );
+        assert!(
+            hover.contents.value.contains("A rule with source files."),
+            "{}",
+            hover.contents.value
+        );
+        for callee in ["native.sources", "alias"] {
+            let help = analysis
+                .snapshot()
+                .signature_help(FilePosition {
+                    file_id: file,
+                    pos: u32::try_from(
+                        source.find(&format!("{callee}(srcs=")).unwrap() + callee.len() + 1,
+                    )
+                    .unwrap()
+                    .into(),
+                })
+                .unwrap()
+                .unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("{help:?}");
+            };
+            assert!(
+                signature.label.starts_with(&format!("def {callee}(")),
+                "{signature:?}"
+            );
+            let [parameter] = signature.parameters.as_deref().unwrap() else {
+                panic!("{signature:?}");
+            };
+            assert_eq!(
+                parameter.documentation.as_deref(),
+                Some("Source file labels.")
+            );
+        }
+        for (call, expected) in [
+            ("native.sources()", "missing-argument"),
+            ("sources(srcs=42)", "invalid-argument-type"),
+            (
+                "native.sources([\"//:input\"])",
+                "too-many-positional-arguments",
+            ),
+            (
+                "macro(implementation=implementation, inherit_attrs=native.glob)",
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(file, format!("{source}\n{call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == expected
+                        && diagnostic
+                            .range()
+                            .is_some_and(|range| range.start().to_usize() >= source.len())),
+                "{call}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn public_names_preserve_context_specific_declarations() {
         let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
             "../../../starpls/src/builtin/builtin.pb"
@@ -1080,14 +1263,14 @@ strict_labels(labels)
             )
             .unwrap();
         let source = "\
-boolean_rule(0)
-boolean_rule(1)
-boolean_rule(True)
-boolean_rule(False)
-native.boolean_rule(0)
-native.boolean_rule(1)
-native.boolean_rule(True)
-native.boolean_rule(False)
+boolean_rule(flag=0)
+boolean_rule(flag=1)
+boolean_rule(flag=True)
+boolean_rule(flag=False)
+native.boolean_rule(flag=0)
+native.boolean_rule(flag=1)
+native.boolean_rule(flag=True)
+native.boolean_rule(flag=False)
 returned = strict_bool(True)
 field = boolean_record.value
 strict_bool(False)
@@ -1121,16 +1304,16 @@ strict_bool(False)
             }
         }
         for (statement, expected) in [
-            ("boolean_rule(2)", "invalid-argument-type"),
-            ("native.boolean_rule(2)", "invalid-argument-type"),
+            ("boolean_rule(flag=2)", "invalid-argument-type"),
+            ("native.boolean_rule(flag=2)", "invalid-argument-type"),
             ("strict_bool(0)", "invalid-argument-type"),
             ("strict_bool(1)", "invalid-argument-type"),
             (
-                "def generic(flag):\n    # type: (int) -> None\n    boolean_rule(flag)",
+                "def generic(flag):\n    # type: (int) -> None\n    boolean_rule(flag=flag)",
                 "invalid-argument-type",
             ),
             (
-                "def generic(flag):\n    # type: (int) -> None\n    native.boolean_rule(flag)",
+                "def generic(flag):\n    # type: (int) -> None\n    native.boolean_rule(flag=flag)",
                 "invalid-argument-type",
             ),
             ("annotated = 1 # type: bool", "invalid-assignment"),

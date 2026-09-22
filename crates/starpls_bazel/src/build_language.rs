@@ -30,13 +30,14 @@ pub fn decode_rules(build_language_output: &[u8]) -> anyhow::Result<Builtins> {
                                 .filter(|attr| !attr.name.starts_with(['$', ':']))
                                 .map(|attr| {
                                     let doc = attr.documentation().to_string();
+                                    let is_mandatory = attr.mandatory();
                                     let r#type =
                                         attribute_type_string_from_discriminator(attr.r#type());
                                     Param {
                                         name: attr.name,
                                         r#type,
                                         doc,
-                                        is_mandatory: false,
+                                        is_mandatory,
                                         ..Default::default()
                                     }
                                 })
@@ -72,4 +73,50 @@ pub fn attribute_type_string_from_discriminator(value: Discriminator) -> String 
         _ => "Unknown",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::decode_rules;
+    use crate::build::attribute::Discriminator;
+    use crate::build::AttributeDefinition;
+    use crate::build::BuildLanguage;
+    use crate::build::RuleDefinition;
+
+    #[test]
+    fn rule_attributes_preserve_requiredness() {
+        let language = BuildLanguage {
+            rule: vec![RuleDefinition {
+                name: "example".to_owned(),
+                attribute: [None, Some(false), Some(true)]
+                    .into_iter()
+                    .map(|mandatory| AttributeDefinition {
+                        name: "value".to_owned(),
+                        r#type: Discriminator::String as i32,
+                        mandatory,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+        };
+        let definitions = decode_rules(&language.encode_to_vec()).unwrap();
+        let [crate::builtin::Value {
+            callable: Some(callable),
+            ..
+        }] = definitions.global.as_slice()
+        else {
+            panic!("expected one callable rule");
+        };
+        assert_eq!(
+            callable
+                .param
+                .iter()
+                .map(|parameter| parameter.is_mandatory)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
 }
