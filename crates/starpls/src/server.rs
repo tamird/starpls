@@ -244,6 +244,26 @@ impl Server {
         self.send(req.into());
     }
 
+    pub(crate) fn refresh_editor_semantics(&mut self) {
+        let Some(workspace) = &self.config.caps.workspace else {
+            return;
+        };
+        let tokens = workspace
+            .semantic_tokens
+            .as_ref()
+            .is_some_and(|capability| capability.refresh_support == Some(true));
+        let hints = workspace
+            .inlay_hint
+            .as_ref()
+            .is_some_and(|capability| capability.refresh_support == Some(true));
+        if tokens {
+            self.send_request::<lsp_types::request::SemanticTokensRefresh>(());
+        }
+        if hints {
+            self.send_request::<lsp_types::request::InlayHintRefreshRequest>(());
+        }
+    }
+
     pub(crate) fn complete_request(&mut self, resp: lsp_server::Response) {
         if let Some(OutgoingRequest::RegisterFileWatchers(id)) =
             self.req_queue.outgoing.complete(resp.id)
@@ -429,6 +449,7 @@ impl Server {
         self.analysis.set_type_interfaces(Vec::new())?;
         self.analysis.set_all_workspace_targets(Vec::new());
         self.invalidate_diagnostics();
+        self.refresh_editor_semantics();
         self.pending_repos.clear();
         if self.configuration.restart_required {
             self.configuration.pending = false;
@@ -551,6 +572,7 @@ impl Server {
             .extend(self.loader.configuration_inputs());
         self.refresh_all_workspace_targets();
         self.invalidate_diagnostics();
+        self.refresh_editor_semantics();
     }
 
     pub(crate) fn open_repository_changed(&self) -> bool {

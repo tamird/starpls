@@ -331,6 +331,7 @@ impl Server {
                     self.analysis.invalidate_loads();
                     self.loader.finish_mapping(repository, result);
                     self.invalidate_diagnostics();
+                    self.refresh_editor_semantics();
                 }
             }
             Task::Retry(req) => self.handle_request(req),
@@ -369,15 +370,17 @@ impl Server {
                     } => {
                         self.is_fetching_repos = false;
                         if revision == self.configuration.revision {
+                            self.analysis.invalidate_loads();
                             self.loader.finish_fetch(fetched, true);
                             self.loader.finish_fetch(failed_repos.clone(), false);
+                            self.invalidate_diagnostics();
                             if self.open_repository_changed() {
                                 if let Err(error) = self.reload_configuration() {
                                     self.send_error_message(&format!("{error:#}"));
                                 }
+                            } else {
+                                self.refresh_editor_semantics();
                             }
-                            self.analysis.invalidate_loads();
-                            self.invalidate_diagnostics();
                         }
 
                         // Fetching external repositories with `bazel query`, as in the case when bzlmod is disabled, often
@@ -436,6 +439,7 @@ impl Server {
                                 self.analysis.set_all_workspace_targets(targets);
                                 self.analysis.invalidate_loads();
                                 self.invalidate_diagnostics();
+                                self.refresh_editor_semantics();
                             }
                         } else {
                             self.refresh_all_workspace_targets();
@@ -585,6 +589,70 @@ mod tests {
             disk,
             tasks: sender,
             debounced,
+        }
+    }
+
+    #[test]
+    fn semantic_refresh_follows_capabilities_and_accepted_results() {
+        {
+            let TestServer {
+                mut server, client, ..
+            } = server();
+            server.refresh_editor_semantics();
+            assert!(client.receiver.try_recv().is_err());
+        }
+        for (tokens, hints) in [
+            (None, None),
+            (Some(false), Some(false)),
+            (Some(true), None),
+            (None, Some(true)),
+            (Some(true), Some(true)),
+        ] {
+            let TestServer {
+                mut server, client, ..
+            } = server();
+            Arc::get_mut(&mut server.config).unwrap().caps =
+                serde_json::from_value(serde_json::json!({"workspace": {
+                    "semanticTokens": {"refreshSupport": tokens},
+                    "inlayHint": {"refreshSupport": hints},
+                }}))
+                .unwrap();
+            let requests = || {
+                client
+                    .receiver
+                    .try_iter()
+                    .filter_map(|message| {
+                        let lsp_server::Message::Request(request) = message else {
+                            return None;
+                        };
+                        Some(request.method)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            server.handle_task(Task::RepoMappingReady {
+                repository: String::new(),
+                revision: 1,
+                result: Ok(Default::default()),
+            });
+            assert!(requests().is_empty(), "stale mapping must not refresh");
+            server.handle_task(Task::RepoMappingReady {
+                repository: String::new(),
+                revision: 0,
+                result: Ok(Default::default()),
+            });
+            let expected = [
+                (tokens, "workspace/semanticTokens/refresh"),
+                (hints, "workspace/inlayHint/refresh"),
+            ]
+            .into_iter()
+            .filter_map(|(enabled, method)| (enabled == Some(true)).then_some(method))
+            .collect::<Vec<_>>();
+            assert_eq!(requests(), expected);
+            server.invalidate_diagnostics();
+            assert!(
+                requests().is_empty(),
+                "ordinary edits use document requests"
+            );
         }
     }
 
