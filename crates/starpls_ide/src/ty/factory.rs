@@ -447,9 +447,23 @@ pub(super) fn attribute_value_type<'db>(
 ) -> Option<Type<'db>> {
     let string = KnownClass::Str.to_instance(db, environment);
     let int = KnownClass::Int.to_instance(db, environment);
-    let list = |element| KnownClass::List.to_specialized_instance(db, environment, &[element]);
-    let dict =
-        |key, value| KnownClass::Dict.to_specialized_instance(db, environment, &[key, value]);
+    // Bazel copies and converts list attribute inputs; context values are lists.
+    let list = |element| {
+        let class = match usage {
+            AttributeUse::Input => KnownClass::Iterable,
+            AttributeUse::BuildContext => KnownClass::List,
+            AttributeUse::RepositoryContext => KnownClass::List,
+        };
+        class.to_specialized_instance(db, environment, &[element])
+    };
+    let dict = |key, value| {
+        let class = match usage {
+            AttributeUse::Input => KnownClass::Mapping,
+            AttributeUse::BuildContext => KnownClass::Dict,
+            AttributeUse::RepositoryContext => KnownClass::Dict,
+        };
+        class.to_specialized_instance(db, environment, &[key, value])
+    };
     let label = || {
         let name = match usage {
             AttributeUse::Input => "Label",
@@ -505,7 +519,26 @@ pub(super) fn attribute_value_type<'db>(
             }
         }
         AttributeKind::LabelList => list(label()?),
-        AttributeKind::LabelKeyedStringDict => dict(label()?, string),
+        AttributeKind::LabelKeyedStringDict => {
+            let keys = label()?;
+            match usage {
+                AttributeUse::Input => {
+                    let label = native_class(db, declarations, "Label")?
+                        .to_instance_approximation(db, environment)?;
+                    // Mapping keys are invariant; inputs can use either or both kinds.
+                    UnionType::from_elements(
+                        db,
+                        environment,
+                        [
+                            dict(label, string),
+                            dict(string, string),
+                            dict(keys, string),
+                        ],
+                    )
+                }
+                AttributeUse::BuildContext | AttributeUse::RepositoryContext => dict(keys, string),
+            }
+        }
         AttributeKind::StringKeyedLabelDict => dict(string, label()?),
         AttributeKind::Output => {
             let output = output()?;

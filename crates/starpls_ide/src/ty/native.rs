@@ -462,9 +462,21 @@ fn annotation(
         .map(|part| {
             if let Some(mapping) = part.trim().strip_prefix("Dictionary: ") {
                 if let Some((key, value)) = mapping.split_once(" -> ") {
-                    let key = annotation(key, false, classes, AnnotationUse::Value);
-                    let value = annotation(value, false, classes, AnnotationUse::Value);
-                    return format!("_starpls_builtins.dict[{key}, {value}]");
+                    let label_key = matches!(key.trim(), "Label" | "label")
+                        && classes.contains("Label");
+                    let key = annotation(key, false, classes, usage);
+                    let value = annotation(value, false, classes, usage);
+                    let mapping = match usage {
+                        AnnotationUse::Value => "_starpls_builtins.dict",
+                        AnnotationUse::AttributeInput => "_starpls_typing.Mapping",
+                    };
+                    // Mapping keys are invariant; Bazel converts either key kind.
+                    if matches!(usage, AnnotationUse::AttributeInput) && label_key {
+                        return format!(
+                            "{mapping}[_starpls_types.Label, {value}] | {mapping}[_starpls_builtins.str, {value}] | {mapping}[{key}, {value}]"
+                        );
+                    }
+                    return format!("{mapping}[{key}, {value}]");
                 }
             }
             let (name, element) = part
@@ -488,16 +500,23 @@ fn annotation(
                 _ => None,
             };
             if let Some(container) = container {
-                let element = annotation(
-                    element.unwrap_or("Unknown"),
-                    false,
-                    classes,
-                    AnnotationUse::Value,
-                );
+                let container = match (container, usage) {
+                    ("_starpls_builtins.list", AnnotationUse::AttributeInput) => {
+                        "_starpls_typing.Iterable"
+                    }
+                    ("_starpls_builtins.dict", AnnotationUse::AttributeInput) => {
+                        "_starpls_typing.Mapping"
+                    }
+                    _ => container,
+                };
+                let element = annotation(element.unwrap_or("Unknown"), false, classes, usage);
                 if variadic {
                     return element;
                 }
-                return if container == "_starpls_builtins.dict" {
+                return if matches!(
+                    container,
+                    "_starpls_builtins.dict" | "_starpls_typing.Mapping"
+                ) {
                     format!("{container}[_starpls_typing.Any, {element}]")
                 } else if container == "_starpls_builtins.tuple" {
                     format!("{container}[{element}, ...]")
@@ -541,6 +560,9 @@ fn annotation(
                     };
                     if !classes.contains(name) {
                         return "_starpls_typing.Any".to_owned();
+                    }
+                    if name == "Label" && matches!(usage, AnnotationUse::AttributeInput) {
+                        return "_starpls_types.Label | _starpls_builtins.str".to_owned();
                     }
                     return format!("_starpls_types.{name}");
                 }
@@ -658,6 +680,107 @@ mod tests {
                 diagnostics[0].range().unwrap(),
                 ruff_text_size::TextRange::new(invalid.into(), (invalid + 1).into()),
             );
+        }
+    }
+
+    #[test]
+    fn label_rule_inputs_accept_converted_iterables() {
+        let function = |name: &str, input: &str| Value {
+            name: name.to_owned(),
+            callable: Some(Callable {
+                param: vec![Param {
+                    name: "srcs".to_owned(),
+                    r#type: input.to_owned(),
+                    is_mandatory: true,
+                    ..Default::default()
+                }],
+                return_type: "None".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        builtins
+            .global
+            .push(function("strict_labels", "List of Labels"));
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(
+                builtins,
+                Builtins {
+                    global: vec![
+                        function("label_rule", "List of Labels"),
+                        function("mapping_rule", "Dictionary: string -> list of strings"),
+                        function("keyed_rule", "Dictionary: Label -> string"),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let source = r#"
+def implementation(ctx):
+    return []
+source_rule = rule(implementation=implementation, attrs={"srcs": attr.label_list(), "mapping": attr.string_list_dict(), "keyed": attr.label_keyed_string_dict()})
+paths = native.glob(["*.rs"])
+labels = [Label("//:input.rs")]
+mapping = {"key": ["value"]}
+native.mapping_rule(srcs=mapping)
+string_keys = {"//:input": "value"}
+label_keys = {Label("//:input"): "value"}
+mixed_keys = {"//:input": "one", Label("//:other"): "two"}
+native.keyed_rule(srcs=string_keys)
+native.keyed_rule(srcs=label_keys)
+native.keyed_rule(srcs=mixed_keys)
+source_rule(name="string_keys", keyed=string_keys)
+source_rule(name="label_keys", keyed=label_keys)
+source_rule(name="mixed_keys", keyed=mixed_keys)
+source_rule(name="mapping", mapping=mapping)
+label_rule(srcs=paths)
+native.label_rule(srcs=paths)
+source_rule(name="source", srcs=paths)
+native.label_rule(srcs=labels)
+source_rule(name="labels", srcs=labels)
+native.label_rule(srcs=("input.rs", Label("//:other.rs")))
+source_rule(name="tuple", srcs=("input.rs", Label("//:other.rs")))
+strict_labels(labels)
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for call in [
+            "native.label_rule(srcs=42)",
+            "native.label_rule(srcs=\"input.rs\")",
+            "native.label_rule(srcs=[42])",
+            "source_rule(name=\"bad\", srcs=42)",
+            "source_rule(name=\"bad\", srcs=\"input.rs\")",
+            "source_rule(name=\"bad\", srcs=[42])",
+            "strict_labels(paths)",
+            "native.keyed_rule(srcs={42: \"bad\"})",
+            "source_rule(name=\"bad\", keyed={42: \"bad\"})",
+        ] {
+            analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    format!("{source}\n{call}\n"),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            assert!(usize::from(diagnostics[0].range().unwrap().start()) > source.len());
         }
     }
 
