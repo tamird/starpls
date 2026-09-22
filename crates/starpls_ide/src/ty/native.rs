@@ -83,16 +83,7 @@ pub(super) fn globals(
                 continue;
             }
             let mut value = value.clone();
-            // Bazel's exported schema omits Label's input/result types. Its
-            // own declaration documentation defines conversion from str|Label.
-            if value.name == "Label" {
-                if let Some(callable) = &mut value.callable {
-                    callable.return_type = "Label".to_owned();
-                    if let [input] = callable.param.as_mut_slice() {
-                        input.r#type = "string; or Label".to_owned();
-                    }
-                }
-            }
+            refine_builtin_signature(&mut value);
             globals.insert(value.name.clone(), value);
         }
     };
@@ -121,6 +112,24 @@ pub(super) fn globals(
         }
     }
     globals
+}
+
+fn refine_builtin_signature(value: &mut Value) {
+    let Some(callable) = &mut value.callable else {
+        return;
+    };
+    match value.name.as_str() {
+        // The inventory omits Label's input and result types.
+        "Label" => {
+            callable.return_type = "Label".to_owned();
+            if let [input] = callable.param.as_mut_slice() {
+                input.r#type = "string; or Label".to_owned();
+            }
+        }
+        // Bazel documents a mutable list, which the inventory calls a sequence.
+        "glob" => callable.return_type = "list of strings".to_owned(),
+        _ => {}
+    }
 }
 
 fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyhow::Result<String> {
@@ -182,6 +191,9 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         }
     }
     if let Some(native) = classes.get_mut("native") {
+        for field in &mut native.field {
+            refine_builtin_signature(field);
+        }
         let workspace = env::make_workspace_builtins();
         for field in rules.global.iter().chain(workspace.global.iter()) {
             if field.name != "workspace"
@@ -619,6 +631,34 @@ mod tests {
         );
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn glob_returns_a_mutable_list_of_strings() {
+        for (path, glob) in [("/main.bzl", "native.glob"), ("/BUILD.bazel", "glob")] {
+            let builtins = starpls_bazel::decode_builtins(include_bytes!(
+                "../../../starpls/src/builtin/builtin.pb"
+            ))
+            .unwrap();
+            let (mut analysis, _) = Analysis::new_for_test();
+            analysis
+                .set_builtin_defs(builtins, Builtins::default())
+                .unwrap();
+            let source = format!(
+                "files = {glob}([\"*.rs\"])\ncombined = files + [\"extra.rs\"]\nfiles.append(\"other.rs\")\nfiles.append(1)\n"
+            );
+            let invalid = u32::try_from(source.rfind('1').unwrap()).unwrap();
+            let file = analysis
+                .open_document(Path::new(path), Dialect::Bazel, None, source, 1)
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{path}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            assert_eq!(
+                diagnostics[0].range().unwrap(),
+                ruff_text_size::TextRange::new(invalid.into(), (invalid + 1).into()),
+            );
+        }
     }
 
     #[test]
