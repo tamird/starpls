@@ -67,6 +67,7 @@ impl ServerCommand {
             definition_provider: Some(OneOf::Left(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
+            document_highlight_provider: Some(OneOf::Left(true)),
             references_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(
                 lsp_types::SemanticTokensOptions {

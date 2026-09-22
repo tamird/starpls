@@ -1,4 +1,3 @@
-use anyhow::Ok;
 use starpls_ide::CompletionItemKind;
 use starpls_ide::CompletionMode::InsertText;
 use starpls_ide::CompletionMode::TextEdit;
@@ -92,28 +91,69 @@ pub(crate) fn find_references(
 ) -> anyhow::Result<Option<Vec<lsp_types::Location>>> {
     let path = path_buf_from_url(&params.text_document_position.text_document.uri)?;
     let file_id = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
-    let source = snapshot.analysis_snapshot.source(file_id)?;
     let pos = try_opt!(convert::text_size_from_lsp_position(
         snapshot,
         file_id,
         params.text_document_position.position,
     )?);
-    let resp = snapshot
+    let references = snapshot
         .analysis_snapshot
-        .find_references(FilePosition { file_id, pos })?
-        .unwrap_or_else(Vec::new)
-        .into_iter()
-        .filter_map(|location| {
-            Some(lsp_types::Location {
-                range: convert::lsp_range_from_text_range(location.range, &source)?,
-                uri: lsp_types::Url::from_file_path(
-                    snapshot.analysis_snapshot.path(location.file_id),
-                )
-                .ok()?,
-            })
-        });
+        .find_references(
+            FilePosition { file_id, pos },
+            params.context.include_declaration,
+        )?
+        .unwrap_or_default();
+    let mut locations = Vec::with_capacity(references.len());
+    for location in references {
+        let source = snapshot.analysis_snapshot.source(location.file_id)?;
+        if let (Some(range), Ok(uri)) = (
+            convert::lsp_range_from_text_range(location.range, &source),
+            lsp_types::Url::from_file_path(snapshot.analysis_snapshot.path(location.file_id)),
+        ) {
+            locations.push(lsp_types::Location { range, uri });
+        }
+    }
+    Ok(Some(locations))
+}
 
-    Ok(Some(resp.collect()))
+pub(crate) fn document_highlights(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::DocumentHighlightParams,
+) -> anyhow::Result<Option<Vec<lsp_types::DocumentHighlight>>> {
+    let position = params.text_document_position_params;
+    let path = path_buf_from_url(&position.text_document.uri)?;
+    let file_id = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let source = snapshot.analysis_snapshot.source(file_id)?;
+    let pos = try_opt!(convert::offset_from_lsp_position(
+        &source.text,
+        &source.index,
+        position.position
+    ));
+    let highlights = snapshot
+        .analysis_snapshot
+        .document_highlights(FilePosition { file_id, pos })?;
+    Ok(highlights.map(|references| {
+        references
+            .into_iter()
+            .filter_map(|reference| {
+                let range = reference.range();
+                let range = starpls_syntax::TextRange::new(
+                    u32::from(range.start()).into(),
+                    u32::from(range.end()).into(),
+                );
+                Some(lsp_types::DocumentHighlight {
+                    range: convert::lsp_range_from_text_range(range, &source)?,
+                    kind: Some(match reference.kind() {
+                        starpls_ide::ReferenceKind::Read => lsp_types::DocumentHighlightKind::READ,
+                        starpls_ide::ReferenceKind::Write => {
+                            lsp_types::DocumentHighlightKind::WRITE
+                        }
+                        starpls_ide::ReferenceKind::Other => lsp_types::DocumentHighlightKind::TEXT,
+                    }),
+                })
+            })
+            .collect()
+    }))
 }
 
 pub(crate) fn completion(

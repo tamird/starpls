@@ -767,7 +767,7 @@ identity(value=Info(value=1))
                 usize::from(target_selection_range.start()),
                 source.find("values:").unwrap()
             );
-            let references = snapshot.find_references(position).unwrap().unwrap();
+            let references = snapshot.find_references(position, true).unwrap().unwrap();
             assert_eq!(references.len(), 2, "{references:?}");
             assert!(
                 references

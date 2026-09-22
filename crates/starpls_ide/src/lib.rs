@@ -26,6 +26,8 @@ use starpls_hir::Fixture;
 pub use starpls_hir::InferenceOptions;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+pub use ty_ide::ReferenceKind;
+pub use ty_ide::ReferenceTarget;
 pub use ty_ide::SemanticToken;
 pub use ty_ide::SemanticTokenModifier;
 pub use ty_ide::SemanticTokenType;
@@ -501,8 +503,30 @@ impl AnalysisSnapshot {
         self.query(|db| document_symbols::document_symbols(db, file_id))
     }
 
-    pub fn find_references(&self, pos: FilePosition) -> Cancellable<Option<Vec<Location>>> {
-        self.query(|db| find_references::find_references(db, pos))
+    pub fn find_references(
+        &self,
+        pos: FilePosition,
+        include_declaration: bool,
+    ) -> Cancellable<Option<Vec<Location>>> {
+        let file = pos.file_id;
+        self.query(|db| {
+            find_references::find_references(db, pos, include_declaration).map(|references| {
+                references
+                    .into_iter()
+                    .map(|reference| Location {
+                        file_id: file,
+                        range: util::text_range(reference.range()),
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    pub fn document_highlights(
+        &self,
+        pos: FilePosition,
+    ) -> Cancellable<Option<Vec<ReferenceTarget>>> {
+        self.query(|db| find_references::find_references(db, pos, true))
     }
 
     pub fn goto_definition(
