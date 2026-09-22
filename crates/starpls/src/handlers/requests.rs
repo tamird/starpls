@@ -202,6 +202,45 @@ pub(crate) fn completion(
     ))
 }
 
+pub(crate) fn semantic_tokens(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::SemanticTokensParams,
+) -> anyhow::Result<Option<lsp_types::SemanticTokensResult>> {
+    Ok(
+        semantic_tokens_impl(snapshot, &params.text_document.uri, None)?
+            .map(lsp_types::SemanticTokensResult::Tokens),
+    )
+}
+
+pub(crate) fn semantic_tokens_range(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::SemanticTokensRangeParams,
+) -> anyhow::Result<Option<lsp_types::SemanticTokensRangeResult>> {
+    Ok(
+        semantic_tokens_impl(snapshot, &params.text_document.uri, Some(params.range))?
+            .map(lsp_types::SemanticTokensRangeResult::Tokens),
+    )
+}
+
+fn semantic_tokens_impl(
+    snapshot: &ServerSnapshot,
+    uri: &lsp_types::Url,
+    range: Option<lsp_types::Range>,
+) -> anyhow::Result<Option<lsp_types::SemanticTokens>> {
+    let path = path_buf_from_url(uri)?;
+    let file = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let source = snapshot.analysis_snapshot.source(file)?;
+    let range = match range {
+        Some(range) => Some(try_opt!(convert::text_range_from_lsp_range(range, &source))),
+        None => None,
+    };
+    let tokens = snapshot.analysis_snapshot.semantic_tokens(file, range)?;
+    Ok(Some(lsp_types::SemanticTokens {
+        result_id: None,
+        data: convert::lsp_semantic_tokens(&tokens, &source),
+    }))
+}
+
 pub(crate) fn hover(
     snapshot: &ServerSnapshot,
     params: lsp_types::HoverParams,

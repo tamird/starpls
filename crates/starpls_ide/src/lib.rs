@@ -26,6 +26,10 @@ use starpls_hir::Fixture;
 pub use starpls_hir::InferenceOptions;
 use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
+pub use ty_ide::SemanticToken;
+pub use ty_ide::SemanticTokenModifier;
+pub use ty_ide::SemanticTokenType;
+pub use ty_ide::SemanticTokens;
 
 pub use crate::completions::CompletionItem;
 pub use crate::completions::CompletionItemKind;
@@ -50,6 +54,7 @@ mod find_references;
 mod goto_definition;
 mod hover;
 mod selection;
+mod semantic_tokens;
 mod show_hir;
 mod show_syntax_tree;
 mod signature_help;
@@ -527,6 +532,14 @@ impl AnalysisSnapshot {
 
     pub fn signature_help(&self, pos: FilePosition) -> Cancellable<Option<SignatureHelp>> {
         self.query(|db| signature_help::signature_help(db, pos))
+    }
+
+    pub fn semantic_tokens(
+        &self,
+        file: File,
+        range: Option<TextRange>,
+    ) -> Cancellable<SemanticTokens> {
+        self.query(|db| semantic_tokens::semantic_tokens(db, file, range))
     }
 
     /// Helper method to handle Salsa cancellations.

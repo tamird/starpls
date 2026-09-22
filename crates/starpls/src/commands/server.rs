@@ -68,6 +68,24 @@ impl ServerCommand {
             document_symbol_provider: Some(OneOf::Left(true)),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
+            semantic_tokens_provider: Some(
+                lsp_types::SemanticTokensOptions {
+                    legend: lsp_types::SemanticTokensLegend {
+                        token_types: starpls_ide::SemanticTokenType::all()
+                            .iter()
+                            .map(|kind| kind.as_lsp_concept().into())
+                            .collect(),
+                        token_modifiers: starpls_ide::SemanticTokenModifier::all_names()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect(),
+                    },
+                    range: Some(true),
+                    full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                    ..Default::default()
+                }
+                .into(),
+            ),
             signature_help_provider: Some(SignatureHelpOptions {
                 trigger_characters: Some(make_trigger_characters(
                     SIGNATURE_HELP_TRIGGER_CHARACTERS,

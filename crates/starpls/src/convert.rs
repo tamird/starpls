@@ -64,6 +64,73 @@ pub(crate) fn lsp_range_from_text_range(
     Some(lsp_types::Range { start, end })
 }
 
+pub(crate) fn text_range_from_lsp_range(
+    range: lsp_types::Range,
+    source: &Source,
+) -> Option<TextRange> {
+    let start = offset_from_lsp_position(&source.text, &source.index, range.start)?;
+    let end = offset_from_lsp_position(&source.text, &source.index, range.end)?;
+    (start <= end).then(|| TextRange::new(start, end))
+}
+
+pub(crate) fn lsp_semantic_tokens(
+    tokens: &[starpls_ide::SemanticToken],
+    source: &Source,
+) -> Vec<lsp_types::SemanticToken> {
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut previous = lsp_types::Position::default();
+    for token in tokens {
+        let range = TextRange::new(
+            u32::from(token.range.start()).into(),
+            u32::from(token.range.end()).into(),
+        );
+        let Some(range) = lsp_range_from_text_range(range, source) else {
+            continue;
+        };
+        // Single-line tokens work with every client and exclude newline bytes.
+        for line in range.start.line..=range.end.line {
+            let start = lsp_types::Position::new(
+                line,
+                if line == range.start.line {
+                    range.start.character
+                } else {
+                    0
+                },
+            );
+            let end = if line == range.end.line {
+                range.end.character
+            } else {
+                let line_range = source
+                    .index
+                    .line_range(OneIndexed::from_zero_indexed(line as usize), &source.text);
+                let text = source.text[line_range].trim_end_matches(['\r', '\n']);
+                let Ok(length) = u32::try_from(text.encode_utf16().count()) else {
+                    continue;
+                };
+                length
+            };
+            if end <= start.character {
+                continue;
+            }
+            let delta_line = start.line - previous.line;
+            let delta_start = if delta_line == 0 {
+                start.character - previous.character
+            } else {
+                start.character
+            };
+            result.push(lsp_types::SemanticToken {
+                delta_line,
+                delta_start,
+                length: end - start.character,
+                token_type: token.token_type as u32,
+                token_modifiers_bitset: token.modifiers.bits(),
+            });
+            previous = start;
+        }
+    }
+    result
+}
+
 fn lsp_position_from_offset(
     text: &str,
     index: &LineIndex,
@@ -196,8 +263,7 @@ mod tests {
     use super::lsp_position_from_offset;
     use super::offset_from_lsp_position;
 
-    #[test]
-    fn diagnostic_conversion_preserves_protocol_fields() {
+    fn source(text: &str) -> (starpls_common::Source, starpls_common::File) {
         let (sender, _) = crossbeam_channel::unbounded();
         let loader = crate::document::DefaultFileLoader::new(
             std::sync::Arc::new(starpls_bazel::client::BazelCLI::new("bazel")),
@@ -217,11 +283,16 @@ mod tests {
                 std::path::Path::new("main.star"),
                 starpls_common::Dialect::Standard,
                 None,
-                "😀x\n".into(),
+                text.into(),
                 0,
             )
             .unwrap();
-        let source = analysis.snapshot().source(file).unwrap();
+        (analysis.snapshot().source(file).unwrap(), file)
+    }
+
+    #[test]
+    fn diagnostic_conversion_preserves_protocol_fields() {
+        let (source, file) = source("😀x\n");
         for (severity, tag, severity_number, tag_number) in [
             (starpls_common::Severity::Error, None, 1, None),
             (
@@ -257,6 +328,38 @@ mod tests {
             }
             assert_eq!(serde_json::to_value(converted).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn semantic_tokens_split_multiline_strings_and_encode_utf16_deltas() {
+        let text = "x = \"\"\"😀\r\nβ\r\n\"\"\"; y\n";
+        let (source, _) = source(text);
+        let tokens = [
+            starpls_ide::SemanticToken {
+                range: (4.into()..20.into()).into(),
+                token_type: starpls_ide::SemanticTokenType::String,
+                modifiers: starpls_ide::SemanticTokenModifier::empty(),
+            },
+            starpls_ide::SemanticToken {
+                range: (22.into()..23.into()).into(),
+                token_type: starpls_ide::SemanticTokenType::Variable,
+                modifiers: starpls_ide::SemanticTokenModifier::READONLY,
+            },
+        ];
+        let actual = super::lsp_semantic_tokens(&tokens, &source);
+        let positions: Vec<_> = actual
+            .iter()
+            .map(|token| (token.delta_line, token.delta_start, token.length))
+            .collect();
+        assert_eq!(positions, [(0, 4, 5), (1, 0, 1), (1, 0, 3), (0, 5, 1)]);
+        assert_eq!(
+            actual[3].token_type,
+            starpls_ide::SemanticTokenType::Variable as u32
+        );
+        assert_eq!(
+            actual[3].token_modifiers_bitset,
+            starpls_ide::SemanticTokenModifier::READONLY.bits()
+        );
     }
 
     #[test]
