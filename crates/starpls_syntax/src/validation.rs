@@ -245,6 +245,15 @@ impl Validator<'_> {
             return;
         }
         match stmt {
+            Stmt::ClassDef(class) => {
+                if self.annotation_mode == AnnotationMode::Interface {
+                    self.visit_identifier(&class.name);
+                    self.visit_body(&class.body);
+                } else {
+                    self.excluded.push(stmt.node_index().load());
+                    self.unsupported(stmt.range());
+                }
+            }
             Stmt::FunctionDef(def) => {
                 let py::StmtFunctionDef {
                     node_index: _,
@@ -522,6 +531,26 @@ impl Validator<'_> {
 /// Declaration shape only; the ordinary visitor still validates names and annotations.
 fn interface_statement(statement: &Stmt) -> bool {
     match statement {
+        Stmt::ClassDef(class) => {
+            class.decorator_list.is_empty()
+                && class.type_params.is_none()
+                && class
+                    .arguments
+                    .as_ref()
+                    .is_none_or(|arguments| arguments.is_empty())
+                && class.body.iter().all(|statement| match statement {
+                    Stmt::AnnAssign(_) => interface_statement(statement),
+                    Stmt::FunctionDef(function) => {
+                        function.name.as_str() == "__init__" && interface_statement(statement)
+                    }
+                    Stmt::Expr(statement) => {
+                        statement.value.is_string_literal_expr()
+                            || statement.value.is_ellipsis_literal_expr()
+                    }
+                    Stmt::Pass(_) => true,
+                    _ => false,
+                })
+        }
         Stmt::FunctionDef(function) => {
             let mut body = function.body.as_slice();
             if let [Stmt::Expr(doc), rest @ ..] = body {
@@ -690,6 +719,14 @@ mod tests {
             ("value: int = ...", true),
             ("def f(value, other: int = ...) -> string: ...", true),
             ("def f():\n    \"Documentation\"\n    pass", true),
+            (
+                "class Info:\n    value: str\n    def __init__(self, *, value: str) -> None: ...",
+                true,
+            ),
+            ("class Info:\n    value: Info | None", true),
+            ("class Info(Base):\n    value: int", false),
+            ("class Info:\n    def method(self): ...", false),
+            ("class Info:\n    value = 1", false),
             (
                 "load(\"types.bzl\", \"Info\")\ndef f(value: Info): ...",
                 true,

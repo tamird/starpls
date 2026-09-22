@@ -362,7 +362,7 @@ fn type_documentation<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<
         }
         _ => false,
     };
-    if native || is_function_type(ty) {
+    if native || is_function_type(ty) || matches!(ty, Type::ClassLiteral(_)) {
         definition
             .docstring(db)
             .map(|doc| Docstring::new(doc.to_string()))

@@ -11,16 +11,57 @@ DEFAULT_TIMEOUT: int
 def fetch(name: string, timeout: int = ...) -> list[string]: ...
 ```
 
-A stub consists of variable annotations, function declarations, loads,
+A stub consists of variable annotations, function and provider declarations, loads,
 docstrings, and placeholders. Variable initializers and parameter defaults are
 omitted or `...`. A function body consists of an optional docstring followed by
-`...` or `pass`. Variables and functions declared in the stub define its exports;
+`...` or `pass`. Variables, functions, and provider classes declared in the stub define its exports;
 loaded names are available in annotation expressions.
 
 For each name loaded from a mapped `.bzl` module, Starpls uses the stub declaration
 when present and source inference otherwise. Annotations are resolved in the
 stub's scope. Stubs are trusted contracts; implementation validation is a
 separate check.
+
+## Providers
+
+A provider export is declared as a class with readonly fields and an explicit
+constructor:
+
+```starlark
+class FilesInfo:
+    files: Final[depset[File]]
+
+    def __init__(self, *, files: depset[File]) -> None: ...
+```
+
+`Final[T]` declares a field with value type `T`. Every declared field is present
+on an instance. `T | None` permits a `None` value. Constructors declare accepted
+arguments using ordinary function annotations. A provider class contains field
+annotations, `__init__`, docstrings, and placeholders; its identity is distinct
+from every other provider class. Field and constructor annotations resolve in
+the stub scope, including references to the provider itself.
+
+Starpls follows source aliases and reexports to pair the class with a unique
+`provider(...)` declaration. The paired class supplies the nominal identity for
+source instances, callers, annotations, and `Target` lookups. Multiple distinct
+classes claiming the same declaration are an error. A stub may expose a subset
+of the fields allowed by the source provider.
+
+For a provider with an initializer, `__init__` describes the initializer's public
+arguments. An exported raw constructor has its own declaration:
+
+```starlark
+class FilesInfo:
+    files: Final[depset[File]]
+
+    def __init__(self, files: list[File]) -> None: ...
+
+def raw_files(*, files: depset[File]) -> FilesInfo: ...
+```
+
+Raw constructors accept field values directly. Each declared field is a required
+keyword argument. The source raw binding and the stub return type identify the
+same provider.
 
 ## Implementation validation
 

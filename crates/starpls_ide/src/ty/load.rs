@@ -188,7 +188,7 @@ pub(super) fn resolve<'db>(
 }
 
 pub(crate) fn binding_names(
-    db: &Database,
+    db: &dyn super::interface::Db,
     definition: Definition<'_>,
 ) -> Option<(starpls_common::File, Box<str>, Box<str>)> {
     let file = definition.program_file(db);

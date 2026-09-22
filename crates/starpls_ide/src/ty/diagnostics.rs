@@ -72,6 +72,10 @@ pub(super) static INCOMPLETE_STUB_VALIDATION: LintMetadata = lint(
     "incomplete-stub-validation",
     "Reports stub contracts that could not be proved.",
 );
+pub(super) static INVALID_PROVIDER_INTERFACE: LintMetadata = lint(
+    "invalid-provider-interface",
+    "Reports invalid or conflicting provider declarations in stubs.",
+);
 
 pub(super) fn registry() -> &'static LintRegistry {
     static REGISTRY: LazyLock<LintRegistry> = LazyLock::new(|| {
@@ -84,6 +88,7 @@ pub(super) fn registry() -> &'static LintRegistry {
             &DEPRECATED_ARGUMENT,
             &INVALID_STUB_IMPLEMENTATION,
             &INCOMPLETE_STUB_VALIDATION,
+            &INVALID_PROVIDER_INTERFACE,
         ] {
             builder.register_lint(lint);
         }
@@ -147,6 +152,7 @@ pub(super) fn check_with_diagnostics(
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let options = db.environment().options(db);
     diagnostics.extend(load::diagnostics(db, program_file));
+    diagnostics.extend(super::interface::diagnostics(db, file));
     if !options.allow_unused_definitions {
         let index = semantic_index(db, program_file);
         for definition in unused_definitions(db, program_file) {
@@ -168,7 +174,10 @@ pub(super) fn check_with_diagnostics(
             };
             let name = index.place_table(scope).symbol(symbol).name();
             let is_module = index.scope(scope).kind() == ScopeKind::Module;
-            if name == "_" || (is_module && !name.starts_with('_')) {
+            if name == "_"
+                || (is_module && !name.starts_with('_'))
+                || (file.is_type_interface(db) && index.scope(scope).kind() == ScopeKind::Class)
+            {
                 continue;
             }
             diagnostics.push(tagged(

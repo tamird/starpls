@@ -232,7 +232,7 @@ impl Database {
                 .chain(starpls_bazel::BUILTINS_VALUES_DENY_LIST.iter().copied())
                 .chain([
                     "str", "string", "Any", "Unknown", "unknown", "NoneType", "Sequence",
-                    "Iterable",
+                    "Iterable", "Final", "Callable",
                 ]);
             return candidates
                 .filter(|name| {
@@ -242,6 +242,7 @@ impl Database {
                             ty_python_semantic::types::Type::ClassLiteral(_)
                                 | ty_python_semantic::types::Type::GenericAlias(_)
                                 | ty_python_semantic::types::Type::Dynamic(_)
+                                | ty_python_semantic::types::Type::SpecialForm(_)
                         )
                     )
                 })

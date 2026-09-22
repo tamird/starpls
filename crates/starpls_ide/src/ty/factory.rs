@@ -6,6 +6,7 @@ use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
+use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use starpls_bazel::attr::AttributeKind;
@@ -1079,6 +1080,33 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
 
 fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
+    let initializer = match call.argument("init") {
+        CheckedArgument::Omitted => None,
+        CheckedArgument::Indeterminate => return None,
+        CheckedArgument::Value { ty, expression: _ } => (!ty.is_none(db)).then_some(ty),
+    };
+    let name = provider_name(db, call, initializer.is_some());
+    if let Some(class) = db.provider_interface(call.file(), call.call().node_index().load()) {
+        if initializer.is_none() {
+            return Some(class);
+        }
+        let fields = super::interface::provider_fields(db, class, &environment)?;
+        let parameters = fields
+            .into_iter()
+            .map(|ProvidedField { name, ty, source }| {
+                let parameter = Parameter::keyword_only(name).with_annotated_type(ty);
+                match source {
+                    Some(source) => parameter.with_source_range(source),
+                    None => parameter,
+                }
+            });
+        let instance = class.to_instance_approximation(db, &environment)?;
+        let raw = Type::single_callable(
+            db,
+            Signature::new(Parameters::standard(parameters), instance),
+        );
+        return Some(Type::heterogeneous_tuple(db, &environment, [class, raw]));
+    }
     let mut fields: Vec<ProvidedField<'_>> = Vec::new();
     let mut open = false;
     let mut documentation = Documentation {
@@ -1142,11 +1170,6 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     if open {
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
     }
-    let initializer = match call.argument("init") {
-        CheckedArgument::Omitted => None,
-        CheckedArgument::Indeterminate => return None,
-        CheckedArgument::Value { ty, expression: _ } => (!ty.is_none(db)).then_some(ty),
-    };
     let self_parameter = || Parameter::positional_only(Some(Name::new("self")));
     let init = if let Some(initializer) = initializer {
         initializer.map_callable_signatures(
@@ -1171,27 +1194,6 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             ),
         )
     };
-    let parsed = ruff_db::parsed::parsed_module(db, call.file().python_file(db)).load(db);
-    let node = covering_node(parsed.syntax().into(), call.call().range());
-    let name = node.parent().and_then(|parent| {
-        let AnyNodeRef::StmtAssign(assignment) = parent else {
-            return None;
-        };
-        let [target] = assignment.targets.as_slice() else {
-            return None;
-        };
-        let target = match target {
-            Expr::Tuple(tuple) => {
-                initializer?;
-                tuple.elts.first()?
-            }
-            _ => target,
-        };
-        let Expr::Name(name) = target else {
-            return None;
-        };
-        Some(name.id.clone())
-    });
     let class = call.class_type(
         db,
         ProvidedClass {
@@ -1216,6 +1218,32 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     } else {
         Some(class)
     }
+}
+
+fn provider_name(db: &Database, call: &CheckedCall<'_, '_>, initialized: bool) -> Option<Name> {
+    let parsed = ruff_db::parsed::parsed_module(db, call.file().python_file(db)).load(db);
+    let node = covering_node(parsed.syntax().into(), call.call().range());
+    node.parent().and_then(|parent| {
+        let AnyNodeRef::StmtAssign(assignment) = parent else {
+            return None;
+        };
+        let [target] = assignment.targets.as_slice() else {
+            return None;
+        };
+        let target = match target {
+            Expr::Tuple(tuple) => {
+                if !initialized {
+                    return None;
+                }
+                tuple.elts.first()?
+            }
+            _ => target,
+        };
+        let Expr::Name(name) = target else {
+            return None;
+        };
+        Some(name.id.clone())
+    })
 }
 
 fn declared_base<'db>(

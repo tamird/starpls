@@ -2,8 +2,15 @@
 
 use std::collections::hash_map::Entry;
 
+use ruff_db::files::FileRange;
 use ruff_db::Db as _;
+use ruff_python_ast::Expr;
+use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::NodeIndex;
+use ruff_python_ast::Stmt;
+use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use salsa::Setter;
 use starpls_common::File;
 use starpls_hir::Db as _;
@@ -13,9 +20,131 @@ use ty_python_core::global_scope;
 use ty_python_core::place_table;
 use ty_python_core::use_def_map;
 use ty_python_core::ProgramFile;
+use ty_python_semantic::provided::ProvidedField;
+use ty_python_semantic::types::ide_support::definitions_for_name;
+use ty_python_semantic::types::list_members::all_end_of_scope_members;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::types::TypeDefinition;
+use ty_python_semantic::ImportAliasResolution;
+use ty_python_semantic::ProgramEnvironment;
+use ty_python_semantic::SemanticModel;
 
 use crate::Analysis;
 use crate::Database;
+
+#[salsa::db]
+pub(crate) trait Db: ty_python_semantic::Db + starpls_hir::Db {
+    fn starlark_program_file(&self, file: File) -> ProgramFile<'_>;
+    fn starlark_file(&self, file: ProgramFile<'_>) -> Option<File>;
+}
+
+#[salsa::db]
+impl Db for Database {
+    fn starlark_program_file(&self, file: File) -> ProgramFile<'_> {
+        Database::starlark_program_file(self, file)
+    }
+    fn starlark_file(&self, file: ProgramFile<'_>) -> Option<File> {
+        Database::starlark_file(self, file)
+    }
+}
+
+pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic::Diagnostic> {
+    use ruff_db::diagnostic::Annotation;
+    use ruff_db::diagnostic::Diagnostic;
+    use ruff_db::diagnostic::DiagnosticId;
+    use ruff_db::diagnostic::Severity;
+    use ruff_db::diagnostic::Span;
+    if !file.is_type_interface(db) {
+        return Vec::new();
+    }
+    let program = db.starlark_program_file(file);
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let model = SemanticModel::new(db, program);
+    let mut diagnostics = Vec::new();
+    let mut report = |range, message: String| {
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(super::diagnostics::INVALID_PROVIDER_INTERFACE.name()),
+            Severity::Error,
+            message,
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(file.source).with_range(range),
+        ));
+        diagnostics.push(diagnostic);
+    };
+    for statement in parsed.suite() {
+        let Stmt::ClassDef(class) = statement else {
+            continue;
+        };
+        if !class.body.iter().any(|statement| matches!(statement, Stmt::FunctionDef(function) if function.name.as_str() == "__init__")) {
+            report(class.name.range, "Provider classes require an explicit __init__ declaration".into());
+        }
+        for statement in &class.body {
+            let Stmt::AnnAssign(field) = statement else {
+                continue;
+            };
+            let Some(name) = field.target.as_name_expr() else {
+                continue;
+            };
+            let qualifiers = model.type_qualifiers(name.into());
+            if name.id.starts_with("__") && name.id.ends_with("__") {
+                report(
+                    name.range(),
+                    "Provider fields cannot define special methods".into(),
+                );
+            } else if !qualifiers.contains(ty_python_semantic::TypeQualifiers::FINAL)
+                || qualifiers.contains(ty_python_semantic::TypeQualifiers::CLASS_VAR)
+            {
+                report(
+                    name.range(),
+                    "Provider fields require an instance annotation of the form Final[T]".into(),
+                );
+            }
+        }
+    }
+    diagnostics.extend(pairing_diagnostics(db, file));
+
+    diagnostics
+}
+
+pub(super) fn pairing_diagnostics(
+    db: &Database,
+    file: File,
+) -> Vec<ruff_db::diagnostic::Diagnostic> {
+    use ruff_db::diagnostic::Annotation;
+    use ruff_db::diagnostic::Diagnostic;
+    use ruff_db::diagnostic::DiagnosticId;
+    use ruff_db::diagnostic::Severity;
+    use ruff_db::diagnostic::Span;
+    let program = db.starlark_program_file(file);
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let mut diagnostics = Vec::new();
+    let mut report = |range, message: String| {
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(super::diagnostics::INVALID_PROVIDER_INTERFACE.name()),
+            Severity::Error,
+            message,
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(file.source).with_range(range),
+        ));
+        diagnostics.push(diagnostic);
+    };
+    for definitions in provider_pairs(db)
+        .values()
+        .filter(|definitions| definitions.len() > 1)
+    {
+        for definition in definitions {
+            if definition.program_file(db) == program {
+                report(
+                    definition.kind(db).target_range(&parsed),
+                    "Multiple stub classes describe the same provider declaration".into(),
+                );
+            }
+        }
+    }
+    diagnostics
+}
 
 impl Analysis {
     /// Replace the explicit trusted contracts atomically after validating every mapping.
@@ -87,6 +216,21 @@ impl Analysis {
 }
 
 impl Database {
+    /// Pair by a unique source call, including aliases, without inferring its result.
+    pub(super) fn provider_interface<'db>(
+        &'db self,
+        source: ProgramFile<'db>,
+        call: NodeIndex,
+    ) -> Option<Type<'db>> {
+        let [definition] = provider_pairs(self)
+            .get(&(source, call.as_u32()?))?
+            .as_slice()
+        else {
+            return None;
+        };
+        Some(SemanticModel::new(self, definition.program_file(self)).definition_type(*definition))
+    }
+
     pub(crate) fn type_interface(&self, from: File, source: File) -> Option<File> {
         let mappings = self.environment().type_interfaces(self);
         if mappings.is_empty() {
@@ -139,8 +283,136 @@ impl Database {
     }
 }
 
-pub(crate) fn export_definitions<'db>(
+/// Correspondence is syntax and binding provenance; type inference begins after selection.
+#[salsa::tracked(returns(ref))]
+fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definition<'_>>> {
+    let mut pairs: FxHashMap<_, Vec<_>> = FxHashMap::default();
+    for (implementation, interface) in db.environment().type_interfaces(db).values() {
+        let file = db.starlark_program_file(*interface);
+        for symbol in place_table(db, global_scope(db, file)).symbols() {
+            let definitions = export_definitions(db, file, symbol.name());
+            let [definition] = definitions.as_slice() else {
+                continue;
+            };
+            if !matches!(definition.kind(db), DefinitionKind::Class(_)) {
+                continue;
+            }
+            let implementations =
+                export_definitions(db, db.starlark_program_file(*implementation), symbol.name());
+            let [implementation] = implementations.as_slice() else {
+                continue;
+            };
+            let Some(origin) = provider_origin(db, *implementation, &mut FxHashSet::default())
+            else {
+                continue;
+            };
+            let definitions = pairs.entry(origin).or_default();
+            if !definitions.contains(definition) {
+                definitions.push(*definition);
+            }
+        }
+    }
+    pairs
+}
+
+fn provider_origin<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    visited: &mut FxHashSet<Definition<'db>>,
+) -> Option<(ProgramFile<'db>, u32)> {
+    if !visited.insert(definition) {
+        return None;
+    }
+    let file = definition.program_file(db);
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    match definition.kind(db) {
+        DefinitionKind::Assignment(assignment) => match assignment.value(&parsed) {
+            Expr::Call(call) => {
+                if assignment.unpack().is_some() {
+                    let node = ruff_python_ast::find_node::covering_node(
+                        parsed.syntax().into(),
+                        call.range(),
+                    );
+                    let ruff_python_ast::AnyNodeRef::StmtAssign(parent) = node.parent()? else {
+                        return None;
+                    };
+                    let [Expr::Tuple(tuple)] = parent.targets.as_slice() else {
+                        return None;
+                    };
+                    if tuple.elts.first()?.range() != assignment.target(&parsed).range() {
+                        return None;
+                    }
+                }
+                Some((file, call.node_index().load().as_u32()?))
+            }
+            Expr::Name(name) => {
+                let model = SemanticModel::new(db, file);
+                let definitions = definitions_for_name(
+                    &model,
+                    &name.id,
+                    name.into(),
+                    ImportAliasResolution::PreserveAliases,
+                );
+                let [definition] = definitions.as_slice() else {
+                    return None;
+                };
+                provider_origin(db, definition.definition()?, visited)
+            }
+            _ => None,
+        },
+        DefinitionKind::ProvidedBinding(_) => {
+            let (from, module, name) = super::load::binding_names(db, definition)?;
+            let source = starpls_common::Db::load_file(db, &module, from.dialect, from).ok()??;
+            let definitions = export_definitions(db, db.starlark_program_file(source), &name);
+            let [definition] = definitions.as_slice() else {
+                return None;
+            };
+            provider_origin(db, *definition, visited)
+        }
+        _ => None,
+    }
+}
+
+/// Read annotation types and origins from Ty's class scope, including recursive fields.
+pub(super) fn provider_fields<'db>(
     db: &'db Database,
+    class: Type<'db>,
+    environment: &ProgramEnvironment<'db>,
+) -> Option<Vec<ProvidedField<'db>>> {
+    let TypeDefinition::StaticClass(definition) = class.definition(db, environment)? else {
+        return None;
+    };
+    let DefinitionKind::Class(class) = definition.kind(db) else {
+        return None;
+    };
+    let file = definition.program_file(db);
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let class = class.node(&parsed);
+    let index = ty_python_core::semantic_index(db, file);
+    let scope = index
+        .node_scope(ty_python_core::scope::NodeWithScopeRef::Class(class))
+        .to_scope_id(db, file);
+    let members: Vec<_> = all_end_of_scope_members(db, scope).collect();
+    let mut fields = Vec::new();
+    for statement in &class.body {
+        let Stmt::AnnAssign(assignment) = statement else {
+            continue;
+        };
+        let name = assignment.target.as_name_expr()?;
+        let member = members
+            .iter()
+            .find(|member| member.member.name == name.id)?;
+        fields.push(ProvidedField {
+            name: name.id.clone(),
+            ty: member.member.ty,
+            source: Some(FileRange::new(file.file(db), name.range())),
+        });
+    }
+    Some(fields)
+}
+
+pub(crate) fn export_definitions<'db>(
+    db: &'db dyn Db,
     file: ProgramFile<'db>,
     name: &str,
 ) -> Vec<Definition<'db>> {
@@ -165,6 +437,258 @@ mod tests {
     use crate::Analysis;
     use crate::FilePosition;
     use crate::LocationLink;
+
+    #[test]
+    fn provider_classes_share_source_identity_and_recursive_fields() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "Info = provider(fields=['value', 'next'])\ndef consume(value: Info) -> Info:\n    return value\noriginal = Info(value='source', next=None)\n",
+        );
+        let interface = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "class Info:\n    value: Final[str]\n    next: Final[Info | None]\n    def __init__(self, *, value: str, next: Info | None) -> None: ...\n",
+        );
+        let caller_text = "load('source.bzl', 'Info', 'consume', 'original')\nitem = consume(Info(value='ok', next=original))\ntext = item.value\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        for file in [source, interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        let hover = analysis
+            .snapshot()
+            .hover(FilePosition {
+                file_id: caller,
+                pos: (caller_text.rfind("value").unwrap() as u32).into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains("value: str"),
+            "{}",
+            hover.contents.value
+        );
+        for bad_call in [
+            "Info(value=42, next=None)",
+            "Info(value='missing')",
+            "item.value = 'changed'",
+            "Other = provider(fields=['value', 'next'])\nconsume(Other(value='ok', next=None))",
+        ] {
+            analysis.update_file(caller, format!("{caller_text}{bad_call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{bad_call}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn provider_aliases_raw_constructors_and_editor_origins_follow_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "");
+        let interface = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        let caller_text = "load('source.bzl', 'Info', 'raw')\nitem = raw(value='ok')\ntext = item.value\ndef consume(target: Target) -> str:\n    return target[Info].value\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        for (prefix, annotation, valid) in [
+            ("", "str", true),
+            ("# moved declaration\n", "int", false),
+            ("\n", "str", true),
+        ] {
+            let source_text = format!("{prefix}def _init(value):\n    return {{'value': value}}\n_Original, raw = provider(fields=['value'], init=_init)\nInfo = _Original\n");
+            let interface_text = format!("{prefix}class Info:\n    \"\"\"Provider documentation.\"\"\"\n    value: Final[{annotation}]\n    def __init__(self, value: {annotation}) -> None: ...\ndef raw(*, value: {annotation}) -> Info: ...\n");
+            analysis.update_file(source, source_text.clone());
+            analysis.update_file(interface, interface_text.clone());
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(caller).unwrap();
+            assert_eq!(diagnostics.is_empty(), valid, "{diagnostics:?}");
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.rfind(".value").unwrap() as u32 + 1).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains(annotation),
+                "{}",
+                hover.contents.value
+            );
+            let provider_hover = snapshot
+                .hover(FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.rfind("Info").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                provider_hover
+                    .contents
+                    .value
+                    .contains("Provider documentation."),
+                "{}",
+                provider_hover.contents.value
+            );
+            for (needle, target, expected) in
+                [(".value", interface, "value"), ("Info", source, "Info")]
+            {
+                let offset =
+                    caller_text.rfind(needle).unwrap() + usize::from(needle.starts_with('.'));
+                let locations = snapshot
+                    .goto_definition(
+                        FilePosition {
+                            file_id: caller,
+                            pos: (offset as u32).into(),
+                        },
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let [LocationLink::Local {
+                    target_file_id,
+                    target_selection_range,
+                    origin_selection_range: _,
+                    target_range: _,
+                }] = locations.as_slice()
+                else {
+                    panic!("{locations:?}");
+                };
+                assert_eq!(*target_file_id, target.source);
+                let text = if target == source {
+                    &source_text
+                } else {
+                    &interface_text
+                };
+                assert_eq!(&text[*target_selection_range], expected);
+            }
+            let help = snapshot
+                .signature_help(FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.find("'ok'").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                help.signatures
+                    .iter()
+                    .any(|signature| signature.label.contains(&format!("value: {annotation}"))),
+                "{help:?}"
+            );
+            let completions = snapshot
+                .completions(
+                    FilePosition {
+                        file_id: caller,
+                        pos: (caller_text.rfind(".value").unwrap() as u32 + 1).into(),
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                completions.iter().any(|item| item.label == "value"),
+                "{completions:?}"
+            );
+        }
+        analysis.update_file(
+            interface,
+            "class Info:\n    value: Fi\n    def __init__(self, *, value: str) -> None: ...\n"
+                .into(),
+        );
+        let completions = analysis
+            .snapshot()
+            .completions(
+                FilePosition {
+                    file_id: interface,
+                    pos: 25.into(),
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            completions.iter().any(|item| item.label == "Final"),
+            "{completions:?}"
+        );
+    }
+
+    #[test]
+    fn provider_pairing_rejects_distinct_contracts_for_one_key() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "Info = provider(fields=['value'])\nAlias = Info\n",
+        );
+        let reexport = fixture.add_file(
+            &mut analysis.db,
+            "reexport.bzl",
+            "load('source.bzl', _Info='Info')\nInfo = _Info\n",
+        );
+        let class = "class Info:\n    value: Final[str]\n    def __init__(self, *, value: str) -> None: ...\n";
+        let interface = fixture.add_file(&mut analysis.db, "source.bzli", class);
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", "load('source.bzl', 'Info')\nload('reexport.bzl', Other='Info')\ndef consume(value: Info) -> str:\n    return value.value\ntext = consume(Other(value='ok'))\n");
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis
+            .set_type_interfaces([(source, interface), (reexport, interface)])
+            .unwrap();
+        for file in [interface, caller] {
+            assert!(analysis.snapshot().diagnostics(file).unwrap().is_empty());
+        }
+        analysis.update_file(
+            interface,
+            format!("{class}{}", class.replace("Info", "Alias")),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(interface).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.id().as_str() == "invalid-provider-interface")
+                .count(),
+            2,
+            "{diagnostics:?}"
+        );
+        analysis.update_file(interface, class.into());
+        for text in [
+            "Info = provider(fields=['value'])\n",
+            "# shifted\nInfo = provider(fields=['value'])\n",
+        ] {
+            analysis.update_file(source, text.into());
+            assert!(analysis.snapshot().diagnostics(caller).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn trusted_exports_are_partial_and_independent_of_the_implementation() {
