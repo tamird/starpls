@@ -1263,7 +1263,7 @@ foo(
 "#,
             expect![[r#"
                 ```python
-                (parameter) bar: str
+                (parameter) bar: str | select[str | None] | None
                 ```
                 The bar attr
             "#]],

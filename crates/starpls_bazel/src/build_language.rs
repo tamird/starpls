@@ -41,9 +41,9 @@ pub fn attribute_type_string_from_discriminator(value: Discriminator) -> String 
     match value {
         Integer | Tristate => "int",
         String | License => "string",
-        Label => "Label",
+        Label | Output => "Label",
         StringList | DistributionSet => "List of strings",
-        LabelList => "List of Labels",
+        LabelList | OutputList => "List of Labels",
         Boolean => "boolean",
         IntegerList => "List of ints",
         LabelListDict => "Dict of Labels",

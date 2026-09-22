@@ -40,6 +40,7 @@ pub(super) struct Attribute {
     pub(super) single_file: Option<bool>,
     pub(super) executable: Option<bool>,
     pub(super) configuration: AttributeConfiguration,
+    configurability: Configurability,
     mandatory: bool,
     default: Option<FileRange>,
     documentation: Option<Box<str>>,
@@ -50,6 +51,26 @@ pub(super) enum AttributeConfiguration {
     Ordinary,
     Starlark,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Configurability {
+    Default,
+    Explicit(bool),
+    Unknown,
+}
+
+impl Attribute {
+    fn configurable(&self) -> Option<bool> {
+        if matches!(self.kind, AttributeKind::Output | AttributeKind::OutputList) {
+            return Some(false);
+        }
+        match self.configurability {
+            Configurability::Default => Some(true),
+            Configurability::Explicit(value) => Some(value),
+            Configurability::Unknown => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
@@ -259,6 +280,14 @@ fn attribute<'db>(
         }
         CheckedArgument::Indeterminate => AttributeConfiguration::Unknown,
     };
+    let configurability = match call.argument("configurable") {
+        CheckedArgument::Omitted => Configurability::Default,
+        CheckedArgument::Value { ty, expression: _ } => match ty.as_bool_literal() {
+            Some(value) => Configurability::Explicit(value),
+            None => Configurability::Unknown,
+        },
+        CheckedArgument::Indeterminate => Configurability::Unknown,
+    };
     let class = call.class_type(
         db,
         ProvidedClass {
@@ -273,6 +302,7 @@ fn attribute<'db>(
                     single_file,
                     executable: flag("executable"),
                     configuration,
+                    configurability,
                     mandatory,
                     default,
                     documentation: doc_string(db, call),
@@ -321,15 +351,20 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         .into_iter()
         .map(|attribute| {
             let ty = attribute_type(db, call, &attribute.r#type)?;
+            let ty = if attribute.configurable && !matches!(kind, RuleKind::Repository) {
+                configurable_input(db, call, ty)?
+            } else {
+                ty
+            };
             let name = Name::new(attribute.name);
             let parameter = Parameter::keyword_only(name.clone()).with_annotated_type(ty);
             let parameter = if attribute.is_mandatory {
                 parameter
             } else {
-                let parameter = parameter.with_default_type(Type::unknown());
+                let parameter = optional_attribute(db, &environment, parameter)
+                    .with_default_type(Type::unknown());
                 if matches!(kind, RuleKind::Macro) {
-                    optional_macro_attribute(db, &environment, parameter)
-                        .with_default_type(Type::none(db, &environment))
+                    parameter.with_default_type(Type::none(db, &environment))
                 } else {
                     parameter
                 }
@@ -402,6 +437,13 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                 .with_default_type(Type::unknown());
         } else if let Some(attribute) = attribute {
             let ty = attribute_type(db, call, &attribute.kind)?;
+            let ty = if !matches!(kind, RuleKind::Repository)
+                && attribute.configurable() != Some(false)
+            {
+                configurable_input(db, call, ty)?
+            } else {
+                ty
+            };
             parameter = parameter.with_annotated_type(ty);
             if let Some(doc) = &attribute.documentation {
                 documentation
@@ -413,9 +455,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                     Some(source) => parameter.with_default(ParameterDefault::Source { ty, source }),
                     None => parameter.with_default_type(Type::unknown()),
                 };
-                if matches!(kind, RuleKind::Macro) {
-                    parameter = optional_macro_attribute(db, &environment, parameter);
-                }
+                parameter = optional_attribute(db, &environment, parameter);
             }
         } else {
             // Keep a known attribute name navigable during recovery. An
@@ -540,7 +580,7 @@ fn inherit_macro_attributes<'db>(
             continue;
         }
         let parameter = if default_type.is_some() {
-            optional_macro_attribute(db, &environment, parameter.clone())
+            optional_attribute(db, &environment, parameter.clone())
                 .with_default_type(Type::none(db, &environment))
         } else {
             parameter.clone()
@@ -566,7 +606,7 @@ fn inherit_macro_attributes<'db>(
     complete
 }
 
-fn optional_macro_attribute<'db>(
+fn optional_attribute<'db>(
     db: &'db Database,
     environment: &ProgramEnvironment<'db>,
     parameter: Parameter<'db>,
@@ -581,6 +621,36 @@ fn optional_macro_attribute<'db>(
         environment,
         [ty, Type::none(db, environment)],
     ))
+}
+
+fn configurable_input<'db>(
+    db: &'db Database,
+    call: &CheckedCall<'_, 'db>,
+    value: Type<'db>,
+) -> Option<Type<'db>> {
+    let environment = ProgramEnvironment::from_file(call.file());
+    let declaration = call.declaration()?;
+    let alternatives =
+        UnionType::from_elements(db, &environment, [value, Type::none(db, &environment)]);
+    let selected = select_type(db, &environment, declaration.program_file(db), alternatives)?;
+    Some(UnionType::from_elements(
+        db,
+        &environment,
+        [value, selected],
+    ))
+}
+
+pub(super) fn select_type<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    declarations: ProgramFile<'db>,
+    value: Type<'db>,
+) -> Option<Type<'db>> {
+    // The generated select declaration has exactly one type parameter.
+    let class = native_class(db, declarations, "select")?;
+    let class = class.as_class_literal()?;
+    let specialized = class.apply_specialization(db, |context| context.specialize(db, vec![value]));
+    Type::from(specialized).to_instance_approximation(db, environment)
 }
 
 fn attribute_type<'db>(
@@ -646,7 +716,7 @@ pub(super) fn attribute_value_type<'db>(
         })
     };
     let output = || match usage {
-        AttributeUse::Input => Some(string),
+        AttributeUse::Input => label(),
         AttributeUse::BuildContext => {
             let class = native_class(db, declarations, "Label")?;
             class.to_instance_approximation(db, environment)

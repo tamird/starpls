@@ -432,6 +432,112 @@ mutable(name="ok", observed="unproved")
     }
 
     #[test]
+    fn configurable_attributes_check_select_alternatives() {
+        let source = r#"
+def rule_impl(ctx):
+    pass
+def implementation(name, visibility, **kwargs):
+    pass
+source_rule = rule(implementation=rule_impl, attrs={
+    "srcs": attr.label_list(), "out": attr.output(),
+})
+required_rule = rule(implementation=rule_impl, attrs={"value": attr.string(mandatory=True)})
+repository = repository_rule(implementation=rule_impl, attrs={"srcs": attr.label_list()})
+required_repository = repository_rule(implementation=rule_impl, attrs={"value": attr.string(mandatory=True)})
+parent = macro(implementation=implementation, attrs={
+    "srcs": attr.label_list(),
+    "target": attr.label(mandatory=True, configurable=False),
+})
+child = macro(implementation=implementation, inherit_attrs=parent)
+common = macro(implementation=implementation, inherit_attrs="common")
+native_child = macro(implementation=implementation, inherit_attrs=native.example)
+def uncertain():
+    # type: () -> bool
+    return True
+partial = macro(implementation=implementation,
+                attrs={"value": attr.string(configurable=uncertain())})
+paths = select({"//:condition": ["//:input"], "//conditions:default": []})
+source_rule(name="ok", srcs=paths + ["//:extra"], out="out")
+source_rule(name="label_output", out=Label("//:out"))
+source_rule(name="default", srcs=select({"//:condition": None}))
+source_rule(name="omitted", srcs=None, out=None, tags=None)
+repository(name="omitted", srcs=None)
+child(name="ok", target="//:input", srcs=paths)
+common(name="ok", features=select({"//:condition": ["feature"]}))
+native.example(name="ok", srcs=paths, target="//:input", uncertain=select({"//:condition": "ok"}), outs=[Label("//:out")])
+native.example(name="omitted", srcs=None, target=None, outs=None)
+native_child(name="ok", srcs=paths, target="//:input")
+partial(name="ok", value=select({"//:condition": "ok"}))
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let builtins = analysis
+            .db
+            .get_builtin_defs(&starpls_common::Dialect::Bazel)
+            .builtins(&analysis.db)
+            .clone();
+        use starpls_bazel::build::attribute::Discriminator;
+        analysis
+            .set_builtin_defs(
+                builtins,
+                starpls_bazel::build::BuildLanguage {
+                    rule: vec![starpls_bazel::build::RuleDefinition {
+                        name: "example".to_owned(),
+                        attribute: [
+                            ("name", Discriminator::String, Some(false), true),
+                            ("srcs", Discriminator::LabelList, Some(true), false),
+                            ("target", Discriminator::Label, Some(false), false),
+                            ("uncertain", Discriminator::String, None, false),
+                            ("outs", Discriminator::OutputList, None, false),
+                        ]
+                        .into_iter()
+                        .map(|(name, kind, configurable, mandatory)| {
+                            starpls_bazel::build::AttributeDefinition {
+                                name: name.to_owned(),
+                                r#type: kind as i32,
+                                configurable,
+                                mandatory: Some(mandatory),
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                        ..Default::default()
+                    }],
+                },
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for statement in [
+            "source_rule(name=None)",
+            "required_rule(name='bad', value=None)",
+            "required_repository(name='bad', value=None)",
+            "native.example(name=None)",
+            "child(name='bad', target=None)",
+            "source_rule(name='bad', srcs=select({'//:condition': [42]}))",
+            "source_rule(name='bad', srcs=select({'//:condition': ['ok'], '//conditions:default': [42]}))",
+            "source_rule(name='bad', out=select({'//:condition': 'out'}))",
+            "repository(name='bad', srcs=select({'//:condition': ['//:input']}))",
+            "source_rule(name=select({'//:condition': 'bad'}))",
+            "child(name='bad', target=select({'//:condition': '//:input'}))",
+            "child(name='bad', target='//:input', srcs=select({'//:condition': [42]}))",
+            "common(name='bad', tags=select({'//:condition': ['tag']}))",
+            "native.example(name='bad', target=select({'//:condition': '//:input'}))",
+            "native.example(name='bad', srcs=select({'//:condition': [42]}))",
+            "native.example(name='bad', uncertain=select({'//:condition': 42}))",
+            "native.example(name='bad', outs=select({'//:condition': ['out']}))",
+            "native_child(name='bad', target=select({'//:condition': '//:input'}))",
+            "partial(name='bad', value=select({'//:condition': 42}))",
+        ] {
+            analysis.update_file(file, format!("{source}\n{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{statement}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type", "{statement}");
+            assert!(diagnostics[0].range().unwrap().start().to_usize() >= source.len());
+        }
+    }
+
+    #[test]
     fn selects_preserve_alternatives_and_deferred_operations() {
         let source = r#"
 strings = {"//:condition": ["a"], "//conditions:default": []}

@@ -44,6 +44,7 @@ pub struct Attribute {
     pub doc: String,
     pub default_value: String,
     pub is_mandatory: bool,
+    pub configurable: bool,
 }
 
 pub fn make_common_attributes() -> CommonAttributes {

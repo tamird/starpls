@@ -28,7 +28,7 @@ pub(super) struct DeclarationSource {
 enum CallableKind<'a> {
     Function,
     Method(&'a str),
-    Rule,
+    Rule(&'a starpls_bazel::build::RuleDefinition),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,7 +346,12 @@ fn declarations(
         }
     }
     let mut rule_declarations = String::new();
-    for value in rule_values.iter().filter(|_| dialect == Dialect::Bazel) {
+    for (rule, value) in rules
+        .rule
+        .iter()
+        .zip(&rule_values)
+        .filter(|_| dialect == Dialect::Bazel)
+    {
         let Some(callable) = &value.callable else {
             continue;
         };
@@ -362,7 +367,7 @@ fn declarations(
             "    ",
             value,
             callable,
-            CallableKind::Rule,
+            CallableKind::Rule(rule),
             AnnotationUse::AttributeInput,
             &declared_classes,
         )?;
@@ -488,7 +493,7 @@ fn write_function(
     input: AnnotationUse,
     classes: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    let name = if matches!(kind, CallableKind::Rule) {
+    let name = if matches!(kind, CallableKind::Rule(_)) {
         "__call__"
     } else {
         &value.name
@@ -500,7 +505,7 @@ fn write_function(
         separator = ", ";
     }
     let mut optional = false;
-    let mut keyword_only = matches!(kind, CallableKind::Rule) && !callable.param.is_empty();
+    let mut keyword_only = matches!(kind, CallableKind::Rule(_)) && !callable.param.is_empty();
     if keyword_only {
         output.push_str(", *");
     }
@@ -558,6 +563,35 @@ fn write_function(
         let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
             annotation(r#type, *is_star_arg || *is_star_star_arg, classes, input)
         });
+        let parameter_type = if let CallableKind::Rule(rule) = kind {
+            let configurable = rule
+                .attribute
+                .iter()
+                .find(|attribute| attribute.name == name)
+                .and_then(|attribute| {
+                    use starpls_bazel::build::attribute::Discriminator;
+                    if matches!(
+                        attribute.r#type(),
+                        Discriminator::Output | Discriminator::OutputList
+                    ) {
+                        Some(false)
+                    } else {
+                        attribute.configurable
+                    }
+                });
+            let parameter_type = if configurable != Some(false) {
+                format!("{parameter_type} | _starpls_types.select[{parameter_type} | None]")
+            } else {
+                parameter_type
+            };
+            if *is_mandatory {
+                parameter_type
+            } else {
+                format!("{parameter_type} | None")
+            }
+        } else {
+            parameter_type
+        };
         write!(output, "{name}: {parameter_type}")?;
         if !is_star_arg && !is_star_star_arg && !is_mandatory {
             optional = true;
@@ -1089,7 +1123,7 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
                 assert!(
                     signature
                         .label
-                        .contains("generator_custom: str | None = None"),
+                        .contains("generator_custom: str | select[str | None] | None = None"),
                     "{signature:?}"
                 );
             }
