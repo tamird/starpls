@@ -74,6 +74,31 @@ You can see the config info [here](https://github.com/neovim/nvim-lspconfig/blob
 
 ## Tips and Tricks
 
+### Editor features
+
+In VS Code or Cursor, use **Find All References**, **Rename Symbol**, and
+**Go to Definition** on Starlark names. References include unopened Bazel
+files in the workspace, loaded dependencies, and configured stubs. An
+initial search can take longer while Bazel resolves dependencies.
+
+Rename updates workspace declarations, callers, and uniquely paired `.bzli`
+declarations. Renaming an explicit `load` alias changes its local uses;
+renaming an export changes its imported spelling and unaliased uses.
+External repositories are read-only. Ambiguous stub correspondence, escaped
+load spellings, and possible binding collisions produce an error. Dynamic
+provider and context fields support navigation; rename requires a source
+binding.
+
+Semantic highlighting, selection expansion, folding, and document highlights
+use the editor's standard controls. To display inferred types and argument
+names inline, enable inlay hints in the editor settings:
+
+```json
+{
+  "editor.inlayHints.enabled": "on"
+}
+```
+
 Make sure to use [PEP 484 type comments](https://peps.python.org/pep-0484/#type-comments) to document your function signatures. This helps a ton with autocomplete for situations like `rule` implementation functions. For example, if you add a type comment as in the following...
 
 ```python
@@ -148,7 +173,11 @@ Starpls has a number of experimental features that can be enabled via command-li
 
 ### `--experimental_infer_ctx_attributes`
 
-Infer attributes on a rule implementation function's `ctx` parameter.
+Infer `ctx.attr`, `ctx.files`, `ctx.file`, `ctx.executable`, `ctx.outputs`,
+and `ctx.split_attr` from a rule's attribute declarations. Completion, hover,
+and navigation use those declarations. A callback registered by exactly one
+rule receives this context; repository rule callbacks receive `ctx.attr`
+alongside native repository methods.
 
 ```python
 def _foo_impl(ctx):
