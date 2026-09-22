@@ -12,7 +12,7 @@ use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use starpls_common::Db;
 use starpls_syntax::source::string_value;
 use ty_python_core::definition::Definition;
@@ -230,98 +230,138 @@ fn is_loaded_alias(db: &Database, file: ProgramFile<'_>, name: &str) -> bool {
     has_load
 }
 
-/// Starlark loads form a module graph independently of which exported value is requested.
-/// A type-inference cycle cannot establish whether this graph contains a load cycle.
-pub(super) fn diagnostics(db: &Database, file: ProgramFile<'_>) -> Vec<Diagnostic> {
-    fn visit(
-        db: &Database,
-        file: starpls_common::File,
-        path: &mut Vec<ruff_db::files::File>,
-        completed: &mut FxHashSet<ruff_db::files::File>,
-    ) -> Option<Vec<String>> {
-        if let Some(start) = path.iter().position(|source| *source == file.source) {
+/// A syntactic load edge, including files whose exported values are unused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadDependency {
+    pub module: Box<str>,
+    pub range: TextRange,
+    pub resolution: LoadResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadResolution {
+    Resolved(starpls_common::File),
+    Pending,
+    Failed(String),
+}
+
+pub(crate) fn dependencies(db: &dyn Db, file: starpls_common::File) -> &[LoadDependency] {
+    direct_loads(db, file.source, (file.dialect, file.info))
+}
+
+#[salsa::tracked(returns(ref))]
+fn direct_loads(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> Vec<LoadDependency> {
+    let (dialect, info) = context;
+    let file = starpls_common::File {
+        source,
+        dialect,
+        info,
+    };
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let source = file.contents(db);
+    parsed
+        .suite()
+        .iter()
+        .filter_map(|statement| {
+            salsa::Database::unwind_if_revision_cancelled(db);
+            let Stmt::Expr(statement) = statement else {
+                return None;
+            };
+            let call = load_call(&statement.value)?;
+            let module = call.arguments.args.first()?;
+            let (name, _) = string_value(&source[module.range()])?;
+            let resolution = match db.load_file(&name, dialect, file) {
+                Ok(Some(file)) => LoadResolution::Resolved(file),
+                Ok(None) => LoadResolution::Pending,
+                Err(error) => LoadResolution::Failed(format!("{error:#}")),
+            };
+            Some(LoadDependency {
+                module: name,
+                range: module.range(),
+                resolution,
+            })
+        })
+        .collect()
+}
+
+// This recursion reads only module edges. A Salsa cycle therefore identifies
+// a load cycle, independently of value inference or the order of checked roots.
+#[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _| true)]
+fn reaches_cycle(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> bool {
+    direct_loads(db, source, context).iter().any(|edge| {
+        let LoadResolution::Resolved(file) = edge.resolution else {
+            return false;
+        };
+        reaches_cycle(db, file.source, (file.dialect, file.info))
+    })
+}
+
+fn cycle_path(db: &dyn Db, mut file: starpls_common::File) -> Option<Vec<String>> {
+    if !reaches_cycle(db, file.source, (file.dialect, file.info)) {
+        return None;
+    }
+    let mut path = Vec::new();
+    let mut positions = FxHashMap::default();
+    loop {
+        salsa::Database::unwind_if_revision_cancelled(db);
+        if let Some(&start) = positions.get(&file) {
             return Some(
                 path[start..]
                     .iter()
-                    .chain(std::iter::once(&file.source))
-                    .map(|source| format!("- {}", source.path(db)))
+                    .chain(std::iter::once(&file))
+                    .map(|file: &starpls_common::File| format!("- {}", file.source.path(db)))
                     .collect(),
             );
         }
-        if completed.contains(&file.source) {
-            return None;
-        }
-        path.push(file.source);
-        let program_file = db.starlark_program_file(file);
-        let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
-        let source = file.contents(db);
-        let mut cycle = None;
-        for statement in parsed.suite() {
-            let Stmt::Expr(statement) = statement else {
-                continue;
+        positions.insert(file, path.len());
+        path.push(file);
+        file = dependencies(db, file).iter().find_map(|edge| {
+            let LoadResolution::Resolved(next) = edge.resolution else {
+                return None;
             };
-            let Some(call) = load_call(&statement.value) else {
-                continue;
-            };
-            let Some(module) = call.arguments.args.first() else {
-                continue;
-            };
-            let Some((module, _)) = string_value(&source[module.range()]) else {
-                continue;
-            };
-            let Ok(Some(loaded)) = db.load_file(&module, file.dialect, file) else {
-                continue;
-            };
-            cycle = visit(db, loaded, path, completed);
-            if cycle.is_some() {
-                break;
-            }
-        }
-        path.pop();
-        if cycle.is_none() {
-            completed.insert(file.source);
-        }
-        cycle
+            reaches_cycle(db, next.source, (next.dialect, next.info)).then_some(next)
+        })?;
     }
+}
 
+pub(super) fn diagnostics(db: &Database, file: ProgramFile<'_>) -> Vec<Diagnostic> {
     let Some(source_file) = db.starlark_file(file) else {
         return Vec::new();
     };
-    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
-    let source = source_file.contents(db);
     let mut diagnostics = Vec::new();
-    let mut path = vec![source_file.source];
-    let mut completed = FxHashSet::default();
-    for statement in parsed.suite() {
-        let Stmt::Expr(statement) = statement else {
-            continue;
-        };
-        let Some(call) = load_call(&statement.value) else {
-            continue;
-        };
-        let Some(module) = call.arguments.args.first() else {
-            continue;
-        };
-        let Some((module_name, _)) = string_value(&source[module.range()]) else {
-            continue;
-        };
-        let message = match db.load_file(&module_name, source_file.dialect, source_file) {
-            Ok(Some(loaded)) => {
+    for LoadDependency {
+        module,
+        range,
+        resolution,
+    } in dependencies(db, source_file)
+    {
+        let message = match resolution {
+            LoadResolution::Resolved(loaded) => {
                 if loaded.source == source_file.source {
                     "Cannot load the current file".to_owned()
-                } else if let Some(cycle) = visit(db, loaded, &mut path, &mut completed) {
+                } else if let Some(cycle) = cycle_path(db, *loaded) {
                     format!("Detected circular import\n{}", cycle.join("\n"))
                 } else {
                     continue;
                 }
             }
-            Ok(None) => continue,
-            Err(error) => format!("Could not resolve module \"{module_name}\": {error}"),
+            LoadResolution::Pending => continue,
+            LoadResolution::Failed(error) => {
+                format!("Could not resolve module \"{module}\": {error}")
+            }
         };
         let mut diagnostic =
             Diagnostic::new(DiagnosticId::lint("load-error"), Severity::Warning, message);
         diagnostic.annotate(Annotation::primary(
-            Span::from(source_file.source).with_range(module.range()),
+            Span::from(source_file.source).with_range(*range),
         ));
         diagnostics.push(diagnostic);
     }
@@ -349,6 +389,102 @@ mod tests {
 
     use crate::Analysis;
     use crate::FilePosition;
+
+    #[test]
+    fn shared_load_tails_are_resolved_once_across_roots() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "leaf.bzl", "value = 1\n");
+        fixture.add_file(&mut analysis.db, "tail.bzl", "load('leaf.bzl')\n");
+        fixture.add_file(&mut analysis.db, "left.bzl", "load('tail.bzl')\n");
+        fixture.add_file(&mut analysis.db, "right.bzl", "load('tail.bzl')\n");
+        let first = fixture.add_file(
+            &mut analysis.db,
+            "first.bzl",
+            "load('left.bzl')\nload('right.bzl')\n",
+        );
+        let second = fixture.add_file(&mut analysis.db, "second.bzl", "load('tail.bzl')\n");
+        loader.add_files_from_fixture(&fixture);
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        for file in [first, second, second, first] {
+            assert!(super::diagnostics(db, db.starlark_program_file(file)).is_empty());
+        }
+        let requests = loader.requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|path| *path == "leaf.bzl").count(),
+            1,
+            "{requests:?}"
+        );
+        assert_eq!(requests.len(), 6, "{requests:?}");
+    }
+
+    #[test]
+    fn overlapping_load_cycles_are_independent_of_root_order() {
+        for reverse in [false, true] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+            let first = fixture.add_file(&mut analysis.db, "first.bzl", "load('shared.bzl')\n");
+            let second = fixture.add_file(&mut analysis.db, "second.bzl", "load('shared.bzl')\n");
+            let shared = fixture.add_file(
+                &mut analysis.db,
+                "shared.bzl",
+                "load('first.bzl')\nload('second.bzl')\n",
+            );
+            loader.add_files_from_fixture(&fixture);
+            let roots = if reverse {
+                [second, first]
+            } else {
+                [first, second]
+            };
+            for cyclic in [true, false, true] {
+                analysis.update_file(
+                    shared,
+                    if cyclic {
+                        "load('first.bzl')\nload('second.bzl')\n"
+                    } else {
+                        "value = 1\n"
+                    }
+                    .into(),
+                );
+                let snapshot = analysis.snapshot();
+                for root in roots {
+                    let db = &snapshot.db;
+                    let diagnostics = super::diagnostics(db, db.starlark_program_file(root));
+                    assert_eq!(!diagnostics.is_empty(), cyclic, "{diagnostics:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_revision_retries_failed_edges_and_detects_new_cycles() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let caller = fixture.add_file(&mut analysis.db, "caller.bzl", "load('new.bzl')\n");
+        loader.add_files_from_fixture(&fixture);
+        {
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let diagnostics = super::diagnostics(db, db.starlark_program_file(caller));
+            assert!(diagnostics[0]
+                .headline_message()
+                .contains("Could not resolve module"));
+        }
+        fixture.add_file(&mut analysis.db, "new.bzl", "load('caller.bzl')\n");
+        loader.add_files_from_fixture(&fixture);
+        analysis.invalidate_loads();
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let diagnostics = super::diagnostics(db, db.starlark_program_file(caller));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .headline_message()
+                .contains("circular import"),
+            "{diagnostics:?}"
+        );
+    }
 
     #[test]
     fn load_cycles_do_not_depend_on_recursive_value_inference() {
