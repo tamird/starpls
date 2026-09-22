@@ -209,6 +209,75 @@ pub(crate) fn folding_ranges(
     ))
 }
 
+pub(crate) fn inlay_hints(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::InlayHintParams,
+) -> anyhow::Result<Option<Vec<lsp_types::InlayHint>>> {
+    let path = path_buf_from_url(&params.text_document.uri)?;
+    let file = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let source = snapshot.analysis_snapshot.source(file)?;
+    let range = try_opt!(convert::text_range_from_lsp_range(params.range, &source));
+    let hints = snapshot.analysis_snapshot.inlay_hints(file, range)?;
+    let mut result = Vec::with_capacity(hints.len());
+    for hint in hints {
+        let starpls_ide::InlayHint {
+            position,
+            kind,
+            label,
+            text_edits: _,
+        } = hint;
+        let position = starpls_syntax::TextRange::empty(u32::from(position).into());
+        let Some(position) = convert::lsp_range_from_text_range(position, &source) else {
+            continue;
+        };
+        let mut parts = Vec::with_capacity(label.parts().len());
+        for part in label.parts() {
+            let location = match part.target() {
+                Some(target) => {
+                    if let Some(path) = snapshot.analysis_snapshot.system_path(target.file()) {
+                        let target_source = snapshot.analysis_snapshot.source(target.file())?;
+                        let range = target.focus_range();
+                        let range = starpls_syntax::TextRange::new(
+                            u32::from(range.start()).into(),
+                            u32::from(range.end()).into(),
+                        );
+                        match (
+                            lsp_types::Url::from_file_path(path),
+                            convert::lsp_range_from_text_range(range, &target_source),
+                        ) {
+                            (Ok(uri), Some(range)) => Some(lsp_types::Location { uri, range }),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            parts.push(lsp_types::InlayHintLabelPart {
+                value: part.text().to_owned(),
+                location,
+                tooltip: None,
+                command: None,
+            });
+        }
+        result.push(lsp_types::InlayHint {
+            position: position.start,
+            label: lsp_types::InlayHintLabel::LabelParts(parts),
+            kind: Some(match kind {
+                starpls_ide::InlayHintKind::Type => lsp_types::InlayHintKind::TYPE,
+                starpls_ide::InlayHintKind::CallArgumentName => lsp_types::InlayHintKind::PARAMETER,
+            }),
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        });
+    }
+    Ok(Some(result))
+}
+
 pub(crate) fn completion(
     snapshot: &ServerSnapshot,
     params: lsp_types::CompletionParams,

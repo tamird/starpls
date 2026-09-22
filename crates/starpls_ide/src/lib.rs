@@ -28,6 +28,8 @@ use starpls_syntax::TextRange;
 use starpls_syntax::TextSize;
 pub use ty_ide::FoldingRange;
 pub use ty_ide::FoldingRangeKind;
+pub use ty_ide::InlayHint;
+pub use ty_ide::InlayHintKind;
 pub use ty_ide::ReferenceKind;
 pub use ty_ide::ReferenceTarget;
 pub use ty_ide::SemanticToken;
@@ -57,6 +59,7 @@ mod document_symbols;
 mod find_references;
 mod goto_definition;
 mod hover;
+mod inlay_hints;
 mod selection;
 mod semantic_tokens;
 mod show_hir;
@@ -446,12 +449,16 @@ pub struct AnalysisSnapshot {
 
 impl AnalysisSnapshot {
     pub fn path(&self, file: impl Into<ruff_db::files::File>) -> &std::path::Path {
+        self.system_path(file)
+            .expect("navigation targets have system paths")
+    }
+
+    pub fn system_path(&self, file: impl Into<ruff_db::files::File>) -> Option<&std::path::Path> {
         let Self { db } = self;
         file.into()
             .path(db)
             .as_system_path()
-            .expect("navigation targets have system paths")
-            .as_std_path()
+            .map(|path| path.as_std_path())
     }
 
     pub fn document(&self, path: &std::path::Path) -> Option<&starpls_common::OpenDocument> {
@@ -582,6 +589,10 @@ impl AnalysisSnapshot {
         self.query(|db| {
             ty_ide::folding_ranges(db, db.starlark_program_file(file).python_file(db), None)
         })
+    }
+
+    pub fn inlay_hints(&self, file: File, range: TextRange) -> Cancellable<Vec<InlayHint>> {
+        self.query(|db| inlay_hints::inlay_hints(db, file, range))
     }
 
     /// Helper method to handle Salsa cancellations.
