@@ -304,6 +304,94 @@ fallback = unknown({{}})
     }
 
     #[test]
+    fn inherited_macro_parameters_follow_loaded_declarations() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                starpls_bazel::Builtins::default(),
+            )
+            .unwrap();
+        let dependency = fixture.add_file(&mut analysis.db, "defs.bzl", "");
+        let caller = r#"load("defs.bzl", "base", "implementation")
+child = macro(implementation=implementation, inherit_attrs=base, attrs={
+    "overridden": attr.int(default=3, doc="Own documentation."),
+    "removed": None,
+})
+child(name="ok", original$0="", overridden=3)
+"#;
+        fixture.add_file(&mut analysis.db, "main.bzl", caller);
+        loader.add_files_from_fixture(&fixture);
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        for (kind, ty, default) in [("string", "str", "'parent'"), ("int", "int", "42")] {
+            let source = format!(
+                r#"# {kind}
+def implementation(**kwargs):
+    pass
+base = rule(implementation=implementation, attrs={{
+    "original": attr.{kind}(default={default}, doc="Inherited documentation."),
+    "overridden": attr.string(),
+    "removed": attr.string(),
+}})
+"#
+            );
+            analysis.update_file(dependency, source.clone());
+            let snapshot = analysis.snapshot();
+            let help = snapshot
+                .signature_help(FilePosition { file_id, pos })
+                .unwrap()
+                .unwrap();
+            let [signature] = help.signatures.as_slice() else {
+                panic!("{help:?}");
+            };
+            assert!(!signature.label.contains("removed"), "{signature:?}");
+            assert!(!signature.label.contains("kwargs"), "{signature:?}");
+            let parameters = signature.parameters.as_ref().unwrap();
+            for (name, expected, doc) in [
+                (
+                    "original:",
+                    format!("original: {ty} | None = None"),
+                    "Inherited documentation.",
+                ),
+                (
+                    "overridden:",
+                    "overridden: int | None = 3".to_owned(),
+                    "Own documentation.",
+                ),
+            ] {
+                let parameter = parameters
+                    .iter()
+                    .find(|parameter| parameter.label.starts_with(name))
+                    .unwrap();
+                assert_eq!(parameter.label, expected);
+                assert_eq!(parameter.documentation.as_deref(), Some(doc));
+            }
+            let locations = snapshot
+                .goto_definition(FilePosition { file_id, pos }, false)
+                .unwrap()
+                .unwrap();
+            let [crate::LocationLink::Local {
+                target_file_id,
+                target_selection_range,
+                ..
+            }] = locations.as_slice()
+            else {
+                panic!("{locations:?}");
+            };
+            assert_eq!(*target_file_id, dependency.source);
+            assert_eq!(
+                &source[usize::from(target_selection_range.start())
+                    ..usize::from(target_selection_range.end())],
+                "\"original\""
+            );
+        }
+    }
+
+    #[test]
     fn keyword_only_after_multiplication_default() {
         let (analysis, fixture) =
             Analysis::from_single_file_fixture("def f(x=1*2, *, y=0): pass\nf(1, y=2$0)");

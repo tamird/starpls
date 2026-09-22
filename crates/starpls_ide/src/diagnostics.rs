@@ -237,12 +237,12 @@ miniature = constructor(
         "disabled": None,
     },
 )
-miniature(required="ok", optional="ok", inherited="ok")
-miniature(**{"required": "ok"})
-miniature(required="ok", flag=0)
-miniature(required="ok", flag=1)
-miniature(required="ok", flag=True)
-miniature(**{"required": "ok", "flag": False})
+miniature(name="example", required="ok", optional="ok")
+miniature(name="example", **{"required": "ok"})
+miniature(name="example", required="ok", flag=0)
+miniature(name="example", required="ok", flag=1)
+miniature(name="example", required="ok", flag=True)
+miniature(name="example", **{"required": "ok", "flag": False})
 example_rule = rule(implementation=implementation, attrs={"flag": attr.bool()})
 example_rule(name="zero", flag=0)
 example_rule(name="one", flag=1)
@@ -261,21 +261,21 @@ def shadowed():
 
         for (call, expected) in [
             (
-                "miniature(required=\"ok\", optional=1)",
+                "miniature(name=\"example\", required=\"ok\", optional=1)",
                 "invalid-argument-type",
             ),
-            ("miniature(optional=\"ok\")", "missing-argument"),
+            ("miniature(name=\"example\", optional=\"ok\")", "missing-argument"),
             (
-                "miniature(required=\"ok\", disabled=\"bad\")",
-                "invalid-argument-type",
+                "miniature(name=\"example\", required=\"ok\", disabled=\"bad\")",
+                "unknown-argument",
             ),
             (
-                "miniature(**{\"required\": \"ok\", \"disabled\": \"bad\"})",
-                "invalid-argument-type",
+                "miniature(name=\"example\", **{\"required\": \"ok\", \"disabled\": \"bad\"})",
+                "unknown-argument",
             ),
-            ("miniature(required=\"ok\", flag=2)", "invalid-argument-type"),
+            ("miniature(name=\"example\", required=\"ok\", flag=2)", "invalid-argument-type"),
             (
-                "def generic(value):\n    # type: (int) -> None\n    miniature(required=\"ok\", flag=value)",
+                "def generic(value):\n    # type: (int) -> None\n    miniature(name=\"example\", required=\"ok\", flag=value)",
                 "invalid-argument-type",
             ),
             ("example_rule(name=\"bad\", flag=2)", "invalid-argument-type"),
@@ -330,6 +330,103 @@ child(name="child", value="value")
                     "Argument to function `macro` is incorrect"
                 );
             }
+            assert!(diagnostics[0].range().unwrap().start().to_usize() >= source.len());
+        }
+    }
+
+    #[test]
+    fn macros_compose_public_attribute_contracts() {
+        let source = r#"
+def implementation(**kwargs):
+    pass
+base = rule(implementation=implementation, attrs={
+    "required": attr.label_list(mandatory=True),
+    "optional": attr.string(default="parent", doc="Original optional attribute."),
+    "removed": attr.int(),
+    "_private": attr.string(),
+    "generator_custom": attr.string(),
+})
+child = macro(implementation=implementation, inherit_attrs=base, attrs={
+    "optional": attr.int(default=3),
+    "removed": None,
+    "own": attr.string(mandatory=True),
+})
+grandchild = macro(implementation=implementation, inherit_attrs=child)
+common = macro(implementation=implementation, inherit_attrs="common")
+closed = macro(implementation=implementation, inherit_attrs=None)
+def uncertain():
+    # type: () -> Any
+    pass
+unknown = macro(implementation=implementation, inherit_attrs=uncertain(),
+                attrs={"own": attr.int(mandatory=True), "removed": None})
+unknown_child = macro(implementation=implementation, inherit_attrs=unknown)
+partial = macro(implementation=implementation, attrs=uncertain())
+partial_child = macro(implementation=implementation, inherit_attrs=base, attrs=uncertain())
+partial_common = macro(implementation=implementation, inherit_attrs="common", attrs=uncertain())
+observed = {"observed": attr.int(mandatory=True)}
+mutable = macro(implementation=implementation, attrs=observed)
+child(name="ok", required=["//:input"], own="ok", optional=None)
+grandchild(name="ok", required=[], own="ok", optional=42, generator_custom="ok")
+common(name="ok", tags=["tag"], visibility=None)
+closed(name="ok", visibility=["//visibility:public"])
+unknown(name="ok", own=42, anything="ok")
+partial(name="ok", anything=42)
+partial_child(name="ok")
+partial_child(name="ok", required=42)
+partial_common(name="ok", tags=42)
+mutable(name="ok")
+mutable(name="ok", observed="unproved")
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (call, expected) in [
+            (
+                "child(name='bad', required=42, own='ok')",
+                "invalid-argument-type",
+            ),
+            (
+                "child(name='bad', required=None, own='ok')",
+                "invalid-argument-type",
+            ),
+            ("child(name='bad', own='ok')", "missing-argument"),
+            (
+                "child(name='bad', required=[], own='ok', optional='bad')",
+                "invalid-argument-type",
+            ),
+            (
+                "grandchild(name='bad', required=[], own='ok', removed=None)",
+                "unknown-argument",
+            ),
+            (
+                "child(name='bad', required=[], own='ok', _private=None)",
+                "unknown-argument",
+            ),
+            ("child(required=[], own='ok')", "missing-argument"),
+            ("closed(name=42)", "invalid-argument-type"),
+            ("closed(name='bad', visibility=42)", "invalid-argument-type"),
+            ("closed(name='bad', arbitrary=None)", "unknown-argument"),
+            ("common(name='bad', tags=42)", "invalid-argument-type"),
+            ("unknown(name='bad', own='bad')", "invalid-argument-type"),
+            ("unknown(name='bad')", "missing-argument"),
+            (
+                "unknown(name='bad', own=42, removed=None)",
+                "invalid-argument-type",
+            ),
+            (
+                "unknown_child(name='bad', own=42, removed=None)",
+                "invalid-argument-type",
+            ),
+            (
+                "macro(implementation=implementation, inherit_attrs='other')",
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(file, format!("{source}\n{call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), expected, "{call}");
             assert!(diagnostics[0].range().unwrap().start().to_usize() >= source.len());
         }
     }

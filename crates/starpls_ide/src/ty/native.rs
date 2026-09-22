@@ -510,6 +510,7 @@ fn write_function(
                 Some("_starpls_typing.Sequence[_starpls_types.depset[_DepsetElement]] | None")
             }
             (CallableKind::Function, "DefaultInfo", "files") => Some("_DefaultInfoFiles"),
+            (CallableKind::Function, "macro", "inherit_attrs") => Some("_starpls_types.rule | _starpls_types.macro | _starpls_typing.Literal[\"common\"] | None"),
             _ => None,
         };
         let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
@@ -920,13 +921,29 @@ strict_labels(labels)
                 name: "sources".to_owned(),
                 doc: "A rule with source files.".to_owned(),
                 callable: Some(Callable {
-                    param: vec![Param {
+                    param: std::iter::once(Param {
                         name: "srcs".to_owned(),
                         r#type: "List of Labels".to_owned(),
                         doc: "Source file labels.".to_owned(),
                         is_mandatory: true,
                         ..Default::default()
-                    }],
+                    })
+                    .chain(
+                        [
+                            "generator_name",
+                            "generator_function",
+                            "generator_location",
+                            "generator_custom",
+                            "_private",
+                        ]
+                        .into_iter()
+                        .map(|name| Param {
+                            name: name.to_owned(),
+                            r#type: "String".to_owned(),
+                            ..Default::default()
+                        }),
+                    )
+                    .collect(),
                     return_type: "None".to_owned(),
                 }),
                 ..Default::default()
@@ -944,6 +961,8 @@ alias = native.sources
 alias(srcs=["//:input"])
 macro(implementation=implementation, inherit_attrs=native.sources)
 macro(implementation=implementation, inherit_attrs=sources)
+child = macro(implementation=implementation, inherit_attrs=alias)
+child(srcs=["//:input"], name="ok", generator_custom="custom")
 "#;
         let file = analysis
             .open_document(
@@ -976,7 +995,7 @@ macro(implementation=implementation, inherit_attrs=sources)
             "{}",
             hover.contents.value
         );
-        for callee in ["native.sources", "alias"] {
+        for callee in ["native.sources", "alias", "child"] {
             let help = analysis
                 .snapshot()
                 .signature_help(FilePosition {
@@ -996,15 +1015,43 @@ macro(implementation=implementation, inherit_attrs=sources)
                 signature.label.starts_with(&format!("def {callee}(")),
                 "{signature:?}"
             );
-            let [parameter] = signature.parameters.as_deref().unwrap() else {
-                panic!("{signature:?}");
-            };
+            let parameter = signature
+                .parameters
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter.label.starts_with("srcs:"))
+                .unwrap();
+            if callee == "child" {
+                assert!(!signature.label.contains("generator_name"), "{signature:?}");
+                assert!(
+                    !signature.label.contains("generator_function"),
+                    "{signature:?}"
+                );
+                assert!(
+                    !signature.label.contains("generator_location"),
+                    "{signature:?}"
+                );
+                assert!(!signature.label.contains("_private"), "{signature:?}");
+                assert!(
+                    signature
+                        .label
+                        .contains("generator_custom: str | None = None"),
+                    "{signature:?}"
+                );
+            }
             assert_eq!(
                 parameter.documentation.as_deref(),
                 Some("Source file labels.")
             );
         }
         for (call, expected) in [
+            ("child(name='missing')", "missing-argument"),
+            ("child(name='wrong', srcs=42)", "invalid-argument-type"),
+            (
+                "child(name='removed', srcs=[], generator_name=None)",
+                "unknown-argument",
+            ),
             ("native.sources()", "missing-argument"),
             ("sources(srcs=42)", "invalid-argument-type"),
             (

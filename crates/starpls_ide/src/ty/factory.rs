@@ -25,6 +25,7 @@ use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::KnownClass;
 use ty_python_semantic::types::Parameter;
 use ty_python_semantic::types::ParameterDefault;
+use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Parameters;
 use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
@@ -291,10 +292,18 @@ enum RuleKind {
 fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
     let common = starpls_bazel::attr::make_common_attributes();
+    let inherit_common = matches!(call.argument("inherit_attrs"), CheckedArgument::Value { ty, expression: _ }
+        if ty.string_literal_value(db) == Some("common"));
     let common = match kind {
         RuleKind::Build => common.build,
         RuleKind::Repository => common.repository,
-        RuleKind::Macro => Vec::new(),
+        RuleKind::Macro => common
+            .build
+            .into_iter()
+            .filter(|attribute| {
+                inherit_common || matches!(attribute.name.as_str(), "name" | "visibility")
+            })
+            .collect(),
     };
     let mut documentation = Documentation {
         text: doc_string(db, call),
@@ -317,87 +326,117 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             let parameter = if attribute.is_mandatory {
                 parameter
             } else {
-                parameter.with_default_type(Type::unknown())
+                let parameter = parameter.with_default_type(Type::unknown());
+                if matches!(kind, RuleKind::Macro) {
+                    optional_macro_attribute(db, &environment, parameter)
+                        .with_default_type(Type::none(db, &environment))
+                } else {
+                    parameter
+                }
             };
             Some((name, parameter))
         })
         .collect::<Option<Vec<_>>>()?;
-    let mut complete = true;
-    match call.argument("attrs") {
-        CheckedArgument::Omitted => {}
-        CheckedArgument::Indeterminate => return None,
+    let mut complete = !matches!(kind, RuleKind::Macro)
+        || inherit_common
+        || inherit_macro_attributes(db, call, &mut parameters, &mut documentation);
+    let attributes = match call.argument("attrs") {
+        CheckedArgument::Omitted => Some(DictionaryItems {
+            items: Box::default(),
+            is_complete: true,
+        }),
         CheckedArgument::Value {
             ty: _,
             expression: _,
-        } => {
-            let DictionaryItems { items, is_complete } = call.dictionary_argument("attrs")?;
-            complete = is_complete;
-            for DictionaryItem {
-                name,
-                ty: value,
-                source,
-            } in items
-            {
-                let source = FileRange::new(call.file().file(db), source);
-                let name = name.as_str();
-                if name.starts_with('_') {
-                    continue;
-                }
-                let attribute = value
-                    .provided_data(db, &environment)
-                    .and_then(|data| data.downcast_ref::<Attribute>());
-                let mut parameter =
-                    Parameter::keyword_only(Name::new(name)).with_source_range(source);
-                if !complete {
-                    parameter = parameter
-                        .with_annotated_type(Type::unknown())
-                        .with_default_type(Type::unknown());
-                } else if matches!(kind, RuleKind::Macro) && value == Type::none(db, &environment) {
-                    // A removed macro attribute can be omitted, but cannot accept a value.
-                    parameter = parameter
-                        .with_annotated_type(Type::Never)
-                        .with_default_type(Type::unknown());
-                } else if let Some(attribute) = attribute {
-                    let ty = attribute_type(db, call, &attribute.kind)?;
-                    parameter = parameter.with_annotated_type(ty);
-                    if let Some(doc) = &attribute.documentation {
-                        documentation
-                            .parameters
-                            .retain(|(existing, _)| existing.as_str() != name);
-                        documentation
-                            .parameters
-                            .push((Name::new(name), doc.clone()));
-                    }
-                    if !attribute.mandatory {
-                        parameter = match attribute.default {
-                            Some(source) => {
-                                parameter.with_default(ParameterDefault::Source { ty, source })
-                            }
-                            None => parameter.with_default_type(Type::unknown()),
-                        };
-                    }
-                } else {
-                    // Keep a known attribute name navigable during recovery. An
-                    // invalid descriptor supplies no type or requiredness contract.
-                    parameter = parameter.with_default_type(Type::unknown());
-                }
-                if let Some(existing) = parameters
-                    .iter()
-                    .position(|(existing, _)| existing.as_str() == name)
-                {
-                    parameters[existing].1 = parameter;
-                } else {
-                    parameters.push((Name::new(name), parameter));
+        } => call.dictionary_argument("attrs"),
+        CheckedArgument::Indeterminate => None,
+    };
+    let DictionaryItems { items, is_complete } = attributes.unwrap_or(DictionaryItems {
+        items: Box::default(),
+        is_complete: false,
+    });
+    complete &= is_complete;
+    if matches!(kind, RuleKind::Macro) && !is_complete {
+        // Unknown own attributes can override or remove any inherited contract.
+        for (name, parameter) in &mut parameters {
+            if !matches!(name.as_str(), "name" | "visibility") {
+                *parameter = parameter
+                    .clone()
+                    .with_annotated_type(Type::unknown())
+                    .with_default_type(Type::unknown());
+            }
+        }
+    }
+    for DictionaryItem {
+        name,
+        ty: value,
+        source,
+    } in items
+    {
+        let source = FileRange::new(call.file().file(db), source);
+        let name = name.as_str();
+        if name.starts_with('_')
+            || (matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility"))
+        {
+            continue;
+        }
+        documentation
+            .parameters
+            .retain(|(existing, _)| existing.as_str() != name);
+        if complete && matches!(kind, RuleKind::Macro) && value.is_none(db) {
+            parameters.retain(|(existing, _)| existing.as_str() != name);
+            continue;
+        }
+        let attribute = value
+            .provided_data(db, &environment)
+            .and_then(|data| data.downcast_ref::<Attribute>());
+        let mut parameter = Parameter::keyword_only(Name::new(name)).with_source_range(source);
+        if !is_complete {
+            parameter = parameter
+                .with_annotated_type(Type::unknown())
+                .with_default_type(Type::unknown());
+        } else if matches!(kind, RuleKind::Macro) && value == Type::none(db, &environment) {
+            // A removed macro attribute can be omitted, but cannot accept a value.
+            parameter = parameter
+                .with_annotated_type(Type::Never)
+                .with_default_type(Type::unknown());
+        } else if let Some(attribute) = attribute {
+            let ty = attribute_type(db, call, &attribute.kind)?;
+            parameter = parameter.with_annotated_type(ty);
+            if let Some(doc) = &attribute.documentation {
+                documentation
+                    .parameters
+                    .push((Name::new(name), doc.clone()));
+            }
+            if !attribute.mandatory {
+                parameter = match attribute.default {
+                    Some(source) => parameter.with_default(ParameterDefault::Source { ty, source }),
+                    None => parameter.with_default_type(Type::unknown()),
+                };
+                if matches!(kind, RuleKind::Macro) {
+                    parameter = optional_macro_attribute(db, &environment, parameter);
                 }
             }
+        } else {
+            // Keep a known attribute name navigable during recovery. An
+            // invalid descriptor supplies no type or requiredness contract.
+            parameter = parameter.with_default_type(Type::unknown());
+        }
+        if let Some(existing) = parameters
+            .iter()
+            .position(|(existing, _)| existing.as_str() == name)
+        {
+            parameters[existing].1 = parameter;
+        } else {
+            parameters.push((Name::new(name), parameter));
         }
     }
     let mut parameters: Vec<_> = parameters
         .into_iter()
         .map(|(_, parameter)| parameter)
         .collect();
-    if !complete || matches!(kind, RuleKind::Macro) {
-        // Partial mappings and inherited macro attributes can contain additional names.
+    if !complete {
+        // Partial mappings and unknown parents can contain additional names.
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
     }
     let callable = Type::function_like_callable(
@@ -429,6 +468,119 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         },
     )
     .to_instance_approximation(db, &environment)
+}
+
+/// Compose the parent's public attributes from its existing callable contract.
+fn inherit_macro_attributes<'db>(
+    db: &'db Database,
+    call: &CheckedCall<'_, 'db>,
+    parameters: &mut Vec<(Name, Parameter<'db>)>,
+    documentation: &mut Documentation,
+) -> bool {
+    let parent = match call.argument("inherit_attrs") {
+        CheckedArgument::Omitted => return true,
+        CheckedArgument::Indeterminate => return false,
+        CheckedArgument::Value { ty, expression: _ } => {
+            if ty.is_none(db) {
+                return true;
+            }
+            ty
+        }
+    };
+    let environment = ProgramEnvironment::from_file(call.file());
+    if !["rule", "macro"].into_iter().any(|name| {
+        declared_class(db, call, name)
+            .and_then(|class| class.to_instance_approximation(db, &environment))
+            .is_some_and(|base| parent.is_subtype_of(db, &environment, base))
+    }) {
+        return false;
+    }
+    let mut signatures = Vec::new();
+    parent.map_callable_signatures(db, &environment, CallableTypeKind::Regular, |signature| {
+        signatures.push(signature.clone());
+        signature
+    });
+    let [signature] = signatures.as_slice() else {
+        return false;
+    };
+    let parent_documentation = parent
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<Documentation>());
+    let definition = parent
+        .definition(db, &environment)
+        .and_then(|definition| definition.definition());
+    let native = definition.is_some_and(|definition| {
+        matches!(definition.program_file(db).file(db).path(db), FilePath::SystemVirtual(path) if path.as_str().starts_with("starpls-native:"))
+    });
+    let docstring = definition
+        .and_then(|definition| definition.docstring(db))
+        .map(ty_ide::Docstring::new);
+    let parameter_docs = docstring
+        .as_ref()
+        .map(ty_ide::Docstring::parameter_documentation)
+        .unwrap_or_default();
+    let mut complete = true;
+    for parameter in signature.parameters().iter() {
+        let ParameterKind::KeywordOnly { name, default_type } = parameter.kind() else {
+            // Native fallback signatures retain nominal identity but have no schema.
+            complete = false;
+            continue;
+        };
+        if name.starts_with('_') || matches!(name.as_str(), "name" | "visibility") {
+            continue;
+        }
+        // Bazel's build-language metadata omits is_documented. These three
+        // native bookkeeping attributes are explicitly undocumented in Bazel.
+        if native
+            && matches!(
+                name.as_str(),
+                "generator_name" | "generator_function" | "generator_location"
+            )
+        {
+            continue;
+        }
+        let parameter = if default_type.is_some() {
+            optional_macro_attribute(db, &environment, parameter.clone())
+                .with_default_type(Type::none(db, &environment))
+        } else {
+            parameter.clone()
+        };
+        let doc = parent_documentation
+            .and_then(|doc| {
+                doc.parameters
+                    .iter()
+                    .find_map(|(key, doc)| (key == name).then(|| doc.clone()))
+            })
+            .or_else(|| {
+                parameter_docs.get(name.as_str()).map(|doc| {
+                    ty_ide::DocstringFragment::new(doc)
+                        .render(ty_ide::MarkupKind::PlainText)
+                        .into_boxed_str()
+                })
+            });
+        if let Some(doc) = doc {
+            documentation.parameters.push((name.clone(), doc));
+        }
+        parameters.push((name.clone(), parameter));
+    }
+    complete
+}
+
+fn optional_macro_attribute<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    parameter: Parameter<'db>,
+) -> Parameter<'db> {
+    let ty = parameter.annotated_type();
+    // An incomplete parent may retain a removed name to reject it through **kwargs.
+    if ty == Type::Never {
+        return parameter;
+    }
+    parameter.with_annotated_type(UnionType::from_elements(
+        db,
+        environment,
+        [ty, Type::none(db, environment)],
+    ))
 }
 
 fn attribute_type<'db>(
