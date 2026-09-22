@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::io::BufRead;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use std::str;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -11,6 +17,24 @@ use serde::Deserialize;
 use serde_json::Deserializer;
 
 const DEFAULT_WORKSPACE_NAMES: &[&str] = &["__main__", "_main"];
+
+pub type RepoMapping = Arc<HashMap<String, String>>;
+
+#[derive(Default)]
+struct MappingInterner {
+    values: HashMap<Box<[u8]>, Weak<HashMap<String, String>>>,
+}
+
+impl MappingInterner {
+    fn intern(&mut self, json: &[u8]) -> anyhow::Result<RepoMapping> {
+        if let Some(mapping) = self.values.get(json).and_then(Weak::upgrade) {
+            return Ok(mapping);
+        }
+        let mapping = Arc::new(serde_json::from_slice(json)?);
+        self.values.insert(json.into(), Arc::downgrade(&mapping));
+        Ok(mapping)
+    }
+}
 
 #[derive(Default)]
 pub struct BazelInfo {
@@ -34,7 +58,18 @@ pub trait BazelClient: Send + Sync + 'static {
     fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()>;
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>>;
     fn fetch_repo(&self, repo: &str) -> anyhow::Result<()>;
-    fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<HashMap<String, String>>;
+    /// Returns mappings in the same order as the canonical repository names.
+    fn dump_repo_mappings(&self, repos: &[&str]) -> anyhow::Result<Vec<RepoMapping>>;
+    fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<RepoMapping> {
+        let mut mappings = self.dump_repo_mappings(&[repo])?;
+        if mappings.len() != 1 {
+            bail!(
+                "expected one repository mapping, received {}",
+                mappings.len()
+            );
+        }
+        Ok(mappings.pop().expect("validated mapping count"))
+    }
     /// Returns None when no module name is available (an extension or unnamed root).
     fn selected_module(&self, canonical_repo: &str) -> anyhow::Result<Option<SelectedModule>>;
 }
@@ -42,6 +77,7 @@ pub trait BazelClient: Send + Sync + 'static {
 pub struct BazelCLI {
     executable: PathBuf,
     working_directory: Option<PathBuf>,
+    mappings: Mutex<MappingInterner>,
 }
 
 impl BazelCLI {
@@ -162,13 +198,52 @@ impl BazelClient for BazelCLI {
         Ok(())
     }
 
-    fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<HashMap<String, String>> {
-        let output = self.run_command(["mod", "--enable_bzlmod", "dump_repo_mapping", repo])?;
-        let json = String::from_utf8(output)?;
-        let mut mappings = Deserializer::from_str(&json).into_iter::<HashMap<String, String>>();
-        Ok(mappings
-            .next()
-            .ok_or_else(|| anyhow!("missing repo mapping for repository: {:?}", repo))??)
+    fn dump_repo_mappings(&self, repos: &[&str]) -> anyhow::Result<Vec<RepoMapping>> {
+        if repos.is_empty() {
+            bail!("repository mapping query requires at least one repository");
+        }
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["mod", "--enable_bzlmod", "dump_repo_mapping"])
+            .args(repos);
+        if let Some(directory) = &self.working_directory {
+            command.current_dir(directory);
+        }
+        // Serialize mapping readers before they can contend for Bazel's server
+        // lock with an unread stdout pipe and this interner lock held elsewhere.
+        let mut mappings = self.mappings.lock().expect("mapping interner was poisoned");
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        std::thread::scope(|scope| {
+            let errors = scope.spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            let result =
+                parse_repo_mappings(std::io::BufReader::new(stdout), repos.len(), &mut mappings);
+            if result.is_err() {
+                // A malformed stream can leave the child blocked on stdout.
+                let _ = child.kill();
+            }
+            let status = child.wait()?;
+            let errors = errors.join().expect("stderr reader panicked")?;
+            if !status.success() && result.is_ok() {
+                bail!(
+                    "failed to query repository mappings with {status}: {}",
+                    String::from_utf8_lossy(&errors)
+                );
+            }
+            result.with_context(|| {
+                format!(
+                    "Bazel repository mapping query ({status}): {}",
+                    String::from_utf8_lossy(&errors)
+                )
+            })
+        })
     }
 
     fn selected_module(&self, canonical_repo: &str) -> anyhow::Result<Option<SelectedModule>> {
@@ -204,6 +279,39 @@ impl BazelClient for BazelCLI {
         }
         Err(graph_error).with_context(|| format!("cannot identify module for @@{canonical_repo}"))
     }
+}
+
+fn parse_repo_mappings(
+    mut output: impl BufRead,
+    expected: usize,
+    interner: &mut MappingInterner,
+) -> anyhow::Result<Vec<RepoMapping>> {
+    interner
+        .values
+        .retain(|_, mapping| mapping.strong_count() > 0);
+    let mut mappings = Vec::with_capacity(expected);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if output.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let json = line.trim_ascii();
+        if json.is_empty() {
+            continue;
+        }
+        if mappings.len() == expected {
+            bail!("unexpected extra repository mapping");
+        }
+        mappings.push(interner.intern(json)?);
+    }
+    if mappings.len() != expected {
+        bail!(
+            "expected {expected} repository mappings, received {}",
+            mappings.len()
+        );
+    }
+    Ok(mappings)
 }
 
 fn selected_module_from_graph(
@@ -289,6 +397,7 @@ impl Default for BazelCLI {
         Self {
             executable: "bazel".into(),
             working_directory: None,
+            mappings: Default::default(),
         }
     }
 }
@@ -298,6 +407,89 @@ mod tests {
     use super::is_extension_repository;
     use super::selected_module_from_graph;
     use super::SelectedModule;
+
+    #[test]
+    fn equal_mapping_outputs_share_storage_across_batches() {
+        let mut interner = super::MappingInterner::default();
+        let output = b"{\"dep\":\"same+\"}\n{\"dep\":\"same+\"}\n";
+        let first = super::parse_repo_mappings(output.as_slice(), 2, &mut interner).unwrap();
+        let [one, two] = first.as_slice() else {
+            panic!("expected two mappings");
+        };
+        assert!(std::sync::Arc::ptr_eq(one, two));
+        let second = super::parse_repo_mappings(output.as_slice(), 2, &mut interner).unwrap();
+        assert!(std::sync::Arc::ptr_eq(one, second.first().unwrap()));
+        assert_eq!(interner.values.len(), 1);
+        drop(first);
+        drop(second);
+        let third = super::parse_repo_mappings(b"{}\n".as_slice(), 1, &mut interner).unwrap();
+        assert!(third.first().unwrap().is_empty());
+        assert_eq!(
+            interner.values.len(),
+            1,
+            "obsolete JSON keys must be released"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_mapping_queries_drain_stderr_and_check_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::BazelClient;
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("streamed-mappings");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("bazel");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+test "$#" = 5 && test "$4" = '' && test "$5" = 'repo+' || exit 99
+i=0
+while test "$i" -lt 2000; do
+  printf 'Bazel progress message while stdout is consumed\n' >&2
+  i=$((i+1))
+done
+printf '{"dep":"main+"}\n{"dep":"repo+"}\n'
+read status < "${0%/*}/status"
+exit "$status"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = super::BazelCLI::new(executable);
+        std::fs::write(root.join("status"), "0\n").unwrap();
+        let mappings = client.dump_repo_mappings(&["", "repo+"]).unwrap();
+        let [main, repository] = mappings.as_slice() else {
+            panic!("expected mappings");
+        };
+        assert_eq!(main["dep"], "main+");
+        assert_eq!(repository["dep"], "repo+");
+        std::fs::write(root.join("status"), "1\n").unwrap();
+        assert!(client.dump_repo_mappings(&["", "repo+"]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repository_mapping_batches_preserve_order_and_require_all_results() {
+        let output = b"{\"dep\":\"first+\"}\n{\"dep\":\"second+\"}\n";
+        let mappings =
+            super::parse_repo_mappings(output.as_slice(), 2, &mut Default::default()).unwrap();
+        let [first, second] = mappings.as_slice() else {
+            panic!("expected two mappings: {mappings:?}");
+        };
+        assert_eq!(first.get("dep").unwrap(), "first+");
+        assert_eq!(second.get("dep").unwrap(), "second+");
+        for (output, count) in [
+            (output.as_slice(), 1),
+            (output.as_slice(), 3),
+            (b"{}\nmalformed".as_slice(), 2),
+            (b"{}\n{\"dep\":42}".as_slice(), 2),
+            (b"".as_slice(), 1),
+        ] {
+            assert!(super::parse_repo_mappings(output, count, &mut Default::default()).is_err());
+        }
+    }
 
     #[test]
     fn module_keys_identify_selected_releases_and_overrides() {

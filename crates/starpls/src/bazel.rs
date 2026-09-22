@@ -13,7 +13,7 @@ pub(crate) struct BazelContext {
     pub(crate) info: BazelInfo,
     pub(crate) rules: starpls_bazel::build::BuildLanguage,
     pub(crate) bzlmod_enabled: bool,
-    pub(crate) main_repo_mapping: std::collections::HashMap<String, String>,
+    pub(crate) main_repo_mapping: starpls_bazel::client::RepoMapping,
 }
 
 impl BazelContext {

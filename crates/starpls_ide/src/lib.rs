@@ -52,6 +52,8 @@ pub use crate::hover::Markup;
 pub use crate::signature_help::ParameterInfo;
 pub use crate::signature_help::SignatureHelp;
 pub use crate::signature_help::SignatureInfo;
+pub use crate::ty::load::LoadDependency;
+pub use crate::ty::load::LoadResolution;
 
 mod build_targets;
 mod completions;
@@ -513,6 +515,10 @@ impl AnalysisSnapshot {
 
     pub fn diagnostics(&self, file_id: File) -> Cancellable<Vec<Diagnostic>> {
         self.query(|db| diagnostics::diagnostics(db, file_id))
+    }
+
+    pub fn load_dependencies(&self, file: File) -> Cancellable<Vec<LoadDependency>> {
+        self.query(|db| ty::load::dependencies(db, file).to_vec())
     }
 
     /// Renders diagnostics obtained from this snapshot using its captured source.

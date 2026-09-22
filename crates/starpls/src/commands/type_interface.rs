@@ -47,16 +47,6 @@ impl TypeInterfaceOptions {
     pub(crate) fn is_configured(&self) -> bool {
         !self.mappings.is_empty()
     }
-    pub(crate) fn install(
-        &self,
-        analysis: &mut Analysis,
-        loader: &crate::document::DefaultFileLoader,
-        workspace: &Path,
-    ) -> anyhow::Result<()> {
-        self.prepare(loader, workspace)?
-            .install(analysis, workspace)
-    }
-
     pub(crate) fn prepare(
         &self,
         loader: &crate::document::DefaultFileLoader,
@@ -223,7 +213,8 @@ mod tests {
         ));
         let mut analysis = starpls_ide::Analysis::new(loader.clone(), Default::default()).unwrap();
         super::TypeInterfaceOptions::default()
-            .install(&mut analysis, &loader, &workspace)
+            .prepare(&loader, &workspace)
+            .and_then(|prepared| prepared.install(&mut analysis, &workspace))
             .unwrap();
         let configured = analysis.type_interface_files();
         assert_eq!(configured.len(), 2);
@@ -283,7 +274,8 @@ mod tests {
             std::fs::write(workspace.join("starpls.toml"), config).unwrap();
             std::fs::write(stubs.join("first.toml"), content).unwrap();
             let error = super::TypeInterfaceOptions::default()
-                .install(&mut analysis, &loader, &workspace)
+                .prepare(&loader, &workspace)
+                .and_then(|prepared| prepared.install(&mut analysis, &workspace))
                 .unwrap_err();
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!(analysis.type_interface_files(), configured);
@@ -296,7 +288,8 @@ mod tests {
         .unwrap();
         std::fs::write(workspace.join("starpls.toml"), &configuration).unwrap();
         let error = super::TypeInterfaceOptions::default()
-            .install(&mut analysis, &loader, &workspace)
+            .prepare(&loader, &workspace)
+            .and_then(|prepared| prepared.install(&mut analysis, &workspace))
             .unwrap_err()
             .to_string();
         for expected in ["one.bzl", "first.toml", "second.toml"] {
@@ -310,7 +303,8 @@ mod tests {
             }],
         };
         let error = options
-            .install(&mut analysis, &loader, &workspace)
+            .prepare(&loader, &workspace)
+            .and_then(|prepared| prepared.install(&mut analysis, &workspace))
             .unwrap_err()
             .to_string();
         for expected in ["one.bzl", "first.toml", "--type_interface"] {
@@ -346,7 +340,8 @@ mod tests {
         super::TypeInterfaceOptions {
             mappings: vec![mapping.clone()],
         }
-        .install(&mut analysis, &loader, &root)
+        .prepare(&loader, &root)
+        .and_then(|prepared| prepared.install(&mut analysis, &root))
         .unwrap();
         let configured = analysis.type_interface_files();
         assert_eq!(configured.len(), 1);
@@ -378,7 +373,8 @@ mod tests {
             ),
         ] {
             let error = super::TypeInterfaceOptions { mappings }
-                .install(&mut analysis, &loader, &root)
+                .prepare(&loader, &root)
+                .and_then(|prepared| prepared.install(&mut analysis, &root))
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             assert_eq!(analysis.type_interface_files(), configured);

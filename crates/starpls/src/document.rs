@@ -119,6 +119,7 @@ pub(crate) struct DefaultFileLoader {
     configuration_inputs: RwLock<HashMap<PathBuf, Option<Vec<u8>>>>,
     repository_roots: RwLock<HashSet<PathBuf>>,
     configuration_revision: Option<u64>,
+    defer_mappings: bool,
     repository_fetches: RwLock<HashMap<String, RepositoryFetch>>,
     repository_mappings: RwLock<HashMap<String, RepositoryMapping>>,
     paused: AtomicBool,
@@ -144,6 +145,7 @@ impl DefaultFileLoader {
             configuration_inputs: Default::default(),
             repository_roots: Default::default(),
             configuration_revision: None,
+            defer_mappings: false,
             repository_fetches: Default::default(),
             repository_mappings: Default::default(),
             paused: AtomicBool::new(false),
@@ -171,6 +173,69 @@ impl DefaultFileLoader {
     pub(crate) fn for_editor(mut self, revision: u64) -> Self {
         self.configuration_revision = Some(revision);
         self
+    }
+
+    pub(crate) fn with_deferred_mappings(mut self) -> Self {
+        self.defer_mappings = true;
+        self
+    }
+
+    /// A bounded batch leaves room for the command and environment on every
+    /// supported platform, including generated repositories with long names.
+    pub(crate) fn pending_repository_mappings(&self) -> Vec<String> {
+        let mut pending: Vec<_> = self
+            .repository_mappings
+            .read()
+            .iter()
+            .filter(|(_, state)| matches!(state, RepositoryMapping::Pending))
+            .map(|(name, _)| name.clone())
+            .collect();
+        pending.sort_unstable();
+        let mut bytes = 0;
+        let count = pending
+            .iter()
+            .take_while(|name| {
+                bytes += name.len() + 1;
+                bytes <= 16 * 1024
+            })
+            .count()
+            .max(1);
+        pending.truncate(count);
+        pending
+    }
+
+    /// Call after invalidating load queries and draining their readers.
+    pub(crate) fn resolve_repository_mappings(&self, repositories: &[String]) {
+        let names: Vec<_> = repositories.iter().map(String::as_str).collect();
+        let result = self
+            .bazel_client
+            .dump_repo_mappings(&names)
+            .and_then(|mappings| {
+                if mappings.len() != repositories.len() {
+                    bail!("repository mapping batch returned an unexpected result count");
+                }
+                Ok(mappings)
+            });
+        let mut cached = self.repository_mappings.write();
+        match result {
+            Ok(mappings) => {
+                cached.extend(
+                    repositories
+                        .iter()
+                        .cloned()
+                        .zip(mappings.into_iter().map(RepositoryMapping::Ready)),
+                );
+            }
+            Err(error) => {
+                let message = format!("repository mapping batch failed: {error:#}");
+                for repository in repositories {
+                    cached.insert(
+                        repository.clone(),
+                        RepositoryMapping::Failed(message.clone()),
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn has_bazel_context(&self) -> bool {
@@ -210,10 +275,10 @@ impl DefaultFileLoader {
     pub(crate) fn finish_mapping(
         &self,
         repository: String,
-        result: anyhow::Result<HashMap<String, String>>,
+        result: anyhow::Result<starpls_bazel::client::RepoMapping>,
     ) {
         let mapping = match result {
-            Ok(mapping) => RepositoryMapping::Ready(Arc::new(mapping)),
+            Ok(mapping) => RepositoryMapping::Ready(mapping),
             Err(error) => RepositoryMapping::Failed(format!("{error:#}")),
         };
         self.repository_mappings.write().insert(repository, mapping);
@@ -242,6 +307,10 @@ impl DefaultFileLoader {
                         repository: repository.to_owned(),
                         revision,
                     })?;
+                    return Ok(None);
+                }
+                if self.defer_mappings {
+                    entry.insert(RepositoryMapping::Pending);
                     return Ok(None);
                 }
             }
@@ -1231,6 +1300,7 @@ pub(crate) mod source_tests {
     #[derive(Default)]
     pub(crate) struct TestBazelClient {
         pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
+        pub(crate) mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl starpls_bazel::client::BazelClient for TestBazelClient {
@@ -1260,26 +1330,115 @@ pub(crate) mod source_tests {
             }
             Ok(())
         }
-        fn dump_repo_mapping(
+        fn dump_repo_mappings(
             &self,
-            from: &str,
-        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-            Ok([
-                (
-                    "dep".to_owned(),
-                    if from == "stubs+" { "rules+" } else { "wrong+" }.to_owned(),
-                ),
-                ("stubs".to_owned(), "stubs+".to_owned()),
-                ("rules".to_owned(), "rules+".to_owned()),
-            ]
-            .into())
+            repositories: &[&str],
+        ) -> anyhow::Result<Vec<starpls_bazel::client::RepoMapping>> {
+            self.mapping_requests.lock().unwrap().push(
+                repositories
+                    .iter()
+                    .map(|repository| (*repository).to_owned())
+                    .collect(),
+            );
+            if repositories.contains(&"fail+") {
+                anyhow::bail!("cannot evaluate requested repository batch");
+            }
+            Ok(repositories
+                .iter()
+                .map(|from| {
+                    Arc::new(
+                        [
+                            (
+                                "dep".to_owned(),
+                                if *from == "stubs+" {
+                                    "rules+"
+                                } else {
+                                    "wrong+"
+                                }
+                                .to_owned(),
+                            ),
+                            ("stubs".to_owned(), "stubs+".to_owned()),
+                            ("rules".to_owned(), "rules+".to_owned()),
+                        ]
+                        .into(),
+                    )
+                })
+                .collect())
         }
         fn selected_module(
             &self,
             _: &str,
         ) -> anyhow::Result<Option<starpls_bazel::client::SelectedModule>> {
-            unimplemented!()
+            Ok(None)
         }
+    }
+
+    #[test]
+    fn deferred_mappings_batch_deduplicate_and_preserve_ready_entries() {
+        let client = Arc::new(TestBazelClient::default());
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader =
+            DefaultFileLoader::new(client.clone(), Default::default(), None, None, sender, true)
+                .with_deferred_mappings();
+        for repository in ["stubs+", "rules+", "stubs+"] {
+            assert!(loader.repository_mapping(repository).unwrap().is_none());
+        }
+        assert!(client.mapping_requests.lock().unwrap().is_empty());
+        let pending = loader.pending_repository_mappings();
+        assert_eq!(pending, ["rules+", "stubs+"]);
+        loader.resolve_repository_mappings(&pending);
+        assert_eq!(
+            client.mapping_requests.lock().unwrap().as_slice(),
+            &[pending]
+        );
+        assert!(loader.pending_repository_mappings().is_empty());
+        assert_eq!(
+            loader.repository_mapping("stubs+").unwrap().unwrap()["dep"],
+            "rules+"
+        );
+        assert_eq!(
+            loader.repository_mapping("rules+").unwrap().unwrap()["dep"],
+            "wrong+"
+        );
+
+        for repository in ["fail+", "other+"] {
+            assert!(loader.repository_mapping(repository).unwrap().is_none());
+        }
+        loader.resolve_repository_mappings(&loader.pending_repository_mappings());
+        for repository in ["fail+", "other+"] {
+            assert!(loader
+                .repository_mapping(repository)
+                .unwrap_err()
+                .to_string()
+                .contains("repository mapping batch failed"));
+        }
+        assert!(loader.repository_mapping("stubs+").unwrap().is_some());
+        assert!(loader.pending_repository_mappings().is_empty());
+    }
+
+    #[test]
+    fn generated_repository_names_use_bounded_mapping_batches() {
+        let client = Arc::new(TestBazelClient::default());
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader =
+            DefaultFileLoader::new(client.clone(), Default::default(), None, None, sender, true)
+                .with_deferred_mappings();
+        for index in 0..1000 {
+            loader
+                .repository_mapping(&format!("npm+{}+{index:04}", "x".repeat(100)))
+                .unwrap();
+        }
+        loop {
+            let batch = loader.pending_repository_mappings();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.iter().map(|name| name.len() + 1).sum::<usize>() <= 16 * 1024);
+            loader.resolve_repository_mappings(&batch);
+        }
+        let requests = client.mapping_requests.lock().unwrap();
+        assert_eq!(requests.iter().map(Vec::len).sum::<usize>(), 1000);
+        assert_eq!(requests.len(), 7);
     }
 
     #[test]

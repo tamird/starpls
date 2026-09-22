@@ -16,6 +16,8 @@ use starpls_common::FileInfo;
 use starpls_common::Severity;
 use starpls_ide::Analysis;
 use starpls_ide::AnalysisSnapshot;
+use starpls_ide::LoadDependency;
+use starpls_ide::LoadResolution;
 use walkdir::WalkDir;
 
 use crate::bazel::BazelContext;
@@ -52,36 +54,104 @@ pub(crate) struct CheckCommand {
     pub(crate) type_interfaces: super::type_interface::TypeInterfaceOptions,
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::CheckCommand;
+    use super::Checker;
+    use crate::document::source_tests::TestBazelClient;
+    use crate::document::DefaultFileLoader;
+
+    #[test]
+    fn external_stub_packages_prepare_their_source_dependency_graph() {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("checker-stub-graph");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        for path in [
+            &workspace,
+            &external.join("stubs+"),
+            &external.join("rules+"),
+            &external.join("wrong+"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            workspace.join("starpls.toml"),
+            "[[stub-packages]]\nmanifest='@stubs//:package.toml'\nallow-unversioned=true\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("stubs+/package.toml"),
+            "format-version=1\n[source]\nrepository='@dep'\nmodule='rules'\nversions=['1']\n[files]\n'defs.bzl'='defs.bzli'\n").unwrap();
+        std::fs::write(
+            external.join("stubs+/defs.bzli"),
+            "def value() -> int: ...\n",
+        )
+        .unwrap();
+        std::fs::write(
+            external.join("rules+/defs.bzl"),
+            "load('@dep//:value.bzl', 'helper')\ndef value(): return helper\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("wrong+/value.bzl"), "helper = 42\n").unwrap();
+        let client = Arc::new(TestBazelClient::default());
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = DefaultFileLoader::new(
+            client.clone(),
+            workspace.clone(),
+            None,
+            external,
+            sender,
+            true,
+        );
+        let info = starpls_bazel::client::BazelInfo {
+            workspace: workspace.clone(),
+            ..Default::default()
+        };
+        let (analysis, loader) = CheckCommand::default()
+            .prepare_analysis(loader, &info, Default::default())
+            .unwrap();
+        assert_eq!(
+            client.mapping_requests.lock().unwrap().as_slice(),
+            &[vec![String::new()], vec!["stubs+".to_owned()]]
+        );
+        let source = analysis.type_interface_sources();
+        let mut checker =
+            Checker::new(analysis, info, Vec::new(), Vec::new(), &[], loader).unwrap();
+        let graph = checker.prepare_loads().unwrap();
+        assert!(graph.unresolved.values().all(Vec::is_empty));
+        assert!(source.iter().all(|source| graph.files.contains(source)));
+        assert_eq!(graph.files.len(), 3);
+        assert_eq!(
+            client.mapping_requests.lock().unwrap().last().unwrap(),
+            &["rules+"]
+        );
+        let diagnostics = checker.analysis.validate_stubs(|_| true).unwrap();
+        assert!(diagnostics
+            .iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .all(|diagnostic| diagnostic.id().as_str() != "load-error"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 impl CheckCommand {
     pub(crate) fn run(self) -> anyhow::Result<()> {
         let bazel_client = Arc::new(BazelCLI::default());
         let bazel_cx = BazelContext::new(&*bazel_client)
             .map_err(|err| anyhow!("failed to initialize Bazel context: {}", err))?;
-        let builtins = load_bazel_builtins();
         let (fetch_repo_sender, _) = crossbeam_channel::unbounded();
-        let loader = Arc::new(DefaultFileLoader::new(
+        let loader = DefaultFileLoader::new(
             bazel_client,
             bazel_cx.info.workspace.clone(),
             bazel_cx.info.workspace_name.clone(),
             bazel_cx.info.output_base.join("external"),
             fetch_repo_sender,
             bazel_cx.bzlmod_enabled,
-        ));
-
+        );
         loader.finish_mapping(String::new(), Ok(bazel_cx.main_repo_mapping));
-
-        let mut analysis = Analysis::new(
-            loader.clone(),
-            starpls_ide::InferenceOptions {
-                infer_ctx_attributes: self.inference_options.infer_ctx_attributes,
-                use_code_flow_analysis: self.inference_options.use_code_flow_analysis,
-                ..Default::default()
-            },
-        )?;
-
-        analysis.set_builtin_defs(builtins, bazel_cx.rules)?;
-        self.type_interfaces
-            .install(&mut analysis, &loader, &bazel_cx.info.workspace)?;
+        let (analysis, loader) = self.prepare_analysis(loader, &bazel_cx.info, bazel_cx.rules)?;
 
         // Strip off the leading "." from each of the specified extensions.
         // This works better when filtering against files with .extension().
@@ -107,6 +177,30 @@ impl CheckCommand {
         )?;
         checker.report_diagnostics(self.validate_stubs, &ignore_patterns)
     }
+
+    fn prepare_analysis(
+        &self,
+        loader: DefaultFileLoader,
+        info: &BazelInfo,
+        rules: starpls_bazel::build::BuildLanguage,
+    ) -> anyhow::Result<(Analysis, Arc<DefaultFileLoader>)> {
+        // Package manifests can resolve source repositories relative to an
+        // external annotation repository. Finish those synchronous queries
+        // before deferring mappings discovered through the source graph.
+        let prepared = self.type_interfaces.prepare(&loader, &info.workspace)?;
+        let loader = Arc::new(loader.with_deferred_mappings());
+        let mut analysis = Analysis::new(
+            loader.clone(),
+            starpls_ide::InferenceOptions {
+                infer_ctx_attributes: self.inference_options.infer_ctx_attributes,
+                use_code_flow_analysis: self.inference_options.use_code_flow_analysis,
+                ..Default::default()
+            },
+        )?;
+        analysis.set_builtin_defs(load_bazel_builtins(), rules)?;
+        prepared.install(&mut analysis, &info.workspace)?;
+        Ok((analysis, loader))
+    }
 }
 
 struct Checker {
@@ -115,6 +209,12 @@ struct Checker {
     files: indexmap::IndexSet<File>,
     ignored_files: HashSet<PathBuf>,
     loader: Arc<DefaultFileLoader>,
+}
+
+#[derive(Default)]
+struct LoadGraph {
+    files: indexmap::IndexSet<File>,
+    unresolved: indexmap::IndexMap<File, Vec<LoadDependency>>,
 }
 
 impl Checker {
@@ -203,11 +303,54 @@ impl Checker {
         Ok(())
     }
 
+    fn prepare_loads(&mut self) -> anyhow::Result<LoadGraph> {
+        let mut graph = LoadGraph {
+            files: self.files.clone(),
+            unresolved: Default::default(),
+        };
+        graph.files.extend(self.analysis.type_interface_sources());
+        let mut frontier: Vec<_> = graph.files.iter().copied().collect();
+        loop {
+            let snapshot = self.analysis.snapshot();
+            let mut pending = indexmap::IndexSet::new();
+            while let Some(file) = frontier.pop() {
+                let mut unresolved = Vec::new();
+                for edge in snapshot.load_dependencies(file)? {
+                    match &edge.resolution {
+                        LoadResolution::Resolved(loaded) => {
+                            if graph.files.insert(*loaded) {
+                                frontier.push(*loaded);
+                            }
+                        }
+                        LoadResolution::Pending => {
+                            pending.insert(file);
+                            unresolved.push(edge);
+                        }
+                        LoadResolution::Failed(_) => unresolved.push(edge),
+                    }
+                }
+                graph.unresolved.insert(file, unresolved);
+            }
+            drop(snapshot);
+            let mut repositories = self.loader.pending_repository_mappings();
+            if repositories.is_empty() {
+                return Ok(graph);
+            }
+            self.analysis.invalidate_loads();
+            while !repositories.is_empty() {
+                self.loader.resolve_repository_mappings(&repositories);
+                repositories = self.loader.pending_repository_mappings();
+            }
+            frontier.extend(pending);
+        }
+    }
+
     fn report_diagnostics(
         &mut self,
         validate_stubs: bool,
         ignore_patterns: &[String],
     ) -> anyhow::Result<()> {
+        let _graph = self.prepare_loads()?;
         let validated = if validate_stubs {
             self.analysis.validate_stubs(|path| {
                 !path

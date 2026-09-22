@@ -79,7 +79,7 @@ pub(crate) enum Task {
     RepoMappingReady {
         repository: String,
         revision: u64,
-        result: anyhow::Result<std::collections::HashMap<String, String>>,
+        result: anyhow::Result<starpls_bazel::client::RepoMapping>,
     },
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
     Retry(lsp_server::Request),
@@ -692,12 +692,17 @@ mod tests {
         fn build_language(&self) -> anyhow::Result<Vec<u8>> {
             Ok(Vec::new())
         }
-        fn dump_repo_mapping(
+        fn dump_repo_mappings(
             &self,
-            repository: &str,
-        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-            self.block(repository)?;
-            Ok([("child".to_owned(), "child+".to_owned())].into())
+            repositories: &[&str],
+        ) -> anyhow::Result<Vec<starpls_bazel::client::RepoMapping>> {
+            repositories
+                .iter()
+                .map(|repository| {
+                    self.block(repository)?;
+                    Ok(Arc::new([("child".to_owned(), "child+".to_owned())].into()))
+                })
+                .collect()
         }
         fn fetch_repo(&self, _: &str) -> anyhow::Result<()> {
             Ok(())
@@ -1118,6 +1123,7 @@ mod tests {
                 retarget: std::sync::Mutex::new(
                     during_fetch.then(|| (external.join("rules+"), new.clone())),
                 ),
+                mapping_requests: Default::default(),
             });
             server.loader = Arc::new(DefaultFileLoader::new(
                 server.bazel_client.clone(),
