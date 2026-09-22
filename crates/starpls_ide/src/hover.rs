@@ -756,7 +756,7 @@ example = {factory}(
     #[test]
     fn dictionary_attributes_offer_names_and_locations() {
         for (setup, attrs, expected) in [
-            ("", "{'_tool': attr.label()}", "Target"),
+            ("", "{'_tool': attr.label()}", "Target | None"),
             (
                 "attrs = {'_tool': attr.label()}\nattrs.update({'_tool': attr.string()})\n",
                 "attrs",

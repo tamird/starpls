@@ -36,10 +36,23 @@ use crate::Database;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct Attribute {
     pub(super) kind: AttributeKind,
+    pub(super) single_file: Option<bool>,
+    pub(super) executable: Option<bool>,
+    pub(super) configuration: AttributeConfiguration,
     mandatory: bool,
     default: Option<FileRange>,
     documentation: Option<Box<str>>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum AttributeConfiguration {
+    Ordinary,
+    Starlark,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+struct StarlarkTransition;
 
 impl get_size2::GetSize for Attribute {
     fn get_heap_size(&self) -> usize {
@@ -66,6 +79,7 @@ pub(super) enum Factory {
     Macro,
     Struct,
     Provider,
+    Transition,
 }
 
 pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<Factory> {
@@ -117,6 +131,7 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
         "macro" => Some(Factory::Macro),
         "struct" => Some(Factory::Struct),
         "provider" => Some(Factory::Provider),
+        "transition" => Some(Factory::Transition),
         _ => None,
     }
 }
@@ -136,6 +151,23 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
         Factory::Macro => rule(db, call, RuleKind::Macro),
         Factory::Struct => structure(db, call),
         Factory::Provider => provider(db, call),
+        Factory::Transition => {
+            let environment = ProgramEnvironment::from_file(call.file());
+            call.class_type(
+                db,
+                ProvidedClass {
+                    name: Name::new("transition"),
+                    bases: declared_base(db, call, "transition"),
+                    class_members: Box::default(),
+                    instance_fields: ProvidedInstanceFields {
+                        fields: Box::default(),
+                        has_dynamic_fields: false,
+                        data: Some(ProvidedData::new(StarlarkTransition)),
+                    },
+                },
+            )
+            .to_instance_approximation(db, &environment)
+        }
     }
 }
 
@@ -168,7 +200,13 @@ fn attribute<'db>(
         CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal()?,
         CheckedArgument::Indeterminate => return None,
     };
-    let default = match call.argument("default") {
+    // Output descriptors expose no default parameter in Bazel's API.
+    let default = match kind {
+        AttributeKind::Output => CheckedArgument::Omitted,
+        AttributeKind::OutputList => CheckedArgument::Omitted,
+        _ => call.argument("default"),
+    };
+    let default = match default {
         CheckedArgument::Omitted => None,
         CheckedArgument::Value { ty: _, expression } => {
             let expression = expression?;
@@ -182,6 +220,50 @@ fn attribute<'db>(
         CheckedArgument::Indeterminate => return None,
     };
     let environment = ProgramEnvironment::from_file(call.file());
+    let flag = |name| match call.argument(name) {
+        CheckedArgument::Omitted => Some(false),
+        CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal(),
+        CheckedArgument::Indeterminate => None,
+    };
+    let single_file = match call.argument("allow_single_file") {
+        CheckedArgument::Value { ty, expression: _ } => {
+            // Bazel sets SINGLE_ARTIFACT for every non-None value, including False.
+            let list =
+                KnownClass::List.to_specialized_instance(db, &environment, &[Type::unknown()]);
+            let boolean = KnownClass::Bool.to_instance(db, &environment);
+            if ty.is_none(db) {
+                Some(false)
+            } else if ty.as_bool_literal().is_some()
+                || (matches!(ty, Type::NominalInstance(_))
+                    && (ty.is_assignable_to(db, &environment, list)
+                        || ty.is_assignable_to(db, &environment, boolean)))
+            {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        CheckedArgument::Omitted => Some(false),
+        CheckedArgument::Indeterminate => None,
+    };
+    let configuration = match call.argument("cfg") {
+        CheckedArgument::Omitted => AttributeConfiguration::Ordinary,
+        CheckedArgument::Value { ty, expression: _ } => {
+            if ty == Type::none(db, &environment)
+                || matches!(ty.string_literal_value(db), Some("target" | "exec"))
+            {
+                AttributeConfiguration::Ordinary
+            } else if ty
+                .provided_data(db, &environment)
+                .is_some_and(|data| data.downcast_ref::<StarlarkTransition>().is_some())
+            {
+                AttributeConfiguration::Starlark
+            } else {
+                AttributeConfiguration::Unknown
+            }
+        }
+        CheckedArgument::Indeterminate => AttributeConfiguration::Unknown,
+    };
     let class = call.class_type(
         db,
         ProvidedClass {
@@ -193,6 +275,9 @@ fn attribute<'db>(
                 has_dynamic_fields: false,
                 data: Some(ProvidedData::new(Attribute {
                     kind,
+                    single_file,
+                    executable: flag("executable"),
+                    configuration,
                     mandatory,
                     default,
                     documentation: doc_string(db, call),
@@ -382,7 +467,7 @@ pub(super) fn attribute_value_type<'db>(
     let output = || match usage {
         AttributeUse::Input => Some(string),
         AttributeUse::BuildContext => {
-            let class = native_class(db, declarations, "File")?;
+            let class = native_class(db, declarations, "Label")?;
             class.to_instance_approximation(db, environment)
         }
         AttributeUse::RepositoryContext => Some(Type::unknown()),
@@ -407,11 +492,31 @@ pub(super) fn attribute_value_type<'db>(
         AttributeKind::StringList => list(string),
         AttributeKind::StringDict => dict(string, string),
         AttributeKind::StringListDict => dict(string, list(string)),
-        AttributeKind::Label => label()?,
+        AttributeKind::Label => {
+            let label = label()?;
+            match usage {
+                AttributeUse::BuildContext => {
+                    UnionType::from_elements(db, environment, [label, Type::none(db, environment)])
+                }
+                AttributeUse::Input => label,
+                AttributeUse::RepositoryContext => {
+                    UnionType::from_elements(db, environment, [label, Type::none(db, environment)])
+                }
+            }
+        }
         AttributeKind::LabelList => list(label()?),
         AttributeKind::LabelKeyedStringDict => dict(label()?, string),
         AttributeKind::StringKeyedLabelDict => dict(string, label()?),
-        AttributeKind::Output => output()?,
+        AttributeKind::Output => {
+            let output = output()?;
+            match usage {
+                AttributeUse::BuildContext => {
+                    UnionType::from_elements(db, environment, [output, Type::none(db, environment)])
+                }
+                AttributeUse::Input => output,
+                AttributeUse::RepositoryContext => output,
+            }
+        }
         AttributeKind::OutputList => list(output()?),
     })
 }
