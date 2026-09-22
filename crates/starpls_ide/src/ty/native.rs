@@ -27,7 +27,7 @@ enum CallableKind {
     Method,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AnnotationUse {
     Value,
     AttributeInput,
@@ -306,47 +306,47 @@ fn declarations(dialect: Dialect, builtins: &Builtins, rules: &Builtins) -> anyh
         }
     }
     let mut exports = String::new();
+    let mut emitted: BTreeMap<String, Vec<(Value, AnnotationUse, String)>> = BTreeMap::new();
     for (context, globals) in contexts {
-        writeln!(exports, "class _starpls_globals_{context:?}:")?;
-        if globals.is_empty() {
-            writeln!(exports, "    pass")?;
-        }
         for value in globals.values() {
-            match &value.callable {
-                Some(callable) => {
-                    writeln!(exports, "    @staticmethod")?;
-                    write_function(
-                        &mut exports,
-                        "    ",
-                        value,
-                        callable,
-                        CallableKind::Function,
-                        if matches!(
-                            context,
-                            APIContext::Bzl | APIContext::Build | APIContext::Prelude
-                        ) && rule_names.contains(value.name.as_str())
-                        {
-                            AnnotationUse::AttributeInput
-                        } else {
-                            AnnotationUse::Value
-                        },
-                        &declared_classes,
-                    )?;
-                }
-                None => writeln!(
+            let export = export_name(context, &value.name);
+            let Some(callable) = &value.callable else {
+                writeln!(
                     exports,
-                    "    {}: {}",
-                    value.name,
+                    "{export}: {}",
                     value_annotation(value, &declared_classes)
-                )?,
+                )?;
+                continue;
+            };
+            let input = if matches!(
+                context,
+                APIContext::Bzl | APIContext::Build | APIContext::Prelude
+            ) && rule_names.contains(value.name.as_str())
+            {
+                AnnotationUse::AttributeInput
+            } else {
+                AnnotationUse::Value
+            };
+            let previous = emitted.entry(value.name.clone()).or_default();
+            if let Some((_, _, alias)) = previous
+                .iter()
+                .find(|(definition, usage, _)| definition == value && *usage == input)
+            {
+                writeln!(exports, "{export} = {alias}")?;
+                continue;
             }
-        }
-        for name in globals.keys() {
-            writeln!(
-                exports,
-                "{} = _starpls_globals_{context:?}.{name}",
-                export_name(context, name)
+            write_function(
+                &mut exports,
+                "",
+                value,
+                callable,
+                CallableKind::Function,
+                input,
+                &declared_classes,
             )?;
+            // Capture this definition before another context reuses its public name.
+            writeln!(exports, "{export} = {}", value.name)?;
+            previous.push((value.clone(), input, export));
         }
     }
     if body.is_empty() {
@@ -806,6 +806,79 @@ strict_labels(labels)
             assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
             assert!(usize::from(diagnostics[0].range().unwrap().start()) > source.len());
+        }
+    }
+
+    #[test]
+    fn public_names_preserve_context_specific_declarations() {
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        builtins.global.push(Value {
+            name: "register_toolchains".to_owned(),
+            callable: Some(Callable {
+                param: vec![Param {
+                    name: "number".to_owned(),
+                    r#type: "int".to_owned(),
+                    is_mandatory: true,
+                    ..Default::default()
+                }],
+                return_type: "None".to_owned(),
+            }),
+            ..Default::default()
+        });
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Builtins::default())
+            .unwrap();
+        for context in [
+            APIContext::Bzl,
+            APIContext::Module,
+            APIContext::Workspace,
+            APIContext::Prelude,
+        ] {
+            let file = analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    Some(starpls_common::FileInfo::Bazel {
+                        api_context: context,
+                        is_external: false,
+                    }),
+                    "register_toolchains(1)".to_owned(),
+                    1,
+                )
+                .unwrap();
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert_eq!(
+                diagnostics.is_empty(),
+                matches!(context, APIContext::Bzl | APIContext::Prelude),
+                "{context:?}: {diagnostics:?}"
+            );
+            let help = snapshot
+                .signature_help(FilePosition {
+                    file_id: file,
+                    pos: 20.into(),
+                })
+                .unwrap()
+                .unwrap();
+            let signature = &help.signatures[0].label;
+            match context {
+                APIContext::Bzl | APIContext::Prelude => {
+                    assert_eq!(signature, "def register_toolchains(number: int) -> None")
+                }
+                APIContext::Module => assert!(
+                    signature.contains("str") && signature.contains("dev_dependency"),
+                    "{signature}"
+                ),
+                APIContext::Workspace => assert!(
+                    signature.contains("Label") && !signature.contains("dev_dependency"),
+                    "{signature}"
+                ),
+                _ => unreachable!(),
+            }
         }
     }
 

@@ -324,6 +324,12 @@ child(name="child", value="value")
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+            if call.starts_with("macro(") {
+                assert_eq!(
+                    diagnostics[0].headline_message(),
+                    "Argument to function `macro` is incorrect"
+                );
+            }
             assert!(diagnostics[0].range().unwrap().start().to_usize() >= source.len());
         }
     }

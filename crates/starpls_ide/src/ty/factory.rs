@@ -112,16 +112,10 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
     }
     // A same-named method is not the global factory declaration.
     if !parsed.suite().iter().any(|statement| {
-        let Stmt::ClassDef(namespace) = statement else {
+        let Stmt::FunctionDef(candidate) = statement else {
             return false;
         };
-        namespace.name.as_str().starts_with("_starpls_globals_")
-            && namespace.body.iter().any(|statement| {
-                let Stmt::FunctionDef(candidate) = statement else {
-                    return false;
-                };
-                candidate.range() == function.range()
-            })
+        candidate.range() == function.range()
     }) {
         return None;
     }
