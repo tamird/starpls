@@ -102,7 +102,7 @@ mod tests {
             Arc::new(BazelCLI::new("bazel")),
             Default::default(),
             None,
-            Default::default(),
+            None,
             sender,
             false,
         );

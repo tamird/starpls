@@ -14,6 +14,7 @@ pub(crate) struct BazelContext {
     pub(crate) info: BazelInfo,
     pub(crate) rules: Builtins,
     pub(crate) bzlmod_enabled: bool,
+    pub(crate) main_repo_mapping: std::collections::HashMap<String, String>,
 }
 
 impl BazelContext {
@@ -55,12 +56,14 @@ impl BazelContext {
         info!("bzlmod_enabled = {}", bzlmod_enabled);
 
         // If bzlmod is enabled, we also need to check if the `bazel mod dump_repo_mapping` command is supported.
-        if bzlmod_enabled {
-            debug!("checking for `bazel mod dump_repo_mapping` capability");
+        let main_repo_mapping = if bzlmod_enabled {
+            debug!("fetching the main repository mapping");
             client
                 .dump_repo_mapping("")
-                .map_err(|err| anyhow!("failed to run `bazel mod dump_repo_mapping`: {}", err))?;
-        }
+                .map_err(|err| anyhow!("failed to run `bazel mod dump_repo_mapping`: {}", err))?
+        } else {
+            Default::default()
+        };
 
         debug!("fetching builtin rules via `bazel info build-language`");
         let rules = load_bazel_build_language(client)
@@ -70,6 +73,7 @@ impl BazelContext {
             info,
             rules,
             bzlmod_enabled,
+            main_repo_mapping,
         })
     }
 }

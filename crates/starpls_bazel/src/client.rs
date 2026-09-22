@@ -7,7 +7,6 @@ use std::str;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
-use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::Deserializer;
 
@@ -32,14 +31,7 @@ pub struct SelectedModule {
 pub trait BazelClient: Send + Sync + 'static {
     fn build_language(&self) -> anyhow::Result<Vec<u8>>;
     fn info(&self) -> anyhow::Result<BazelInfo>;
-    fn resolve_repo_from_mapping(
-        &self,
-        apparent_repo: &str,
-        from_repo: &str,
-    ) -> anyhow::Result<Option<String>>;
-    fn clear_repo_mappings(&self);
     fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()>;
-    fn repo_mapping_keys(&self, from_repo: &str) -> anyhow::Result<Vec<String>>;
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>>;
     fn fetch_repo(&self, repo: &str) -> anyhow::Result<()>;
     fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<HashMap<String, String>>;
@@ -49,7 +41,7 @@ pub trait BazelClient: Send + Sync + 'static {
 
 pub struct BazelCLI {
     executable: PathBuf,
-    repo_mappings: RwLock<HashMap<String, HashMap<String, String>>>,
+    working_directory: Option<PathBuf>,
 }
 
 impl BazelCLI {
@@ -60,12 +52,25 @@ impl BazelCLI {
         }
     }
 
+    pub fn with_working_directory(mut self, directory: PathBuf) -> anyhow::Result<Self> {
+        if self.executable.is_relative() && self.executable.components().count() > 1 {
+            self.executable = std::env::current_dir()?.join(&self.executable);
+        }
+        self.working_directory = Some(directory);
+        Ok(self)
+    }
+
     fn run_command<I, S>(&self, args: I) -> anyhow::Result<Vec<u8>>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = Command::new(&self.executable).args(args).output()?;
+        let mut command = Command::new(&self.executable);
+        command.args(args);
+        if let Some(directory) = &self.working_directory {
+            command.current_dir(directory);
+        }
+        let output = command.output()?;
         if !output.status.success() {
             bail!(
                 "failed to run Bazel command with exit status {}, stderr={:?}",
@@ -138,48 +143,9 @@ impl BazelClient for BazelCLI {
         })
     }
 
-    fn resolve_repo_from_mapping(
-        &self,
-        apparent_repo: &str,
-        from_repo: &str,
-    ) -> anyhow::Result<Option<String>> {
-        // First, check if we've already fetched the repo mapping for the repository specified by `from_repo`.
-        let mappings = self.repo_mappings.read();
-        if let Some(mapping) = mappings.get(from_repo) {
-            return Ok(mapping.get(apparent_repo).cloned());
-        }
-        drop(mappings);
-
-        let mapping = self.dump_repo_mapping(from_repo)?;
-        let canonical_repo = mapping.get(apparent_repo).cloned();
-        self.repo_mappings
-            .write()
-            .insert(from_repo.to_string(), mapping);
-        Ok(canonical_repo)
-    }
-
-    fn clear_repo_mappings(&self) {
-        self.repo_mappings.write().clear();
-    }
-
     fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()> {
         self.run_command(["query", "--keep_going", &format!("@@{}//...", repo)])?;
         Ok(())
-    }
-
-    fn repo_mapping_keys(&self, from_repo: &str) -> anyhow::Result<Vec<String>> {
-        let mappings = self.repo_mappings.read();
-        if let Some(mapping) = mappings.get(from_repo) {
-            return Ok(mapping.keys().cloned().collect());
-        }
-        drop(mappings);
-
-        let mapping = self.dump_repo_mapping(from_repo)?;
-        let keys = mapping.keys().cloned().collect();
-        self.repo_mappings
-            .write()
-            .insert(from_repo.to_string(), mapping);
-        Ok(keys)
     }
 
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
@@ -322,7 +288,7 @@ impl Default for BazelCLI {
     fn default() -> Self {
         Self {
             executable: "bazel".into(),
-            repo_mappings: Default::default(),
+            working_directory: None,
         }
     }
 }

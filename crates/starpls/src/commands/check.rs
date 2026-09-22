@@ -68,6 +68,8 @@ impl CheckCommand {
             bazel_cx.bzlmod_enabled,
         ));
 
+        loader.finish_mapping(String::new(), Ok(bazel_cx.main_repo_mapping));
+
         let mut analysis = Analysis::new(
             loader.clone(),
             starpls_ide::InferenceOptions {

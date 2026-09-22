@@ -105,6 +105,7 @@ pub(crate) fn find_references(
         .analysis_snapshot
         .workspace_references(position, &candidates, params.context.include_declaration)?
         .unwrap_or_default();
+    snapshot.ensure_workspace_ready()?;
     let mut locations = Vec::with_capacity(references.len());
     for location in references {
         let source = snapshot.analysis_snapshot.source(location.file_id)?;
@@ -138,6 +139,7 @@ fn rename_locations(
     let rename = try_opt!(snapshot
         .analysis_snapshot
         .rename(position, &candidates, new_name)??);
+    snapshot.ensure_workspace_ready()?;
     for location in &rename.locations {
         let path = snapshot.analysis_snapshot.path(location.file_id);
         if !snapshot.loader.is_editable(path)? {

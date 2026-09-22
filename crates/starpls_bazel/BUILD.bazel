@@ -46,7 +46,6 @@ rust_library(
         ":builtin_proto_rust",
         "@crates//:anyhow",
         "@crates//:bytes",
-        "@crates//:parking_lot",
         "@crates//:prost",
         "@crates//:serde",
         "@crates//:serde_json",

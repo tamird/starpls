@@ -23,7 +23,7 @@ impl<T> TaskPool<T> {
         })
     }
 
-    fn spawn<F>(&self, f: F)
+    pub(crate) fn spawn<F>(&self, f: F)
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
@@ -35,7 +35,7 @@ impl<T> TaskPool<T> {
     }
 
     #[allow(unused)]
-    fn spawn_with_sender<F>(&self, f: F)
+    pub(crate) fn spawn_with_sender<F>(&self, f: F)
     where
         T: Send + 'static,
         F: FnOnce(Sender<T>) + Send + 'static,

@@ -50,6 +50,7 @@ pub(crate) struct Server {
     pub(crate) connection: Connection,
     pub(crate) req_queue: ReqQueue<(), OutgoingRequest>,
     pub(crate) task_pool_handle: TaskPoolHandle<Task>,
+    pub(crate) bazel_task_pool: TaskPool<Task>,
     pub(crate) workspace: PathBuf,
     pub(crate) analysis_changed: bool,
     pub(crate) diagnostics_manager: DiagnosticsManager,
@@ -69,6 +70,7 @@ pub(crate) struct ServerSnapshot {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) analysis_snapshot: AnalysisSnapshot,
     pub(crate) configuration_revision: u64,
+    pub(crate) configuration_ready: bool,
     pub(crate) workspace: PathBuf,
     pub(crate) loader: Arc<DefaultFileLoader>,
 }
@@ -76,9 +78,9 @@ pub(crate) struct ServerSnapshot {
 #[derive(Default)]
 pub(crate) struct ConfigurationState {
     pub(crate) revision: u64,
+    pub(crate) complete: bool,
     pub(crate) refreshing: bool,
     pub(crate) pending: bool,
-    pub(crate) deferred_requests: Vec<lsp_server::Request>,
     pub(crate) needs_reopen: bool,
     restart_required: bool,
     inputs: HashMap<PathBuf, Option<Vec<u8>>>,
@@ -88,76 +90,53 @@ pub(crate) struct ConfigurationState {
 
 pub(crate) struct ConfigurationReady {
     pub(crate) revision: u64,
-    pub(crate) loader: Arc<DefaultFileLoader>,
-    pub(crate) interfaces: anyhow::Result<crate::commands::type_interface::PreparedInterfaces>,
+    pub(crate) result: anyhow::Result<PreparedConfiguration>,
+}
+
+pub(crate) struct PreparedConfiguration {
+    loader: Box<DefaultFileLoader>,
+    rules: Option<Builtins>,
+    interfaces: anyhow::Result<crate::commands::type_interface::PreparedInterfaces>,
 }
 
 impl std::fmt::Debug for ConfigurationReady {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigurationReady")
             .field("revision", &self.revision)
-            .field("interfaces", &self.interfaces)
+            .field("error", &self.result.as_ref().err())
             .finish_non_exhaustive()
     }
 }
 
 impl Server {
     pub(crate) fn new(connection: Connection, config: ServerConfig) -> anyhow::Result<Self> {
-        // Create the task pool for processing incoming requests.
+        let bazel_path = config.args.bazel_path.as_deref().unwrap_or("bazel");
+        let client = BazelCLI::new(bazel_path).with_working_directory(config.workspace.clone())?;
+        Self::with_client(connection, config, Arc::new(client))
+    }
+
+    pub(crate) fn with_client(
+        connection: Connection,
+        config: ServerConfig,
+        bazel_client: Arc<dyn BazelClient>,
+    ) -> anyhow::Result<Self> {
         let (task_pool_sender, task_pool_receiver) = crossbeam_channel::unbounded();
         let task_pool = TaskPool::with_num_threads(task_pool_sender.clone(), 4)?;
         let task_pool_handle = TaskPoolHandle::new(task_pool_receiver, task_pool);
-
-        // Check if the user specified a path to the Bazel executable.
-        let bazel_path = config
-            .args
-            .bazel_path
-            .clone()
-            .unwrap_or("bazel".to_string());
-
-        debug!(
-            "fetching Bazel configuration using Bazel executable at {:?}",
-            bazel_path
+        // Bazel serializes commands; keep its waits away from editor workers.
+        let bazel_task_pool = TaskPool::with_num_threads(task_pool_sender.clone(), 1)?;
+        let workspace = config.workspace.clone();
+        let loader = Arc::new(
+            DefaultFileLoader::new(
+                bazel_client.clone(),
+                workspace.clone(),
+                None,
+                None,
+                task_pool_sender.clone(),
+                false,
+            )
+            .for_editor(0),
         );
-
-        // Determine Bazel configuration.
-        let mut has_bazel_init_err = false;
-        let bazel_client = Arc::new(BazelCLI::new(&bazel_path));
-        let bazel_cx = match BazelContext::new(&*bazel_client) {
-            Ok(cx) => cx,
-            Err(err) => {
-                has_bazel_init_err = true;
-                error!("failed to initialize Bazel context: {}", err);
-                Default::default()
-            }
-        };
-
-        // Query for all targets in the current workspace, to use for label completion.
-        let targets = if config.args.enable_label_completions {
-            debug!("querying for all targets in the current workspace");
-            match bazel_client.query_all_workspace_targets() {
-                Ok(targets) => {
-                    debug!("successfully queried for all targets");
-                    targets
-                }
-                Err(err) => {
-                    error!("failed to query all workspace targets: {}", err);
-                    has_bazel_init_err = true;
-                    Default::default()
-                }
-            }
-        } else {
-            Default::default()
-        };
-
-        let loader = Arc::new(DefaultFileLoader::new(
-            bazel_client.clone(),
-            bazel_cx.info.workspace.clone(),
-            bazel_cx.info.workspace_name,
-            bazel_cx.info.output_base.join("external"),
-            task_pool_sender.clone(),
-            bazel_cx.bzlmod_enabled,
-        ));
         let mut analysis = Analysis::new(
             loader.clone(),
             InferenceOptions {
@@ -166,33 +145,8 @@ impl Server {
                 ..Default::default()
             },
         )?;
-
-        if let Err(error) =
-            config
-                .args
-                .type_interfaces
-                .install(&mut analysis, &loader, &bazel_cx.info.workspace)
-        {
-            connection.sender.send(
-                lsp_server::Notification::new(
-                    "window/showMessage".to_owned(),
-                    lsp_types::ShowMessageParams {
-                        typ: lsp_types::MessageType::ERROR,
-                        message: format!("{error:#}"),
-                    },
-                )
-                .into(),
-            )?;
-        }
-        analysis.set_all_workspace_targets(targets);
-        analysis.set_builtin_defs(load_bazel_builtins(), bazel_cx.rules)?;
-
-        // Check for a prelude file. We skip verifying that `//tools/build_tools` is actually a package (i.e.
-        // that it actually contains a `BUILD.bazel`) file for simplicity.
-        let prelude = bazel_cx
-            .info
-            .workspace
-            .join("tools/build_rules/prelude_bazel");
+        analysis.set_builtin_defs(load_bazel_builtins(), Builtins::default())?;
+        let prelude = workspace.join("tools/build_rules/prelude_bazel");
         if let Ok(file) = analysis.file(
             &prelude,
             Dialect::Bazel,
@@ -204,14 +158,14 @@ impl Server {
             info!("found prelude file at {:?}", prelude);
             analysis.set_bazel_prelude_file(file);
         }
-
         let analysis_debounce_interval = config.args.analysis_debounce_interval;
         let mut server = Server {
             config: Arc::new(config),
             connection,
             req_queue: Default::default(),
             task_pool_handle,
-            workspace: bazel_cx.info.workspace,
+            bazel_task_pool,
+            workspace,
             analysis_changed: !analysis.type_interface_files().is_empty(),
             diagnostics_manager: Default::default(),
             analysis,
@@ -224,17 +178,15 @@ impl Server {
             pending_repos: Default::default(),
             is_fetching_repos: false,
             is_refreshing_all_workspace_targets: false,
-            bzlmod_enabled: bazel_cx.bzlmod_enabled,
+            bzlmod_enabled: false,
             loader,
             configuration: Default::default(),
         };
 
         server.configuration.inputs = server.loader.configuration_inputs();
 
-        if has_bazel_init_err {
-            server.send_error_message(BAZEL_INIT_ERR_MESSAGE);
-        }
-
+        server.configuration.pending = true;
+        server.start_configuration_refresh();
         Ok(server)
     }
 
@@ -243,6 +195,10 @@ impl Server {
             config: self.config.clone(),
             analysis_snapshot: self.analysis.snapshot(),
             configuration_revision: self.configuration.revision,
+            configuration_ready: self.configuration.complete
+                && !self.configuration.refreshing
+                && !self.configuration.pending
+                && self.loader.is_ready(),
             workspace: self.workspace.clone(),
             loader: self.loader.clone(),
         }
@@ -453,7 +409,9 @@ impl Server {
 
     pub(crate) fn reload_configuration(&mut self) -> anyhow::Result<()> {
         self.configuration.revision += 1;
+        self.configuration.complete = false;
         self.configuration.pending = true;
+        self.loader.pause(true);
         let snapshot = self.analysis.snapshot();
         for file in self.analysis.type_interface_files() {
             let path = snapshot.path(file);
@@ -488,42 +446,76 @@ impl Server {
         self.configuration.pending = false;
         self.configuration.refreshing = true;
         let revision = self.configuration.revision;
-        let loader = Arc::new(self.loader.fresh(revision));
+        let template = self.loader.clone();
+        template.pause(true);
+        self.analysis.invalidate_loads();
         let workspace = self.workspace.clone();
         let options = self.config.args.type_interfaces.clone();
         let client = self.bazel_client.clone();
-        self.task_pool_handle.spawn(move || {
-            client.clear_repo_mappings();
-            let interfaces = options.prepare(&loader, &workspace);
-            Task::ConfigurationReady(ConfigurationReady {
-                revision,
-                loader,
-                interfaces,
-            })
+        self.bazel_task_pool.spawn(move || {
+            let result = (|| {
+                let (loader, rules) = if template.has_bazel_context() {
+                    (template.fresh(), None)
+                } else {
+                    let context = BazelContext::new(&*client)?;
+                    if context.info.workspace.canonicalize()? != workspace.canonicalize()? {
+                        anyhow::bail!(
+                            "Bazel reported workspace {}, expected {}",
+                            context.info.workspace.display(),
+                            workspace.display()
+                        );
+                    }
+                    let loader = template.with_context(
+                        context.info.workspace_name,
+                        context.info.output_base.join("external"),
+                        context.bzlmod_enabled,
+                    );
+                    loader.finish_mapping(String::new(), Ok(context.main_repo_mapping));
+                    (loader, Some(context.rules))
+                };
+                let interfaces = options.prepare(&loader, &workspace);
+                Ok(PreparedConfiguration {
+                    loader: Box::new(loader),
+                    rules,
+                    interfaces,
+                })
+            })();
+            Task::ConfigurationReady(ConfigurationReady { revision, result })
         });
     }
 
     pub(crate) fn finish_configuration_refresh(&mut self, ready: ConfigurationReady) {
-        let ConfigurationReady {
-            revision,
-            loader,
-            interfaces,
-        } = ready;
+        let ConfigurationReady { revision, result } = ready;
         self.configuration.refreshing = false;
         if revision != self.configuration.revision {
             self.start_configuration_refresh();
             return;
         }
-        let changed: Vec<_> = loader
+        let PreparedConfiguration {
+            loader,
+            rules,
+            interfaces,
+        } = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.loader.pause(false);
+                self.send_error_message(&format!("{BAZEL_INIT_ERR_MESSAGE} {error:#}"));
+                self.invalidate_diagnostics();
+                return;
+            }
+        };
+        let changed = loader
             .configuration_inputs()
             .into_iter()
-            .filter_map(|(path, contents)| (std::fs::read(&path).ok() != contents).then_some(path))
-            .collect();
-        if !changed.is_empty() {
+            .any(|(path, contents)| std::fs::read(&path).ok() != contents);
+        if changed {
             self.configuration.pending = true;
             self.start_configuration_refresh();
             return;
         }
+        // Requests evaluated before the new environment arrived must retry.
+        self.configuration.revision += 1;
+        let loader = Arc::new((*loader).for_editor(self.configuration.revision));
         let snapshot = self.analysis.snapshot();
         let mut admission = Ok(());
         self.configuration.needs_reopen = false;
@@ -539,11 +531,18 @@ impl Server {
             }
         }
         drop(snapshot);
+        self.bzlmod_enabled = loader.bzlmod_enabled();
         self.loader = loader;
         let replacement = self.analysis.replace_loader(self.loader.clone());
+        let native = match rules {
+            Some(rules) => self.analysis.set_builtin_defs(load_bazel_builtins(), rules),
+            None => Ok(()),
+        };
         let result = admission
             .and(replacement)
+            .and(native)
             .and_then(|()| interfaces?.install(&mut self.analysis, &self.workspace));
+        self.configuration.complete = result.is_ok();
         if let Err(error) = result {
             self.send_error_message(&format!("Cannot reload Starpls configuration: {error:#}"));
         }
@@ -592,7 +591,7 @@ impl Server {
         let revision = self.configuration.revision;
 
         self.is_fetching_repos = true;
-        self.task_pool_handle.spawn_with_sender(move |sender| {
+        self.bazel_task_pool.spawn_with_sender(move |sender| {
             sender
                 .send(Task::FetchExternalRepos(FetchExternalReposProgress::Begin(
                     repos.clone(),
@@ -638,7 +637,7 @@ impl Server {
         let revision = self.configuration.revision;
 
         self.is_refreshing_all_workspace_targets = true;
-        self.task_pool_handle.spawn_with_sender(move |sender| {
+        self.bazel_task_pool.spawn_with_sender(move |sender| {
             sender
                 .send(Task::RefreshAllWorkspaceTargets(
                     RefreshAllWorkspaceTargetsProgress::Begin,
@@ -663,7 +662,15 @@ impl Server {
 }
 
 impl ServerSnapshot {
+    pub(crate) fn ensure_workspace_ready(&self) -> anyhow::Result<()> {
+        if !self.configuration_ready || !self.loader.mappings_ready() {
+            anyhow::bail!("Bazel configuration or repository mappings are not ready for workspace references or rename");
+        }
+        Ok(())
+    }
+
     pub(crate) fn reference_files(&self, name: &str) -> anyhow::Result<Vec<File>> {
+        self.ensure_workspace_ready()?;
         let mut files = self.analysis_snapshot.reference_files()?;
         let mut paths = self.loader.loaded_paths();
         let mut walk = walkdir::WalkDir::new(&self.workspace).into_iter();

@@ -72,6 +72,15 @@ pub(crate) enum Task {
         response: lsp_server::Response,
     },
     ConfigurationReady(crate::server::ConfigurationReady),
+    ResolveRepoMapping {
+        repository: String,
+        revision: u64,
+    },
+    RepoMappingReady {
+        repository: String,
+        revision: u64,
+        result: anyhow::Result<std::collections::HashMap<String, String>>,
+    },
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
     Retry(lsp_server::Request),
     /// Events from fetching external repositories.
@@ -94,9 +103,27 @@ pub fn process_connection(
     initialize_params: InitializeParams,
 ) -> anyhow::Result<()> {
     debug!("initializing state and starting event loop");
+    #[allow(deprecated)]
+    let root = initialize_params
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .map(|folder| &folder.uri)
+        .or(initialize_params.root_uri.as_ref());
+    let root = match root {
+        Some(uri) => crate::convert::path_buf_from_url(uri)?,
+        None => std::env::current_dir()?,
+    };
+    let root = root.canonicalize()?;
+    let workspace = root
+        .ancestors()
+        .find(|path| crate::document::is_repository_root(path))
+        .unwrap_or(&root)
+        .to_path_buf();
     let config = ServerConfig {
         args,
         caps: initialize_params.capabilities,
+        workspace,
     };
     let server = Server::new(connection, config)?;
     server.run()
@@ -157,10 +184,6 @@ impl Server {
         if self.configuration.refreshing {
             return Ok(());
         }
-        for request in std::mem::take(&mut self.configuration.deferred_requests) {
-            self.handle_request(request);
-        }
-
         if !self.pending_repos.is_empty() && !self.is_fetching_repos {
             self.fetch_bazel_external_repos();
         }
@@ -208,10 +231,6 @@ impl Server {
     }
 
     fn handle_request(&mut self, req: lsp_server::Request) {
-        if self.configuration.refreshing {
-            self.configuration.deferred_requests.push(req);
-            return;
-        }
         RequestDispatcher::new(req, self)
             .on::<extensions::ShowSyntaxTree>(requests::show_syntax_tree)
             .on::<extensions::ShowHir>(requests::show_hir)
@@ -280,6 +299,40 @@ impl Server {
                 }
             }
             Task::ConfigurationReady(ready) => self.finish_configuration_refresh(ready),
+            Task::ResolveRepoMapping {
+                repository,
+                revision,
+            } => {
+                if revision == self.configuration.revision && !self.configuration.refreshing {
+                    let client = self.bazel_client.clone();
+                    self.bazel_task_pool.spawn(move || {
+                        let result = client.dump_repo_mapping(&repository);
+                        Task::RepoMappingReady {
+                            repository,
+                            revision,
+                            result,
+                        }
+                    });
+                }
+            }
+            Task::RepoMappingReady {
+                repository,
+                revision,
+                result,
+            } => {
+                if revision == self.configuration.revision && !self.configuration.refreshing {
+                    if let Err(error) = &result {
+                        self.send_error_message(&format!(
+                            "Cannot load repository mapping for @@{repository}: {error:#}"
+                        ));
+                    }
+                    // Drain readers while the lookup is still pending, so a
+                    // workspace edit cannot accept references from that state.
+                    self.analysis.invalidate_loads();
+                    self.loader.finish_mapping(repository, result);
+                    self.invalidate_diagnostics();
+                }
+            }
             Task::Retry(req) => self.handle_request(req),
             Task::FetchExternalRepos(progress) => {
                 let token = "FetchExternalRepos".to_string();
@@ -489,7 +542,7 @@ mod tests {
             bazel_client.clone(),
             "/workspace".into(),
             None,
-            "/external".into(),
+            std::path::PathBuf::from("/external"),
             sender.clone(),
             false,
         );
@@ -502,10 +555,12 @@ mod tests {
             config: Arc::new(ServerConfig {
                 args: Default::default(),
                 caps: Default::default(),
+                workspace: "/workspace".into(),
             }),
             connection,
             req_queue: Default::default(),
             task_pool_handle: TaskPoolHandle::new(receiver, pool),
+            bazel_task_pool: TaskPool::with_num_threads(sender.clone(), 1).unwrap(),
             workspace: "/workspace".into(),
             analysis_changed: false,
             diagnostics_manager: Default::default(),
@@ -530,6 +585,326 @@ mod tests {
             disk,
             tasks: sender,
             debounced,
+        }
+    }
+
+    struct BlockedClient {
+        workspace: std::path::PathBuf,
+        operation: &'static str,
+        gate: std::sync::Mutex<Option<(Sender<()>, Receiver<()>)>>,
+        fail: bool,
+    }
+
+    impl BlockedClient {
+        fn block(&self, operation: &str) -> anyhow::Result<()> {
+            if operation == self.operation {
+                if let Some((entered, resume)) = self.gate.lock().unwrap().take() {
+                    entered.send(())?;
+                    resume.recv()?;
+                }
+                if self.fail {
+                    anyhow::bail!("blocked Bazel command failed");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl starpls_bazel::client::BazelClient for BlockedClient {
+        fn info(&self) -> anyhow::Result<starpls_bazel::client::BazelInfo> {
+            self.block("info")?;
+            Ok(starpls_bazel::client::BazelInfo {
+                workspace: self.workspace.clone(),
+                output_base: self.workspace.join("output"),
+                release: "release 9".to_owned(),
+                starlark_semantics: String::new(),
+                workspace_name: None,
+            })
+        }
+        fn build_language(&self) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn dump_repo_mapping(
+            &self,
+            repository: &str,
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            self.block(repository)?;
+            Ok([("child".to_owned(), "child+".to_owned())].into())
+        }
+        fn fetch_repo(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn null_query_external_repo_targets(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn selected_module(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<starpls_bazel::client::SelectedModule>> {
+            Ok(None)
+        }
+    }
+
+    fn hover(
+        server: &mut Server,
+        client: &Connection,
+        path: &Path,
+        line: u32,
+        id: i32,
+    ) -> serde_json::Value {
+        server.register_and_handle_request(lsp_server::Request::new(
+            id.into(),
+            "textDocument/hover".into(),
+            serde_json::json!({
+                "textDocument": {"uri": lsp_types::Url::from_file_path(path).unwrap()},
+                "position": {"line": line, "character": 1},
+            }),
+        ));
+        let response = response(server, client, id);
+        assert!(response.error.is_none(), "{response:?}");
+        response.result.unwrap()
+    }
+
+    fn change(server: &mut Server, path: &Path, text: &str) {
+        server
+            .handle_event(
+                notification::<lsp_types::notification::DidChangeTextDocument>(
+                    lsp_types::DidChangeTextDocumentParams {
+                        text_document: lsp_types::VersionedTextDocumentIdentifier {
+                            uri: lsp_types::Url::from_file_path(path).unwrap(),
+                            version: 2,
+                        },
+                        content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: text.to_owned(),
+                        }],
+                    },
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn local_requests_and_edits_run_while_startup_is_blocked() {
+        use clap::Parser;
+        for fail in [false, true] {
+            let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+                .join(format!("blocked-startup-{fail}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("MODULE.bazel"), "").unwrap();
+            std::fs::write(
+                root.join("source.bzl"),
+                "def compute(value): return value\n",
+            )
+            .unwrap();
+            let stub = root.join("source.bzli");
+            std::fs::write(&stub, "def compute(value: int) -> int: ...\n").unwrap();
+            let (entered, entering) = crossbeam_channel::bounded(1);
+            let (resume, resumed) = crossbeam_channel::bounded(1);
+            let bazel = Arc::new(BlockedClient {
+                workspace: root.clone(),
+                operation: "info",
+                gate: std::sync::Mutex::new(Some((entered, resumed))),
+                fail,
+            });
+            let cli = crate::Cli::try_parse_from([
+                "starpls",
+                "server",
+                "--type_interface",
+                "source.bzl=source.bzli",
+            ])
+            .unwrap();
+            let Some(crate::Commands::Server(args)) = cli.command else {
+                panic!("server command");
+            };
+            let (connection, client) = Connection::memory();
+            let mut server = Server::with_client(
+                connection,
+                ServerConfig {
+                    args,
+                    caps: Default::default(),
+                    workspace: root.clone(),
+                },
+                bazel,
+            )
+            .unwrap();
+            entering.recv_timeout(Duration::from_secs(10)).unwrap();
+            let external = root.join("output/external/dependency+/open.bzl");
+            std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+            std::fs::write(&external, "answer = 7\n").unwrap();
+            server
+                .open_document(&external, "answer = 'unsaved'\n".into(), 4)
+                .unwrap();
+            let local = root.join("local.bzl");
+            server
+                .open_document(&local, "value = 1\nrule\n".into(), 1)
+                .unwrap();
+            server
+                .open_document(&stub, "def compute(value: str) -> str: ...\n".into(), 3)
+                .unwrap();
+            assert!(hover(&mut server, &client, &local, 0, 100)
+                .to_string()
+                .contains("Literal[1]"));
+            assert!(hover(&mut server, &client, &local, 1, 101)
+                .to_string()
+                .contains("rule("));
+            change(&mut server, &local, "value = 'updated'\nrule\n");
+            assert!(hover(&mut server, &client, &local, 0, 102)
+                .to_string()
+                .contains("updated"));
+            assert!(server.snapshot().reference_files("value").is_err());
+            assert!(server.analysis.type_interface_files().is_empty());
+            std::fs::write(root.join("MODULE.bazel"), "# changed during startup\n").unwrap();
+            server
+                .configuration_changed(&[root.join("MODULE.bazel")])
+                .unwrap();
+            resume.send(()).unwrap();
+            finish_reload(&mut server);
+            assert!(
+                server.configuration.refreshing,
+                "stale startup result must restart"
+            );
+            finish_reload(&mut server);
+            assert_eq!(server.configuration.complete, !fail);
+            assert_eq!(
+                server.analysis.type_interface_files().len(),
+                usize::from(!fail)
+            );
+            assert!(server
+                .analysis
+                .document(&stub)
+                .unwrap()
+                .contents
+                .contains("str"));
+            assert!(hover(&mut server, &client, &local, 0, 103)
+                .to_string()
+                .contains("updated"));
+            assert_eq!(server.analysis.document(&local).unwrap().version, 2);
+            if !fail {
+                let snapshot = server.analysis.snapshot();
+                let file = snapshot.open_file(&external).unwrap().unwrap();
+                assert_eq!(file.is_external(), Some(true));
+                assert!(snapshot
+                    .document(snapshot.path(file))
+                    .unwrap()
+                    .contents
+                    .contains("unsaved"));
+                drop(snapshot);
+                std::fs::write(root.join("starpls.toml"), "invalid configuration").unwrap();
+                server
+                    .configuration_changed(&[root.join("starpls.toml")])
+                    .unwrap();
+                finish_reload(&mut server);
+                assert!(!server.snapshot().configuration_ready);
+                assert!(server.analysis.type_interface_files().is_empty());
+            }
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn mapping_waits_release_snapshots_and_report_failure() {
+        for fail in [false, true] {
+            let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+                .join(format!("blocked-mapping-{fail}"));
+            let external = root.join("output/external");
+            let dependency = external.join("dep+");
+            let child = external.join("child+");
+            std::fs::create_dir_all(&dependency).unwrap();
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(root.join("MODULE.bazel"), "").unwrap();
+            std::fs::write(child.join("child.bzl"), "value = 42\n").unwrap();
+            let source = dependency.join("dep.bzl");
+            std::fs::write(&source, "load('@child//:child.bzl', 'value')\nvalue\n").unwrap();
+            let (entered, entering) = crossbeam_channel::bounded(1);
+            let (resume, resumed) = crossbeam_channel::bounded(1);
+            let bazel = Arc::new(BlockedClient {
+                workspace: root.clone(),
+                operation: "dep+",
+                gate: std::sync::Mutex::new(Some((entered, resumed))),
+                fail,
+            });
+            let (connection, client) = Connection::memory();
+            let mut server = Server::with_client(
+                connection,
+                ServerConfig {
+                    workspace: root.clone(),
+                    ..Default::default()
+                },
+                bazel,
+            )
+            .unwrap();
+            finish_reload(&mut server);
+            server
+                .loader
+                .finish_fetch(["dep+".to_owned(), "child+".to_owned()], true);
+            server
+                .open_document(&source, std::fs::read_to_string(&source).unwrap(), 1)
+                .unwrap();
+            assert!(hover(&mut server, &client, &source, 1, 110)
+                .to_string()
+                .contains("Unknown"));
+            loop {
+                crossbeam_channel::select! {
+                    recv(entering) -> entered => { entered.unwrap(); break; }
+                    recv(server.task_pool_handle.receiver) -> task => server.handle_task(task.unwrap()),
+                    default(Duration::from_secs(10)) => panic!("mapping did not start"),
+                }
+            }
+            assert!(server.snapshot().reference_files("value").is_err());
+            let local = root.join("local.bzl");
+            server
+                .open_document(&local, "value = 1\n".into(), 1)
+                .unwrap();
+            assert!(hover(&mut server, &client, &local, 0, 111)
+                .to_string()
+                .contains("Literal[1]"));
+            change(&mut server, &local, "value = 'updated'\n");
+            assert!(hover(&mut server, &client, &local, 0, 112)
+                .to_string()
+                .contains("updated"));
+            resume.send(()).unwrap();
+            loop {
+                let task = server
+                    .task_pool_handle
+                    .receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                let mapping = matches!(task, Task::RepoMappingReady { .. });
+                server.handle_task(task);
+                if mapping {
+                    break;
+                }
+            }
+            if fail {
+                assert!(client
+                    .receiver
+                    .try_iter()
+                    .any(|message| serde_json::to_string(&message)
+                        .unwrap()
+                        .contains("blocked Bazel command failed")));
+                let snapshot = server.snapshot();
+                let file = snapshot
+                    .analysis_snapshot
+                    .open_file(&source)
+                    .unwrap()
+                    .unwrap();
+                assert!(collect_diagnostics(&snapshot, file)
+                    .unwrap()
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("blocked Bazel command failed")));
+            } else {
+                assert!(hover(&mut server, &client, &source, 1, 113)
+                    .to_string()
+                    .contains("Literal[42]"));
+            }
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -578,18 +953,40 @@ mod tests {
         server.handle_event(Event::Task(task)).unwrap();
     }
 
-    fn finish_reload(server: &mut Server) {
+    fn next_configuration(server: &mut Server) -> Task {
         loop {
             let task = server
                 .task_pool_handle
                 .receiver
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
-            let done = matches!(task, Task::ConfigurationReady(_));
-            server.handle_task(task);
-            if done {
-                break;
+            if matches!(task, Task::ConfigurationReady(_)) {
+                return task;
             }
+            server.handle_task(task);
+        }
+    }
+
+    fn finish_reload(server: &mut Server) {
+        let task = next_configuration(server);
+        server.handle_task(task);
+    }
+
+    fn response(server: &mut Server, client: &Connection, id: i32) -> lsp_server::Response {
+        loop {
+            for message in client.receiver.try_iter() {
+                if let lsp_server::Message::Response(response) = message {
+                    if response.id == id.into() {
+                        return response;
+                    }
+                }
+            }
+            let task = server
+                .task_pool_handle
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            server.handle_task(task);
         }
     }
 
@@ -869,15 +1266,9 @@ mod tests {
         )
         .unwrap();
         server.handle_task(old);
-        server.handle_task(old_response);
-        assert_eq!(server.configuration.deferred_requests.len(), 1);
         assert!(published(&client).is_empty());
-        let ready = server
-            .task_pool_handle
-            .receiver
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        assert!(matches!(ready, Task::ConfigurationReady(_)), "{ready:?}");
+        server.handle_task(old_response);
+        let ready = next_configuration(&mut server);
         // A second save arrives while a prepared result is waiting in the queue.
         std::fs::write(
             root.join("starpls.toml"),
@@ -891,26 +1282,9 @@ mod tests {
         .unwrap();
         server.handle_task(ready);
         assert!(server.analysis.type_interface_files().is_empty());
-        let ready = server
-            .task_pool_handle
-            .receiver
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        server.handle_task(ready);
-        for request in std::mem::take(&mut server.configuration.deferred_requests) {
-            server.handle_request(request);
-        }
-        let response = server
-            .task_pool_handle
-            .receiver
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        server.handle_task(response);
-        assert!(client.receiver.try_iter().any(|message| match message {
-            lsp_server::Message::Response(response) =>
-                response.id == 51.into() && !response.result.unwrap().to_string().contains("stale"),
-            _ => false,
-        }));
+        finish_reload(&mut server);
+        let response = response(&mut server, &client, 51);
+        assert!(!response.result.unwrap().to_string().contains("stale"));
         assert_eq!(server.analysis.type_interface_files().len(), 1);
         assert!(!collect_diagnostics(&server.snapshot(), file)
             .unwrap()

@@ -387,15 +387,26 @@ impl Analysis {
         salsa::Database::trigger_cancellation(db);
         db.loader = loader;
         let mut error = None;
+        let mut contexts = Vec::new();
         for (source, document) in db.system.documents() {
-            if let Err(admission) = db.loader.file_info(
+            match db.loader.file_info(
                 document.path.as_std_path(),
                 source.as_std_path(),
                 document.dialect,
                 document.info,
             ) {
-                error.get_or_insert(admission);
+                Ok(info) => {
+                    if info != document.info {
+                        contexts.push((source.to_path_buf(), info));
+                    }
+                }
+                Err(admission) => {
+                    error.get_or_insert(admission);
+                }
             }
+        }
+        for (source, info) in contexts {
+            db.source_system_mut().set_document_info(&source, info);
         }
         self.invalidate_loads();
         match error {

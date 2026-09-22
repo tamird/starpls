@@ -127,6 +127,10 @@ impl SourceSystem {
         documents.remove(&path)
     }
 
+    pub fn set_document_info(&mut self, source: &SystemPath, info: Option<FileInfo>) {
+        self.documents.get_mut(source).expect("open document").info = info;
+    }
+
     pub fn document(&self, path: &SystemPath) -> Option<&OpenDocument> {
         let path = self.source_path(path).ok()?;
         let Self {

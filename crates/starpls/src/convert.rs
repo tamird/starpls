@@ -313,7 +313,7 @@ mod tests {
             std::sync::Arc::new(starpls_bazel::client::BazelCLI::new("bazel")),
             Default::default(),
             None,
-            Default::default(),
+            None,
             sender,
             false,
         );

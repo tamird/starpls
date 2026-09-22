@@ -5,6 +5,8 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::path::MAIN_SEPARATOR;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -93,6 +95,12 @@ enum RepositoryFetch {
     Failed,
 }
 
+enum RepositoryMapping {
+    Pending,
+    Ready(Arc<HashMap<String, String>>),
+    Failed(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RepositoryContext {
     Resolved(Repository),
@@ -104,7 +112,7 @@ pub(crate) struct DefaultFileLoader {
     bazel_client: Arc<dyn BazelClient>,
     workspace: PathBuf,
     workspace_name: Option<String>,
-    external_output_base: PathBuf,
+    external_output_base: Option<PathBuf>,
     fetch_repo_sender: Sender<Task>,
     bzlmod_enabled: bool,
     repositories: RwLock<HashMap<PathBuf, RepositoryContext>>,
@@ -112,6 +120,8 @@ pub(crate) struct DefaultFileLoader {
     repository_roots: RwLock<HashSet<PathBuf>>,
     configuration_revision: Option<u64>,
     repository_fetches: RwLock<HashMap<String, RepositoryFetch>>,
+    repository_mappings: RwLock<HashMap<String, RepositoryMapping>>,
+    paused: AtomicBool,
 }
 
 impl DefaultFileLoader {
@@ -119,7 +129,7 @@ impl DefaultFileLoader {
         bazel_client: Arc<dyn BazelClient>,
         workspace: PathBuf,
         workspace_name: Option<String>,
-        external_output_base: PathBuf,
+        external_output_base: impl Into<Option<PathBuf>>,
         fetch_repo_sender: Sender<Task>,
         bzlmod_enabled: bool,
     ) -> Self {
@@ -127,7 +137,7 @@ impl DefaultFileLoader {
             bazel_client,
             workspace,
             workspace_name,
-            external_output_base,
+            external_output_base: external_output_base.into(),
             fetch_repo_sender,
             bzlmod_enabled,
             repositories: Default::default(),
@@ -135,22 +145,111 @@ impl DefaultFileLoader {
             repository_roots: Default::default(),
             configuration_revision: None,
             repository_fetches: Default::default(),
+            repository_mappings: Default::default(),
+            paused: AtomicBool::new(false),
         };
         loader.watch_repository(&loader.workspace);
         loader
     }
 
-    pub(crate) fn fresh(&self, revision: u64) -> Self {
-        let mut loader = Self::new(
+    pub(crate) fn with_context(
+        &self,
+        workspace_name: Option<String>,
+        external: PathBuf,
+        bzlmod: bool,
+    ) -> Self {
+        Self::new(
+            self.bazel_client.clone(),
+            self.workspace.clone(),
+            workspace_name,
+            external,
+            self.fetch_repo_sender.clone(),
+            bzlmod,
+        )
+    }
+
+    pub(crate) fn for_editor(mut self, revision: u64) -> Self {
+        self.configuration_revision = Some(revision);
+        self
+    }
+
+    pub(crate) fn has_bazel_context(&self) -> bool {
+        self.external_output_base.is_some()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.has_bazel_context() && !self.paused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mappings_ready(&self) -> bool {
+        self.repository_mappings
+            .read()
+            .values()
+            .all(|mapping| matches!(mapping, RepositoryMapping::Ready(_)))
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        Self::new(
             self.bazel_client.clone(),
             self.workspace.clone(),
             self.workspace_name.clone(),
             self.external_output_base.clone(),
             self.fetch_repo_sender.clone(),
             self.bzlmod_enabled,
-        );
-        loader.configuration_revision = Some(revision);
-        loader
+        )
+    }
+
+    pub(crate) fn pause(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bzlmod_enabled(&self) -> bool {
+        self.bzlmod_enabled
+    }
+
+    pub(crate) fn finish_mapping(
+        &self,
+        repository: String,
+        result: anyhow::Result<HashMap<String, String>>,
+    ) {
+        let mapping = match result {
+            Ok(mapping) => RepositoryMapping::Ready(Arc::new(mapping)),
+            Err(error) => RepositoryMapping::Failed(format!("{error:#}")),
+        };
+        self.repository_mappings.write().insert(repository, mapping);
+    }
+
+    fn repository_mapping(
+        &self,
+        repository: &str,
+    ) -> anyhow::Result<Option<Arc<HashMap<String, String>>>> {
+        if self.paused.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut mappings = self.repository_mappings.write();
+        match mappings.entry(repository.to_owned()) {
+            Entry::Occupied(entry) => {
+                return match entry.get() {
+                    RepositoryMapping::Pending => Ok(None),
+                    RepositoryMapping::Ready(mapping) => Ok(Some(mapping.clone())),
+                    RepositoryMapping::Failed(error) => Err(anyhow::Error::msg(error.clone())),
+                }
+            }
+            Entry::Vacant(entry) => {
+                if let Some(revision) = self.configuration_revision {
+                    entry.insert(RepositoryMapping::Pending);
+                    self.fetch_repo_sender.send(Task::ResolveRepoMapping {
+                        repository: repository.to_owned(),
+                        revision,
+                    })?;
+                    return Ok(None);
+                }
+            }
+        }
+        drop(mappings);
+        let result = self.bazel_client.dump_repo_mapping(repository);
+        self.finish_mapping(repository.to_owned(), result);
+        self.repository_mapping(repository)
     }
 
     fn watch_repository(&self, root: &Path) {
@@ -239,7 +338,12 @@ impl DefaultFileLoader {
     ) -> anyhow::Result<Option<Repository>> {
         let old = match previous.repositories.read().get(source) {
             Some(RepositoryContext::Resolved(repository)) => Some(repository.clone()),
-            Some(RepositoryContext::Unknown) => return Ok(None),
+            Some(RepositoryContext::Unknown) => {
+                if previous.has_bazel_context() {
+                    return Ok(None);
+                }
+                None
+            }
             Some(RepositoryContext::Displaced) => bail!(
                 "repository context for open file {} changed; close and reopen it",
                 original.display()
@@ -263,6 +367,8 @@ impl DefaultFileLoader {
             } else {
                 match self
                     .external_output_base
+                    .as_ref()
+                    .context("Bazel configuration is loading")?
                     .join(&repository.name)
                     .canonicalize()
                 {
@@ -280,6 +386,15 @@ impl DefaultFileLoader {
         };
         if target != source || repository_moved {
             bail!("open file {} refers to {} after the dependency change (buffer: {}); close and reopen it to use the new repository", original.display(), target.display(), source.display());
+        }
+        if !previous.has_bazel_context() {
+            if old
+                .as_ref()
+                .is_some_and(|repository| !repository.name.is_empty())
+            {
+                return Ok(old);
+            }
+            return self.repository_for_source(original, source);
         }
         Ok(old)
     }
@@ -334,7 +449,20 @@ impl DefaultFileLoader {
     ) -> anyhow::Result<Option<ResolvedLabel>> {
         let from_path = from.path(db);
         let repository = try_opt!(self.repository_for_source(from_path, from_path)?);
+        if (!self.has_bazel_context() || self.paused.load(Ordering::Relaxed))
+            && (!repository.name.is_empty()
+                || (!label.repo().is_empty() && label.kind() != RepoKind::Current))
+        {
+            return Ok(None);
+        }
         self.ensure_repository(&repository)?;
+        if self.bzlmod_enabled
+            && label.kind() == RepoKind::Apparent
+            && !label.repo().is_empty()
+            && self.repository_mapping(&repository.name)?.is_none()
+        {
+            return Ok(None);
+        }
         let repository = self.resolve_repository(label, &repository)?;
         let resolved_path = if label.is_relative() {
             package_for_path(from_path, &repository.root)?
@@ -412,6 +540,11 @@ impl DefaultFileLoader {
         from: &Repository,
     ) -> anyhow::Result<Repository> {
         self.watch_repository(&from.root);
+        if self.paused.load(Ordering::Relaxed)
+            && (!from.name.is_empty() || !label.repo().is_empty())
+        {
+            bail!("Bazel configuration is loading");
+        }
         let name = match label.kind() {
             RepoKind::Current => return Ok(from.clone()),
             RepoKind::Canonical => label.repo().to_owned(),
@@ -419,9 +552,10 @@ impl DefaultFileLoader {
                 if label.repo().is_empty() {
                     String::new()
                 } else if self.bzlmod_enabled {
-                    let name = self
-                        .bazel_client
-                        .resolve_repo_from_mapping(label.repo(), &from.name)?;
+                    let mapping = self
+                        .repository_mapping(&from.name)?
+                        .context("Bazel repository mapping is loading")?;
+                    let name = mapping.get(label.repo()).cloned();
                     name.with_context(|| {
                         format!(
                             "cannot resolve repository @{} from @@{}",
@@ -439,7 +573,10 @@ impl DefaultFileLoader {
         let root = if name.is_empty() {
             self.workspace.clone()
         } else {
-            self.external_output_base.join(&name)
+            self.external_output_base
+                .as_ref()
+                .context("Bazel configuration is loading")?
+                .join(&name)
         };
         self.watch_repository(&root);
         Ok(Repository { name, root })
@@ -500,13 +637,22 @@ impl DefaultFileLoader {
             Some(RepositoryContext::Displaced) => return Ok(None),
             Some(RepositoryContext::Resolved(repository)) => {
                 let repository = repository.clone();
-                if !path.starts_with(&self.external_output_base) {
+                if !self
+                    .external_output_base
+                    .as_ref()
+                    .is_some_and(|base| path.starts_with(base))
+                {
                     return Ok(Some(repository));
                 }
             }
             None => {}
         }
-        let repository = if let Ok(relative) = path.strip_prefix(&self.external_output_base) {
+        let external = self.external_output_base.as_ref().and_then(|base| {
+            path.strip_prefix(base)
+                .ok()
+                .map(|relative| (base, relative))
+        });
+        let repository = if let Some((base, relative)) = external {
             let name = relative
                 .components()
                 .next()
@@ -517,12 +663,22 @@ impl DefaultFileLoader {
                 .context("Bazel repository name is not UTF-8")?;
             Some(Repository {
                 name: name.to_owned(),
-                root: self.external_output_base.join(name),
+                root: base.join(name),
             })
         } else if path.starts_with(&self.workspace)
             || path.extension().is_some_and(|ext| ext == "bzli")
         {
-            Some(self.main_repository())
+            let nested = canonical
+                .parent()
+                .into_iter()
+                .flat_map(Path::ancestors)
+                .take_while(|parent| *parent != self.workspace)
+                .any(is_repository_root);
+            if !self.has_bazel_context() && nested {
+                None
+            } else {
+                Some(self.main_repository())
+            }
         } else {
             None
         };
@@ -609,11 +765,9 @@ impl DefaultFileLoader {
             }) = repository
             {
                 if !canonical_repo.is_empty()
-                    && (!self
-                        .external_output_base
-                        .join(&canonical_repo)
-                        .try_exists()
-                        .unwrap_or(false))
+                    && self.external_output_base.as_ref().is_some_and(|base| {
+                        !base.join(&canonical_repo).try_exists().unwrap_or(false)
+                    })
                 {
                     let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
                         FetchExternalRepoRequest {
@@ -807,6 +961,9 @@ impl FileLoader for DefaultFileLoader {
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
                 };
                 let repository = try_opt!(self.repository_for_source(&from_path, &from_path)?);
+                if !self.is_ready() && (!repository.name.is_empty() || !label.repo().is_empty()) {
+                    return Ok(None);
+                }
                 self.ensure_repository(&repository)?;
 
                 if !label.has_leading_slashes()
@@ -814,7 +971,8 @@ impl FileLoader for DefaultFileLoader {
                     && err != Some(ParseError::InvalidRepo)
                 {
                     if label.kind() == RepoKind::Apparent && self.bzlmod_enabled {
-                        let names = self.bazel_client.repo_mapping_keys(&repository.name)?;
+                        let mapping = try_opt!(self.repository_mapping(&repository.name)?);
+                        let names = mapping.keys().cloned();
                         return Ok(Some(
                             names
                                 .into_iter()
@@ -828,7 +986,7 @@ impl FileLoader for DefaultFileLoader {
                     }
                     return Ok(match label.kind() {
                         RepoKind::Canonical | RepoKind::Apparent => Some(
-                            fs::read_dir(&self.external_output_base)?
+                            fs::read_dir(try_opt!(self.external_output_base.as_ref()))?
                                 .filter_map(|entry| {
                                     let entry = entry.ok()?;
                                     entry.file_type().ok()?.is_dir().then(|| LoadItemCandidate {
@@ -1082,33 +1240,8 @@ pub(crate) mod source_tests {
         fn info(&self) -> anyhow::Result<starpls_bazel::client::BazelInfo> {
             unimplemented!()
         }
-        fn resolve_repo_from_mapping(
-            &self,
-            apparent: &str,
-            from: &str,
-        ) -> anyhow::Result<Option<String>> {
-            Ok(Some(
-                match apparent {
-                    "dep" => {
-                        if from == "stubs+" {
-                            "rules+"
-                        } else {
-                            "wrong+"
-                        }
-                    }
-                    "stubs" => "stubs+",
-                    "rules" => "rules+",
-                    _ => return Ok(None),
-                }
-                .to_owned(),
-            ))
-        }
-        fn clear_repo_mappings(&self) {}
         fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()> {
             self.fetch_repo(repo)
-        }
-        fn repo_mapping_keys(&self, from: &str) -> anyhow::Result<Vec<String>> {
-            Ok(vec![from.to_owned()])
         }
         fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
             unimplemented!()
@@ -1129,9 +1262,17 @@ pub(crate) mod source_tests {
         }
         fn dump_repo_mapping(
             &self,
-            _: &str,
+            from: &str,
         ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-            unimplemented!()
+            Ok([
+                (
+                    "dep".to_owned(),
+                    if from == "stubs+" { "rules+" } else { "wrong+" }.to_owned(),
+                ),
+                ("stubs".to_owned(), "stubs+".to_owned()),
+                ("rules".to_owned(), "rules+".to_owned()),
+            ]
+            .into())
         }
         fn selected_module(
             &self,
@@ -1298,7 +1439,7 @@ pub(crate) mod source_tests {
             analysis.document(&new_physical).unwrap().path.as_std_path(),
             new_alias
         );
-        let fresh = loader.fresh(1);
+        let fresh = loader.fresh().for_editor(1);
         fresh
             .register_path(&canonical, &fresh.main_repository())
             .unwrap();
@@ -1324,7 +1465,7 @@ pub(crate) mod source_tests {
             Arc::new(BazelCLI::new("bazel")),
             Default::default(),
             None,
-            Default::default(),
+            None,
             sender,
             false,
         );

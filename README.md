@@ -48,7 +48,10 @@ Experimental features are enabled through flags on the `starpls server` subcomma
 }
 ```
 
-Note: If you don't put `starpls` directly on the `$PATH`, then for `bazel.lsp.command` you'll have to specify the absolute path to the `starpls` executable instead. Additionally, if your VSCode setup also has any tasks that run Bazel commands on open, those might temporarily block the server from starting up because of the Bazel lock; the server will still spin up once it is able to acquire the lock.
+If `starpls` is outside `$PATH`, set `bazel.lsp.command` to its absolute path.
+Bazel metadata loads in the background while local hover, completion, and
+navigation are available. Diagnostics wait for configuration loading to
+finish; workspace references and rename require a valid configuration.
 
 Alternatively, you can build `starpls` with Bazel:
 
