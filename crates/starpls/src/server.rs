@@ -69,6 +69,8 @@ pub(crate) struct ServerSnapshot {
     pub(crate) config: Arc<ServerConfig>,
     pub(crate) analysis_snapshot: AnalysisSnapshot,
     pub(crate) configuration_revision: u64,
+    pub(crate) workspace: PathBuf,
+    pub(crate) loader: Arc<DefaultFileLoader>,
 }
 
 #[derive(Default)]
@@ -241,6 +243,8 @@ impl Server {
             config: self.config.clone(),
             analysis_snapshot: self.analysis.snapshot(),
             configuration_revision: self.configuration.revision,
+            workspace: self.workspace.clone(),
+            loader: self.loader.clone(),
         }
     }
 
@@ -655,6 +659,85 @@ impl Server {
                 ))
                 .unwrap();
         });
+    }
+}
+
+impl ServerSnapshot {
+    pub(crate) fn reference_files(&self, name: &str) -> anyhow::Result<Vec<File>> {
+        let mut files = self.analysis_snapshot.reference_files()?;
+        let mut paths = self.loader.loaded_paths();
+        let mut walk = walkdir::WalkDir::new(&self.workspace).into_iter();
+        while let Some(entry) = walk.next() {
+            self.analysis_snapshot.check_cancelled()?;
+            let entry = entry?;
+            if !crate::document::visit_source_entry(&entry, &self.config.args.ignore_patterns) {
+                if entry.file_type().is_dir() {
+                    walk.skip_current_dir();
+                }
+                continue;
+            }
+            // Nested repositories have their own load context. Loaded files and editor
+            // buffers enter below through the loader's established repository identity.
+            if entry.depth() > 0
+                && entry.file_type().is_dir()
+                && crate::document::is_repository_root(entry.path())
+            {
+                walk.skip_current_dir();
+                continue;
+            }
+            if entry.file_type().is_file()
+                && crate::document::source_kind(&self.workspace, entry.path(), &["star", "sky"])
+                    .is_some()
+            {
+                paths.push(entry.into_path());
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        for path in paths {
+            self.analysis_snapshot.check_cancelled()?;
+            let Some((dialect, context)) =
+                crate::document::source_kind(&self.workspace, &path, &["star", "sky"])
+            else {
+                continue;
+            };
+            let open = self.analysis_snapshot.open_file(&path)?;
+            let contents = match open {
+                Some(file) => self.analysis_snapshot.source(file)?.text.to_string(),
+                None => match std::fs::read_to_string(&path) {
+                    Ok(contents) => contents,
+                    Err(error) => {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                },
+            };
+            // Escaped load strings may spell an export without its literal name.
+            if !contents.contains(name) && !contents.contains('\\') {
+                continue;
+            }
+            let file = match open {
+                Some(file) => file,
+                None => self.analysis_snapshot.file(
+                    &path,
+                    dialect,
+                    context.map(|api_context| FileInfo::Bazel {
+                        api_context,
+                        is_external: false,
+                    }),
+                )??,
+            };
+            files.push(file);
+        }
+        files.sort_by(|left, right| {
+            self.analysis_snapshot
+                .path(*left)
+                .cmp(self.analysis_snapshot.path(*right))
+        });
+        files.dedup_by_key(|file| file.source);
+        Ok(files)
     }
 }
 

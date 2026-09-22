@@ -225,6 +225,8 @@ impl Server {
             .on::<lsp_types::request::FoldingRangeRequest>(requests::folding_ranges)
             .on::<lsp_types::request::InlayHintRequest>(requests::inlay_hints)
             .on::<lsp_types::request::References>(requests::find_references)
+            .on::<lsp_types::request::PrepareRenameRequest>(requests::prepare_rename)
+            .on::<lsp_types::request::Rename>(requests::rename)
             .on::<lsp_types::request::SemanticTokensFullRequest>(requests::semantic_tokens)
             .on::<lsp_types::request::SemanticTokensRangeRequest>(requests::semantic_tokens_range)
             .on::<lsp_types::request::SignatureHelpRequest>(requests::signature_help)

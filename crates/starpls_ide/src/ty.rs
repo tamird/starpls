@@ -28,13 +28,13 @@ use crate::Database;
 mod context;
 mod diagnostics;
 mod factory;
-mod interface;
-mod load;
+pub(crate) mod interface;
+pub(crate) mod load;
 mod native;
 #[cfg(test)]
 mod skylib_tests;
 mod support;
-mod validation;
+pub(crate) mod validation;
 
 pub(crate) use diagnostics::check;
 pub(crate) use factory::Documentation;

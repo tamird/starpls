@@ -6,23 +6,21 @@ use std::sync::Arc;
 use annotate_snippets::Level;
 use annotate_snippets::Renderer;
 use anyhow::anyhow;
-use anyhow::bail;
 use clap::Args;
 use ruff_db::diagnostic::Diagnostic;
 use ruff_db::diagnostic::DisplayDiagnosticConfig;
 use starpls_bazel::client::BazelCLI;
 use starpls_bazel::client::BazelInfo;
-use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_common::Severity;
 use starpls_ide::Analysis;
 use starpls_ide::AnalysisSnapshot;
-use walkdir::DirEntry;
 use walkdir::WalkDir;
 
 use crate::bazel::BazelContext;
 use crate::commands::InferenceOptions;
+use crate::document::is_ignored_name;
 use crate::document::DefaultFileLoader;
 use crate::document::{self};
 use crate::server::load_bazel_builtins;
@@ -117,21 +115,6 @@ struct Checker {
     loader: Arc<DefaultFileLoader>,
 }
 
-fn is_ignored_name(name: &std::ffi::OsStr, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| name == pattern.as_str())
-}
-
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| {
-            // Don't consider lone "." as a hidden entry.
-            s.starts_with('.') && s != "."
-        })
-        .unwrap_or(false)
-}
-
 impl Checker {
     fn new(
         analysis: Analysis,
@@ -153,9 +136,10 @@ impl Checker {
             .files
             .extend(checker.analysis.type_interface_files());
         for path in paths {
-            for entry in WalkDir::new(&path).into_iter().filter_entry(|e| {
-                !is_hidden(e) && !is_ignored_name(e.file_name(), &ignore_patterns)
-            }) {
+            for entry in WalkDir::new(&path)
+                .into_iter()
+                .filter_entry(|e| document::visit_source_entry(e, &ignore_patterns))
+            {
                 let entry = entry?;
                 if entry.file_type().is_file() {
                     let is_explicit = entry.path().as_os_str().to_str() == Some(path.as_str());
@@ -177,28 +161,14 @@ impl Checker {
         self.loader.repository_for_path(&path)?;
         let canonical_path = path.canonicalize()?;
 
-        let (dialect, api_context) = match document::dialect_and_api_context_for_workspace_path(
-            &self.bazel_info.workspace,
-            &canonical_path,
-        ) {
-            Some(res) => res,
-            None => bail!("Failed to determine Starlark dialect for file: {:?}", path),
-        };
-
-        // Only process files that match any of the file extensions passed via the command line.
-        // This always includes ".star" and ".sky" files.
-        if dialect == Dialect::Standard
-            && !path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| extensions.contains(&ext))
-                .unwrap_or(false)
-        {
+        let Some((dialect, api_context)) =
+            document::source_kind(&self.bazel_info.workspace, &canonical_path, extensions)
+        else {
             if is_explicit {
                 self.ignored_files.insert(path.to_path_buf());
             }
             return Ok(());
-        }
+        };
 
         let info = api_context.map(|api_context| FileInfo::Bazel {
             api_context,

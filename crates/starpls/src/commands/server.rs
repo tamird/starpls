@@ -42,6 +42,10 @@ pub(crate) struct ServerCommand {
     #[clap(long = "analysis_debounce_interval", default_value_t = 250)]
     pub(crate) analysis_debounce_interval: u64,
 
+    /// File and directory names excluded from workspace references and rename.
+    #[clap(long = "ignore_pattern")]
+    pub(crate) ignore_patterns: Vec<String>,
+
     #[command(flatten)]
     pub(crate) inference_options: InferenceOptions,
 
@@ -74,6 +78,10 @@ impl ServerCommand {
             )),
             folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
+            rename_provider: Some(OneOf::Right(lsp_types::RenameOptions {
+                prepare_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            })),
             semantic_tokens_provider: Some(
                 lsp_types::SemanticTokensOptions {
                     legend: lsp_types::SemanticTokensLegend {

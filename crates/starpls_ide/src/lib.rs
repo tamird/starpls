@@ -46,6 +46,7 @@ pub use crate::completions::TextEdit;
 pub use crate::document_symbols::DocumentSymbol;
 pub use crate::document_symbols::SymbolKind;
 pub use crate::document_symbols::SymbolTag;
+pub use crate::find_references::Rename;
 pub use crate::hover::Hover;
 pub use crate::hover::Markup;
 pub use crate::signature_help::ParameterInfo;
@@ -512,22 +513,73 @@ impl AnalysisSnapshot {
         self.query(|db| document_symbols::document_symbols(db, file_id))
     }
 
+    pub fn reference_name(&self, pos: FilePosition) -> Cancellable<Option<String>> {
+        self.query(|db| find_references::reference_name(db, pos))
+    }
+
     pub fn find_references(
         &self,
         pos: FilePosition,
         include_declaration: bool,
     ) -> Cancellable<Option<Vec<Location>>> {
         let file = pos.file_id;
+        self.workspace_references(pos, &[file], include_declaration)
+    }
+
+    pub fn workspace_references(
+        &self,
+        pos: FilePosition,
+        candidates: &[File],
+        include_declaration: bool,
+    ) -> Cancellable<Option<Vec<Location>>> {
         self.query(|db| {
-            find_references::find_references(db, pos, include_declaration).map(|references| {
-                references
-                    .into_iter()
-                    .map(|reference| Location {
-                        file_id: file,
-                        range: util::text_range(reference.range()),
-                    })
-                    .collect()
-            })
+            find_references::workspace_references(db, pos, candidates, include_declaration)
+        })
+    }
+
+    pub fn rename(
+        &self,
+        pos: FilePosition,
+        candidates: &[File],
+        new_name: Option<&str>,
+    ) -> Cancellable<anyhow::Result<Option<Rename>>> {
+        self.query(|db| find_references::rename(db, pos, candidates, new_name))
+    }
+
+    /// Candidate discovery checks cancellation even while walking non-source directories.
+    pub fn check_cancelled(&self) -> Cancellable<()> {
+        self.query(salsa::Database::unwind_if_revision_cancelled)
+    }
+
+    pub fn file(
+        &self,
+        path: &std::path::Path,
+        dialect: Dialect,
+        info: Option<FileInfo>,
+    ) -> Cancellable<anyhow::Result<File>> {
+        self.query(|db| {
+            let path_system = starpls_common::system_path(path)?;
+            let source = db.system.source_path(path_system)?;
+            let info = db
+                .loader
+                .file_info(path, source.as_std_path(), dialect, info)?;
+            File::from_path(db, source.as_std_path(), dialect, info)
+        })
+    }
+
+    pub fn reference_files(&self) -> Cancellable<Vec<File>> {
+        self.query(|db| {
+            let mut files: Vec<_> = db
+                .system
+                .documents()
+                .filter_map(|(path, document)| {
+                    File::from_path(db, path.as_std_path(), document.dialect, document.info).ok()
+                })
+                .collect();
+            for (source, stub) in db.environment().type_interfaces(db).values() {
+                files.extend([*source, *stub]);
+            }
+            files
         })
     }
 

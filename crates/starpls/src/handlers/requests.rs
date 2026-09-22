@@ -96,12 +96,14 @@ pub(crate) fn find_references(
         file_id,
         params.text_document_position.position,
     )?);
+    let position = FilePosition { file_id, pos };
+    let name = try_opt!(snapshot
+        .analysis_snapshot
+        .reference_name(position.clone())?);
+    let candidates = snapshot.reference_files(&name)?;
     let references = snapshot
         .analysis_snapshot
-        .find_references(
-            FilePosition { file_id, pos },
-            params.context.include_declaration,
-        )?
+        .workspace_references(position, &candidates, params.context.include_declaration)?
         .unwrap_or_default();
     let mut locations = Vec::with_capacity(references.len());
     for location in references {
@@ -114,6 +116,137 @@ pub(crate) fn find_references(
         }
     }
     Ok(Some(locations))
+}
+
+fn rename_locations(
+    snapshot: &ServerSnapshot,
+    position: lsp_types::TextDocumentPositionParams,
+    new_name: Option<&str>,
+) -> anyhow::Result<Option<(starpls_common::File, starpls_ide::Rename)>> {
+    let path = path_buf_from_url(&position.text_document.uri)?;
+    let file_id = try_opt!(snapshot.analysis_snapshot.open_file(&path)?);
+    let pos = try_opt!(convert::text_size_from_lsp_position(
+        snapshot,
+        file_id,
+        position.position
+    )?);
+    let position = FilePosition { file_id, pos };
+    let name = try_opt!(snapshot
+        .analysis_snapshot
+        .reference_name(position.clone())?);
+    let candidates = snapshot.reference_files(&name)?;
+    let rename = try_opt!(snapshot
+        .analysis_snapshot
+        .rename(position, &candidates, new_name)??);
+    for location in &rename.locations {
+        let path = snapshot.analysis_snapshot.path(location.file_id);
+        if !snapshot.loader.is_editable(path)? {
+            anyhow::bail!(
+                "Cannot rename a declaration or reference in external repository {}",
+                path.display()
+            );
+        }
+    }
+    Ok(Some((file_id, rename)))
+}
+
+pub(crate) fn prepare_rename(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::TextDocumentPositionParams,
+) -> anyhow::Result<Option<lsp_types::PrepareRenameResponse>> {
+    let (file, rename) = try_opt!(rename_locations(snapshot, params, None)?);
+    let source = snapshot.analysis_snapshot.source(file)?;
+    let range = try_opt!(convert::lsp_range_from_text_range(rename.range, &source));
+    Ok(Some(lsp_types::PrepareRenameResponse::Range(range)))
+}
+
+pub(crate) fn rename(
+    snapshot: &ServerSnapshot,
+    params: lsp_types::RenameParams,
+) -> anyhow::Result<Option<lsp_types::WorkspaceEdit>> {
+    let (_, rename) = try_opt!(rename_locations(
+        snapshot,
+        params.text_document_position,
+        Some(&params.new_name)
+    )?);
+    let mut documents: Vec<lsp_types::TextDocumentEdit> = Vec::new();
+    for location in rename.locations {
+        let path = snapshot.analysis_snapshot.path(location.file_id);
+        let source = snapshot.analysis_snapshot.source(location.file_id)?;
+        let document = snapshot.analysis_snapshot.document(path);
+        let uri_path = document.map_or(path, |document| document.path.as_std_path());
+        let uri = lsp_types::Url::from_file_path(uri_path).map_err(|()| {
+            anyhow::anyhow!("Cannot construct an editor URI for {}", uri_path.display())
+        })?;
+        let range =
+            convert::lsp_range_from_text_range(location.range, &source).ok_or_else(|| {
+                anyhow::anyhow!("Cannot convert a rename range in {}", path.display())
+            })?;
+        let edit = lsp_types::TextEdit {
+            range,
+            new_text: params.new_name.clone(),
+        };
+        if let Some(previous) = documents.last_mut() {
+            if previous.text_document.uri == uri {
+                previous.edits.push(lsp_types::OneOf::Left(edit));
+                continue;
+            }
+        }
+        documents.push(lsp_types::TextDocumentEdit {
+            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                uri,
+                version: document.map(|document| document.version),
+            },
+            edits: vec![lsp_types::OneOf::Left(edit)],
+        });
+    }
+    let document_changes = snapshot
+        .config
+        .caps
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace_edit.as_ref())
+        .and_then(|edit| edit.document_changes)
+        .unwrap_or(false);
+    if !document_changes
+        && documents
+            .iter()
+            .any(|document| document.text_document.version.is_some())
+    {
+        anyhow::bail!(
+            "Renaming open documents requires client support for versioned document changes"
+        );
+    }
+    Ok(Some(if document_changes {
+        lsp_types::WorkspaceEdit {
+            document_changes: Some(lsp_types::DocumentChanges::Edits(documents)),
+            ..Default::default()
+        }
+    } else {
+        lsp_types::WorkspaceEdit {
+            changes: Some(
+                documents
+                    .into_iter()
+                    .map(|document| {
+                        (
+                            document.text_document.uri,
+                            document
+                                .edits
+                                .into_iter()
+                                .map(|edit| match edit {
+                                    lsp_types::OneOf::Left(edit) => edit,
+                                    lsp_types::OneOf::Right(_) => {
+                                        unreachable!("rename uses plain text edits")
+                                    }
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }))
 }
 
 pub(crate) fn document_highlights(

@@ -428,7 +428,7 @@ fn annotations(
     Ok(())
 }
 
-fn parameter_pairs<'a>(
+pub(crate) fn parameter_pairs<'a>(
     source: &'a StmtFunctionDef,
     stub: &'a StmtFunctionDef,
 ) -> Result<Vec<(&'a Parameter, &'a Parameter)>, &'static str> {

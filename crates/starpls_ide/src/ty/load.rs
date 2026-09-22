@@ -29,6 +29,92 @@ use ty_python_semantic::types::Type;
 
 use crate::Database;
 
+pub(crate) struct LoadSpelling {
+    pub(crate) binding: ProvidedBinding,
+    pub(crate) remote: Box<str>,
+    pub(crate) remote_range: TextRange,
+    pub(crate) explicit: bool,
+    pub(crate) plain: bool,
+}
+
+fn spellings(call: &ExprCall, source: &str) -> Vec<LoadSpelling> {
+    call.arguments
+        .iter_source_order()
+        .skip(1)
+        .filter_map(|argument| {
+            let (expression, target, alias) = match argument {
+                ArgOrKeyword::Arg(expression) => (expression, expression.node_index().load(), None),
+                ArgOrKeyword::Keyword(keyword) => (
+                    &keyword.value,
+                    keyword.node_index().load(),
+                    Some(keyword.arg.as_ref()?),
+                ),
+            };
+            let text = &source[expression.range()];
+            let (remote, prefix) = string_value(text)?;
+            let suffix = if text.ends_with("\"\"\"") || text.ends_with("'''") {
+                3
+            } else {
+                1
+            };
+            let remote_range = TextRange::new(
+                expression.start() + TextSize::from(prefix),
+                expression.end() - TextSize::from(suffix),
+            );
+            let (name, range) = alias.map_or_else(
+                || (Name::new(remote.as_ref()), remote_range),
+                |alias| (alias.id.clone(), alias.range()),
+            );
+            let plain = &source[remote_range] == remote.as_ref();
+            Some(LoadSpelling {
+                binding: ProvidedBinding {
+                    target,
+                    name,
+                    range,
+                },
+                remote,
+                remote_range,
+                explicit: alias.is_some(),
+                plain,
+            })
+        })
+        .collect()
+}
+
+pub(crate) struct Load<'db> {
+    pub(crate) definition: Definition<'db>,
+    pub(crate) spelling: LoadSpelling,
+}
+
+pub(crate) fn bindings(db: &Database, file: starpls_common::File) -> Vec<Load<'_>> {
+    let program = db.starlark_program_file(file);
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let index = ty_python_core::semantic_index(db, program);
+    let source = file.contents(db);
+    let mut loads = Vec::new();
+    for statement in parsed.suite() {
+        let Some(definitions) = index.provided_statement_definitions(statement) else {
+            continue;
+        };
+        let Stmt::Expr(statement) = statement else {
+            continue;
+        };
+        let Some(call) = load_call(&statement.value) else {
+            continue;
+        };
+        for spelling in spellings(call, &source) {
+            let Some(definition) = definitions.iter().find(|definition| {
+                matches!(definition.kind(db), DefinitionKind::ProvidedBinding(binding) if binding.binding.target == spelling.binding.target)
+            }) else { continue; };
+            loads.push(Load {
+                definition: *definition,
+                spelling,
+            });
+        }
+    }
+    loads
+}
+
 pub(super) fn statements(db: &Database, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
     let Some(source_file) = db.starlark_file(file) else {
         return Vec::new();
@@ -43,45 +129,12 @@ pub(super) fn statements(db: &Database, file: ProgramFile<'_>) -> Vec<ProvidedSt
                 return None;
             };
             let call = load_call(&statement.value)?;
-            let bindings = call
-                .arguments
-                .iter_source_order()
-                .skip(1)
-                .filter_map(|argument| {
-                    let (name, range) = match argument {
-                        ArgOrKeyword::Arg(expr) => {
-                            let (name, prefix) = string_value(&source[expr.range()])?;
-                            let text = &source[expr.range()];
-                            let suffix = if text.ends_with("\"\"\"") || text.ends_with("'''") {
-                                3
-                            } else {
-                                1
-                            };
-                            let range = TextRange::new(
-                                expr.start() + TextSize::from(prefix),
-                                expr.end() - TextSize::from(suffix),
-                            );
-                            (Name::new(name), range)
-                        }
-                        ArgOrKeyword::Keyword(keyword) => {
-                            let name = keyword.arg.as_ref()?;
-                            (name.id.clone(), name.range())
-                        }
-                    };
-                    let target = match argument {
-                        ArgOrKeyword::Arg(expr) => expr.node_index().load(),
-                        ArgOrKeyword::Keyword(keyword) => keyword.node_index().load(),
-                    };
-                    Some(ProvidedBinding {
-                        target,
-                        name,
-                        range,
-                    })
-                })
-                .collect();
             Some(ProvidedStatement {
                 statement: statement.node_index().load(),
-                bindings,
+                bindings: spellings(call, &source)
+                    .into_iter()
+                    .map(|spelling| spelling.binding)
+                    .collect(),
             })
         })
         .collect()
@@ -134,7 +187,7 @@ pub(super) fn resolve<'db>(
     }
 }
 
-pub(super) fn binding_names(
+pub(crate) fn binding_names(
     db: &Database,
     definition: Definition<'_>,
 ) -> Option<(starpls_common::File, Box<str>, Box<str>)> {
@@ -149,19 +202,11 @@ pub(super) fn binding_names(
     let source = source_file.contents(db);
     let module = call.arguments.args.first()?;
     let (module_name, _) = string_value(&source[module.range()])?;
-    let target = call
-        .arguments
-        .iter_source_order()
-        .find_map(|argument| match argument {
-            ArgOrKeyword::Arg(expr) => {
-                (expr.node_index().load() == binding.binding.target).then_some(expr)
-            }
-            ArgOrKeyword::Keyword(keyword) => {
-                (keyword.node_index().load() == binding.binding.target).then_some(&keyword.value)
-            }
-        })
+    let spelling = spellings(call, &source)
+        .into_iter()
+        .find(|spelling| spelling.binding.target == binding.binding.target)
         .expect("load binding target belongs to its statement");
-    let (name, _) = string_value(&source[target.range()])?;
+    let name = spelling.remote;
     Some((source_file, module_name, name))
 }
 

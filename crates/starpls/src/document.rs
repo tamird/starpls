@@ -40,6 +40,42 @@ macro_rules! try_opt {
     };
 }
 
+/// Shared recursive admission for the checker and workspace editor operations.
+pub(crate) fn visit_source_entry(entry: &walkdir::DirEntry, ignore_patterns: &[String]) -> bool {
+    let name = entry.file_name();
+    !name
+        .to_str()
+        .is_some_and(|name| name.starts_with('.') && name != ".")
+        && !is_ignored_name(name, ignore_patterns)
+}
+
+pub(crate) fn is_repository_root(path: &Path) -> bool {
+    ["MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel"]
+        .iter()
+        .any(|name| path.join(name).is_file())
+}
+
+pub(crate) fn is_ignored_name(name: &std::ffi::OsStr, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| name == pattern.as_str())
+}
+
+pub(crate) fn source_kind(
+    workspace: &Path,
+    path: &Path,
+    extensions: &[&str],
+) -> Option<(Dialect, Option<APIContext>)> {
+    let (dialect, context) = dialect_and_api_context_for_workspace_path(workspace, path)?;
+    if dialect == Dialect::Standard
+        && !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.contains(&extension))
+    {
+        return None;
+    }
+    Some((dialect, context))
+}
+
 pub(crate) const DEPENDENCY_FILES: [&str; 7] = [
     "MODULE.bazel",
     "MODULE.bazel.lock",
@@ -311,6 +347,30 @@ impl DefaultFileLoader {
             resolved_path,
             repository,
         }))
+    }
+
+    pub(crate) fn loaded_paths(&self) -> Vec<PathBuf> {
+        self.repositories.read().keys().cloned().collect()
+    }
+
+    pub(crate) fn is_editable(&self, path: &Path) -> anyhow::Result<bool> {
+        let workspace = self.workspace.canonicalize()?;
+        if !path.starts_with(&workspace) {
+            return Ok(false);
+        }
+        if path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .take_while(|parent| *parent != workspace)
+            .any(is_repository_root)
+        {
+            return Ok(false);
+        }
+        // The source is already canonical, including an unsaved new document.
+        Ok(self
+            .repository_for_source(path, path)?
+            .is_some_and(|repository| repository.name.is_empty()))
     }
 
     pub(crate) fn main_repository(&self) -> Repository {
