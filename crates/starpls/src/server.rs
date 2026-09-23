@@ -616,11 +616,14 @@ impl Server {
 
         self.is_fetching_repos = true;
         self.bazel_task_pool.spawn_with_sender(move |sender| {
-            sender
+            if sender
                 .send(Task::FetchExternalRepos(FetchExternalReposProgress::Begin(
                     repos.clone(),
                 )))
-                .unwrap();
+                .is_err()
+            {
+                return;
+            }
 
             let mut failed_repos = vec![];
 
@@ -639,16 +642,14 @@ impl Server {
                 }
             }
 
-            sender
-                .send(Task::FetchExternalRepos(FetchExternalReposProgress::End {
-                    revision,
-                    fetched: repos
-                        .into_iter()
-                        .filter(|repo| !failed_repos.contains(repo))
-                        .collect(),
-                    failed: failed_repos,
-                }))
-                .unwrap();
+            let _ = sender.send(Task::FetchExternalRepos(FetchExternalReposProgress::End {
+                revision,
+                fetched: repos
+                    .into_iter()
+                    .filter(|repo| !failed_repos.contains(repo))
+                    .collect(),
+                failed: failed_repos,
+            }));
         });
     }
 
@@ -662,11 +663,14 @@ impl Server {
 
         self.is_refreshing_all_workspace_targets = true;
         self.bazel_task_pool.spawn_with_sender(move |sender| {
-            sender
+            if sender
                 .send(Task::RefreshAllWorkspaceTargets(
                     RefreshAllWorkspaceTargetsProgress::Begin,
                 ))
-                .unwrap();
+                .is_err()
+            {
+                return;
+            }
 
             let targets = match bazel_client.query_all_workspace_targets() {
                 Ok(targets) => Some(targets),
@@ -676,11 +680,9 @@ impl Server {
                 }
             };
 
-            sender
-                .send(Task::RefreshAllWorkspaceTargets(
-                    RefreshAllWorkspaceTargetsProgress::End { revision, targets },
-                ))
-                .unwrap();
+            let _ = sender.send(Task::RefreshAllWorkspaceTargets(
+                RefreshAllWorkspaceTargetsProgress::End { revision, targets },
+            ));
         });
     }
 }

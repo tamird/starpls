@@ -25,8 +25,12 @@ impl AnalysisDebouncer {
                         Ok(file_ids) => pending_file_ids.extend(file_ids),
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            sink.send(Task::AnalysisRequested(pending_file_ids.drain().collect()))
-                                .unwrap();
+                            if sink
+                                .send(Task::AnalysisRequested(pending_file_ids.drain().collect()))
+                                .is_err()
+                            {
+                                break;
+                            }
                             active = false;
                         }
                     }
