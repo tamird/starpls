@@ -121,6 +121,19 @@ Python-only syntax is diagnosed and its containing statement is omitted from ana
 neighboring statements are still checked; names introduced only by an omitted statement remain
 undefined.
 
+Concatenating selectors with nullable container payloads can lose element
+types. For example:
+
+```python
+parts = select({"//:enabled": ["a"], "//conditions:default": None})
+combined = parts + [42]  # inferred: select[list[Unknown | int] | None]
+```
+
+The `Unknown` element can allow incompatible assignments to escape checking.
+This also affects macro label-list parameters: a parameter can retain
+`select[list[Label] | None]` while concatenating it with `[]` produces
+`select[list[Unknown] | None]`.
+
 ## Batch checking
 
 Run `starpls check` from the Bazel workspace with source files or directories:

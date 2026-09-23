@@ -477,10 +477,31 @@ example(name="omitted", tool="//:tool", _private=None)
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
+        for (name, expected) in [
+            ("srcs", "select[list[Label] | None]"),
+            ("combined", "select[list[Unknown] | None]"),
+        ] {
+            let hover = analysis
+                .snapshot()
+                .hover(crate::FilePosition {
+                    file_id: file,
+                    pos: (source.find(name).unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("{name}: {expected}\n")),
+                "{}",
+                hover.contents.value
+            );
+        }
         for (statement, expected) in [
             ("bad = srcs # type: list[Label]", "invalid-assignment"),
             (
-                "bad = combined # type: select[list[int] | None]",
+                "bad = srcs # type: select[list[int] | None]",
                 "invalid-assignment",
             ),
             ("bad = tool # type: str", "invalid-assignment"),
@@ -660,10 +681,10 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
         for (name, expected) in [
             ("known_mixed", "select[list[str | int]]"),
             ("declared_mixed", "select[list[str | int]]"),
-            ("nullable_mixed", "select[list[str | int] | None]"),
+            ("nullable_mixed", "select[list[Unknown | int] | None]"),
             ("known_empty", "select[list[str | Unknown]]"),
             ("known_empty_left", "select[list[str | Unknown]]"),
-            ("nullable_empty", "select[list[str | Unknown] | None]"),
+            ("nullable_empty", "select[list[Unknown] | None]"),
             (
                 "mapping_empty",
                 "select[dict[str | Unknown, int | Unknown]]",
@@ -709,6 +730,10 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
             ),
             (
                 "bad = known_mixed # type: select[list[int]]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = nullable_mixed # type: select[list[str] | None]",
                 "invalid-assignment",
             ),
             (
