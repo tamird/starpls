@@ -72,14 +72,12 @@ pub(crate) enum Task {
         response: lsp_server::Response,
     },
     ConfigurationReady(crate::server::ConfigurationReady),
-    ResolveRepoMapping {
-        repository: String,
+    /// Wake the event loop to batch pending mappings after draining its tasks.
+    ResolveRepoMappings,
+    RepoMappingsReady {
+        repositories: Vec<String>,
         revision: u64,
-    },
-    RepoMappingReady {
-        repository: String,
-        revision: u64,
-        result: anyhow::Result<starpls_bazel::client::RepoMapping>,
+        result: anyhow::Result<Vec<starpls_bazel::client::RepoMapping>>,
     },
     /// Retry a previously failed request (e.g. due to Salsa cancellation).
     Retry(lsp_server::Request),
@@ -184,6 +182,7 @@ impl Server {
         if self.configuration.refreshing {
             return Ok(());
         }
+        self.resolve_repository_mappings();
         if !self.pending_repos.is_empty() && !self.is_fetching_repos {
             self.fetch_bazel_external_repos();
         }
@@ -202,6 +201,28 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    fn resolve_repository_mappings(&mut self) {
+        if self.is_resolving_repo_mappings || self.configuration.refreshing {
+            return;
+        }
+        let repositories = self.loader.pending_repository_mappings();
+        if repositories.is_empty() {
+            return;
+        }
+        self.is_resolving_repo_mappings = true;
+        let revision = self.configuration.revision;
+        let client = self.bazel_client.clone();
+        self.bazel_task_pool.spawn(move || {
+            let names: Vec<_> = repositories.iter().map(String::as_str).collect();
+            let result = client.dump_repo_mappings(&names);
+            Task::RepoMappingsReady {
+                repositories,
+                revision,
+                result,
+            }
+        });
     }
 
     fn update_diagnostics(&mut self, file_ids: Vec<File>) {
@@ -299,37 +320,25 @@ impl Server {
                 }
             }
             Task::ConfigurationReady(ready) => self.finish_configuration_refresh(ready),
-            Task::ResolveRepoMapping {
-                repository,
-                revision,
-            } => {
-                if revision == self.configuration.revision && !self.configuration.refreshing {
-                    let client = self.bazel_client.clone();
-                    self.bazel_task_pool.spawn(move || {
-                        let result = client.dump_repo_mapping(&repository);
-                        Task::RepoMappingReady {
-                            repository,
-                            revision,
-                            result,
-                        }
-                    });
-                }
-            }
-            Task::RepoMappingReady {
-                repository,
+            Task::ResolveRepoMappings => {}
+            Task::RepoMappingsReady {
+                repositories,
                 revision,
                 result,
             } => {
+                self.is_resolving_repo_mappings = false;
                 if revision == self.configuration.revision && !self.configuration.refreshing {
-                    if let Err(error) = &result {
-                        self.send_error_message(&format!(
-                            "Cannot load repository mapping for @@{repository}: {error:#}"
-                        ));
-                    }
-                    // Drain readers while the lookup is still pending, so a
+                    // Drain readers while the lookups are still pending, so a
                     // workspace edit cannot accept references from that state.
                     self.analysis.invalidate_loads();
-                    self.loader.finish_mapping(repository, result);
+                    if let Err(error) = self
+                        .loader
+                        .finish_repository_mappings(&repositories, result)
+                    {
+                        self.send_error_message(&format!(
+                            "Cannot load repository mapping batch: {error:#}"
+                        ));
+                    }
                     self.invalidate_diagnostics();
                     self.refresh_editor_semantics();
                 }
@@ -578,6 +587,7 @@ mod tests {
             bazel_client,
             pending_repos: Default::default(),
             is_fetching_repos: false,
+            is_resolving_repo_mappings: false,
             is_refreshing_all_workspace_targets: false,
             bzlmod_enabled: false,
             loader,
@@ -629,16 +639,16 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            server.handle_task(Task::RepoMappingReady {
-                repository: String::new(),
+            server.handle_task(Task::RepoMappingsReady {
+                repositories: vec![String::new()],
                 revision: 1,
-                result: Ok(Default::default()),
+                result: Ok(vec![Default::default()]),
             });
             assert!(requests().is_empty(), "stale mapping must not refresh");
-            server.handle_task(Task::RepoMappingReady {
-                repository: String::new(),
+            server.handle_task(Task::RepoMappingsReady {
+                repositories: vec![String::new()],
                 revision: 0,
-                result: Ok(Default::default()),
+                result: Ok(vec![Default::default()]),
             });
             let expected = [
                 (tokens, "workspace/semanticTokens/refresh"),
@@ -661,6 +671,7 @@ mod tests {
         operation: &'static str,
         gate: std::sync::Mutex<Option<(Sender<()>, Receiver<()>)>>,
         fail: bool,
+        mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl BlockedClient {
@@ -696,6 +707,10 @@ mod tests {
             &self,
             repositories: &[&str],
         ) -> anyhow::Result<Vec<starpls_bazel::client::RepoMapping>> {
+            self.mapping_requests
+                .lock()
+                .unwrap()
+                .push(repositories.iter().map(|name| (*name).to_owned()).collect());
             repositories
                 .iter()
                 .map(|repository| {
@@ -783,6 +798,7 @@ mod tests {
                 operation: "info",
                 gate: std::sync::Mutex::new(Some((entered, resumed))),
                 fail,
+                mapping_requests: Default::default(),
             });
             let cli = crate::Cli::try_parse_from([
                 "starpls",
@@ -901,6 +917,7 @@ mod tests {
                 operation: "dep+",
                 gate: std::sync::Mutex::new(Some((entered, resumed))),
                 fail,
+                mapping_requests: Default::default(),
             });
             let (connection, client) = Connection::memory();
             let mut server = Server::with_client(
@@ -925,7 +942,7 @@ mod tests {
             loop {
                 crossbeam_channel::select! {
                     recv(entering) -> entered => { entered.unwrap(); break; }
-                    recv(server.task_pool_handle.receiver) -> task => server.handle_task(task.unwrap()),
+                    recv(server.task_pool_handle.receiver) -> task => server.handle_event(Event::Task(task.unwrap())).unwrap(),
                     default(Duration::from_secs(10)) => panic!("mapping did not start"),
                 }
             }
@@ -948,7 +965,14 @@ mod tests {
                     .receiver
                     .recv_timeout(Duration::from_secs(10))
                     .unwrap();
-                let mapping = matches!(task, Task::RepoMappingReady { .. });
+                let mapping = matches!(
+                    task,
+                    Task::RepoMappingsReady {
+                        repositories: _,
+                        revision: _,
+                        result: _
+                    }
+                );
                 server.handle_task(task);
                 if mapping {
                     break;
@@ -978,6 +1002,154 @@ mod tests {
             }
             drop(server);
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn mapping_batches_accumulate_requests_and_discard_stale_results() {
+        for (stale, fail) in [(false, false), (false, true), (true, false)] {
+            let TestServer {
+                mut server,
+                client,
+                disk,
+                tasks,
+                debounced,
+            } = server();
+            let (entered, entering) = crossbeam_channel::bounded(1);
+            let (resume, resumed) = crossbeam_channel::bounded(1);
+            let bazel = Arc::new(BlockedClient {
+                workspace: "/workspace".into(),
+                operation: "a+",
+                gate: std::sync::Mutex::new(Some((entered, resumed))),
+                fail,
+                mapping_requests: Default::default(),
+            });
+            server.bazel_client = bazel.clone();
+            server.loader = Arc::new(
+                DefaultFileLoader::new(
+                    bazel.clone(),
+                    "/workspace".into(),
+                    None,
+                    std::path::PathBuf::from("/external"),
+                    tasks.clone(),
+                    true,
+                )
+                .for_editor(0),
+            );
+            server.analysis =
+                Analysis::with_system(server.loader.clone(), Default::default(), disk);
+            let request = |loader: &DefaultFileLoader, name: &str| {
+                loader.resolve_repository(
+                    &starpls_bazel::Label::parse("@child//:defs.bzl").unwrap(),
+                    &crate::document::Repository {
+                        name: name.to_owned(),
+                        root: std::path::Path::new("/external").join(name),
+                    },
+                )
+            };
+            for name in ["b+", "a+", "a+"] {
+                assert!(request(&server.loader, name)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("loading"));
+            }
+            server
+                .handle_event(Event::Task(Task::ResolveRepoMappings))
+                .unwrap();
+            entering.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(server.is_resolving_repo_mappings);
+            assert_eq!(
+                bazel.mapping_requests.lock().unwrap().as_slice(),
+                &[vec!["a+".to_owned(), "b+".to_owned()]]
+            );
+
+            if stale {
+                server.configuration.revision = 1;
+                server.loader = Arc::new(server.loader.fresh().for_editor(1));
+            }
+            for name in ["c+", "d+", "c+"] {
+                assert!(request(&server.loader, name).is_err());
+            }
+            server
+                .handle_event(Event::Task(Task::ResolveRepoMappings))
+                .unwrap();
+            assert!(server.is_resolving_repo_mappings);
+            assert_eq!(bazel.mapping_requests.lock().unwrap().len(), 1);
+            resume.send(()).unwrap();
+            let first = server
+                .task_pool_handle
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                matches!(
+                    first,
+                    Task::RepoMappingsReady {
+                        repositories: _,
+                        revision: _,
+                        result: _
+                    }
+                ),
+                "{first:?}"
+            );
+            // Handle completion separately to observe its publication before
+            // the event boundary dispatches the next accumulated batch.
+            server.handle_task(first);
+            assert!(!server.is_resolving_repo_mappings);
+            assert_eq!(server.analysis_changed, !stale);
+            let errors = client
+                .receiver
+                .try_iter()
+                .filter(|message| {
+                    serde_json::to_string(message)
+                        .unwrap()
+                        .contains("blocked Bazel command failed")
+                })
+                .count();
+            assert_eq!(errors, usize::from(fail && !stale));
+            if !stale {
+                for name in ["a+", "b+"] {
+                    let result = request(&server.loader, name);
+                    assert_eq!(result.is_err(), fail);
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains("blocked Bazel command failed"));
+                    }
+                }
+            } else {
+                assert_eq!(server.loader.pending_repository_mappings(), ["c+", "d+"]);
+                assert!(debounced.is_empty());
+            }
+            server
+                .handle_event(Event::Task(Task::ResolveRepoMappings))
+                .unwrap();
+            let second = server
+                .task_pool_handle
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                matches!(
+                    second,
+                    Task::RepoMappingsReady {
+                        repositories: _,
+                        revision: _,
+                        result: _
+                    }
+                ),
+                "{second:?}"
+            );
+            server.handle_event(Event::Task(second)).unwrap();
+            assert!(!server.is_resolving_repo_mappings);
+            assert!(server.loader.pending_repository_mappings().is_empty());
+            assert_eq!(
+                bazel.mapping_requests.lock().unwrap().as_slice(),
+                &[
+                    vec!["a+".to_owned(), "b+".to_owned()],
+                    vec!["c+".to_owned(), "d+".to_owned()],
+                ]
+            );
+            assert!(request(&server.loader, "c+").is_ok());
+            assert!(request(&server.loader, "d+").is_ok());
         }
     }
 
@@ -1060,6 +1232,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
             server.handle_task(task);
+            server.resolve_repository_mappings();
         }
     }
 

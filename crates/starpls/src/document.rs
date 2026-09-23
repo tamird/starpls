@@ -207,15 +207,22 @@ impl DefaultFileLoader {
     /// Call after invalidating load queries and draining their readers.
     pub(crate) fn resolve_repository_mappings(&self, repositories: &[String]) {
         let names: Vec<_> = repositories.iter().map(String::as_str).collect();
-        let result = self
-            .bazel_client
-            .dump_repo_mappings(&names)
-            .and_then(|mappings| {
-                if mappings.len() != repositories.len() {
-                    bail!("repository mapping batch returned an unexpected result count");
-                }
-                Ok(mappings)
-            });
+        let result = self.bazel_client.dump_repo_mappings(&names);
+        let _ = self.finish_repository_mappings(repositories, result);
+    }
+
+    /// Call after invalidating load queries and draining their readers.
+    pub(crate) fn finish_repository_mappings(
+        &self,
+        repositories: &[String],
+        result: anyhow::Result<Vec<starpls_bazel::client::RepoMapping>>,
+    ) -> anyhow::Result<()> {
+        let result = result.and_then(|mappings| {
+            if mappings.len() != repositories.len() {
+                bail!("repository mapping batch returned an unexpected result count");
+            }
+            Ok(mappings)
+        });
         let mut cached = self.repository_mappings.write();
         match result {
             Ok(mappings) => {
@@ -225,6 +232,7 @@ impl DefaultFileLoader {
                         .cloned()
                         .zip(mappings.into_iter().map(RepositoryMapping::Ready)),
                 );
+                Ok(())
             }
             Err(error) => {
                 let message = format!("repository mapping batch failed: {error:#}");
@@ -234,6 +242,7 @@ impl DefaultFileLoader {
                         RepositoryMapping::Failed(message.clone()),
                     );
                 }
+                Err(error)
             }
         }
     }
@@ -301,12 +310,9 @@ impl DefaultFileLoader {
                 }
             }
             Entry::Vacant(entry) => {
-                if let Some(revision) = self.configuration_revision {
+                if self.configuration_revision.is_some() {
                     entry.insert(RepositoryMapping::Pending);
-                    self.fetch_repo_sender.send(Task::ResolveRepoMapping {
-                        repository: repository.to_owned(),
-                        revision,
-                    })?;
+                    self.fetch_repo_sender.send(Task::ResolveRepoMappings)?;
                     return Ok(None);
                 }
                 if self.defer_mappings {
@@ -1414,6 +1420,21 @@ pub(crate) mod source_tests {
         }
         assert!(loader.repository_mapping("stubs+").unwrap().is_some());
         assert!(loader.pending_repository_mappings().is_empty());
+        for repository in ["short+", "missing+"] {
+            assert!(loader.repository_mapping(repository).unwrap().is_none());
+        }
+        let pending = loader.pending_repository_mappings();
+        assert!(loader
+            .finish_repository_mappings(&pending, Ok(vec![Default::default()]))
+            .is_err());
+        for repository in pending {
+            assert!(loader
+                .repository_mapping(&repository)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected result count"));
+        }
+        assert!(loader.repository_mapping("stubs+").unwrap().is_some());
     }
 
     #[test]
