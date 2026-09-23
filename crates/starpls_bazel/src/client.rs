@@ -70,7 +70,10 @@ pub trait BazelClient: Send + Sync + 'static {
     fn info(&self) -> anyhow::Result<BazelInfo>;
     fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()>;
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>>;
-    fn fetch_repo(&self, repo: &str) -> anyhow::Result<()>;
+    fn fetch_repos(&self, repos: &[&str]) -> anyhow::Result<()>;
+    fn fetch_repo(&self, repo: &str) -> anyhow::Result<()> {
+        self.fetch_repos(&[repo])
+    }
     /// Returns mappings in the same order as the canonical repository names.
     fn dump_repo_mappings(&self, repos: &[&str]) -> anyhow::Result<Vec<RepoMapping>>;
     fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<RepoMapping> {
@@ -206,8 +209,13 @@ impl BazelClient for BazelCLI {
         Ok(targets)
     }
 
-    fn fetch_repo(&self, repo: &str) -> anyhow::Result<()> {
-        self.run_command(["fetch", "--repo", &format!("@@{}", repo)])?;
+    fn fetch_repos(&self, repos: &[&str]) -> anyhow::Result<()> {
+        if repos.is_empty() {
+            bail!("repository fetch requires at least one repository");
+        }
+        let args = std::iter::once("fetch".to_owned())
+            .chain(repos.iter().map(|repo| format!("--repo=@@{repo}")));
+        self.run_command(args)?;
         Ok(())
     }
 
@@ -462,6 +470,47 @@ mod tests {
     use super::is_extension_repository;
     use super::selected_module_from_graph;
     use super::SelectedModule;
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_fetches_use_repeated_canonical_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::BazelClient;
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("fetch-arguments");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("bazel");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "${0%/*}/arguments"
+read status < "${0%/*}/status"
+echo 'native fetch failure' >&2
+exit "$status"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = super::BazelCLI::new(executable);
+        assert!(client.fetch_repos(&[]).is_err());
+        assert!(!root.join("arguments").exists());
+        std::fs::write(root.join("status"), "0\n").unwrap();
+        client
+            .fetch_repos(&["first+", "rules++ext+second"])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("arguments")).unwrap(),
+            "fetch\n--repo=@@first+\n--repo=@@rules++ext+second\n"
+        );
+        std::fs::write(root.join("status"), "1\n").unwrap();
+        let error = client.fetch_repo("broken+").unwrap_err().to_string();
+        assert!(error.contains("native fetch failure"), "{error}");
+        assert!(std::fs::read_to_string(root.join("arguments"))
+            .unwrap()
+            .ends_with("fetch\n--repo=@@broken+\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn equal_mapping_outputs_share_storage_across_batches() {

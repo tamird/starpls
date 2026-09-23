@@ -136,8 +136,11 @@ Recursive discovery stops at nested repository roots. Explicit paths use
 their existing repository context, including Bazel's external directory.
 
 Load discovery fetches missing external repositories through Bazel and
-retries their dependencies. Each repository is attempted once; missing
-files within an existing repository remain load failures.
+retries their dependencies. Bzlmod repositories are fetched in bounded
+batches; a failed multi-repository batch retries each member individually
+to determine its outcome. Completed attempts are cached for the check,
+including failures. Missing files within an existing repository remain
+load failures.
 
 `--progress` reports load discovery, repository mapping batches, fetches,
 and file checking on stderr. The JSON report separates selected files,

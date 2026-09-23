@@ -88,6 +88,69 @@ pub(crate) const DEPENDENCY_FILES: [&str; 7] = [
     ".bazelversion",
 ];
 
+#[derive(Debug)]
+pub(crate) struct RepositoryFetchResult {
+    pub(crate) name: String,
+    pub(crate) result: Result<(), String>,
+}
+
+/// Obtain per-repository results without publishing into a loader's cache.
+pub(crate) fn fetch_repositories(
+    client: &dyn BazelClient,
+    repositories: &[String],
+    bzlmod: bool,
+    mut progress: impl FnMut(&str),
+) -> Vec<RepositoryFetchResult> {
+    let mut remaining = repositories;
+    let mut results = Vec::with_capacity(repositories.len());
+    while !remaining.is_empty() {
+        let mut bytes = 0;
+        let count = if bzlmod {
+            remaining
+                .iter()
+                .take_while(|name| {
+                    bytes += name.len() + "--repo=@@".len() + 1;
+                    bytes <= 16 * 1024
+                })
+                .count()
+                .max(1)
+        } else {
+            1
+        };
+        let (batch, rest) = remaining.split_at(count);
+        remaining = rest;
+        progress(&format!("Fetching {} repositories", batch.len()));
+        let result = if bzlmod {
+            client.fetch_repos(&batch.iter().map(String::as_str).collect::<Vec<_>>())
+        } else {
+            client.null_query_external_repo_targets(&batch[0])
+        };
+        if let Err(error) = &result {
+            if batch.len() > 1 {
+                progress(&format!(
+                    "Fetch batch failed: {error:#}; retrying {} repositories individually",
+                    batch.len()
+                ));
+                results.extend(batch.iter().map(|repo| {
+                    RepositoryFetchResult {
+                        name: repo.clone(),
+                        result: client
+                            .fetch_repo(repo)
+                            .map_err(|error| format!("{error:#}")),
+                    }
+                }));
+                continue;
+            }
+        }
+        let result = result.map_err(|error| format!("{error:#}"));
+        results.extend(batch.iter().map(|repo| RepositoryFetchResult {
+            name: repo.clone(),
+            result: result.clone(),
+        }));
+    }
+    results
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum RepositoryFetch {
     Pending,
@@ -599,6 +662,23 @@ impl DefaultFileLoader {
         };
         self.finish_fetch([repository.name.clone()], outcome);
         result
+    }
+
+    pub(crate) fn fetch_repositories(
+        &self,
+        repositories: &[String],
+        progress: impl FnMut(&str),
+    ) -> Vec<RepositoryFetchResult> {
+        let results = fetch_repositories(
+            &*self.bazel_client,
+            repositories,
+            self.bzlmod_enabled,
+            progress,
+        );
+        for RepositoryFetchResult { name, result } in &results {
+            self.finish_fetch([name.clone()], result.clone());
+        }
+        results
     }
 
     pub(crate) fn selected_module(
@@ -1328,25 +1408,14 @@ pub(crate) mod source_tests {
         pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
         pub(crate) mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
         pub(crate) fetch_requests: std::sync::Mutex<Vec<String>>,
+        pub(crate) fetch_batches: std::sync::Mutex<Vec<Vec<String>>>,
         pub(crate) fetch_files:
             std::sync::Mutex<std::collections::HashMap<String, (std::path::PathBuf, String)>>,
         pub(crate) fetch_failures: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
-    impl starpls_bazel::client::BazelClient for TestBazelClient {
-        fn build_language(&self) -> anyhow::Result<Vec<u8>> {
-            unimplemented!()
-        }
-        fn info(&self) -> anyhow::Result<starpls_bazel::client::BazelInfo> {
-            unimplemented!()
-        }
-        fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()> {
-            self.fetch_repo(repo)
-        }
-        fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
-            unimplemented!()
-        }
-        fn fetch_repo(&self, repo: &str) -> anyhow::Result<()> {
+    impl TestBazelClient {
+        fn materialize_repository(&self, repo: &str) -> anyhow::Result<()> {
             self.fetch_requests.lock().unwrap().push(repo.to_owned());
             if let Some((path, contents)) = self.fetch_files.lock().unwrap().remove(repo) {
                 std::fs::create_dir_all(path.parent().unwrap())?;
@@ -1371,6 +1440,55 @@ pub(crate) mod source_tests {
                 }
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn fetch_batches_bound_arguments_and_skip_empty_requests() {
+        let client = TestBazelClient::default();
+        assert!(super::fetch_repositories(&client, &[], true, |_| {}).is_empty());
+        assert!(client.fetch_batches.lock().unwrap().is_empty());
+        let repositories: Vec<_> = (0..40)
+            .map(|index| format!("{}+{index}", "long_repo".repeat(120)))
+            .collect();
+        let results = super::fetch_repositories(&client, &repositories, true, |_| {});
+        assert_eq!(results.len(), repositories.len());
+        assert!(results.iter().all(|result| result.result.is_ok()));
+        let batches = client.fetch_batches.lock().unwrap();
+        assert!(batches.len() > 1);
+        assert!(batches.iter().all(|batch| batch
+            .iter()
+            .map(|name| name.len() + "--repo=@@".len() + 1)
+            .sum::<usize>()
+            <= 16 * 1024));
+        assert_eq!(batches.concat(), repositories);
+    }
+
+    impl starpls_bazel::client::BazelClient for TestBazelClient {
+        fn build_language(&self) -> anyhow::Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn info(&self) -> anyhow::Result<starpls_bazel::client::BazelInfo> {
+            unimplemented!()
+        }
+        fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()> {
+            self.fetch_repo(repo)
+        }
+        fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn fetch_repos(&self, repos: &[&str]) -> anyhow::Result<()> {
+            self.fetch_batches
+                .lock()
+                .unwrap()
+                .push(repos.iter().map(|repo| (*repo).to_owned()).collect());
+            let mut result = Ok(());
+            for repo in repos {
+                if let Err(error) = self.materialize_repository(repo) {
+                    result = Err(error);
+                }
+            }
+            result
         }
         fn dump_repo_mappings(
             &self,

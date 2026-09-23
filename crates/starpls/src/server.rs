@@ -625,30 +625,23 @@ impl Server {
                 return;
             }
 
-            let mut failed_repos = vec![];
-
-            for repo in &repos {
-                debug!("fetching external repository \"@@{}\"", repo);
-                if let Err(err) = if bzlmod_enabled {
-                    bazel_client.fetch_repo(repo)
-                } else {
-                    bazel_client.null_query_external_repo_targets(repo)
-                } {
-                    failed_repos.push(repo.clone());
-                    error!(
-                        "failed to fetch external repository \"@@{}\": {}",
-                        repo, err
-                    );
+            let mut repos: Vec<_> = repos.into_iter().collect();
+            repos.sort_unstable();
+            let results = crate::document::fetch_repositories(
+                &*bazel_client,
+                &repos,
+                bzlmod_enabled,
+                |message| debug!("{message}"),
+            );
+            for crate::document::RepositoryFetchResult { name, result } in &results {
+                if let Err(error) = result {
+                    error!("failed to fetch external repository @@{name}: {error}");
                 }
             }
 
             let _ = sender.send(Task::FetchExternalRepos(FetchExternalReposProgress::End {
                 revision,
-                fetched: repos
-                    .into_iter()
-                    .filter(|repo| !failed_repos.contains(repo))
-                    .collect(),
-                failed: failed_repos,
+                results,
             }));
         });
     }

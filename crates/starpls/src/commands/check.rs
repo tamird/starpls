@@ -219,6 +219,67 @@ mod tests {
     }
 
     #[test]
+    fn fetch_batches_preserve_individual_results_and_do_not_repeat() {
+        for failed in [false, true] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-fetch-batch-{failed}"), true);
+            checker.loader.resolve_repository_mappings(&[String::new()]);
+            let extra = checker.bazel_info.workspace.join("extra.bzl");
+            std::fs::write(
+                &extra,
+                "load('@@good+//:defs.bzl', 'good')\nload('@@bad+//:defs.bzl', 'bad')\nprint(good, bad)\n",
+            )
+            .unwrap();
+            checker.load_file(&extra, true, &[], true).unwrap();
+            client.fetch_files.lock().unwrap().extend([
+                (
+                    "rules+".to_owned(),
+                    (external.join("rules+/defs.bzl"), "value = 42\n".to_owned()),
+                ),
+                (
+                    "good+".to_owned(),
+                    (external.join("good+/defs.bzl"), "good = 42\n".to_owned()),
+                ),
+                (
+                    "bad+".to_owned(),
+                    (external.join("bad+/defs.bzl"), "bad = 42\n".to_owned()),
+                ),
+            ]);
+            if failed {
+                client.fetch_failures.lock().unwrap().insert(
+                    "bad+".to_owned(),
+                    "repository authentication failed".to_owned(),
+                );
+            }
+            let report_path = checker.bazel_info.workspace.join("coverage.json");
+            for _ in 0..2 {
+                let result = checker.report_diagnostics(false, &[], Some(&report_path));
+                assert_eq!(result.is_err(), failed, "{result:?}");
+                let requests = client.fetch_requests.lock().unwrap();
+                assert_eq!(requests.len(), if failed { 6 } else { 3 });
+                let batches = client.fetch_batches.lock().unwrap();
+                assert_eq!(batches.len(), if failed { 4 } else { 1 });
+                assert_eq!(batches[0].len(), 3);
+                if failed {
+                    assert!(batches[1..].iter().all(|batch| batch.len() == 1));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+                assert_eq!(report["complete"], !failed);
+                let unresolved = report["unresolved_loads"].as_array().unwrap();
+                assert_eq!(unresolved.len(), usize::from(failed));
+                if failed {
+                    assert_eq!(unresolved[0]["module"], "@@bad+//:defs.bzl");
+                    assert!(unresolved[0]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("repository authentication failed"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_queries_can_materialize_repositories_despite_package_errors() {
         let (mut checker, client, external) = fetch_checker("checker-fetch-legacy", false);
         client.fetch_files.lock().unwrap().insert(
@@ -980,12 +1041,13 @@ impl Checker {
             if fetches.is_empty() {
                 frontier.extend(pending);
             } else {
-                for repo in fetches {
+                let results = self.loader.fetch_repositories(&fetches, |message| {
                     if self.progress {
-                        eprintln!("Fetching repository @@{repo}");
+                        eprintln!("{message}");
                     }
-                    let repository = self.loader.canonical_repository(repo.clone())?;
-                    if let Err(error) = self.loader.fetch_repository(&repository) {
+                });
+                for document::RepositoryFetchResult { name: repo, result } in results {
+                    if let Err(error) = result {
                         eprintln!("Failed to fetch repository @@{repo}: {error:#}");
                     }
                 }

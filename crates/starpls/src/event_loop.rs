@@ -34,8 +34,7 @@ pub(crate) enum FetchExternalReposProgress {
     Begin(FxHashSet<String>),
     End {
         revision: u64,
-        fetched: Vec<String>,
-        failed: Vec<String>,
+        results: Vec<crate::document::RepositoryFetchResult>,
     },
 }
 
@@ -372,19 +371,17 @@ impl Server {
                             ..Default::default()
                         })
                     }
-                    FetchExternalReposProgress::End {
-                        revision,
-                        fetched,
-                        failed: failed_repos,
-                    } => {
+                    FetchExternalReposProgress::End { revision, results } => {
                         self.is_fetching_repos = false;
+                        let mut failed_repos = Vec::new();
                         if revision == self.configuration.revision {
                             self.analysis.invalidate_loads();
-                            self.loader.finish_fetch(fetched, Ok(()));
-                            self.loader.finish_fetch(
-                                failed_repos.clone(),
-                                Err("Bazel repository fetch failed; see the server log".to_owned()),
-                            );
+                            for crate::document::RepositoryFetchResult { name, result } in results {
+                                if result.is_err() {
+                                    failed_repos.push(name.clone());
+                                }
+                                self.loader.finish_fetch([name], result);
+                            }
                             self.invalidate_diagnostics();
                             if self.open_repository_changed() {
                                 if let Err(error) = self.reload_configuration() {
@@ -613,6 +610,23 @@ mod tests {
             } = server();
             server.refresh_editor_semantics();
             assert!(client.receiver.try_recv().is_err());
+            server.is_fetching_repos = true;
+            server.handle_task(Task::FetchExternalRepos(FetchExternalReposProgress::End {
+                revision: 1,
+                results: vec![
+                    crate::document::RepositoryFetchResult {
+                        name: "old-success+".to_owned(),
+                        result: Ok(()),
+                    },
+                    crate::document::RepositoryFetchResult {
+                        name: "old-failure+".to_owned(),
+                        result: Err("old configuration failure".to_owned()),
+                    },
+                ],
+            }));
+            assert!(!server.is_fetching_repos);
+            assert!(server.loader.begin_fetch("old-success+".to_owned()));
+            assert!(server.loader.begin_fetch("old-failure+".to_owned()));
         }
         for (tokens, hints) in [
             (None, None),
@@ -722,7 +736,7 @@ mod tests {
                 })
                 .collect()
         }
-        fn fetch_repo(&self, _: &str) -> anyhow::Result<()> {
+        fn fetch_repos(&self, _: &[&str]) -> anyhow::Result<()> {
             Ok(())
         }
         fn null_query_external_repo_targets(&self, _: &str) -> anyhow::Result<()> {
@@ -1297,6 +1311,7 @@ mod tests {
             std::os::unix::fs::symlink(&helper, external.join("helper+")).unwrap();
             server.bazel_client = Arc::new(crate::document::source_tests::TestBazelClient {
                 fetch_requests: Default::default(),
+                fetch_batches: Default::default(),
                 fetch_files: Default::default(),
                 fetch_failures: Default::default(),
                 retarget: std::sync::Mutex::new(
@@ -1882,8 +1897,7 @@ mod tests {
             .handle_event(Event::Task(Task::FetchExternalRepos(
                 FetchExternalReposProgress::End {
                     revision: server.configuration.revision,
-                    fetched: Vec::new(),
-                    failed: Vec::new(),
+                    results: Vec::new(),
                 },
             )))
             .unwrap();
