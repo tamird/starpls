@@ -20,12 +20,25 @@ const DEFAULT_WORKSPACE_NAMES: &[&str] = &["__main__", "_main"];
 
 pub type RepoMapping = Arc<HashMap<String, String>>;
 
-#[derive(Default)]
-struct MappingInterner {
-    values: HashMap<Box<[u8]>, Weak<HashMap<String, String>>>,
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MappingFormat {
+    #[default]
+    Compact,
+    Json,
 }
 
-impl MappingInterner {
+#[derive(Default)]
+struct MappingState {
+    values: HashMap<Box<[u8]>, Weak<HashMap<String, String>>>,
+    format: MappingFormat,
+}
+
+struct MappingOutput {
+    mappings: Vec<RepoMapping>,
+    empty_stdout: bool,
+}
+
+impl MappingState {
     fn intern(&mut self, json: &[u8]) -> anyhow::Result<RepoMapping> {
         if let Some(mapping) = self.values.get(json).and_then(Weak::upgrade) {
             return Ok(mapping);
@@ -77,7 +90,7 @@ pub trait BazelClient: Send + Sync + 'static {
 pub struct BazelCLI {
     executable: PathBuf,
     working_directory: Option<PathBuf>,
-    mappings: Mutex<MappingInterner>,
+    mappings: Mutex<MappingState>,
 }
 
 impl BazelCLI {
@@ -202,48 +215,72 @@ impl BazelClient for BazelCLI {
         if repos.is_empty() {
             bail!("repository mapping query requires at least one repository");
         }
-        let mut command = Command::new(&self.executable);
-        command
-            .args(["mod", "--enable_bzlmod", "dump_repo_mapping"])
-            .args(repos);
-        if let Some(directory) = &self.working_directory {
-            command.current_dir(directory);
-        }
         // Serialize mapping readers before they can contend for Bazel's server
         // lock with an unread stdout pipe and this interner lock held elsewhere.
-        let mut mappings = self.mappings.lock().expect("mapping interner was poisoned");
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let mut stderr = child.stderr.take().expect("stderr was piped");
-        std::thread::scope(|scope| {
-            let errors = scope.spawn(move || {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes).map(|_| bytes)
-            });
-            let result =
-                parse_repo_mappings(std::io::BufReader::new(stdout), repos.len(), &mut mappings);
-            if result.is_err() {
-                // A malformed stream can leave the child blocked on stdout.
-                let _ = child.kill();
+        let mut state = self.mappings.lock().expect("mapping state was poisoned");
+        loop {
+            let mut command = Command::new(&self.executable);
+            command.args(["mod", "--enable_bzlmod", "dump_repo_mapping"]);
+            if state.format == MappingFormat::Compact {
+                command.arg("--output=compact_json");
             }
-            let status = child.wait()?;
-            let errors = errors.join().expect("stderr reader panicked")?;
-            if !status.success() && result.is_ok() {
+            command.args(repos);
+            if let Some(directory) = &self.working_directory {
+                command.current_dir(directory);
+            }
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let mut stderr = child.stderr.take().expect("stderr was piped");
+            let (result, status, errors) = std::thread::scope(|scope| -> anyhow::Result<_> {
+                let errors = scope.spawn(move || {
+                    let mut bytes = Vec::new();
+                    stderr.read_to_end(&mut bytes).map(|_| bytes)
+                });
+                let result =
+                    parse_repo_mappings(std::io::BufReader::new(stdout), repos.len(), &mut state);
+                if result.is_err() {
+                    // A malformed stream can leave the child blocked on stdout.
+                    let _ = child.kill();
+                }
+                let status = child.wait()?;
+                let errors = errors.join().expect("stderr reader panicked")?;
+                Ok((result, status, errors))
+            })?;
+            let MappingOutput {
+                mappings,
+                empty_stdout,
+            } = result.with_context(|| {
+                format!(
+                    "Bazel repository mapping query ({status}): {}",
+                    String::from_utf8_lossy(&errors)
+                )
+            })?;
+            if state.format == MappingFormat::Compact
+                && empty_stdout
+                && status.code() == Some(2)
+                && unsupported_compact_mapping_format(&errors)
+            {
+                state.format = MappingFormat::Json;
+                continue;
+            }
+            if !status.success() {
                 bail!(
                     "failed to query repository mappings with {status}: {}",
                     String::from_utf8_lossy(&errors)
                 );
             }
-            result.with_context(|| {
-                format!(
-                    "Bazel repository mapping query ({status}): {}",
-                    String::from_utf8_lossy(&errors)
-                )
-            })
-        })
+            if mappings.len() != repos.len() {
+                bail!(
+                    "expected {} repository mappings, received {}",
+                    repos.len(),
+                    mappings.len()
+                );
+            }
+            return Ok(mappings);
+        }
     }
 
     fn selected_module(&self, canonical_repo: &str) -> anyhow::Result<Option<SelectedModule>> {
@@ -284,18 +321,20 @@ impl BazelClient for BazelCLI {
 fn parse_repo_mappings(
     mut output: impl BufRead,
     expected: usize,
-    interner: &mut MappingInterner,
-) -> anyhow::Result<Vec<RepoMapping>> {
+    interner: &mut MappingState,
+) -> anyhow::Result<MappingOutput> {
     interner
         .values
         .retain(|_, mapping| mapping.strong_count() > 0);
     let mut mappings = Vec::with_capacity(expected);
     let mut line = Vec::new();
+    let mut empty_stdout = true;
     loop {
         line.clear();
         if output.read_until(b'\n', &mut line)? == 0 {
             break;
         }
+        empty_stdout = false;
         let json = line.trim_ascii();
         if json.is_empty() {
             continue;
@@ -303,15 +342,31 @@ fn parse_repo_mappings(
         if mappings.len() == expected {
             bail!("unexpected extra repository mapping");
         }
-        mappings.push(interner.intern(json)?);
+        let mapping = if json.starts_with(b"{") || interner.format == MappingFormat::Json {
+            interner.intern(json)?
+        } else {
+            let index = serde_json::from_slice::<usize>(json)?;
+            let referenced = mappings.get(index).with_context(|| {
+                format!("repository mapping reference {index} does not identify an earlier record")
+            })?;
+            Arc::clone(referenced)
+        };
+        mappings.push(mapping);
     }
-    if mappings.len() != expected {
-        bail!(
-            "expected {expected} repository mappings, received {}",
-            mappings.len()
-        );
-    }
-    Ok(mappings)
+    Ok(MappingOutput {
+        mappings,
+        empty_stdout,
+    })
+}
+
+fn unsupported_compact_mapping_format(stderr: &[u8]) -> bool {
+    let Ok(stderr) = str::from_utf8(stderr) else {
+        return false;
+    };
+    stderr.lines().any(|line| {
+        line.starts_with("ERROR: While parsing option --output=compact_json: Not a valid output format: 'compact_json' (should be ")
+            && line.ends_with(')')
+    })
 }
 
 fn selected_module_from_graph(
@@ -410,19 +465,25 @@ mod tests {
 
     #[test]
     fn equal_mapping_outputs_share_storage_across_batches() {
-        let mut interner = super::MappingInterner::default();
+        let mut interner = super::MappingState::default();
         let output = b"{\"dep\":\"same+\"}\n{\"dep\":\"same+\"}\n";
-        let first = super::parse_repo_mappings(output.as_slice(), 2, &mut interner).unwrap();
+        let first = super::parse_repo_mappings(output.as_slice(), 2, &mut interner)
+            .unwrap()
+            .mappings;
         let [one, two] = first.as_slice() else {
             panic!("expected two mappings");
         };
         assert!(std::sync::Arc::ptr_eq(one, two));
-        let second = super::parse_repo_mappings(output.as_slice(), 2, &mut interner).unwrap();
+        let second = super::parse_repo_mappings(output.as_slice(), 2, &mut interner)
+            .unwrap()
+            .mappings;
         assert!(std::sync::Arc::ptr_eq(one, second.first().unwrap()));
         assert_eq!(interner.values.len(), 1);
         drop(first);
         drop(second);
-        let third = super::parse_repo_mappings(b"{}\n".as_slice(), 1, &mut interner).unwrap();
+        let third = super::parse_repo_mappings(b"{}\n".as_slice(), 1, &mut interner)
+            .unwrap()
+            .mappings;
         assert!(third.first().unwrap().is_empty());
         assert_eq!(
             interner.values.len(),
@@ -444,7 +505,7 @@ mod tests {
         std::fs::write(
             &executable,
             r#"#!/bin/sh
-test "$#" = 5 && test "$4" = '' && test "$5" = 'repo+' || exit 99
+test "$#" = 6 && test "$4" = '--output=compact_json' && test "$5" = '' && test "$6" = 'repo+' || exit 99
 i=0
 while test "$i" -lt 2000; do
   printf 'Bazel progress message while stdout is consumed\n' >&2
@@ -471,10 +532,11 @@ exit "$status"
     }
 
     #[test]
-    fn repository_mapping_batches_preserve_order_and_require_all_results() {
+    fn repository_mapping_batches_preserve_order_and_reject_invalid_records() {
         let output = b"{\"dep\":\"first+\"}\n{\"dep\":\"second+\"}\n";
-        let mappings =
-            super::parse_repo_mappings(output.as_slice(), 2, &mut Default::default()).unwrap();
+        let mappings = super::parse_repo_mappings(output.as_slice(), 2, &mut Default::default())
+            .unwrap()
+            .mappings;
         let [first, second] = mappings.as_slice() else {
             panic!("expected two mappings: {mappings:?}");
         };
@@ -482,13 +544,132 @@ exit "$status"
         assert_eq!(second.get("dep").unwrap(), "second+");
         for (output, count) in [
             (output.as_slice(), 1),
-            (output.as_slice(), 3),
             (b"{}\nmalformed".as_slice(), 2),
             (b"{}\n{\"dep\":42}".as_slice(), 2),
-            (b"".as_slice(), 1),
         ] {
             assert!(super::parse_repo_mappings(output, count, &mut Default::default()).is_err());
         }
+    }
+
+    #[test]
+    fn compact_mappings_reference_only_earlier_records() {
+        let output = b"{\"dep\":\"first+\"}\n0\n{\"dep\":\"second+\"}\n1\n2\n";
+        let parsed =
+            super::parse_repo_mappings(output.as_slice(), 5, &mut Default::default()).unwrap();
+        let [first, second, third, fourth, fifth] = parsed.mappings.as_slice() else {
+            panic!("expected five records");
+        };
+        assert!(std::sync::Arc::ptr_eq(first, second));
+        assert!(std::sync::Arc::ptr_eq(second, fourth));
+        assert!(std::sync::Arc::ptr_eq(third, fifth));
+        assert_eq!(first["dep"], "first+");
+        assert_eq!(third["dep"], "second+");
+        for invalid in [
+            "0\n",
+            "{}\n1\n",
+            "{}\n-1\n",
+            "{}\n0.0\n",
+            "{}\ntrue\n",
+            "{}\n[]\n",
+            "{}\n18446744073709551616\n",
+        ] {
+            assert!(
+                super::parse_repo_mappings(invalid.as_bytes(), 2, &mut Default::default()).is_err(),
+                "{invalid}"
+            );
+        }
+        let mut legacy = super::MappingState {
+            format: super::MappingFormat::Json,
+            ..Default::default()
+        };
+        assert!(super::parse_repo_mappings(b"{}\n0\n".as_slice(), 2, &mut legacy).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_mapping_negotiation_requires_the_exact_option_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::BazelClient;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("mapping-format");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("bazel");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+mode=json
+if test "$4" = '--output=compact_json'; then mode=compact; fi
+printf '%s\n' "$mode" >> "${0%/*}/calls"
+cat "${0%/*}/$mode.stdout"
+cat "${0%/*}/$mode.stderr" >&2
+read status < "${0%/*}/$mode.status"
+exit "$status"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let unsupported = "ERROR: While parsing option --output=compact_json: Not a valid output format: 'compact_json' (should be text, json, graph, streamed_proto or streamed_jsonproto)\n";
+        let compact = "{\"dep\":\"repo+\"}\n0\n";
+        std::fs::write(
+            root.join("json.stdout"),
+            "{\"dep\":\"repo+\"}\n{\"dep\":\"repo+\"}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("json.stderr"), "").unwrap();
+        std::fs::write(root.join("json.status"), "0\n").unwrap();
+        for (output, errors, status, succeeds, calls) in [
+            (compact, "", "0\n", true, "compact\ncompact\n"),
+            ("", unsupported, "2\n", true, "compact\njson\njson\n"),
+            ("", unsupported, "1\n", false, "compact\n"),
+            ("\n", unsupported, "2\n", false, "compact\n"),
+            ("{}\n", unsupported, "2\n", false, "compact\n"),
+            (
+                "",
+                "ERROR: repository evaluation failed\n",
+                "2\n",
+                false,
+                "compact\n",
+            ),
+            ("", "", "0\n", false, "compact\n"),
+            ("{}\n", "", "0\n", false, "compact\n"),
+            ("{}\n0\n0\n", "", "0\n", false, "compact\n"),
+            ("{}\ninvalid\n", unsupported, "2\n", false, "compact\n"),
+            (compact, "evaluation failed\n", "2\n", false, "compact\n"),
+        ] {
+            std::fs::write(root.join("calls"), "").unwrap();
+            std::fs::write(root.join("compact.stdout"), output).unwrap();
+            std::fs::write(root.join("compact.stderr"), errors).unwrap();
+            std::fs::write(root.join("compact.status"), status).unwrap();
+            let client = super::BazelCLI::new(&executable);
+            let result = client.dump_repo_mappings(&["", "repo+"]);
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "stdout={output:?}, stderr={errors:?}, status={status:?}: {result:?}"
+            );
+            if succeeds {
+                let maps = result.unwrap();
+                let [first, second] = maps.as_slice() else {
+                    panic!("expected two mappings");
+                };
+                assert!(std::sync::Arc::ptr_eq(first, second));
+                client.dump_repo_mappings(&["", "repo+"]).unwrap();
+            }
+            assert_eq!(std::fs::read_to_string(root.join("calls")).unwrap(), calls);
+            if !succeeds {
+                std::fs::write(root.join("compact.stdout"), compact).unwrap();
+                std::fs::write(root.join("compact.stderr"), "").unwrap();
+                std::fs::write(root.join("compact.status"), "0\n").unwrap();
+                client.dump_repo_mappings(&["", "repo+"]).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(root.join("calls")).unwrap(),
+                    "compact\ncompact\n"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
