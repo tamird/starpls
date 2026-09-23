@@ -41,6 +41,13 @@ use super::factory::BuildSetting;
 use super::factory::Factory;
 use crate::Database;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContextKind {
+    Build,
+    Repository,
+    Aspect,
+}
+
 pub(super) fn parameter_type<'db>(
     db: &'db Database,
     definition: Definition<'db>,
@@ -84,7 +91,10 @@ pub(super) fn parameter_type<'db>(
         let Some(factory) = factory::declaration(db, declaration) else {
             continue;
         };
-        if !matches!(factory, Factory::Rule { repository: _ } | Factory::Macro) {
+        if !matches!(
+            factory,
+            Factory::Rule { repository: _ } | Factory::Aspect | Factory::Macro
+        ) {
             continue;
         }
         // An unknown expansion could register this callback a second time;
@@ -110,44 +120,63 @@ pub(super) fn parameter_type<'db>(
     }
     let (call, signature, declaration, factory) = registration?;
     let declarations = declaration.program_file(db);
-    let repository = match factory {
+    let context_kind = match factory {
         Factory::Macro => {
             let result = call.inferred_type(&model)?;
-            let data = result
-                .provided_data(db, &environment)?
-                .downcast_ref::<factory::RuleData>()?;
+            let data = result.provided_data(db, &environment)?;
+            let data = data.downcast_ref::<factory::RuleData>()?;
             return data.parameter_type(db, &environment, declarations, parameter.name().as_str());
         }
-        Factory::Rule { repository } => repository,
+        Factory::Rule { repository } => {
+            if repository {
+                ContextKind::Repository
+            } else {
+                ContextKind::Build
+            }
+        }
+        Factory::Aspect => ContextKind::Aspect,
         Factory::Attribute(_) => return None,
         Factory::BuildSetting(_) => return None,
         Factory::Struct => return None,
         Factory::Provider => return None,
         Factory::Transition => return None,
     };
-    if function.parameters.iter_non_variadic_params().count() != 1
+    let parameter_count = if context_kind == ContextKind::Aspect {
+        2
+    } else {
+        1
+    };
+    if function.parameters.iter_non_variadic_params().count() != parameter_count
         || function.parameters.vararg.is_some()
         || function.parameters.kwarg.is_some()
     {
         return None;
     }
-    let build_setting = if repository {
-        None
-    } else {
+    if context_kind == ContextKind::Aspect {
+        if !function.parameters.kwonlyargs.is_empty() {
+            return None;
+        }
+        if function.parameters.index(parameter.name().as_str()) == Some(0) {
+            let target = factory::native_class(db, declarations, "Target")?;
+            return target.to_instance_approximation(db, &environment);
+        }
+    }
+    let build_setting = if context_kind == ContextKind::Build {
         let argument = argument(call, &signature, "build_setting").ok()?;
         argument
             .and_then(|argument| argument.inferred_type(&model))
             .filter(|ty| !ty.is_none(db))
+    } else {
+        None
     };
     let setting_kind = build_setting.and_then(|ty| {
         let data = ty.provided_data(db, &environment)?;
         data.downcast_ref::<BuildSetting>().copied()
     });
-    let common = starpls_bazel::attr::make_common_attributes();
-    let mut common = if repository {
-        common.repository
-    } else {
-        common.build
+    let mut common = match context_kind {
+        ContextKind::Build => starpls_bazel::attr::make_common_attributes().build,
+        ContextKind::Repository => starpls_bazel::attr::make_common_attributes().repository,
+        ContextKind::Aspect => Vec::new(),
     };
     if let Some(setting_kind) = setting_kind {
         common.extend(setting_kind.attributes());
@@ -158,7 +187,7 @@ pub(super) fn parameter_type<'db>(
             &environment,
             declarations,
             kind,
-            if repository {
+            if context_kind == ContextKind::Repository {
                 AttributeUse::RepositoryContext
             } else {
                 AttributeUse::BuildContext(
@@ -203,7 +232,10 @@ pub(super) fn parameter_type<'db>(
         View::Outputs,
         View::SplitAttr,
     ] {
-        if repository && view != View::Attr {
+        if context_kind == ContextKind::Repository && view != View::Attr {
+            continue;
+        }
+        if context_kind == ContextKind::Aspect && matches!(view, View::Outputs | View::SplitAttr) {
             continue;
         }
         let mut complete = schema.is_complete;
@@ -247,7 +279,7 @@ pub(super) fn parameter_type<'db>(
                     continue;
                 }
                 Type::unknown()
-            } else if repository {
+            } else if context_kind == ContextKind::Repository {
                 let attribute = attribute?;
                 if attribute.kind == AttributeKind::Label && attribute.has_non_none_value() {
                     factory::native_class(db, declarations, "Label")?
@@ -326,7 +358,11 @@ pub(super) fn parameter_type<'db>(
             source: None,
         });
     }
-    let name = if repository { "repository_ctx" } else { "ctx" };
+    let name = if context_kind == ContextKind::Repository {
+        "repository_ctx"
+    } else {
+        "ctx"
+    };
     let base = match setting_kind {
         Some(setting_kind) => factory::specialized_native_class(
             db,
@@ -631,6 +667,103 @@ mod tests {
             assert_eq!(*target_file_id, file.source);
             assert_eq!(&source[*target_selection_range], key);
         }
+    }
+
+    #[test]
+    fn aspect_callbacks_use_target_and_own_attributes() {
+        let source = r#"def implementation(subject, context):
+    subject.files.to_list()
+    context.attr.mode
+    context.attr._tool.label
+    context.files._tool
+    context.file._tool
+    context.executable._tool
+    context.rule.attr.unselected
+    _wrong_target: str = subject.files.to_list()
+    _wrong_mode: int = context.attr.mode
+    print(_wrong_target, _wrong_mode)
+make_aspect = aspect
+example = make_aspect(implementation=implementation, attrs={
+    "mode": attr.string(default="fast", values=["fast", "slow"]),
+    "_tool": attr.label(default="//:tool", allow_single_file=True, executable=True, cfg="exec"),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let snapshot = analysis.snapshot();
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "    subject.files",
+            "depset[File]",
+            "",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "    context.attr.mode",
+            "str",
+            "\"mode\"",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "    context.files._tool",
+            "list[File]",
+            "\"_tool\"",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "    context.file._tool",
+            "File",
+            "\"_tool\"",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "    context.executable._tool",
+            "File",
+            "\"_tool\"",
+        );
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "invalid-assignment"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn aspect_parameter_contract_requires_a_unique_registration() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        for (parameters, extra, registration, expected) in [
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "str"),
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.int(default=1, values=[1])})", "int"),
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "str"),
+            ("item, env", "other = aspect(implementation=implementation)", "aspect(implementation=implementation)", "Unknown"),
+            ("item, *, env", "", "aspect(implementation=implementation)", "Unknown"),
+            ("item, env, *rest", "", "aspect(implementation=implementation)", "Unknown"),
+            ("item, env", "def aspect(implementation): pass", "aspect(implementation=implementation)", "Unknown"),
+        ] {
+            let source = format!("def implementation({parameters}):\n    env.attr.mode\n{extra}\nexample = {registration}\n");
+            analysis.update_file(file, source.clone());
+            check_field(&analysis.snapshot(), file, &source, "    env.attr.mode", expected, "");
+        }
+        let source = "def implementation(item: str, env):\n    item.upper()\nexample = aspect(implementation=implementation)\n";
+        analysis.update_file(file, source.to_owned());
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

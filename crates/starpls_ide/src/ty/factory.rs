@@ -273,6 +273,7 @@ pub(super) enum Factory {
     Attribute(AttributeKind),
     BuildSetting(BuildSetting),
     Rule { repository: bool },
+    Aspect,
     Macro,
     Struct,
     Provider,
@@ -336,6 +337,7 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
     match function.name.as_str() {
         "rule" => Some(Factory::Rule { repository: false }),
         "repository_rule" => Some(Factory::Rule { repository: true }),
+        "aspect" => Some(Factory::Aspect),
         "macro" => Some(Factory::Macro),
         "struct" => Some(Factory::Struct),
         "provider" => Some(Factory::Provider),
@@ -367,6 +369,7 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
             },
         ),
         Factory::Macro => rule(db, call, RuleKind::Macro),
+        Factory::Aspect => None,
         Factory::Struct => structure(db, call),
         Factory::Provider => provider(db, call),
         Factory::Transition => descriptor(
