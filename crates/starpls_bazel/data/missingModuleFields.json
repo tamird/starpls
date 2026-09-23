@@ -225,5 +225,63 @@
         "return_type": "CcInfo"
       }
     }
+  ],
+  "platform_common": [
+    {
+      "name": "ToolchainInfo",
+      "doc": "Creates a toolchain provider containing the supplied fields.",
+      "callable": {
+        "params": [
+          {
+            "name": "kwargs",
+            "type": "Unknown",
+            "doc": "",
+            "default_value": "",
+            "is_mandatory": false,
+            "is_star_arg": false,
+            "is_star_star_arg": true
+          }
+        ],
+        "return_type": "ToolchainInfo"
+      }
+    }
+  ],
+  "repository_ctx": [
+    {
+      "name": "repo_metadata",
+      "doc": "Returns metadata describing whether this repository is reproducible and which attributes reproduce it.",
+      "callable": {
+        "params": [
+          {
+            "name": "*",
+            "type": "",
+            "doc": "",
+            "default_value": "",
+            "is_mandatory": false,
+            "is_star_arg": true,
+            "is_star_star_arg": false
+          },
+          {
+            "name": "reproducible",
+            "type": "bool",
+            "doc": "",
+            "default_value": "False",
+            "is_mandatory": false,
+            "is_star_arg": false,
+            "is_star_star_arg": false
+          },
+          {
+            "name": "attrs_for_reproducibility",
+            "type": "Dictionary: string -> object",
+            "doc": "",
+            "default_value": "{}",
+            "is_mandatory": false,
+            "is_star_arg": false,
+            "is_star_star_arg": false
+          }
+        ],
+        "return_type": "repo_metadata"
+      }
+    }
   ]
 }

@@ -186,11 +186,16 @@ fn declarations(
     for (name, fields) in env::make_missing_module_members() {
         if let Some(class) = classes.get_mut(&name) {
             for field in fields {
-                if !class
+                if let Some(existing) = class
                     .field
-                    .iter()
-                    .any(|existing| existing.name == field.name)
+                    .iter_mut()
+                    .find(|existing| existing.name == field.name)
                 {
+                    // Some exported provider keys omit their callable contract.
+                    if existing.callable.is_none() {
+                        existing.callable = field.callable;
+                    }
+                } else {
                     class.field.push(field);
                 }
             }
@@ -220,6 +225,12 @@ fn declarations(
         });
     }
     if dialect == Dialect::Bazel {
+        classes
+            .entry("repo_metadata".to_owned())
+            .or_insert_with(|| Type {
+                name: "repo_metadata".to_owned(),
+                ..Default::default()
+            });
         classes.entry("select".to_owned()).or_insert_with(|| Type {
             name: "select".to_owned(),
             doc: "Deferred configuration-dependent alternatives.".to_owned(),
@@ -262,13 +273,31 @@ fn declarations(
             )?;
         }
         let mut names = BTreeSet::new();
+        if class.name == "ToolchainInfo" {
+            names.insert("__getattr__");
+            writeln!(body, "        @_starpls_typing.type_check_only")?;
+            writeln!(body, "        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_typing.Any: ...")?;
+        }
+        if class.name == "ToolchainContext" {
+            names.extend(["__getitem__", "__contains__"]);
+            // Aspect toolchain contexts can return aspect providers, so the
+            // shared native type cannot promise a ToolchainInfo result.
+            writeln!(body, "        def __getitem__(self, key: _starpls_builtins.str | _starpls_types.Label | _starpls_types.ToolchainTypeInfo) -> _starpls_typing.Any: ...")?;
+            writeln!(body, "        def __contains__(self, key: _starpls_builtins.str | _starpls_types.Label | _starpls_types.ToolchainTypeInfo) -> _starpls_builtins.bool: ...")?;
+        }
         if class.name == "select" {
             names.extend(["__add__", "__radd__", "__or__", "__ror__"]);
             write_select_operators(&mut body)?;
         }
         if class.name == "Target" {
-            names.extend(["label", "__getitem__", "__contains__"]);
+            names.extend(["label", "files", "__getitem__", "__contains__"]);
             writeln!(body, "        label: _starpls_types.Label")?;
+            // The default Bazel API exposes DefaultInfo.files directly;
+            // incompatible_disable_target_default_provider_fields disables it.
+            writeln!(
+                body,
+                "        files: _starpls_types.depset[_starpls_types.File]"
+            )?;
             // Target access normalizes DefaultInfo.files even when the raw
             // provider constructor omitted it.
             writeln!(body, "        @_starpls_typing.overload")?;
@@ -477,8 +506,14 @@ fn rule_type(name: &str) -> String {
 }
 
 fn value_annotation(value: &Value, classes: &BTreeSet<String>) -> String {
-    let annotation = annotation(&value.r#type, false, classes, AnnotationUse::Value);
-    if starpls_bazel::KNOWN_PROVIDER_TYPES.contains(&value.name.as_str()) {
+    let known_provider = starpls_bazel::KNOWN_PROVIDER_TYPES.contains(&value.name.as_str());
+    let value_type = if known_provider && value.r#type == "Provider" {
+        &value.name
+    } else {
+        &value.r#type
+    };
+    let annotation = annotation(value_type, false, classes, AnnotationUse::Value);
+    if known_provider {
         format!("_starpls_types.Provider[{annotation}]")
     } else {
         annotation
@@ -974,6 +1009,156 @@ example(name='second', visibility=[Label('//visibility:public')])
                 assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len(), "{bad}: {diagnostic:?}");
             }
         }
+    }
+
+    #[test]
+    fn native_toolchain_and_repository_protocols() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = r#"def inspect(toolchains: ToolchainContext, key: ToolchainTypeInfo, target: Target, ctx: repository_ctx):
+    toolchains["//:toolchain"]
+    toolchains[Label("//:toolchain")]
+    toolchains[key]
+    available: bool = "//:toolchain" in toolchains
+    info: ToolchainInfo = platform_common.ToolchainInfo(tool=1, files=[])
+    info.tool
+    selected: ToolchainInfo = target[platform_common.ToolchainInfo]
+    setting: ConstraintSettingInfo = target[platform_common.ConstraintSettingInfo]
+    files = target.files.to_list()
+    files[0].basename
+    metadata = ctx.repo_metadata(reproducible=True)
+    ctx.repo_metadata(attrs_for_reproducibility={"checksum": "abc", "count": 1})
+    attrs = {"checksum": "abc"}
+    ctx.repo_metadata(attrs_for_reproducibility=attrs)
+    (available, selected, setting, metadata)
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for invalid in [
+            "toolchains[42]",
+            "42 in toolchains",
+            "platform_common.ToolchainInfo(42)",
+            "_wrong: CcInfo = platform_common.ToolchainInfo(); _wrong",
+            "_wrong: CcInfo = target[platform_common.ConstraintSettingInfo]; _wrong",
+            "InstrumentedFilesInfo()",
+            "files[0].missing",
+            "_wrong: list[int] = files; _wrong",
+            "ctx.repo_metadata(reproducible='yes')",
+            "ctx.repo_metadata(attrs_for_reproducibility={1: 'value'})",
+            "ctx.repo_metadata(True)",
+            "metadata.missing",
+        ] {
+            analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    format!("{source}    {invalid}\n"),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{invalid}: {diagnostics:?}");
+            };
+            assert!(
+                usize::from(diagnostic.range().unwrap().start()) >= source.len(),
+                "{invalid}: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_keys_with_missing_instance_metadata_are_gradual() {
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        builtins
+            .r#type
+            .retain(|class| class.name != "ConstraintSettingInfo");
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = "def inspect(target: Target):\n    target[platform_common.ConstraintSettingInfo].unknown_member\n";
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn complete_inventory_signatures_take_precedence() {
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let platform = builtins
+            .r#type
+            .iter_mut()
+            .find(|class| class.name == "platform_common")
+            .unwrap();
+        let constructor = platform
+            .field
+            .iter_mut()
+            .find(|field| field.name == "ToolchainInfo")
+            .unwrap();
+        constructor.callable = Some(Callable {
+            param: vec![Param {
+                name: "value".to_owned(),
+                r#type: "string".to_owned(),
+                is_mandatory: true,
+                ..Default::default()
+            }],
+            return_type: "ToolchainInfo".to_owned(),
+        });
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = "platform_common.ToolchainInfo(value='valid')\nplatform_common.ToolchainInfo(value=42)\n";
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        let range = diagnostic.range().unwrap();
+        assert_eq!(
+            &source[usize::from(range.start())..usize::from(range.end())],
+            "value=42"
+        );
     }
 
     #[test]
