@@ -576,6 +576,10 @@ mod tests {
     use std::path::Path;
 
     use ruff_python_ast::Stmt;
+    use starpls_bazel::build::attribute::Discriminator;
+    use starpls_bazel::build::AttributeDefinition;
+    use starpls_bazel::build::BuildLanguage;
+    use starpls_bazel::build::RuleDefinition;
     use starpls_bazel::APIContext;
     use starpls_common::Dialect;
     use starpls_common::FileInfo;
@@ -609,6 +613,72 @@ consume(**invalid)
                 >= source.find("consume(**invalid)").unwrap(),
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn native_keyword_dictionary_completeness_follows_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                BuildLanguage {
+                    rule: vec![RuleDefinition {
+                        name: "alias".to_owned(),
+                        attribute: [
+                            ("name", Discriminator::String, true, false),
+                            ("actual", Discriminator::Label, true, true),
+                            ("tags", Discriminator::StringList, false, false),
+                            ("testonly", Discriminator::Boolean, false, false),
+                            ("deprecation", Discriminator::String, false, false),
+                        ]
+                        .into_iter()
+                        .map(
+                            |(name, kind, mandatory, configurable)| AttributeDefinition {
+                                name: name.to_owned(),
+                                r#type: kind as i32,
+                                mandatory: Some(mandatory),
+                                configurable: Some(configurable),
+                                ..Default::default()
+                            },
+                        )
+                        .collect(),
+                        ..Default::default()
+                    }],
+                },
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        for (extra_keyword, escape, valid) in [
+            ("", "", true),
+            ("", "    mutate(options)\n", false),
+            ("", "", true),
+            (", deprecation=1", "", false),
+        ] {
+            let source = format!(
+                r#"def mutate(value):
+    value["deprecation"] = 1
+
+def register(name: str):
+    options = dict(tags=["manual"], testonly=True{extra_keyword})
+{escape}    native.alias(name=name, actual="//:target", **options)
+    native.alias(name=name + "_again", actual="//:target", **options)
+"#
+            );
+            analysis.update_file(file, source.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.is_empty(), valid, "{source}\n{diagnostics:?}");
+            let first_call = source.find("native.alias(").unwrap();
+            for diagnostic in diagnostics {
+                assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+                assert!(
+                    usize::from(diagnostic.range().unwrap().start()) >= first_call,
+                    "{source}\n{diagnostic:?}"
+                );
+            }
+        }
     }
 
     #[test]
