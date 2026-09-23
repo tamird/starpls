@@ -37,6 +37,7 @@ use super::factory;
 use super::factory::Attribute;
 use super::factory::AttributeConfiguration;
 use super::factory::AttributeUse;
+use super::factory::BuildSetting;
 use super::factory::Factory;
 use crate::Database;
 
@@ -130,12 +131,27 @@ pub(super) fn parameter_type<'db>(
     {
         return None;
     }
+    let build_setting = if repository {
+        None
+    } else {
+        let argument = argument(call, &signature, "build_setting").ok()?;
+        argument
+            .and_then(|argument| argument.inferred_type(&model))
+            .filter(|ty| !ty.is_none(db))
+    };
+    let setting_kind = build_setting.and_then(|ty| {
+        let data = ty.provided_data(db, &environment)?;
+        data.downcast_ref::<BuildSetting>().copied()
+    });
     let common = starpls_bazel::attr::make_common_attributes();
-    let common = if repository {
+    let mut common = if repository {
         common.repository
     } else {
         common.build
     };
+    if let Some(setting_kind) = setting_kind {
+        common.extend(setting_kind.attributes());
+    }
     let attribute_type = |kind| {
         factory::attribute_value_type(
             db,
@@ -167,7 +183,7 @@ pub(super) fn parameter_type<'db>(
             call,
             ProvidedClass {
                 name: Name::new(name),
-                bases: vec![factory::native_class(db, declarations, base)?].into_boxed_slice(),
+                bases: vec![base].into_boxed_slice(),
                 class_members: Box::default(),
                 instance_fields: ProvidedInstanceFields {
                     fields,
@@ -211,7 +227,17 @@ pub(super) fn parameter_type<'db>(
                 })
             })
             .collect::<Vec<_>>();
+        if view == View::Attr && build_setting.is_some() && setting_kind.is_none() {
+            fields.extend(BuildSetting::ATTRIBUTE_NAMES.map(|name| ProvidedField {
+                name: Name::new(name),
+                ty: Type::unknown(),
+                source: None,
+            }));
+        }
         for DictionaryItem { name, ty, source } in &schema.items {
+            if setting_kind.is_some() && BuildSetting::ATTRIBUTE_NAMES.contains(&name.as_str()) {
+                continue;
+            }
             let attribute = ty
                 .provided_data(db, &environment)
                 .and_then(|data| data.downcast_ref::<Attribute>());
@@ -288,7 +314,12 @@ pub(super) fn parameter_type<'db>(
                 }
             }
         }
-        let ty = make_class(view.name(), "struct", fields.into_boxed_slice(), !complete)?;
+        let ty = make_class(
+            view.name(),
+            factory::native_class(db, declarations, "struct")?,
+            fields.into_boxed_slice(),
+            !complete,
+        )?;
         context_fields.push(ProvidedField {
             name: Name::new(view.name()),
             ty,
@@ -296,7 +327,16 @@ pub(super) fn parameter_type<'db>(
         });
     }
     let name = if repository { "repository_ctx" } else { "ctx" };
-    make_class(name, name, context_fields.into_boxed_slice(), false)
+    let base = match setting_kind {
+        Some(setting_kind) => factory::specialized_native_class(
+            db,
+            declarations,
+            name,
+            setting_kind.value_type(db, &environment),
+        )?,
+        None => factory::native_class(db, declarations, name)?,
+    };
+    make_class(name, base, context_fields.into_boxed_slice(), false)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -590,6 +630,146 @@ mod tests {
             };
             assert_eq!(*target_file_id, file.source);
             assert_eq!(&source[*target_selection_range], key);
+        }
+    }
+
+    #[test]
+    fn loaded_build_setting_values_follow_descriptor_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        enable_context(&mut analysis);
+        let settings = fixture.add_file(&mut analysis.db, "//:settings.bzl", "");
+        let source = r#"load("//:settings.bzl", "setting")
+def implementation(context):
+    context.build_setting_value
+    context.attr.build_setting_default
+    context.attr.help
+    _wrong_value: None = context.build_setting_value
+    _wrong_default: None = context.attr.build_setting_default
+    _wrong_help: None = context.attr.help
+    print(_wrong_value, _wrong_default, _wrong_help)
+example = rule(implementation=implementation, build_setting=setting)
+"#;
+        let file = fixture.add_file(&mut analysis.db, "//:defs.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        for (descriptor, value, default) in [
+            ("config.bool()", "bool", "bool"),
+            ("config.int()", "int", "int"),
+            ("config.string()", "str", "str"),
+            ("config.string(allow_multiple=True)", "list[str]", "str"),
+            ("config.string(allow_multiple=False)", "str", "str"),
+            (
+                "config.string(allow_multiple=option())",
+                "str | list[str]",
+                "str",
+            ),
+            ("config.string_list()", "list[str]", "list[str]"),
+            (
+                "config.string_list(flag=True, repeatable=True)",
+                "list[str]",
+                "list[str]",
+            ),
+            ("config.bool()", "bool", "bool"),
+        ] {
+            analysis.update_file(
+                settings,
+                format!("def option() -> bool: return True\nsetting = {descriptor}\n"),
+            );
+            let snapshot = analysis.snapshot();
+            let setting_diagnostics = snapshot.diagnostics(settings).unwrap();
+            assert!(
+                setting_diagnostics.is_empty(),
+                "{descriptor}: {setting_diagnostics:?}"
+            );
+            check_field(
+                &snapshot,
+                file,
+                source,
+                "    context.build_setting_value",
+                value,
+                "",
+            );
+            check_field(
+                &snapshot,
+                file,
+                source,
+                "    context.attr.build_setting_default",
+                default,
+                "",
+            );
+            check_field(&snapshot, file, source, "    context.attr.help", "str", "");
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 3, "{descriptor}: {diagnostics:?}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.id().as_str() == "invalid-assignment"),
+                "{diagnostics:?}"
+            );
+        }
+        let position = FilePosition {
+            file_id: file,
+            pos: ((source.find("build_setting_value").unwrap() + "build_setting_value".len() - 1)
+                as u32)
+                .into(),
+        };
+        {
+            let snapshot = analysis.snapshot();
+            let hover = snapshot.hover(position).unwrap().unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains("Value of the build setting represented"),
+                "{}",
+                hover.contents.value
+            );
+        }
+        analysis.update_file(
+            file,
+            source.replace(
+                "    print(",
+                "    context.build_setting_value = True\n    print(",
+            ),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .concise_message()
+                .to_string()
+                .contains("read-only")),
+            "{diagnostics:?}"
+        );
+        analysis.update_file(file, source.to_owned());
+        analysis.update_file(
+            settings,
+            "def choose(value): return value\nsetting = choose(None)\n".to_owned(),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let source = source.replace("build_setting=setting)", "build_setting=setting, attrs={\"build_setting_default\": attr.int(), \"help\": attr.bool()})");
+        analysis.update_file(file, source.clone());
+        for (descriptor, default, help, errors) in [
+            ("choose(None)", "int", "bool", 2),
+            ("config.string()", "str", "str", 3),
+        ] {
+            analysis.update_file(
+                settings,
+                format!("def choose(value): return value\nsetting = {descriptor}\n"),
+            );
+            let snapshot = analysis.snapshot();
+            check_field(
+                &snapshot,
+                file,
+                &source,
+                "    context.attr.build_setting_default",
+                default,
+                "",
+            );
+            check_field(&snapshot, file, &source, "    context.attr.help", help, "");
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), errors, "{descriptor}: {diagnostics:?}");
         }
     }
 

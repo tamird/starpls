@@ -156,17 +156,66 @@ struct StarlarkTransition;
 pub(super) enum BuildSetting {
     Bool,
     Int,
-    String,
+    String { allow_multiple: Option<bool> },
     StringList,
 }
 
 impl BuildSetting {
+    pub(super) const ATTRIBUTE_NAMES: [&str; 2] = ["build_setting_default", "help"];
+
     fn attribute_kind(self) -> AttributeKind {
         match self {
             Self::Bool => AttributeKind::Bool,
             Self::Int => AttributeKind::Int,
-            Self::String => AttributeKind::String,
+            Self::String { allow_multiple: _ } => AttributeKind::String,
             Self::StringList => AttributeKind::StringList,
+        }
+    }
+
+    pub(super) fn attributes(self) -> [starpls_bazel::attr::Attribute; 2] {
+        let [default, help] = Self::ATTRIBUTE_NAMES;
+        [
+            (
+                default,
+                self.attribute_kind(),
+                "Default value of this build setting.",
+                true,
+            ),
+            (
+                help,
+                AttributeKind::String,
+                "Help text for this build setting.",
+                false,
+            ),
+        ]
+        .map(
+            |(name, kind, doc, mandatory)| starpls_bazel::attr::Attribute {
+                name: name.to_owned(),
+                r#type: kind,
+                doc: doc.to_owned(),
+                default_value: String::new(),
+                is_mandatory: mandatory,
+                configurable: false,
+            },
+        )
+    }
+
+    pub(super) fn value_type<'db>(
+        self,
+        db: &'db Database,
+        environment: &ProgramEnvironment<'db>,
+    ) -> Type<'db> {
+        let string = KnownClass::Str.to_instance(db, environment);
+        let strings = || KnownClass::List.to_specialized_instance(db, environment, &[string]);
+        match self {
+            Self::Bool => KnownClass::Bool.to_instance(db, environment),
+            Self::Int => KnownClass::Int.to_instance(db, environment),
+            Self::String { allow_multiple } => match allow_multiple {
+                Some(true) => strings(),
+                Some(false) => string,
+                None => UnionType::from_elements(db, environment, [string, strings()]),
+            },
+            Self::StringList => strings(),
         }
     }
 }
@@ -266,7 +315,9 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
             return Some(Factory::BuildSetting(match function.name.as_str() {
                 "bool" => BuildSetting::Bool,
                 "int" => BuildSetting::Int,
-                "string" => BuildSetting::String,
+                "string" => BuildSetting::String {
+                    allow_multiple: Some(false),
+                },
                 "string_list" => BuildSetting::StringList,
                 _ => return None,
             }));
@@ -296,7 +347,14 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
 pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
     match declaration(db, call.declaration()?)? {
         Factory::Attribute(kind) => attribute(db, call, kind),
-        Factory::BuildSetting(kind) => {
+        Factory::BuildSetting(mut kind) => {
+            if let BuildSetting::String { allow_multiple } = &mut kind {
+                *allow_multiple = match call.argument("allow_multiple") {
+                    CheckedArgument::Omitted => Some(false),
+                    CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal(),
+                    CheckedArgument::Indeterminate => None,
+                };
+            }
             descriptor(db, call, "BuildSetting", ProvidedData::new(kind))
         }
         Factory::Rule { repository } => rule(
@@ -524,29 +582,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         data.downcast_ref::<BuildSetting>().copied()
     });
     if let Some(setting_kind) = setting_kind {
-        for (name, attribute_kind, doc, mandatory) in [
-            (
-                "build_setting_default",
-                setting_kind.attribute_kind(),
-                "Default value of this build setting.",
-                true,
-            ),
-            (
-                "help",
-                AttributeKind::String,
-                "Help text for this build setting.",
-                false,
-            ),
-        ] {
-            common.push(starpls_bazel::attr::Attribute {
-                name: name.to_owned(),
-                r#type: attribute_kind,
-                doc: doc.to_owned(),
-                default_value: String::new(),
-                is_mandatory: mandatory,
-                configurable: false,
-            });
-        }
+        common.extend(setting_kind.attributes());
     }
     let mut documentation = Documentation {
         text: doc_string(db, call),
@@ -609,7 +645,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     if build_setting.is_some() && setting_kind.is_none() {
         // An unresolved descriptor may be None. Admit its possible attributes
         // without weakening other attributes or accepting arbitrary keywords.
-        for name in ["build_setting_default", "help"] {
+        for name in BuildSetting::ATTRIBUTE_NAMES {
             let name = Name::new(name);
             attributes.push(RuleAttribute {
                 parameter: Some(
@@ -668,7 +704,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         if matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility") {
             continue;
         }
-        if setting_kind.is_some() && matches!(name, "build_setting_default" | "help") {
+        if setting_kind.is_some() && BuildSetting::ATTRIBUTE_NAMES.contains(&name) {
             // Bazel rejects declarations that collide with generated attributes.
             continue;
         }
@@ -1020,11 +1056,21 @@ pub(super) fn specialized_native_instance<'db>(
     name: &str,
     value: Type<'db>,
 ) -> Option<Type<'db>> {
+    let class = specialized_native_class(db, declarations, name, value)?;
+    class.to_instance_approximation(db, environment)
+}
+
+pub(super) fn specialized_native_class<'db>(
+    db: &'db Database,
+    declarations: ProgramFile<'db>,
+    name: &str,
+    value: Type<'db>,
+) -> Option<Type<'db>> {
     // Callers select generated declarations with exactly one type parameter.
     let class = native_class(db, declarations, name)?;
     let class = class.as_class_literal()?;
     let specialized = class.apply_specialization(db, |context| context.specialize(db, vec![value]));
-    Type::from(specialized).to_instance_approximation(db, environment)
+    Some(Type::from(specialized))
 }
 
 fn attribute_type<'db>(
