@@ -356,6 +356,14 @@ fn declarations(
                         }
                     } else if class.name == "DefaultInfo" && field.name == "files" {
                         Some("_DefaultInfoFiles")
+                    } else if class.name == "FilesToRunProvider"
+                        && matches!(
+                            field.name.as_str(),
+                            "executable" | "runfiles_manifest" | "repo_mapping_manifest"
+                        )
+                    {
+                        // Bazel's inventory omits allowReturnNones on these fields.
+                        Some("_starpls_types.File | None")
                     } else {
                         None
                     };
@@ -1008,6 +1016,58 @@ example(name='second', visibility=[Label('//visibility:public')])
                 assert_eq!(diagnostic.id().as_str(), "invalid-argument-type", "{bad}: {diagnostic:?}");
                 assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len(), "{bad}: {diagnostic:?}");
             }
+        }
+    }
+
+    #[test]
+    fn files_to_run_members_preserve_absence_and_narrowing() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        for name in ["executable", "runfiles_manifest", "repo_mapping_manifest"] {
+            let source = format!(
+                r#"def inspect(provider: FilesToRunProvider):
+    value = provider.{name}
+    if value != None:
+        return value.path
+    return None
+"#
+            );
+            let file = analysis
+                .open_document(Path::new("/main.bzl"), Dialect::Bazel, None, source, 1)
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+            let source = format!(
+                "def inspect(provider: FilesToRunProvider):\n    return provider.{name}.path\n"
+            );
+            analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    source.clone(),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{name}: {diagnostics:?}");
+            };
+            assert_eq!(
+                diagnostic.id().as_str(),
+                "unresolved-attribute",
+                "{name}: {diagnostic:?}"
+            );
+            assert!(
+                diagnostic.concise_message().to_string().contains("None"),
+                "{name}: {diagnostic:?}"
+            );
         }
     }
 
