@@ -18,6 +18,7 @@ use ty_python_semantic::provided::BuiltinUsage;
 use ty_python_semantic::provided::ProvidedBindingResolution;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::types::KnownClass;
+use ty_python_semantic::types::Type;
 use ty_python_semantic::AnalysisSettings;
 use ty_python_semantic::Db as _;
 use ty_python_semantic::ProgramEnvironment;
@@ -447,6 +448,43 @@ impl ty_python_semantic::Db for Database {
         factory::result(self, call)
     }
 
+    fn provided_type_test<'db>(
+        &'db self,
+        file: ProgramFile<'db>,
+        callable: Type<'db>,
+        compared_value: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let tag = compared_value.string_literal_value(self)?;
+        if !matches!(callable, Type::FunctionLiteral(_)) {
+            return None;
+        }
+        let binding = self.language_builtin(file, "type", BuiltinUsage::Runtime)?;
+        let native_type = binding.resolve_type(self)?;
+        if callable != native_type {
+            return None;
+        }
+        let environment = ProgramEnvironment::from_file(file);
+        let unknown = Type::unknown();
+        // Runtime tags differ from annotation names, and provider names need
+        // not identify a unique type. Only canonical core tags are exhaustive.
+        let ty = match tag {
+            "bool" => KnownClass::Bool.to_instance(self, &environment),
+            "int" => KnownClass::Int.to_instance(self, &environment),
+            "float" => KnownClass::Float.to_instance(self, &environment),
+            "string" => KnownClass::Str.to_instance(self, &environment),
+            "NoneType" => Type::none(self, &environment),
+            "range" => KnownClass::Range.to_instance(self, &environment),
+            "list" => KnownClass::List.to_specialized_instance(self, &environment, &[unknown]),
+            "dict" => {
+                KnownClass::Dict.to_specialized_instance(self, &environment, &[unknown, unknown])
+            }
+            "set" => KnownClass::Set.to_specialized_instance(self, &environment, &[unknown]),
+            "tuple" => Type::homogeneous_tuple(self, &environment, unknown),
+            _ => return None,
+        };
+        Some(ty)
+    }
+
     fn provided_builtin<'db>(
         &'db self,
         file: ProgramFile<'db>,
@@ -546,6 +584,174 @@ mod tests {
     use ty_python_semantic::SemanticModel;
 
     use crate::Analysis;
+
+    #[test]
+    fn native_type_tests_preserve_collection_arguments() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        for (annotation, tag, matched, excluded) in [
+            ("bool | int", "bool", "bool", "int"),
+            ("bool | int", "int", "int", "bool"),
+            ("str | Target", "string", "str", "Target"),
+            ("int | Target", "int", "int", "Target"),
+            ("float | None", "float", "float*", "int | None"),
+            ("float | int", "float", "float*", "int"),
+            ("str | None", "NoneType", "None", "str"),
+            ("range | Target", "range", "range", "Target"),
+            ("list[Target] | Target", "list", "list[Target]", "Target"),
+            (
+                "dict[str, Target] | Target",
+                "dict",
+                "dict[str, Target]",
+                "Target",
+            ),
+            (
+                "tuple[int, str] | Target",
+                "tuple",
+                "tuple[int, str]",
+                "Target",
+            ),
+            ("set[str] | Target", "set", "set[str]", "Target"),
+            ("str | int", "str", "str | int", "str | int"),
+            ("str | int", "unknown", "str | int", "str | int"),
+        ] {
+            let source = format!("def probe(value: {annotation}):\n    if type(value) == \"{tag}\":\n        return value # matched\n    else:\n        return value # excluded\n");
+            analysis.update_file(file, source.clone());
+            let snapshot = analysis.snapshot();
+            for (marker, expected) in [("value # matched", matched), ("value # excluded", excluded)]
+            {
+                let hover = snapshot
+                    .hover(crate::FilePosition {
+                        file_id: file,
+                        pos: (source.find(marker).unwrap() as u32).into(),
+                    })
+                    .unwrap()
+                    .unwrap();
+                let expected =
+                    expected.replace("Target", "Target[FilesToRunProvider[File | None] | None]");
+                assert!(
+                    hover.contents.value.contains(&format!(": {expected}\n")),
+                    "{tag}, {marker}: {}",
+                    hover.contents.value
+                );
+            }
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{tag}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn native_type_test_identity_follows_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        for (declarations, call, expected) in [
+            ("classify = type", "classify", "list[Target]"),
+            (
+                "def classify(value): return \"list\"",
+                "classify",
+                "list[Target] | Target",
+            ),
+            ("classify = type", "classify", "list[Target]"),
+            (
+                "def type(value): return \"list\"",
+                "type",
+                "list[Target] | Target",
+            ),
+        ] {
+            let source = format!("{declarations}\ndef probe(value: list[Target] | Target):\n    if {call}(value) == \"list\":\n        return value # matched\n    return value\n");
+            analysis.update_file(file, source.clone());
+            let hover = analysis
+                .snapshot()
+                .hover(crate::FilePosition {
+                    file_id: file,
+                    pos: (source.find("value # matched").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            let expected =
+                expected.replace("Target", "Target[FilesToRunProvider[File | None] | None]");
+            assert!(
+                hover.contents.value.contains(&format!(": {expected}\n")),
+                "{declarations}: {}",
+                hover.contents.value
+            );
+        }
+        let source = r#"def targets(value: list[Target] | Target) -> list[Target]:
+    if type(value) == type([]):
+        return value
+    return [value]
+
+def incorrect(value: list[Target] | Target) -> list[str]:
+    if type(value) == "list":
+        return value
+    return []
+"#;
+        analysis.update_file(file, source.to_owned());
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-return-type");
+    }
+
+    #[test]
+    fn native_type_tests_ignore_build_prelude_shadows() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(
+            &mut analysis.db,
+            "defs.bzl",
+            r#"def make(condition) -> list[int] | str:
+    return [1] if condition else "text"
+def type(value):
+    return "list"
+"#,
+        );
+        fixture.add_prelude_file(&mut analysis.db, "load(\"defs.bzl\", \"make\", \"type\")\n");
+        let source = "value = make(True)\nresult = value if type(value) == \"list\" else None\n";
+        let file = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD",
+            source,
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        let snapshot = analysis.snapshot();
+        let hover = snapshot
+            .hover(crate::FilePosition {
+                file_id: file,
+                pos: (source.find("value if").unwrap() as u32).into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains(": list[int] | str\n"),
+            "{}",
+            hover.contents.value
+        );
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
 
     #[test]
     fn native_annotations_drive_editor_requests_across_import_edits() {

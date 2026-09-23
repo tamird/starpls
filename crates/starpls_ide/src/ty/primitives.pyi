@@ -25,6 +25,7 @@ class bool:
     @type_check_only
     def __ge__(self, other: bool, /) -> bool: ...
 
+@final
 @disjoint_base
 class str:
     if TYPE_CHECKING:
@@ -152,6 +153,7 @@ class bytes:
     def elems(self) -> Iterable[int]:
         """Return an opaque iterable of byte values, each an integer from 0 to 255."""
 
+@final
 @disjoint_base
 class list(Sequence[_T]):
     if TYPE_CHECKING:
@@ -205,6 +207,7 @@ class list(Sequence[_T]):
     def remove(self, value: object, /) -> None:
         """Remove the first equal element, or fail when no element matches."""
 
+@final
 @disjoint_base
 class set(AbstractSet[_T]):
     if TYPE_CHECKING:
@@ -269,6 +272,7 @@ class set(AbstractSet[_T]):
     def update(self, *others: Collection[_T]) -> None:
         """Add elements from the other collections."""
 
+@final
 @disjoint_base
 class dict(Mapping[_KT, _VT]):
     if TYPE_CHECKING:

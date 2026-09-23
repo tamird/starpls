@@ -2243,7 +2243,7 @@ def stop():
         assert_eq!(
             types,
             [
-                "str",
+                "Literal[\"int\"]",
                 "list[tuple[int, int]]",
                 "list[int]",
                 "list[int]",

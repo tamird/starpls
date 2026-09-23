@@ -121,6 +121,17 @@ fn assemble(original: &str, replacements: &str, scalars: &[&str]) -> anyhow::Res
             ));
         } else if scalars.contains(&name) {
             count_owner(&mut seen, name)?;
+            // Core Starlark values cannot be subclassed, even when their
+            // retained Python declarations permit it.
+            let is_final = class.decorator_list.iter().any(|decorator| {
+                let ast::Expr::Name(name) = &decorator.expression else {
+                    return false;
+                };
+                name.id == "final"
+            });
+            if !is_final {
+                edits.push((TextRange::empty(class.start()), "@final\n".to_owned()));
+            }
             scalar_members(original, &class.body, &mut edits)?;
         }
     }
