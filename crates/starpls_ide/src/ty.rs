@@ -586,6 +586,32 @@ mod tests {
     use crate::Analysis;
 
     #[test]
+    fn dictionary_constructor_keys_keep_argument_types() {
+        let source = r#"def consume(tags: list[str], testonly: bool):
+    pass
+common = dict(tags=["manual"], testonly=True)
+consume(**common)
+consume(tags=common["tags"], testonly=common["testonly"])
+common["tags"] = ["local"]
+consume(**common)
+invalid = dict(tags=[1], testonly=True)
+consume(**invalid)
+"#;
+        let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
+        assert!(
+            usize::from(diagnostics[0].range().unwrap().start())
+                >= source.find("consume(**invalid)").unwrap(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn native_type_tests_preserve_collection_arguments() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         analysis
