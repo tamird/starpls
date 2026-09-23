@@ -556,7 +556,7 @@
         "params": [
           {
             "name": "extension_bzl_file",
-            "type": "Label",
+            "type": "string",
             "doc": "A label to the Starlark file defining the module extension.",
             "default_value": "",
             "is_mandatory": true,
@@ -637,7 +637,7 @@
         "params": [
           {
             "name": "repo_rule_bzl_file",
-            "type": "Label",
+            "type": "string",
             "doc": "A label to the Starlark file defining the repo rule.",
             "default_value": "",
             "is_mandatory": true,

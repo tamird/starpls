@@ -23,7 +23,13 @@ pub fn rule_value(rule: &RuleDefinition) -> Value {
                 .filter(|attribute| !attribute.name.starts_with(['$', ':']))
                 .map(|attribute| Param {
                     name: attribute.name.clone(),
-                    r#type: attribute_type_string_from_discriminator(attribute.r#type()),
+                    // Bazel exports visibility as STRING_LIST, but converts
+                    // its values through NODEP_LABEL_LIST at rule admission.
+                    r#type: if attribute.name == "visibility" {
+                        "List of Labels".to_owned()
+                    } else {
+                        attribute_type_string_from_discriminator(attribute.r#type())
+                    },
                     doc: attribute.documentation().to_owned(),
                     is_mandatory: attribute.mandatory(),
                     ..Default::default()

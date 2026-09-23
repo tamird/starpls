@@ -562,12 +562,23 @@ fn write_function(
             _ => None,
         };
         let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
-            let input = if matches!(kind, CallableKind::Method("attr"))
+            let package_label = matches!(kind, CallableKind::Function)
+                && matches!(value.name.as_str(), "package" | "repo")
+                && matches!(
+                    name,
+                    "default_visibility"
+                        | "default_applicable_licenses"
+                        | "default_package_metadata"
+                        | "default_compatible_with"
+                        | "default_restricted_to"
+                );
+            let label_default = matches!(kind, CallableKind::Method("attr"))
                 && name == "default"
                 && matches!(
                     value.name.as_str(),
                     "label" | "label_list" | "label_keyed_string_dict" | "string_keyed_label_dict"
-                ) {
+                );
+            let input = if package_label || label_default {
                 AnnotationUse::AttributeInput
             } else {
                 input
@@ -897,6 +908,71 @@ mod tests {
                 diagnostics[0].range().unwrap(),
                 ruff_text_size::TextRange::new(invalid.into(), (invalid + 1).into()),
             );
+        }
+    }
+
+    #[test]
+    fn native_label_inputs_follow_the_host_conversion() {
+        for (path, context, source, bad_calls) in [
+            (
+                "/BUILD.bazel",
+                APIContext::Build,
+                r#"labels = ['//visibility:public']
+package(default_visibility=labels, default_package_metadata=[Label('//:license')])
+example(name='first', visibility=labels)
+example(name='second', visibility=[Label('//visibility:public')])
+"#,
+                vec![
+                    "package(default_visibility=[42])",
+                    "package(features=[Label('//:feature')])",
+                    "example(name='bad', visibility=[42])",
+                ],
+            ),
+            (
+                "/main.bzl",
+                APIContext::Bzl,
+                "native.example(name='first', visibility=[Label('//visibility:public')])\n",
+                vec!["native.example(name='bad', visibility=[42])"],
+            ),
+            (
+                "/REPO.bazel",
+                APIContext::Repo,
+                r#"repo(default_visibility=['//visibility:public'],
+     default_applicable_licenses=('//:license',))
+"#,
+                vec!["repo(default_visibility=[42])"],
+            ),
+            (
+                "/MODULE.bazel",
+                APIContext::Module,
+                "use_extension('//:defs.bzl', 'extension')\nuse_repo_rule('//:defs.bzl', 'repository')\n",
+                vec!["use_extension(42, 'extension')", "use_repo_rule(42, 'repository')"],
+            ),
+        ] {
+            let builtins = starpls_bazel::decode_builtins(include_bytes!("../../../starpls/src/builtin/builtin.pb")).unwrap();
+            let rules = BuildLanguage {
+                rule: vec![RuleDefinition {
+                    name: "example".to_owned(),
+                    attribute: vec![
+                        AttributeDefinition { name: "name".to_owned(), r#type: Discriminator::String as i32, mandatory: Some(true), configurable: Some(false), ..Default::default() },
+                        AttributeDefinition { name: "visibility".to_owned(), r#type: Discriminator::StringList as i32, configurable: Some(false), ..Default::default() },
+                    ],
+                    ..Default::default()
+                }],
+            };
+            let (mut analysis, _) = Analysis::new_for_test();
+            analysis.set_builtin_defs(builtins, rules).unwrap();
+            let info = Some(starpls_common::FileInfo::Bazel { api_context: context, is_external: false });
+            let file = analysis.open_document(Path::new(path), Dialect::Bazel, info, source.to_owned(), 1).unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{path}: {diagnostics:?}");
+            for bad in bad_calls {
+                analysis.open_document(Path::new(path), Dialect::Bazel, info, format!("{source}{bad}\n"), 2).unwrap();
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                let [diagnostic] = diagnostics.as_slice() else { panic!("{bad}: {diagnostics:?}"); };
+                assert_eq!(diagnostic.id().as_str(), "invalid-argument-type", "{bad}: {diagnostic:?}");
+                assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len(), "{bad}: {diagnostic:?}");
+            }
         }
     }
 
