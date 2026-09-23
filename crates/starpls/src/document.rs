@@ -578,6 +578,15 @@ pub(crate) struct ResolvedLabel {
 }
 
 impl DefaultFileLoader {
+    fn label_needs_bazel_context(&self, label: &Label, from: &Repository) -> bool {
+        // Before configuration arrives, false does not yet mean legacy mode:
+        // even an empty apparent name may require a Bzlmod mapping.
+        !from.name.is_empty()
+            || !label.repo().is_empty()
+            || (label.kind() == RepoKind::Apparent
+                && (!self.has_bazel_context() || self.bzlmod_enabled))
+    }
+
     fn resolve_label(
         &self,
         db: &dyn Db,
@@ -586,16 +595,12 @@ impl DefaultFileLoader {
     ) -> anyhow::Result<Option<ResolvedLabel>> {
         let from_path = from.path(db);
         let repository = try_opt!(self.repository_for_source(from_path, from_path)?);
-        if (!self.has_bazel_context() || self.paused.load(Ordering::Relaxed))
-            && (!repository.name.is_empty()
-                || (!label.repo().is_empty() && label.kind() != RepoKind::Current))
-        {
+        if !self.is_ready() && self.label_needs_bazel_context(label, &repository) {
             return Ok(None);
         }
         self.ensure_repository(&repository)?;
         if self.bzlmod_enabled
             && label.kind() == RepoKind::Apparent
-            && !label.repo().is_empty()
             && self.repository_mapping(&repository.name)?.is_none()
         {
             return Ok(None);
@@ -698,25 +703,21 @@ impl DefaultFileLoader {
         from: &Repository,
     ) -> anyhow::Result<Repository> {
         self.watch_repository(&from.root);
-        if self.paused.load(Ordering::Relaxed)
-            && (!from.name.is_empty() || !label.repo().is_empty())
-        {
+        if !self.is_ready() && self.label_needs_bazel_context(label, from) {
             bail!("Bazel configuration is loading");
         }
         let name = match label.kind() {
             RepoKind::Current => return Ok(from.clone()),
             RepoKind::Canonical => label.repo().to_owned(),
             RepoKind::Apparent => {
-                if label.repo().is_empty() {
-                    String::new()
-                } else if self.bzlmod_enabled {
+                if self.bzlmod_enabled {
                     let mapping = self
                         .repository_mapping(&from.name)?
                         .context("Bazel repository mapping is loading")?;
                     let name = mapping.get(label.repo()).cloned();
                     name.with_context(|| {
                         format!(
-                            "cannot resolve repository @{} from @@{}",
+                            "cannot resolve repository @{}// from @@{}//",
                             label.repo(),
                             from.name
                         )
@@ -1136,10 +1137,16 @@ impl FileLoader for DefaultFileLoader {
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
                 };
                 let repository = try_opt!(self.repository_for_source(&from_path, &from_path)?);
-                if !self.is_ready() && (!repository.name.is_empty() || !label.repo().is_empty()) {
+                if !self.is_ready() && self.label_needs_bazel_context(&label, &repository) {
                     return Ok(None);
                 }
                 self.ensure_repository(&repository)?;
+                if self.bzlmod_enabled
+                    && label.kind() == RepoKind::Apparent
+                    && self.repository_mapping(&repository.name)?.is_none()
+                {
+                    return Ok(None);
+                }
 
                 if !label.has_leading_slashes()
                     && !label.is_relative()
@@ -1614,6 +1621,290 @@ pub(crate) mod source_tests {
         let requests = client.mapping_requests.lock().unwrap();
         assert_eq!(requests.iter().map(Vec::len).sum::<usize>(), 1000);
         assert_eq!(requests.len(), 7);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_apparent_repositories_follow_the_callers_mapping() {
+        use starpls_bazel::Label;
+        use starpls_ide::LoadDependency;
+        use starpls_ide::LoadResolution;
+        use starpls_ide::LocationLink;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("empty-apparent-repository");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        let current = workspace.join("local-override");
+        let mapped = external.join("mapped+");
+        for directory in [&workspace, &external, &current, &mapped] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for (directory, marker) in [
+            (&workspace, "main.bzl"),
+            (&current, "current.bzl"),
+            (&mapped, "mapped.bzl"),
+        ] {
+            std::fs::write(directory.join("same.bzl"), "value = 1\n").unwrap();
+            std::fs::write(directory.join(marker), "").unwrap();
+        }
+        std::os::unix::fs::symlink(&current, external.join("current+")).unwrap();
+        let source_path = external.join("current+/source.bzl");
+        let client = Arc::new(TestBazelClient::default());
+        for bzlmod in [true, false] {
+            let (sender, _) = crossbeam_channel::unbounded();
+            let loader = Arc::new(DefaultFileLoader::new(
+                client.clone(),
+                workspace.clone(),
+                None,
+                external.clone(),
+                sender,
+                bzlmod,
+            ));
+            let mut analysis = Analysis::new(loader.clone(), Default::default()).unwrap();
+            // Test absent, main, and external empty-name mappings. Even a local
+            // override's canonical physical path must retain its caller context.
+            for mapping in [None, Some(""), Some("mapped+")] {
+                analysis.invalidate_loads();
+                loader.finish_mapping(
+                    "current+".to_owned(),
+                    Ok(Arc::new(
+                        mapping
+                            .map(|name| (String::new(), name.to_owned()))
+                            .into_iter()
+                            .collect(),
+                    )),
+                );
+                let apparent = if !bzlmod {
+                    Some((&workspace, "main.bzl"))
+                } else {
+                    mapping.map(|name| {
+                        if name.is_empty() {
+                            (&workspace, "main.bzl")
+                        } else {
+                            (&mapped, "mapped.bzl")
+                        }
+                    })
+                };
+                for (label, expected) in [
+                    ("//:same.bzl", Some((&current, "current.bzl"))),
+                    ("@@//:same.bzl", Some((&workspace, "main.bzl"))),
+                    ("@//:same.bzl", apparent),
+                ] {
+                    let text = format!(
+                        "load(\"{label}\", \"value\")\nreference = \"{label}\"\nresult = value\n"
+                    );
+                    let file = analysis
+                        .open_document(&source_path, Dialect::Bazel, None, text.clone(), 1)
+                        .unwrap();
+                    let snapshot = analysis.snapshot();
+                    assert_eq!(snapshot.path(file), current.join("source.bzl"));
+                    let dependencies = snapshot.load_dependencies(file).unwrap();
+                    let [LoadDependency {
+                        module: _,
+                        range: _,
+                        resolution,
+                    }] = dependencies.as_slice()
+                    else {
+                        panic!("{dependencies:?}");
+                    };
+                    let navigation = snapshot
+                        .goto_definition(
+                            FilePosition {
+                                file_id: file,
+                                pos: (text.rfind(label).unwrap() as u32 + 1).into(),
+                            },
+                            false,
+                        )
+                        .unwrap()
+                        .unwrap_or_default();
+                    let completions = snapshot
+                        .completions(
+                            FilePosition {
+                                file_id: file,
+                                pos: (text.find(':').unwrap() as u32 + 1).into(),
+                            },
+                            None,
+                        )
+                        .unwrap()
+                        .unwrap_or_default();
+                    match expected {
+                        Some((directory, marker)) => {
+                            let LoadResolution::Resolved(target) = resolution else {
+                                panic!("{dependencies:?}")
+                            };
+                            assert_eq!(snapshot.path(*target), directory.join("same.bzl"));
+                            let [LocationLink::External {
+                                origin_selection_range: _,
+                                target_path,
+                            }] = navigation.as_slice()
+                            else {
+                                panic!("{navigation:?}")
+                            };
+                            assert_eq!(*target_path, directory.join("same.bzl"));
+                            let markers: Vec<_> = completions
+                                .iter()
+                                .map(|item| item.label.as_str())
+                                .filter(|label| {
+                                    ["main.bzl", "current.bzl", "mapped.bzl"].contains(label)
+                                })
+                                .collect();
+                            assert_eq!(markers, [marker]);
+                        }
+                        None => {
+                            let LoadResolution::Failed(error) = resolution else {
+                                panic!("{dependencies:?}")
+                            };
+                            assert!(
+                                error.contains("cannot resolve repository @// from @@current+//"),
+                                "{error}"
+                            );
+                            assert!(navigation.is_empty(), "{navigation:?}");
+                            assert!(completions.is_empty(), "{completions:?}");
+                        }
+                    }
+                }
+            }
+            // Root-module @// is also an explicit mapping entry.
+            loader.finish_mapping(
+                String::new(),
+                Ok(Arc::new([(String::new(), String::new())].into())),
+            );
+            assert_eq!(
+                loader
+                    .resolve_repository(
+                        &Label::parse("@//:same.bzl").unwrap(),
+                        &loader.main_repository()
+                    )
+                    .unwrap(),
+                loader.main_repository()
+            );
+        }
+        assert!(client.mapping_requests.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_apparent_repositories_wait_for_configuration_and_mapping() {
+        use starpls_bazel::Label;
+        use starpls_ide::LoadDependency;
+        use starpls_ide::LoadResolution;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("pending-empty-repository");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("same.bzl"), "value = 1\n").unwrap();
+        let client = Arc::new(TestBazelClient::default());
+        // The initial editor loader has no context and does not yet know whether
+        // Bzlmod is enabled. False here must not imply confirmed legacy semantics.
+        for context in [None, Some(root.join("external"))] {
+            let configured = context.is_some();
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let loader = Arc::new(
+                DefaultFileLoader::new(
+                    client.clone(),
+                    workspace.clone(),
+                    None,
+                    context,
+                    sender,
+                    configured,
+                )
+                .for_editor(1),
+            );
+            let mut analysis = Analysis::new(loader.clone(), Default::default()).unwrap();
+            let text =
+                "load(\"@//:same.bzl\", \"value\")\nreference = \"@//:same.bzl\"\nresult = value\n";
+            let file = analysis
+                .open_document(
+                    &workspace.join("source.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    text.into(),
+                    1,
+                )
+                .unwrap();
+            for paused in [true, false] {
+                loader.pause(paused);
+                analysis.invalidate_loads();
+                let snapshot = analysis.snapshot();
+                let dependencies = snapshot.load_dependencies(file).unwrap();
+                assert!(
+                    matches!(
+                        dependencies.as_slice(),
+                        [LoadDependency {
+                            module: _,
+                            range: _,
+                            resolution: LoadResolution::Pending
+                        }]
+                    ),
+                    "{dependencies:?}"
+                );
+                assert!(snapshot
+                    .goto_definition(
+                        FilePosition {
+                            file_id: file,
+                            pos: (text.rfind("@//").unwrap() as u32 + 1).into()
+                        },
+                        false
+                    )
+                    .unwrap()
+                    .unwrap_or_default()
+                    .is_empty());
+                assert!(snapshot
+                    .completions(
+                        FilePosition {
+                            file_id: file,
+                            pos: (text.find(':').unwrap() as u32 + 1).into()
+                        },
+                        None
+                    )
+                    .unwrap()
+                    .unwrap_or_default()
+                    .is_empty());
+                for spelling in ["//:same.bzl", "@@//:same.bzl"] {
+                    assert_eq!(
+                        loader
+                            .resolve_repository(
+                                &Label::parse(spelling).unwrap(),
+                                &loader.main_repository()
+                            )
+                            .unwrap(),
+                        loader.main_repository()
+                    );
+                }
+            }
+            assert!(client.mapping_requests.lock().unwrap().is_empty());
+            if configured {
+                assert_eq!(loader.pending_repository_mappings(), [""]);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    crate::event_loop::Task::ResolveRepoMappings
+                ));
+                assert!(receiver.try_recv().is_err());
+                analysis.invalidate_loads();
+                loader.finish_mapping(
+                    String::new(),
+                    Ok(Arc::new([(String::new(), String::new())].into())),
+                );
+                let snapshot = analysis.snapshot();
+                let dependencies = snapshot.load_dependencies(file).unwrap();
+                let [LoadDependency {
+                    module: _,
+                    range: _,
+                    resolution: LoadResolution::Resolved(target),
+                }] = dependencies.as_slice()
+                else {
+                    panic!("{dependencies:?}")
+                };
+                assert_eq!(snapshot.path(*target), workspace.join("same.bzl"));
+                assert!(snapshot.diagnostics(file).unwrap().is_empty());
+            } else {
+                assert!(loader.pending_repository_mappings().is_empty());
+                assert!(receiver.try_recv().is_err());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
