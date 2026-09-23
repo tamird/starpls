@@ -791,6 +791,46 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
     }
 
     #[test]
+    fn min_and_max_preserve_comparable_element_types() {
+        for name in ["min", "max"] {
+            let source = format!(
+                r#"def key(value: dict[str, int]) -> int:
+    return value["size"]
+numbers = [1, 2]
+records = [{{"size": 1}}, {{"size": 2}}]
+integer: int = {name}(numbers)
+scalar: int = {name}(1, 2, 3)
+floating: float = {name}((1.0, 2.0))
+text: str = {name}("abc".elems(), key=None)
+flag: bool = {name}([False, True])
+selected: dict[str, int] = {name}(records, key=key)
+pair: dict[str, int] = {name}(records[0], records[1], key=key)
+"#
+            );
+            let (mut analysis, fixture) = native_analysis(&source);
+            let file = fixture.main_file();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+            for statement in [
+                format!("{name}(numbers, default=0)"),
+                format!("{name}(numbers, key=42)"),
+                format!("{name}(1)"),
+                format!("{name}(records)"),
+                format!("{name}(numbers, key)"),
+                format!("bad: str = {name}(numbers)"),
+                format!("bad: int = {name}(records, key=key)"),
+            ] {
+                analysis.update_file(file, format!("{source}{statement}\n"));
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("{statement}: {diagnostics:?}");
+                };
+                assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+            }
+        }
+    }
+
+    #[test]
     fn depsets_preserve_element_types_and_target_defaults() {
         let source = r#"
 def inspect(target, artifact):
