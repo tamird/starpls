@@ -773,7 +773,11 @@ example = {factory}(
     #[test]
     fn dictionary_attributes_offer_names_and_locations() {
         for (setup, attrs, expected) in [
-            ("", "{'_tool': attr.label()}", "Target | None"),
+            (
+                "",
+                "{'_tool': attr.label()}",
+                "Target[FilesToRunProvider[File | None] | None] | None",
+            ),
             (
                 "attrs = {'_tool': attr.label()}\nattrs.update({'_tool': attr.string()})\n",
                 "attrs",

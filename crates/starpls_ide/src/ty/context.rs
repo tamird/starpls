@@ -144,7 +144,10 @@ pub(super) fn parameter_type<'db>(
             if repository {
                 AttributeUse::RepositoryContext
             } else {
-                AttributeUse::BuildContext
+                AttributeUse::BuildContext(
+                    factory::native_class(db, declarations, "Target")?
+                        .to_instance_approximation(db, &environment)?,
+                )
             },
         )
     };
@@ -375,13 +378,31 @@ fn field_type<'db>(
             None => Some(Type::unknown()),
         }
     };
+    let target = || {
+        // Successful executable/single-artifact prerequisites exclude targets
+        // without FilesToRunProvider. Other dependencies can be environment groups.
+        let provider = if attribute.executable == Some(true) {
+            factory::specialized_native_instance(
+                db,
+                environment,
+                declarations,
+                "FilesToRunProvider",
+                native("File")?,
+            )?
+        } else if attribute.single_file == Some(true) {
+            native("FilesToRunProvider")?
+        } else {
+            return native("Target");
+        };
+        factory::specialized_native_instance(db, environment, declarations, "Target", provider)
+    };
     match view {
         View::Attr => {
             if attribute.kind == AttributeKind::Label {
                 match attribute.configuration {
-                    AttributeConfiguration::Starlark => return Some(list(native("Target")?)),
+                    AttributeConfiguration::Starlark => return Some(list(target()?)),
                     AttributeConfiguration::Unknown => return Some(Type::unknown()),
-                    AttributeConfiguration::Ordinary => return Some(present(native("Target")?)),
+                    AttributeConfiguration::Ordinary => return Some(present(target()?)),
                 }
             }
             if attribute.kind == AttributeKind::Output {
@@ -392,7 +413,7 @@ fn field_type<'db>(
                 environment,
                 declarations,
                 &attribute.kind,
-                AttributeUse::BuildContext,
+                AttributeUse::BuildContext(target()?),
             )
         }
         View::Files => dependency(&attribute.kind)
@@ -415,7 +436,7 @@ fn field_type<'db>(
                 AttributeConfiguration::Starlark => {}
             }
             let string = KnownClass::Str.to_instance(db, environment);
-            let target = native("Target")?;
+            let target = target()?;
             let value = match attribute.kind {
                 AttributeKind::Label => target,
                 AttributeKind::LabelList => list(target),
@@ -626,6 +647,84 @@ example = macro(implementation=implementation, attrs={{
     }
 
     #[test]
+    fn dependency_contracts_preserve_provider_presence() {
+        let source = r#"def transition_impl(settings, attr):
+    return [{}]
+split = transition(implementation=transition_impl, inputs=[], outputs=[])
+def implementation(ctx):
+    files_to_run = ctx.attr.single[DefaultInfo].files_to_run
+    optional_executable = files_to_run.executable
+    if optional_executable != None:
+        print(optional_executable.path)
+    ctx.attr.tool[DefaultInfo].files_to_run.executable.path
+    ctx.attr.single[DefaultInfo].files_to_run.runfiles_manifest
+    ctx.attr.split[0][DefaultInfo].files_to_run.executable.path
+    for target in ctx.split_attr.split.values():
+        print(target[DefaultInfo].files_to_run.executable.path)
+    ctx.actions.run(executable=files_to_run, outputs=[])
+    ctx.actions.run(executable=ctx.attr.tool[DefaultInfo].files_to_run, outputs=[])
+example = rule(implementation=implementation, attrs={
+    "tool": attr.label(mandatory=True, executable=True, cfg="exec"),
+    "single": attr.label(mandatory=True, allow_single_file=True),
+    "split": attr.label(mandatory=True, executable=True, cfg=split),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for expression in [
+            "ctx.attr.single[DefaultInfo].files_to_run.executable.path",
+            "ctx.attr.tool[DefaultInfo].files_to_run.runfiles_manifest.path",
+        ] {
+            let source = source.replacen(
+                "    files_to_run =",
+                &format!("    {expression}\n    files_to_run ="),
+                1,
+            );
+            analysis.update_file(file, source.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{expression}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+            assert_eq!(
+                &source[diagnostic.range().unwrap()],
+                expression,
+                "{diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_presence_tracks_descriptor_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        for (options, errors) in [
+            ("", 1),
+            (", executable=True, cfg='exec'", 0),
+            ("", 1),
+            (", executable=unknown(), cfg='exec'", 1),
+            (", allow_single_file=True", 0),
+            (", allow_single_file=unknown()", 1),
+            (", providers=[PackageSpecificationInfo]", 1),
+        ] {
+            let source = format!("def unknown():\n    pass\ndef implementation(ctx):\n    ctx.attr.dep[DefaultInfo].files_to_run.executable\nexample = rule(implementation=implementation, attrs={{'dep': attr.label(mandatory=True{options})}})\n");
+            analysis.update_file(file, source.clone());
+            for _ in 0..2 {
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                assert_eq!(diagnostics.len(), errors, "{options}: {diagnostics:?}");
+                if let Some(diagnostic) = diagnostics.first() {
+                    assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+                    assert!(diagnostic.concise_message().to_string().contains("None"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn required_and_defaulted_context_values_are_present() {
         let source = r#"def computed(name):
     return None
@@ -657,21 +756,37 @@ example = rule(implementation=implementation, attrs={
         let file = fixture.main_file();
         let snapshot = analysis.snapshot();
         for (expression, expected, key) in [
-            ("ctx.attr.required", "Target", "\"required\""),
-            ("ctx.attr.defaulted", "Target", "\"defaulted\""),
+            (
+                "ctx.attr.required",
+                "Target[FilesToRunProvider[File | None]]",
+                "\"required\"",
+            ),
+            (
+                "ctx.attr.defaulted",
+                "Target[FilesToRunProvider[File | None]]",
+                "\"defaulted\"",
+            ),
             ("ctx.file.required", "File", "\"required\""),
             ("ctx.file.defaulted", "File", "\"defaulted\""),
             ("ctx.executable.tool", "File", "\"tool\""),
             ("ctx.attr.output", "Label", "\"output\""),
             ("ctx.outputs.output", "File", "\"output\""),
-            ("ctx.attr.optional", "Target | None", "\"optional\""),
+            (
+                "ctx.attr.optional",
+                "Target[FilesToRunProvider[File | None]] | None",
+                "\"optional\"",
+            ),
             ("ctx.file.optional", "File | None", "\"optional\""),
             (
                 "ctx.executable.optional_tool",
                 "File | None",
                 "\"optional_tool\"",
             ),
-            ("ctx.attr.computed", "Target | None", "\"computed\""),
+            (
+                "ctx.attr.computed",
+                "Target[FilesToRunProvider[File | None] | None] | None",
+                "\"computed\"",
+            ),
         ] {
             check_field(&snapshot, file, source, expression, expected, key);
         }
@@ -696,9 +811,21 @@ example = rule(implementation=implementation, attrs={
         enable_context(&mut analysis);
         let file = fixture.main_file();
         for (default, expected, errors) in [
-            ("None   ", "Target | None", 1),
-            ("'//:x' ", "Target", 0),
-            ("None   ", "Target | None", 1),
+            (
+                "None   ",
+                "Target[FilesToRunProvider[File | None] | None] | None",
+                1,
+            ),
+            (
+                "'//:x' ",
+                "Target[FilesToRunProvider[File | None] | None]",
+                0,
+            ),
+            (
+                "None   ",
+                "Target[FilesToRunProvider[File | None] | None] | None",
+                1,
+            ),
         ] {
             let source = format!("DEFAULT = {default}\ndef implementation(ctx):\n    ctx.attr.dep[DefaultInfo]\nexample = rule(implementation=implementation, attrs={{'dep': attr.label(default=DEFAULT)}})\n");
             analysis.update_file(file, source.clone());
@@ -820,10 +947,18 @@ example = rule(implementation=implementation, executable=True, outputs={"implici
         enable_context(&mut analysis);
         let snapshot = analysis.snapshot();
         for (expression, expected, key) in [
-            ("ctx.attr.dep", "Target | None", "\"dep\""),
+            (
+                "ctx.attr.dep",
+                "Target[FilesToRunProvider[File | None] | None] | None",
+                "\"dep\"",
+            ),
             ("ctx.attr.out", "Label | None", "\"out\""),
             ("ctx.attr.outs", "list[Label]", "\"outs\""),
-            ("ctx.attr.split", "list[Target]", "\"split\""),
+            (
+                "ctx.attr.split",
+                "list[Target[FilesToRunProvider[File | None] | None]]",
+                "\"split\"",
+            ),
             ("ctx.files.srcs", "list[File]", "\"srcs\""),
             ("ctx.files.keyed", "list[File]", "\"keyed\""),
             ("ctx.files.named", "list[File]", "\"named\""),
@@ -837,22 +972,22 @@ example = rule(implementation=implementation, executable=True, outputs={"implici
             ("ctx.outputs.executable", "File", ""),
             (
                 "ctx.split_attr.split",
-                "dict[str | None, Target]",
+                "dict[str | None, Target[FilesToRunProvider[File | None] | None]]",
                 "\"split\"",
             ),
             (
                 "ctx.split_attr.split_list",
-                "dict[str | None, list[Target]]",
+                "dict[str | None, list[Target[FilesToRunProvider[File | None] | None]]]",
                 "\"split_list\"",
             ),
             (
                 "ctx.split_attr.split_keyed",
-                "dict[str | None, list[Target]]",
+                "dict[str | None, list[Target[FilesToRunProvider[File | None] | None]]]",
                 "\"split_keyed\"",
             ),
             (
                 "ctx.split_attr.split_named",
-                "dict[str | None, dict[str, Target]]",
+                "dict[str | None, dict[str, Target[FilesToRunProvider[File | None] | None]]]",
                 "\"split_named\"",
             ),
         ] {

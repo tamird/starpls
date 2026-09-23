@@ -89,7 +89,7 @@ impl RuleData {
             } else {
                 UnionType::from_elements(db, environment, [value, none])
             };
-            select_type(db, environment, declarations, alternatives)
+            specialized_native_instance(db, environment, declarations, "select", alternatives)
         };
         let value = match attribute.configurable() {
             Some(configurable) => {
@@ -901,7 +901,13 @@ fn configurable_input<'db>(
     let declaration = call.declaration()?;
     let alternatives =
         UnionType::from_elements(db, &environment, [value, Type::none(db, &environment)]);
-    let selected = select_type(db, &environment, declaration.program_file(db), alternatives)?;
+    let selected = specialized_native_instance(
+        db,
+        &environment,
+        declaration.program_file(db),
+        "select",
+        alternatives,
+    )?;
     Some(UnionType::from_elements(
         db,
         &environment,
@@ -909,14 +915,15 @@ fn configurable_input<'db>(
     ))
 }
 
-pub(super) fn select_type<'db>(
+pub(super) fn specialized_native_instance<'db>(
     db: &'db Database,
     environment: &ProgramEnvironment<'db>,
     declarations: ProgramFile<'db>,
+    name: &str,
     value: Type<'db>,
 ) -> Option<Type<'db>> {
-    // The generated select declaration has exactly one type parameter.
-    let class = native_class(db, declarations, "select")?;
+    // Callers select generated declarations with exactly one type parameter.
+    let class = native_class(db, declarations, name)?;
     let class = class.as_class_literal()?;
     let specialized = class.apply_specialization(db, |context| context.specialize(db, vec![value]));
     Type::from(specialized).to_instance_approximation(db, environment)
@@ -938,9 +945,9 @@ fn attribute_type<'db>(
     )
 }
 
-pub(super) enum AttributeUse {
+pub(super) enum AttributeUse<'db> {
     Input,
-    BuildContext,
+    BuildContext(Type<'db>),
     RepositoryContext,
     MacroContext,
 }
@@ -950,7 +957,7 @@ pub(super) fn attribute_value_type<'db>(
     environment: &ProgramEnvironment<'db>,
     declarations: ProgramFile<'db>,
     kind: &AttributeKind,
-    usage: AttributeUse,
+    usage: AttributeUse<'db>,
 ) -> Option<Type<'db>> {
     let string = KnownClass::Str.to_instance(db, environment);
     let int = KnownClass::Int.to_instance(db, environment);
@@ -958,7 +965,7 @@ pub(super) fn attribute_value_type<'db>(
     let list = |element| {
         let class = match usage {
             AttributeUse::Input => KnownClass::Iterable,
-            AttributeUse::BuildContext => KnownClass::List,
+            AttributeUse::BuildContext(_) => KnownClass::List,
             AttributeUse::RepositoryContext => KnownClass::List,
             AttributeUse::MacroContext => KnownClass::List,
         };
@@ -967,31 +974,28 @@ pub(super) fn attribute_value_type<'db>(
     let dict = |key, value| {
         let class = match usage {
             AttributeUse::Input => KnownClass::Mapping,
-            AttributeUse::BuildContext => KnownClass::Dict,
+            AttributeUse::BuildContext(_) => KnownClass::Dict,
             AttributeUse::RepositoryContext => KnownClass::Dict,
             AttributeUse::MacroContext => KnownClass::Dict,
         };
         class.to_specialized_instance(db, environment, &[key, value])
     };
     let label = || {
-        let name = match usage {
-            AttributeUse::Input => "Label",
-            AttributeUse::BuildContext => "Target",
-            AttributeUse::RepositoryContext => "Label",
-            AttributeUse::MacroContext => "Label",
-        };
-        let declaration = native_class(db, declarations, name)?;
+        if let AttributeUse::BuildContext(target) = usage {
+            return Some(target);
+        }
+        let declaration = native_class(db, declarations, "Label")?;
         let label = declaration.to_instance_approximation(db, environment)?;
         Some(match usage {
             AttributeUse::Input => UnionType::from_elements(db, environment, [label, string]),
-            AttributeUse::BuildContext => label,
+            AttributeUse::BuildContext(_) => label,
             AttributeUse::RepositoryContext => label,
             AttributeUse::MacroContext => label,
         })
     };
     let output = || match usage {
         AttributeUse::Input => label(),
-        AttributeUse::BuildContext => {
+        AttributeUse::BuildContext(_) => {
             let class = native_class(db, declarations, "Label")?;
             class.to_instance_approximation(db, environment)
         }
@@ -1008,7 +1012,7 @@ pub(super) fn attribute_value_type<'db>(
                     environment,
                     [boolean, Type::int_literal(0), Type::int_literal(1)],
                 ),
-                AttributeUse::BuildContext => boolean,
+                AttributeUse::BuildContext(_) => boolean,
                 AttributeUse::RepositoryContext => boolean,
                 AttributeUse::MacroContext => boolean,
             }
@@ -1022,7 +1026,7 @@ pub(super) fn attribute_value_type<'db>(
         AttributeKind::Label => {
             let label = label()?;
             match usage {
-                AttributeUse::BuildContext => {
+                AttributeUse::BuildContext(_) => {
                     UnionType::from_elements(db, environment, [label, Type::none(db, environment)])
                 }
                 AttributeUse::Input => label,
@@ -1050,7 +1054,7 @@ pub(super) fn attribute_value_type<'db>(
                         ],
                     )
                 }
-                AttributeUse::BuildContext => dict(keys, string),
+                AttributeUse::BuildContext(_) => dict(keys, string),
                 AttributeUse::RepositoryContext => dict(keys, string),
                 AttributeUse::MacroContext => dict(keys, string),
             }
@@ -1059,7 +1063,7 @@ pub(super) fn attribute_value_type<'db>(
         AttributeKind::Output => {
             let output = output()?;
             match usage {
-                AttributeUse::BuildContext => {
+                AttributeUse::BuildContext(_) => {
                     UnionType::from_elements(db, environment, [output, Type::none(db, environment)])
                 }
                 AttributeUse::Input => output,
