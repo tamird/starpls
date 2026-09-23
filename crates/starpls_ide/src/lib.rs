@@ -7,6 +7,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use ruff_db::diagnostic::DisplayDiagnosticConfig;
 use ruff_db::diagnostic::DisplayDiagnostics;
+use ruff_db::system::System;
+use ruff_db::system::SystemPath;
 use salsa::Setter;
 use starpls_bazel::Builtins;
 use starpls_common::Db;
@@ -288,11 +290,9 @@ impl Analysis {
     ) -> anyhow::Result<File> {
         let Self { db } = self;
         let system_path = starpls_common::system_path(path)?;
-        let source = db.system.source_path(system_path)?;
-        let info = db
-            .loader
-            .file_info(path, source.as_std_path(), dialect, info)?;
-        File::from_path(db, source.as_std_path(), dialect, info)
+        let path = SystemPath::absolute(system_path, db.system.current_directory());
+        let info = db.loader.file_info(path.as_std_path(), dialect, info)?;
+        File::from_path(db, path.as_std_path(), dialect, info)
     }
 
     pub fn open_document(
@@ -305,23 +305,29 @@ impl Analysis {
     ) -> anyhow::Result<File> {
         let Self { db } = self;
         let system_path = starpls_common::system_path(path)?;
-        let source = db.system.source_path(system_path)?;
-        let info = db
-            .loader
-            .file_info(path, source.as_std_path(), dialect, info)?;
-        starpls_common::open_document(db, path, dialect, info, contents, version)
+        let path = SystemPath::absolute(system_path, db.system.current_directory());
+        let info = db.loader.file_info(path.as_std_path(), dialect, info)?;
+        starpls_common::open_document(db, path.as_std_path(), dialect, info, contents, version)
     }
 
     pub fn close_document(&mut self, path: &std::path::Path) -> anyhow::Result<Option<File>> {
         let Self { db } = self;
+        salsa::Database::trigger_cancellation(db);
         let path = starpls_common::system_path(path)?;
-        let path = db.system.source_path(path)?;
-        let Some(document) = db.system.document(&path) else {
+        let Some(document) = db.system.document(path) else {
             return Ok(None);
         };
-        let file = File::from_path(db, path.as_std_path(), document.dialect, document.info)?;
-        db.source_system_mut().close(&path);
-        ruff_db::files::File::sync_path(db, &path);
+        let file = File::from_path(
+            db,
+            document.path.as_std_path(),
+            document.dialect,
+            document.info,
+        )?;
+        let affected = db.system.paths_for_change(path)?;
+        db.source_system_mut().close(path);
+        for path in affected {
+            ruff_db::files::File::sync_path(db, &path);
+        }
         Ok(Some(file))
     }
 
@@ -330,13 +336,24 @@ impl Analysis {
         db.system.document(starpls_common::system_path(path).ok()?)
     }
 
+    pub fn validate_document(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let Self { db } = self;
+        let path = starpls_common::system_path(path)?;
+        db.system.validate_document(path)
+    }
+
     pub fn open_files(&self) -> Vec<File> {
         let Self { db } = self;
         db.system
             .documents()
-            .map(|(path, document)| {
-                File::from_path(db, path.as_std_path(), document.dialect, document.info)
-                    .expect("open documents have readable source text")
+            .map(|(_, document)| {
+                File::from_path(
+                    db,
+                    document.path.as_std_path(),
+                    document.dialect,
+                    document.info,
+                )
+                .expect("open documents have readable source text")
             })
             .collect()
     }
@@ -358,8 +375,9 @@ impl Analysis {
         salsa::Database::trigger_cancellation(db);
         for path in paths {
             let path = starpls_common::system_path(path)?;
-            let path = db.system.source_path(path)?;
-            ruff_db::files::File::sync_path(db, &path);
+            for path in db.system.paths_for_change(path)? {
+                ruff_db::files::File::sync_path(db, &path);
+            }
         }
         let environment = db.environment();
         let revision = environment.load_revision(db) + 1;
@@ -391,12 +409,10 @@ impl Analysis {
         let mut error = None;
         let mut contexts = Vec::new();
         for (source, document) in db.system.documents() {
-            match db.loader.file_info(
-                document.path.as_std_path(),
-                source.as_std_path(),
-                document.dialect,
-                document.info,
-            ) {
+            match db
+                .loader
+                .file_info(document.path.as_std_path(), document.dialect, document.info)
+            {
                 Ok(info) => {
                     if info != document.info {
                         contexts.push((source.to_path_buf(), info));
@@ -466,6 +482,23 @@ pub struct AnalysisSnapshot {
 }
 
 impl AnalysisSnapshot {
+    pub fn source_aliases(&self, path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+        let Self { db } = self;
+        let path = starpls_common::system_path(path)?;
+        let aliases = db.system.source_aliases(path)?;
+        Ok(aliases
+            .into_iter()
+            .map(|path| path.into_std_path_buf())
+            .collect())
+    }
+
+    pub fn source_path(&self, path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        let Self { db } = self;
+        let path = starpls_common::system_path(path)?;
+        let source = db.system.source_path(path)?;
+        Ok(source.into_std_path_buf())
+    }
+
     pub fn path(&self, file: impl Into<ruff_db::files::File>) -> &std::path::Path {
         self.system_path(file)
             .expect("navigation targets have system paths")
@@ -487,8 +520,12 @@ impl AnalysisSnapshot {
     pub fn open_file(&self, path: &std::path::Path) -> Cancellable<Option<File>> {
         self.query(|db| {
             let path = starpls_common::system_path(path).ok()?;
-            let path = db.system.source_path(path).ok()?;
+            let path = SystemPath::absolute(path, db.system.current_directory());
             let document = db.system.document(&path)?;
+            // Sharing bytes does not change the requested semantic context.
+            if document.path != path {
+                return None;
+            }
             File::from_path(db, path.as_std_path(), document.dialect, document.info).ok()
         })
     }
@@ -580,11 +617,9 @@ impl AnalysisSnapshot {
     ) -> Cancellable<anyhow::Result<File>> {
         self.query(|db| {
             let path_system = starpls_common::system_path(path)?;
-            let source = db.system.source_path(path_system)?;
-            let info = db
-                .loader
-                .file_info(path, source.as_std_path(), dialect, info)?;
-            File::from_path(db, source.as_std_path(), dialect, info)
+            let path = SystemPath::absolute(path_system, db.system.current_directory());
+            let info = db.loader.file_info(path.as_std_path(), dialect, info)?;
+            File::from_path(db, path.as_std_path(), dialect, info)
         })
     }
 
@@ -593,8 +628,14 @@ impl AnalysisSnapshot {
             let mut files: Vec<_> = db
                 .system
                 .documents()
-                .filter_map(|(path, document)| {
-                    File::from_path(db, path.as_std_path(), document.dialect, document.info).ok()
+                .filter_map(|(_, document)| {
+                    File::from_path(
+                        db,
+                        document.path.as_std_path(),
+                        document.dialect,
+                        document.info,
+                    )
+                    .ok()
                 })
                 .collect();
             for (source, stub) in db.environment().type_interfaces(db).values() {
@@ -714,7 +755,6 @@ pub trait FileLoader: Send + Sync + 'static {
     fn file_info(
         &self,
         _path: &std::path::Path,
-        _source: &std::path::Path,
         _dialect: Dialect,
         info: Option<FileInfo>,
     ) -> anyhow::Result<Option<FileInfo>> {

@@ -521,9 +521,11 @@ impl ty_python_semantic::Db for Database {
     }
 
     fn is_open_file(&self, file: File) -> bool {
-        file.path(self)
-            .as_system_path()
-            .is_some_and(|path| self.system.document(path).is_some())
+        file.path(self).as_system_path().is_some_and(|path| {
+            self.system
+                .document(path)
+                .is_some_and(|document| document.path.as_path() == path)
+        })
     }
 
     fn dyn_clone(&self) -> Box<dyn ty_python_semantic::Db> {

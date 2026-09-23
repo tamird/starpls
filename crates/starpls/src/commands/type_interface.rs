@@ -57,7 +57,7 @@ impl TypeInterfaceOptions {
             let path = workspace.join(path);
             match loader.repository_for_path(&path)? {
                 Some(repository) => loader.register_path(&path, &repository),
-                None => Ok(path.canonicalize()?),
+                None => starpls_common::absolute_path(&path),
             }
         };
         for TypeInterfaceMapping { source, interface } in &self.mappings {
@@ -315,6 +315,107 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn installed_stub_packages_share_edits_without_sharing_contracts() {
+        use starpls_bazel::APIContext;
+        use starpls_common::Dialect;
+        use starpls_common::FileInfo;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("installed-stubs");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        let backing = root.join("backing");
+        for directory in [&workspace, &external, &backing] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            backing.join("defs.bzl"),
+            "def identity(value): return value\n",
+        )
+        .unwrap();
+        std::fs::write(
+            backing.join("defs.bzli"),
+            "def identity(value: int) -> int: ...\n",
+        )
+        .unwrap();
+        std::fs::write(backing.join("stubs.toml"), "format-version = 1\n[source]\nrepository = '@@one+'\nmodule = 'local'\nversions = ['1']\n[files]\n'defs.bzl' = 'defs.bzli'\n").unwrap();
+        std::os::unix::fs::symlink(&backing, external.join("stubs+")).unwrap();
+        for name in ["one+", "two+"] {
+            let directory = external.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::os::unix::fs::symlink(backing.join("defs.bzl"), directory.join("defs.bzl"))
+                .unwrap();
+        }
+        std::fs::write(
+            workspace.join("starpls.toml"),
+            "[[stub-packages]]\nmanifest = '@@stubs+//:stubs.toml'\nallow-unversioned = true\n",
+        )
+        .unwrap();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
+            std::sync::Arc::new(crate::document::source_tests::TestBazelClient::default()),
+            workspace.clone(),
+            None,
+            external.clone(),
+            sender,
+            false,
+        ));
+        let mut analysis = starpls_ide::Analysis::new(loader.clone(), Default::default()).unwrap();
+        super::TypeInterfaceOptions::default()
+            .prepare(&loader, &workspace)
+            .unwrap()
+            .install(&mut analysis, &workspace)
+            .unwrap();
+        let info = Some(FileInfo::Bazel {
+            api_context: APIContext::Bzl,
+            is_external: false,
+        });
+        let caller = analysis.open_document(&workspace.join("caller.bzl"), Dialect::Bazel, info,
+            "load('@@one+//:defs.bzl', one = 'identity')\nload('@@two+//:defs.bzl', two = 'identity')\none('bad')\ntwo('ok')\n".into(), 1).unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let interfaces = analysis.type_interface_files();
+        let [interface] = interfaces.as_slice() else {
+            panic!("{interfaces:?}")
+        };
+        assert_eq!(
+            analysis.snapshot().path(*interface),
+            external.join("stubs+/defs.bzli")
+        );
+        analysis
+            .open_document(
+                &backing.join("defs.bzli"),
+                Dialect::Bazel,
+                info,
+                "def identity(value: str) -> str: ...\n".into(),
+                1,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(caller).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut manager = crate::diagnostics::DiagnosticsManager::default();
+        assert_eq!(
+            manager.request(&snapshot, *interface).unwrap().0,
+            *interface
+        );
+        drop(snapshot);
+        analysis.close_document(&backing.join("defs.bzli")).unwrap();
+        assert_eq!(analysis.snapshot().diagnostics(caller).unwrap().len(), 1);
+        // A contract explicitly configured for the physical source has its own scope.
+        let physical = analysis
+            .file(&backing.join("defs.bzl"), Dialect::Bazel, info)
+            .unwrap();
+        analysis
+            .set_type_interfaces([(physical, *interface)])
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn mapping_installation_validates_all_files_before_replacing_configuration() {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
             .join("type-interface-config");
@@ -369,7 +470,7 @@ mod tests {
                     source: source.clone(),
                     interface: root.join("missing.bzli"),
                 }],
-                "cannot resolve type interface",
+                "cannot open",
             ),
         ] {
             let error = super::TypeInterfaceOptions { mappings }

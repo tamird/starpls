@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+
 use starpls_ide::CompletionItemKind;
 use starpls_ide::CompletionMode::InsertText;
 use starpls_ide::CompletionMode::TextEdit;
@@ -140,13 +143,32 @@ fn rename_locations(
         .analysis_snapshot
         .rename(position, &candidates, new_name)??);
     snapshot.ensure_workspace_ready()?;
+    let matched: HashSet<_> = rename
+        .locations
+        .iter()
+        .map(|location| {
+            (
+                snapshot.analysis_snapshot.path(location.file_id),
+                location.range,
+            )
+        })
+        .collect();
     for location in &rename.locations {
         let path = snapshot.analysis_snapshot.path(location.file_id);
-        if !snapshot.loader.is_editable(path)? {
+        let source = snapshot.analysis_snapshot.source_path(path)?;
+        if !snapshot.loader.is_editable(path, &source)? {
             anyhow::bail!(
                 "Cannot rename a declaration or reference in external repository {}",
                 path.display()
             );
+        }
+        for alias in snapshot.analysis_snapshot.source_aliases(path)? {
+            if !matched.contains(&(alias.as_path(), location.range)) {
+                anyhow::bail!(
+                    "Cannot rename shared source {}: the interpretation at {} is outside this rename",
+                    source.display(), alias.display()
+                );
+            }
         }
     }
     Ok(Some((file_id, rename)))
@@ -171,12 +193,17 @@ pub(crate) fn rename(
         params.text_document_position,
         Some(&params.new_name)
     )?);
-    let mut documents: Vec<lsp_types::TextDocumentEdit> = Vec::new();
+    let mut documents = BTreeMap::new();
+    let mut edits = HashSet::new();
     for location in rename.locations {
         let path = snapshot.analysis_snapshot.path(location.file_id);
+        let physical = snapshot.analysis_snapshot.source_path(path)?;
+        if !edits.insert((physical.clone(), location.range)) {
+            continue;
+        }
         let source = snapshot.analysis_snapshot.source(location.file_id)?;
         let document = snapshot.analysis_snapshot.document(path);
-        let uri_path = document.map_or(path, |document| document.path.as_std_path());
+        let uri_path = document.map_or(physical.as_path(), |document| document.path.as_std_path());
         let uri = lsp_types::Url::from_file_path(uri_path).map_err(|()| {
             anyhow::anyhow!("Cannot construct an editor URI for {}", uri_path.display())
         })?;
@@ -188,20 +215,19 @@ pub(crate) fn rename(
             range,
             new_text: params.new_name.clone(),
         };
-        if let Some(previous) = documents.last_mut() {
-            if previous.text_document.uri == uri {
-                previous.edits.push(lsp_types::OneOf::Left(edit));
-                continue;
-            }
-        }
-        documents.push(lsp_types::TextDocumentEdit {
-            text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
-                uri,
-                version: document.map(|document| document.version),
-            },
-            edits: vec![lsp_types::OneOf::Left(edit)],
-        });
+        documents
+            .entry(uri.clone())
+            .or_insert_with(|| lsp_types::TextDocumentEdit {
+                text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: document.map(|document| document.version),
+                },
+                edits: Vec::new(),
+            })
+            .edits
+            .push(lsp_types::OneOf::Left(edit));
     }
+    let documents: Vec<_> = documents.into_values().collect();
     let document_changes = snapshot
         .config
         .caps

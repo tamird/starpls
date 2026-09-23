@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(report.loaded_dependencies.len(), 2);
         for file in report.loaded_dependencies {
             assert_eq!(file.repository.as_deref(), Some("rules+"));
-            assert!(file.path.starts_with(physical.canonicalize().unwrap()));
+            assert!(file.path.starts_with(external.join("rules+")));
         }
     }
 
@@ -461,9 +461,9 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
             .join("checker-explicit-paths");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("source.bzl"), "value = 1\n").unwrap();
+        std::fs::write(root.join("overlay.txt"), "value = 1\n").unwrap();
         std::fs::write(root.join("unsupported.py"), "value = 1\n").unwrap();
-        std::os::unix::fs::symlink(root.join("source.bzl"), root.join("alias.bzl")).unwrap();
+        std::os::unix::fs::symlink(root.join("overlay.txt"), root.join("BUILD.bazel")).unwrap();
         let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             Arc::new(TestBazelClient::default()),
@@ -481,12 +481,16 @@ mod tests {
         let (analysis, loader) = options
             .prepare_analysis(loader, &info, Default::default())
             .unwrap();
-        let paths = ["alias.bzl", "unsupported.py"]
+        let paths = ["BUILD.bazel", "unsupported.py"]
             .map(|name| root.join(name).to_str().unwrap().to_owned())
             .to_vec();
         let mut checker =
             Checker::new(analysis, info, paths, &[], loader, receiver, &options).unwrap();
         assert_eq!(checker.files.len(), 1);
+        assert_eq!(
+            checker.files.iter().next().unwrap().api_context(),
+            Some(starpls_bazel::APIContext::Build)
+        );
         assert_eq!(checker.input_errors.len(), 1);
         let graph = checker.prepare_loads().unwrap();
         let snapshot = checker.analysis.snapshot();
@@ -496,7 +500,7 @@ mod tests {
         assert!(!report.complete);
         assert_eq!(
             report.checked_files.first().unwrap().path,
-            root.join("source.bzl").canonicalize().unwrap()
+            root.join("BUILD.bazel")
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -911,11 +915,10 @@ impl Checker {
         extensions: &[&str],
         bazel_only: bool,
     ) -> anyhow::Result<()> {
-        let path = std::path::absolute(path)?;
-        let canonical_path = path.canonicalize()?;
+        let path = starpls_common::absolute_path(path)?;
 
         let Some((dialect, api_context)) =
-            document::source_kind(&self.bazel_info.workspace, &canonical_path, extensions)
+            document::source_kind(&self.bazel_info.workspace, &path, extensions)
         else {
             if is_explicit {
                 if !bazel_only {
@@ -934,10 +937,10 @@ impl Checker {
 
         let info = api_context.map(|api_context| FileInfo::Bazel {
             api_context,
-            is_external: canonical_path.starts_with(&self.bazel_info.output_base),
+            is_external: path.starts_with(&self.bazel_info.output_base),
         });
 
-        let file = self.analysis.file(&canonical_path, dialect, info)?;
+        let file = self.analysis.file(&path, dialect, info)?;
         self.files.insert(file);
 
         Ok(())

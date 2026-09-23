@@ -181,12 +181,8 @@ fn load_package(
 }
 
 fn contained_file(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("cannot resolve {}", path.display()))?;
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve repository {}", root.display()))?;
+    let path = starpls_common::absolute_path(path)?;
+    let root = starpls_common::absolute_path(root)?;
     if !path.starts_with(&root) {
         bail!(
             "{} is outside repository {}",
@@ -194,7 +190,10 @@ fn contained_file(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
             root.display()
         );
     }
-    if !path.is_file() {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("cannot resolve {}", path.display()))?;
+    if !metadata.is_file() {
         bail!("{} must be a file", path.display());
     }
     Ok(path)

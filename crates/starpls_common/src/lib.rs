@@ -74,7 +74,7 @@ pub enum FileInfo {
     },
 }
 
-/// A physical file interpreted in a particular Starlark host context.
+/// A logical source path interpreted in a particular Starlark host context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct File {
     pub source: ruff_db::files::File,
@@ -187,6 +187,14 @@ pub fn system_path(path: &std::path::Path) -> anyhow::Result<&ruff_db::system::S
     Ok(ruff_db::system::SystemPath::new(path))
 }
 
+/// Normalize a host path with the same rules as Ruff's file interner.
+pub fn absolute_path(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let cwd = system_path(&cwd)?;
+    let path = system_path(path)?;
+    Ok(ruff_db::system::SystemPath::absolute(path, cwd).into_std_path_buf())
+}
+
 pub fn open_document(
     db: &mut dyn Db,
     path: &std::path::Path,
@@ -199,7 +207,10 @@ pub fn open_document(
     let path = db
         .source_system_mut()
         .open(path, contents, dialect, info, version)?;
-    ruff_db::files::File::sync_path(db, &path);
+    let affected = db.source_system_mut().paths_for_change(&path)?;
+    for path in affected {
+        ruff_db::files::File::sync_path(db, &path);
+    }
     File::from_path(db, path.as_std_path(), dialect, info)
 }
 

@@ -127,8 +127,8 @@ versions = ["1.4.0", "1.4.1"]
 The package declares the Bazel dependencies referenced by its manifest and stub
 files. `source.repository` resolves in the package's repository mapping.
 `files` maps source paths, relative to the source repository root, to stub paths
-relative to the manifest directory. Each path must identify a file within its
-respective repository.
+relative to the manifest directory. Paths identify installed files within their
+respective repositories, including files and directories mounted by symlinks.
 
 ## Resolution
 

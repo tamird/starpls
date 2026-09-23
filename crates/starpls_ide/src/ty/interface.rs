@@ -3,7 +3,6 @@
 use std::collections::hash_map::Entry;
 
 use ruff_db::files::FileRange;
-use ruff_db::Db as _;
 use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
@@ -236,12 +235,7 @@ impl Database {
         if mappings.is_empty() {
             return None;
         }
-        let (_, interface) = mappings.get(&source.source).or_else(|| {
-            let path = starpls_common::system_path(source.path(self)).ok()?;
-            let canonical = self.system().canonicalize_path(path).ok()?;
-            let source = ruff_db::files::system_path_to_file(self, &canonical).ok()?;
-            mappings.get(&source)
-        })?;
+        let (_, interface) = mappings.get(&source.source)?;
         // An interface may import the implementation's existing nominal providers.
         // It must not resolve that import back to its own declaration of the name.
         (interface.source != from.source).then_some(*interface)

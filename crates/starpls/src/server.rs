@@ -423,7 +423,7 @@ impl Server {
                 changed = true;
             }
         }
-        if changed {
+        if changed || self.open_repository_changed() {
             self.reload_configuration()?;
         }
         Ok(())
@@ -437,7 +437,7 @@ impl Server {
         let snapshot = self.analysis.snapshot();
         for file in self.analysis.type_interface_files() {
             let path = snapshot.path(file);
-            if snapshot.document(path).is_none() {
+            if snapshot.open_file(path)?.is_none() {
                 self.send_notification::<lsp_types::notification::PublishDiagnostics>(
                     lsp_types::PublishDiagnosticsParams {
                         uri: lsp_types::Url::from_file_path(path).expect("absolute interface"),
@@ -543,11 +543,12 @@ impl Server {
         let mut admission = Ok(());
         self.configuration.needs_reopen = false;
         for file in self.analysis.open_files() {
-            let source = snapshot.path(file);
-            let document = snapshot.document(source).expect("open file");
-            if let Err(error) =
-                loader.restore_document_context(&self.loader, document.path.as_std_path(), source)
-            {
+            let path = snapshot.path(file);
+            if let Err(error) = loader.restore_document_context(
+                &self.loader,
+                path,
+                self.analysis.validate_document(path),
+            ) {
                 self.send_error_message(&format!("{error:#}"));
                 admission = Err(error);
                 self.configuration.needs_reopen = true;
@@ -580,10 +581,8 @@ impl Server {
     pub(crate) fn open_repository_changed(&self) -> bool {
         let snapshot = self.analysis.snapshot();
         self.analysis.open_files().into_iter().any(|file| {
-            let source = snapshot.path(file);
-            let document = snapshot.document(source).expect("open file");
-            self.loader
-                .open_repository_changed(document.path.as_std_path(), source)
+            let path = snapshot.path(file);
+            !self.loader.is_displaced(path) && self.analysis.validate_document(path).is_err()
         })
     }
 
@@ -728,8 +727,8 @@ impl ServerSnapshot {
                 continue;
             };
             let open = self.analysis_snapshot.open_file(&path)?;
-            let contents = match open {
-                Some(file) => self.analysis_snapshot.source(file)?.text.to_string(),
+            let contents = match self.analysis_snapshot.document(&path) {
+                Some(document) => document.contents.clone(),
                 None => match std::fs::read_to_string(&path) {
                     Ok(contents) => contents,
                     Err(error) => {

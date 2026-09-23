@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use ruff_db::file_revision::FileRevision;
 use ruff_db::system::walk_directory::WalkDirectoryBuilder;
@@ -63,6 +65,70 @@ pub struct SourceSystem {
     documents: HashMap<SystemPathBuf, OpenDocument>,
     virtual_sources: HashMap<SystemVirtualPathBuf, String>,
     revision: u64,
+    aliases: Arc<Mutex<SourceAliases>>,
+}
+
+/// Semantic paths can share disk contents and an editor buffer. Disk revisions
+/// include the target identity: two archive members can have the same timestamp.
+#[derive(Debug, Default)]
+struct SourceAliases {
+    sources: HashMap<SystemPathBuf, SourceAlias>,
+    paths: HashMap<SystemPathBuf, HashSet<SystemPathBuf>>,
+    revision: u64,
+}
+
+#[derive(Debug)]
+struct SourceAlias {
+    source: SystemPathBuf,
+    disk_revision: Option<FileRevision>,
+    revision: FileRevision,
+}
+
+impl SourceAliases {
+    fn insert(&mut self, path: SystemPathBuf, source: SystemPathBuf) {
+        let Self {
+            sources,
+            paths,
+            revision: _,
+        } = self;
+        let alias = SourceAlias {
+            source: source.clone(),
+            disk_revision: None,
+            revision: FileRevision::default(),
+        };
+        match sources.entry(path.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(alias);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().source == source {
+                    return;
+                }
+                let old = entry.insert(alias);
+                let aliases = paths.get_mut(&old.source).expect("indexed source");
+                aliases.remove(&path);
+                if aliases.is_empty() {
+                    paths.remove(&old.source);
+                }
+            }
+        }
+        paths.entry(source).or_default().insert(path);
+    }
+
+    fn metadata(&mut self, path: &SystemPath, metadata: Metadata) -> Metadata {
+        let Self {
+            sources,
+            paths: _,
+            revision,
+        } = self;
+        let alias = sources.get_mut(path).expect("indexed source");
+        if alias.disk_revision != Some(metadata.revision()) {
+            *revision += 1;
+            alias.disk_revision = Some(metadata.revision());
+            alias.revision = FileRevision::new(u128::from(*revision));
+        }
+        Metadata::new(alias.revision, metadata.permissions(), metadata.file_type())
+    }
 }
 
 impl SourceSystem {
@@ -72,6 +138,7 @@ impl SourceSystem {
             documents: HashMap::new(),
             virtual_sources: HashMap::new(),
             revision: 0,
+            aliases: Arc::default(),
         }
     }
 
@@ -97,6 +164,7 @@ impl SourceSystem {
             base: _,
             documents,
             virtual_sources: _,
+            aliases: _,
             revision,
         } = self;
         *revision += 1;
@@ -105,7 +173,7 @@ impl SourceSystem {
         documents.insert(
             source.clone(),
             OpenDocument {
-                path,
+                path: path.clone(),
                 contents,
                 version,
                 dialect,
@@ -113,7 +181,42 @@ impl SourceSystem {
                 revision: file_revision,
             },
         );
-        Ok(source)
+        Ok(path)
+    }
+
+    /// Files affected by a buffer edit or filesystem event, including aliases
+    /// of both the old and new target when a symlink has changed.
+    pub fn paths_for_change(&self, path: &SystemPath) -> Result<Vec<SystemPathBuf>> {
+        let path = SystemPath::absolute(path, self.base.current_directory());
+        let source = self.source_path(&path)?;
+        let mut aliases = self.aliases.lock().expect("source aliases poisoned");
+        let mut affected = HashSet::from([path.clone()]);
+        for source in aliases
+            .sources
+            .get(&path)
+            .map(|alias| &alias.source)
+            .into_iter()
+            .chain([&source])
+        {
+            if let Some(paths) = aliases.paths.get(source) {
+                affected.extend(paths.iter().cloned());
+            }
+        }
+        aliases.insert(path, source);
+        Ok(affected.into_iter().collect())
+    }
+
+    /// Logical interpretations already admitted for this backing source.
+    pub fn source_aliases(&self, path: &SystemPath) -> Result<Vec<SystemPathBuf>> {
+        let source = self.source_path(path)?;
+        let aliases = self.aliases.lock().expect("source aliases poisoned");
+        Ok(aliases
+            .paths
+            .get(&source)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect())
     }
 
     pub fn close(&mut self, path: &SystemPath) -> Option<OpenDocument> {
@@ -122,6 +225,7 @@ impl SourceSystem {
             base: _,
             documents,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         documents.remove(&path)
@@ -137,6 +241,7 @@ impl SourceSystem {
             base: _,
             documents,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         documents.get(&path)
@@ -155,6 +260,24 @@ impl SourceSystem {
         {
             return Ok(source.clone());
         }
+        self.disk_source_path(&path)
+    }
+
+    /// An open URI keeps its buffer until the editor closes it, even if a
+    /// dependency refresh changes the file reached by that URI on disk.
+    pub fn validate_document(&self, path: &SystemPath) -> anyhow::Result<()> {
+        let source = self.source_path(path)?;
+        let target = self.disk_source_path(path)?;
+        if target != source {
+            anyhow::bail!(
+                "open file {path} refers to {target} after the dependency change (buffer: {source}); close and reopen it to use the new repository"
+            );
+        }
+        Ok(())
+    }
+
+    fn disk_source_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
+        let path = SystemPath::absolute(path, self.base.current_directory());
         let mut ancestor = path.as_path();
         loop {
             match self.base.canonicalize_path(ancestor) {
@@ -200,6 +323,7 @@ impl SourceSystem {
             base: _,
             documents,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         documents
@@ -210,6 +334,12 @@ impl SourceSystem {
 
 impl System for SourceSystem {
     fn path_metadata(&self, path: &SystemPath) -> Result<Metadata> {
+        let path = SystemPath::absolute(path, self.base.current_directory());
+        let source = self.source_path(&path)?;
+        self.aliases
+            .lock()
+            .expect("source aliases poisoned")
+            .insert(path.clone(), source.clone());
         if let Some(OpenDocument {
             path: _,
             contents: _,
@@ -217,7 +347,7 @@ impl System for SourceSystem {
             dialect: _,
             info: _,
             revision,
-        }) = self.document(path)
+        }) = self.documents.get(&source)
         {
             return Ok(Metadata::new(*revision, None, FileType::File));
         }
@@ -225,9 +355,15 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
-        base.path_metadata(path)
+        let metadata = base.path_metadata(&path)?;
+        Ok(self
+            .aliases
+            .lock()
+            .expect("source aliases poisoned")
+            .metadata(&path, metadata))
     }
 
     fn read_to_string(&self, path: &SystemPath) -> Result<String> {
@@ -246,6 +382,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.read_to_string(path)
@@ -271,6 +408,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.canonicalize_path(path)
@@ -280,6 +418,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.is_same_file(first, second)
@@ -289,6 +428,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.which(binary_name)
@@ -298,6 +438,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.command_executor()
@@ -307,6 +448,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.read_to_notebook(path)
@@ -319,6 +461,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.read_virtual_path_to_string(path)
@@ -331,6 +474,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.read_virtual_path_to_notebook(path)
@@ -340,6 +484,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.current_directory()
@@ -349,6 +494,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.user_config_directory()
@@ -358,6 +504,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.cache_dir()
@@ -370,6 +517,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.read_directory(path)
@@ -379,6 +527,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.walk_directory(path)
@@ -388,6 +537,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.env_var(name)
@@ -397,6 +547,7 @@ impl System for SourceSystem {
             base,
             documents: _,
             virtual_sources: _,
+            aliases: _,
             revision: _,
         } = self;
         base.as_writable()

@@ -293,15 +293,15 @@ impl Server {
                 for (file, ticket, diagnostics) in results {
                     let path = snapshot.path(file);
                     if self.diagnostics_manager.complete(&snapshot, file, ticket) {
-                        let path = snapshot
-                            .document(path)
-                            .map_or(path, |document| document.path.as_std_path());
                         let uri = lsp_types::Url::from_file_path(path).expect("absolute file path");
                         self.send_notification::<lsp_types::notification::PublishDiagnostics>(
                             lsp_types::PublishDiagnosticsParams {
                                 uri,
                                 diagnostics,
-                                version: ticket.document.map(|document| document.version),
+                                version: snapshot
+                                    .document(path)
+                                    .filter(|document| document.path.as_std_path() == path)
+                                    .map(|document| document.version),
                             },
                         );
                     }
@@ -1284,7 +1284,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn transitive_watches_and_retargeted_open_repositories() {
-        for (physical, during_fetch) in [(false, false), (true, false), (true, true)] {
+        for (during_fetch, missing) in [(false, false), (true, false), (false, true)] {
             let TestServer {
                 mut server,
                 client,
@@ -1293,7 +1293,7 @@ mod tests {
                 debounced: _,
             } = server();
             let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-                .join(format!("reload-repositories-{physical}-{during_fetch}"));
+                .join(format!("reload-repositories-{during_fetch}-{missing}"));
             let workspace = root.join("workspace");
             let external = root.join("external");
             let old = root.join("old");
@@ -1305,7 +1305,9 @@ mod tests {
             }
             let text = "load(\"@@helper+//:defs.bzl\", \"helper_value\")\nvalue = helper_value\n";
             std::fs::write(old.join("defs.bzl"), text).unwrap();
-            std::fs::write(new.join("defs.bzl"), "value = 2\n").unwrap();
+            if !missing {
+                std::fs::write(new.join("defs.bzl"), "value = 2\n").unwrap();
+            }
             std::fs::write(helper.join("defs.bzl"), "helper_value = 1\n").unwrap();
             std::os::unix::fs::symlink(&old, external.join("rules+")).unwrap();
             std::os::unix::fs::symlink(&helper, external.join("helper+")).unwrap();
@@ -1368,11 +1370,7 @@ mod tests {
                 ),
                 "{request:?}"
             );
-            let alias = if physical {
-                old.join("defs.bzl")
-            } else {
-                external.join("rules+/defs.bzl")
-            };
+            let alias = external.join("rules+/defs.bzl");
             server
                 .open_document(&alias, format!("{text}unsaved = 42\n"), 7)
                 .unwrap();
@@ -1380,7 +1378,20 @@ mod tests {
                 std::fs::remove_file(external.join("rules+")).unwrap();
                 std::os::unix::fs::symlink(&new, external.join("rules+")).unwrap();
             }
-            server.reload_configuration().unwrap();
+            if during_fetch {
+                server.reload_configuration().unwrap();
+            } else {
+                crate::handlers::notifications::did_change_watched_files(
+                    &mut server,
+                    lsp_types::DidChangeWatchedFilesParams {
+                        changes: vec![lsp_types::FileEvent {
+                            uri: lsp_types::Url::from_file_path(&alias).unwrap(),
+                            typ: lsp_types::FileChangeType::CHANGED,
+                        }],
+                    },
+                )
+                .unwrap();
+            }
             finish_reload(&mut server);
             if during_fetch {
                 assert!(!server.configuration.needs_reopen);
@@ -1421,13 +1432,7 @@ mod tests {
             finish_reload(&mut server);
             assert!(server.configuration.needs_reopen);
             assert_eq!(server.analysis.document(&alias).unwrap().version, 8);
-            assert_eq!(
-                server
-                    .loader
-                    .repository_for_path(&old.join("defs.bzl"))
-                    .unwrap(),
-                None
-            );
+            assert_eq!(server.loader.repository_for_path(&alias).unwrap(), None);
 
             crate::handlers::notifications::did_close_text_document(
                 &mut server,
@@ -1440,6 +1445,7 @@ mod tests {
             .unwrap();
             finish_reload(&mut server);
             assert!(!server.configuration.needs_reopen);
+            std::fs::write(new.join("defs.bzl"), "value = 2\n").unwrap();
             if during_fetch {
                 server
                     .open_document(
@@ -1666,6 +1672,168 @@ mod tests {
                 message.params.to_string().contains("Restart Starpls"),
             _ => false,
         }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_buffers_preserve_diagnostic_uris_and_unique_rename_edits() {
+        let TestServer {
+            mut server,
+            client,
+            disk: _,
+            tasks,
+            debounced: _,
+        } = server();
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("editor-contexts");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("BUILD"), "").unwrap();
+        let defs = workspace.join("defs.bzl");
+        std::fs::write(&defs, "def f(): pass\n").unwrap();
+        let stub = root.join("defs.bzli");
+        let installed_stub = workspace.join("defs.bzli");
+        std::fs::write(&stub, "def f(): ...\n").unwrap();
+        std::os::unix::fs::symlink(&stub, &installed_stub).unwrap();
+        server.loader = Arc::new(DefaultFileLoader::new(
+            Arc::new(crate::document::source_tests::TestBazelClient::default()),
+            workspace.clone(),
+            None,
+            root.join("external"),
+            tasks,
+            false,
+        ));
+        server.analysis = Analysis::new(server.loader.clone(), Default::default()).unwrap();
+        server.workspace = workspace.clone();
+        server.configuration.complete = true;
+        Arc::get_mut(&mut server.config).unwrap().caps =
+            serde_json::from_value(serde_json::json!({
+                "workspace": {"workspaceEdit": {"documentChanges": true}}
+            }))
+            .unwrap();
+        let source = server
+            .analysis
+            .file(&defs, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        let interface = server
+            .analysis
+            .file(&installed_stub, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        server
+            .analysis
+            .set_type_interfaces([(source, interface)])
+            .unwrap();
+        server
+            .open_document(&stub, "bad: Missing\n".into(), 9)
+            .unwrap();
+        let task = captured_diagnostics(&mut server, interface);
+        server.handle_task(task);
+        let updates = published(&client);
+        let [update] = updates.as_slice() else {
+            panic!("{updates:?}")
+        };
+        assert_eq!(
+            update.uri,
+            lsp_types::Url::from_file_path(&installed_stub).unwrap()
+        );
+        assert_eq!(update.version, None);
+        assert!(!update.diagnostics.is_empty(), "{update:?}");
+        server.analysis.set_type_interfaces([]).unwrap();
+        server.analysis.close_document(&stub).unwrap();
+
+        let backing = workspace.join("backing.bzl");
+        std::fs::write(&backing, "value = 0\n").unwrap();
+        for name in ["one.bzl", "two.bzl"] {
+            let alias = workspace.join(name);
+            std::os::unix::fs::symlink(&backing, &alias).unwrap();
+            server
+                .analysis
+                .file(&alias, starpls_common::Dialect::Bazel, None)
+                .unwrap();
+        }
+        server
+            .open_document(&backing, "load('//:defs.bzl', 'f')\nf()\n".into(), 7)
+            .unwrap();
+        server
+            .open_document(&defs, "def f(): pass\n".into(), 1)
+            .unwrap();
+        let snapshot = server.snapshot();
+        let candidates = snapshot.reference_files("f").unwrap();
+        let paths: Vec<_> = candidates
+            .iter()
+            .map(|file| snapshot.analysis_snapshot.path(*file))
+            .collect();
+        assert!(
+            paths.contains(&workspace.join("one.bzl").as_path()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&workspace.join("two.bzl").as_path()),
+            "{paths:?}"
+        );
+        let parameters = lsp_types::RenameParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::from_file_path(&defs).unwrap(),
+                },
+                position: lsp_types::Position::new(0, 4),
+            },
+            new_name: "renamed".into(),
+            work_done_progress_params: Default::default(),
+        };
+        let edit = crate::handlers::requests::rename(&snapshot, parameters.clone())
+            .unwrap()
+            .unwrap();
+        let Some(lsp_types::DocumentChanges::Edits(edits)) = edit.document_changes else {
+            panic!("{edit:?}")
+        };
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        let references = edits
+            .iter()
+            .find(|edit| {
+                edit.text_document.uri == lsp_types::Url::from_file_path(&backing).unwrap()
+            })
+            .unwrap();
+        assert_eq!(references.text_document.version, Some(7));
+        assert_eq!(references.edits.len(), 2, "{references:?}");
+        drop(snapshot);
+        // A workspace symlink must not make an outside file eligible for edits.
+        let outside = root.join("outside.bzl");
+        std::fs::write(&outside, "load('//:defs.bzl', 'f')\nf()\n").unwrap();
+        let alias = workspace.join("outside.bzl");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        server
+            .analysis
+            .file(&alias, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        let error =
+            crate::handlers::requests::rename(&server.snapshot(), parameters.clone()).unwrap_err();
+        assert!(error.to_string().contains("Cannot rename"), "{error}");
+        std::fs::remove_file(&alias).unwrap();
+        server
+            .analysis
+            .sync_files(std::slice::from_ref(&alias))
+            .unwrap();
+        // Distinct module identities can share a declaration's physical bytes.
+        let second_defs = workspace.join("other-defs.bzl");
+        std::os::unix::fs::symlink(&defs, &second_defs).unwrap();
+        server
+            .analysis
+            .file(&second_defs, starpls_common::Dialect::Bazel, None)
+            .unwrap();
+        server
+            .open_document(
+                &workspace.join("other-caller.bzl"),
+                "load('//:other-defs.bzl', 'f')\nf()\n".into(),
+                1,
+            )
+            .unwrap();
+        let error = crate::handlers::requests::rename(&server.snapshot(), parameters).unwrap_err();
+        assert!(
+            error.to_string().contains("Cannot rename shared source"),
+            "{error}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
