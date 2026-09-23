@@ -808,6 +808,45 @@ def unknown(target, key, values):
     }
 
     #[test]
+    fn default_info_tracks_files_to_run_presence() {
+        let source = r#"
+def inspect(target: Target, artifact: File, info: DefaultInfo, precise: DefaultInfo[depset[File]]):
+    raw = DefaultInfo().files_to_run # type: None
+    raw_executable = DefaultInfo(executable=artifact).files_to_run # type: None
+    files = DefaultInfo(files=depset([artifact])).files.to_list() # type: list[File]
+    configured_files = target[DefaultInfo].files.to_list() # type: list[File]
+    for value in [target[DefaultInfo].files_to_run, info.files_to_run, precise.files_to_run]:
+        if value != None:
+            executable = value.executable
+            if executable != None:
+                print(executable.path)
+    print(raw, raw_executable, files, configured_files)
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for expression in [
+            "DefaultInfo().files_to_run.executable",
+            "DefaultInfo(executable=artifact).files_to_run.executable",
+            "target[DefaultInfo].files_to_run.executable",
+            "info.files_to_run.executable",
+            "precise.files_to_run.executable",
+        ] {
+            analysis.update_file(file, format!("{source}    {expression}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{expression}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+            assert!(diagnostic.concise_message().to_string().contains("None"));
+            assert!(diagnostic
+                .range()
+                .is_some_and(|range| range.start().to_usize() >= source.len()));
+        }
+    }
+
+    #[test]
     fn targets_expose_labels_and_typed_provider_lookup() {
         let source = r#"
 Info = provider(fields=["message"])

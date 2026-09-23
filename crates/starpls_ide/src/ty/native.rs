@@ -245,7 +245,7 @@ fn declarations(
             "Provider" => Some("_ProviderValue"),
             "depset" => Some("_DepsetElement"),
             "select" => Some("_SelectValue"),
-            "DefaultInfo" => Some("_DefaultInfoFiles"),
+            "DefaultInfo" => Some("_DefaultInfoFiles, _DefaultInfoFilesToRun"),
             _ => None,
         };
         if let Some(parameter) = parameter {
@@ -299,11 +299,12 @@ fn declarations(
                 "        files: _starpls_types.depset[_starpls_types.File]"
             )?;
             // Target access normalizes DefaultInfo.files even when the raw
-            // provider constructor omitted it.
+            // provider constructor omitted it. Package groups can still lack
+            // FilesToRunProvider, so its presence remains optional.
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
                 body,
-                "        def __getitem__(self, key: _starpls_typing.Callable[..., _starpls_types.DefaultInfo]) -> _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File]]: ..."
+                "        def __getitem__(self, key: _starpls_typing.Callable[..., _starpls_types.DefaultInfo]) -> _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File], _starpls_types.FilesToRunProvider | None]: ..."
             )?;
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
@@ -354,8 +355,12 @@ fn declarations(
                             "files" => Some("_starpls_types.struct[_starpls_builtins.list[_starpls_types.File]]"),
                             _ => None,
                         }
-                    } else if class.name == "DefaultInfo" && field.name == "files" {
-                        Some("_DefaultInfoFiles")
+                    } else if class.name == "DefaultInfo" {
+                        match field.name.as_str() {
+                            "files" => Some("_DefaultInfoFiles"),
+                            "files_to_run" => Some("_DefaultInfoFilesToRun"),
+                            _ => None,
+                        }
                     } else if class.name == "FilesToRunProvider"
                         && matches!(
                             field.name.as_str(),
@@ -467,7 +472,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -672,7 +677,7 @@ fn write_function(
         (CallableKind::Function, "select") => Some("_starpls_types.select[_SelectValue]"),
         (CallableKind::Function, "depset") => Some("_starpls_types.depset[_DepsetElement]"),
         (CallableKind::Function, "DefaultInfo") => {
-            Some("_starpls_types.DefaultInfo[_DefaultInfoFiles]")
+            Some("_starpls_types.DefaultInfo[_DefaultInfoFiles, None]")
         }
         (CallableKind::Method("depset"), "to_list") => {
             Some("_starpls_builtins.list[_DepsetElement]")
