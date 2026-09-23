@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::BufRead;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,6 +19,25 @@ use serde::Deserialize;
 use serde_json::Deserializer;
 
 const DEFAULT_WORKSPACE_NAMES: &[&str] = &["__main__", "_main"];
+
+fn repository_argument_bytes(repo: &str) -> usize {
+    "--repo=@@".len() + repo.len() + 1
+}
+
+/// Number of repositories to fetch together, allowing one oversized name to fail individually.
+pub fn repository_fetch_batch_len(repos: &[String]) -> usize {
+    // Bazel expands rc options into its server request. Keep room under the
+    // 4 MiB request limit for rc provenance, option expansion, and the environment.
+    let mut bytes = 0;
+    repos
+        .iter()
+        .take_while(|repo| {
+            bytes += repository_argument_bytes(repo);
+            bytes <= 256 * 1024
+        })
+        .count()
+        .max(usize::from(!repos.is_empty()))
+}
 
 pub type RepoMapping = Arc<HashMap<String, String>>;
 
@@ -213,9 +234,44 @@ impl BazelClient for BazelCLI {
         if repos.is_empty() {
             bail!("repository fetch requires at least one repository");
         }
-        let args = std::iter::once("fetch".to_owned())
-            .chain(repos.iter().map(|repo| format!("--repo=@@{repo}")));
-        self.run_command(args)?;
+        for repo in repos {
+            if repo.contains(['\0', '\r', '\n']) {
+                bail!("repository name contains a NUL or newline: {repo:?}");
+            }
+        }
+        if repos
+            .iter()
+            .map(|repo| repository_argument_bytes(repo))
+            .sum::<usize>()
+            <= 16 * 1024
+        {
+            let args = std::iter::once("fetch".to_owned())
+                .chain(repos.iter().map(|repo| format!("--repo=@@{repo}")));
+            self.run_command(args)?;
+        } else {
+            let mut rc = tempfile::Builder::new()
+                .prefix("starpls-fetch-")
+                .tempfile()?;
+            let config = rc
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("temporary file has an ASCII name")
+                .to_owned();
+            let contents: String = repos
+                .iter()
+                .map(|repo| {
+                    let quoted = repo.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("fetch:{config} \"--repo=@@{quoted}\"\n")
+                })
+                .collect();
+            rc.write_all(contents.as_bytes())?;
+            let mut rc_arg = OsString::from("--bazelrc=");
+            rc_arg.push(rc.path());
+            // A unique config makes an ignored rc an error, rather than a fetch
+            // with no repository selection. Normal Bazel rc files still apply.
+            self.run_command([rc_arg, "fetch".into(), format!("--config={config}").into()])?;
+        }
         Ok(())
     }
 
@@ -473,7 +529,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn repository_fetches_use_repeated_canonical_arguments() {
+    fn repository_fetches_select_exact_repositories_and_clean_up() {
         use std::os::unix::fs::PermissionsExt;
 
         use super::BazelClient;
@@ -484,7 +540,12 @@ mod tests {
         std::fs::write(
             &executable,
             r#"#!/bin/sh
-printf '%s\n' "$@" >> "${0%/*}/arguments"
+set -eu
+printf '%s\n' "$@" > "${0%/*}/arguments"
+pwd > "${0%/*}/cwd"
+case "$1" in
+  --bazelrc=*) cat "${1#--bazelrc=}" > "${0%/*}/rc" ;;
+esac
 read status < "${0%/*}/status"
 echo 'native fetch failure' >&2
 exit "$status"
@@ -492,8 +553,13 @@ exit "$status"
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let client = super::BazelCLI::new(executable);
+        let client = super::BazelCLI::new(executable)
+            .with_working_directory(root.clone())
+            .unwrap();
         assert!(client.fetch_repos(&[]).is_err());
+        for invalid in ["bad\0name", "bad\rname", "bad\nname"] {
+            assert!(client.fetch_repos(&["first+", invalid]).is_err());
+        }
         assert!(!root.join("arguments").exists());
         std::fs::write(root.join("status"), "0\n").unwrap();
         client
@@ -503,12 +569,48 @@ exit "$status"
             std::fs::read_to_string(root.join("arguments")).unwrap(),
             "fetch\n--repo=@@first+\n--repo=@@rules++ext+second\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(root.join("cwd")).unwrap().trim(),
+            root.canonicalize().unwrap().to_str().unwrap()
+        );
         std::fs::write(root.join("status"), "1\n").unwrap();
         let error = client.fetch_repo("broken+").unwrap_err().to_string();
         assert!(error.contains("native fetch failure"), "{error}");
-        assert!(std::fs::read_to_string(root.join("arguments"))
-            .unwrap()
-            .ends_with("fetch\n--repo=@@broken+\n"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("arguments")).unwrap(),
+            "fetch\n--repo=@@broken+\n"
+        );
+
+        std::fs::write(root.join("status"), "0\n").unwrap();
+        let direct = "a".repeat(16 * 1024 - "--repo=@@".len() - 1);
+        client.fetch_repo(&direct).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("arguments")).unwrap(),
+            format!("fetch\n--repo=@@{direct}\n")
+        );
+        let large = format!("{direct}a");
+        for status in [0, 1] {
+            std::fs::write(root.join("status"), format!("{status}\n")).unwrap();
+            let result = client.fetch_repos(&[&large, "a\"b\\c #d'", "first+"]);
+            if status == 0 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("native fetch failure"), "{error}");
+            }
+            let arguments = std::fs::read_to_string(root.join("arguments")).unwrap();
+            let arguments: Vec<_> = arguments.lines().collect();
+            let [rc_arg, command, config_arg] = arguments.as_slice() else {
+                panic!("unexpected fetch arguments: {arguments:?}");
+            };
+            assert_eq!(*command, "fetch");
+            let path = std::path::Path::new(rc_arg.strip_prefix("--bazelrc=").unwrap());
+            assert!(!path.exists(), "temporary rc survived fetch");
+            let config = config_arg.strip_prefix("--config=").unwrap();
+            assert_eq!(path.file_name().unwrap(), config);
+            assert_eq!(std::fs::read_to_string(root.join("rc")).unwrap(),
+                format!("fetch:{config} \"--repo=@@{large}\"\nfetch:{config} \"--repo=@@a\\\"b\\\\c #d'\"\nfetch:{config} \"--repo=@@first+\"\n"));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

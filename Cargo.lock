@@ -2536,6 +2536,7 @@ dependencies = [
  "protoc-gen-tonic",
  "serde",
  "serde_json",
+ "tempfile",
  "tonic",
 ]
 

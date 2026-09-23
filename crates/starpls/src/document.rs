@@ -14,6 +14,7 @@ use anyhow::bail;
 use anyhow::Context;
 use crossbeam_channel::Sender;
 use parking_lot::RwLock;
+use starpls_bazel::client::repository_fetch_batch_len;
 use starpls_bazel::client::BazelClient;
 use starpls_bazel::label::PartialParse;
 use starpls_bazel::label::RepoKind;
@@ -104,16 +105,8 @@ pub(crate) fn fetch_repositories(
     let mut remaining = repositories;
     let mut results = Vec::with_capacity(repositories.len());
     while !remaining.is_empty() {
-        let mut bytes = 0;
         let count = if bzlmod {
-            remaining
-                .iter()
-                .take_while(|name| {
-                    bytes += name.len() + "--repo=@@".len() + 1;
-                    bytes <= 16 * 1024
-                })
-                .count()
-                .max(1)
+            repository_fetch_batch_len(remaining)
         } else {
             1
         };
@@ -1358,7 +1351,7 @@ pub(crate) mod source_tests {
         let client = TestBazelClient::default();
         assert!(super::fetch_repositories(&client, &[], true, |_| {}).is_empty());
         assert!(client.fetch_batches.lock().unwrap().is_empty());
-        let repositories: Vec<_> = (0..40)
+        let repositories: Vec<_> = (0..600)
             .map(|index| format!("{}+{index}", "long_repo".repeat(120)))
             .collect();
         let results = super::fetch_repositories(&client, &repositories, true, |_| {});
@@ -1370,7 +1363,7 @@ pub(crate) mod source_tests {
             .iter()
             .map(|name| name.len() + "--repo=@@".len() + 1)
             .sum::<usize>()
-            <= 16 * 1024));
+            <= 256 * 1024));
         assert_eq!(batches.concat(), repositories);
     }
 

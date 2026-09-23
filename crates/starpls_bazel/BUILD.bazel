@@ -49,6 +49,7 @@ rust_library(
         "@crates//:prost",
         "@crates//:serde",
         "@crates//:serde_json",
+        "@crates//:tempfile",
     ],
 )
 
