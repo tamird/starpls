@@ -609,6 +609,8 @@ fn write_function(
             }
             (CallableKind::Function, "DefaultInfo", "files") => Some("_DefaultInfoFiles"),
             (CallableKind::Function, "macro", "inherit_attrs") => Some("_starpls_types.rule | _starpls_types.macro | _starpls_typing.Literal[\"common\"] | None"),
+            // Both action constructors inspect each tool, including depset members.
+            (CallableKind::Method("actions"), "run" | "run_shell", "tools") => Some("_starpls_typing.Sequence[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]] | _starpls_types.depset[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]]"),
             _ => None,
         };
         let parameter_type = parameter_type.map(str::to_owned).unwrap_or_else(|| {
@@ -1022,6 +1024,65 @@ example(name='second', visibility=[Label('//visibility:public')])
                 let [diagnostic] = diagnostics.as_slice() else { panic!("{bad}: {diagnostics:?}"); };
                 assert_eq!(diagnostic.id().as_str(), "invalid-argument-type", "{bad}: {diagnostic:?}");
                 assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len(), "{bad}: {diagnostic:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn action_tools_accept_providers_and_file_depsets() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        for (method, arguments) in [("run", "executable=file"), ("run_shell", "command='true'")] {
+            let source = format!(
+                r#"def inspect(actions: actions, file: File, provider: FilesToRunProvider):
+    files = depset([file])
+    tools = [file, provider, files]
+    actions.{method}(outputs=[], {arguments}, tools=tools)
+    actions.{method}(outputs=[], {arguments}, tools=(file, provider, files))
+    actions.{method}(outputs=[], {arguments}, tools=files)
+    actions.{method}(outputs=[], {arguments}, tools=depset([provider]))
+    actions.{method}(outputs=[], {arguments}, tools=depset([files]))
+"#
+            );
+            let file = analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    source.clone(),
+                    1,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{method}: {diagnostics:?}");
+            for invalid in [
+                "[1]",
+                "[depset(['bad'])]",
+                "depset(['bad'])",
+                "file",
+                "None",
+            ] {
+                analysis
+                    .open_document(
+                        Path::new("/main.bzl"),
+                        Dialect::Bazel,
+                        None,
+                        format!("{source}    actions.{method}(outputs=[], {arguments}, tools={invalid})\n"),
+                        2,
+                    )
+                    .unwrap();
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("{method}, {invalid}: {diagnostics:?}");
+                };
+                assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+                assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
             }
         }
     }
