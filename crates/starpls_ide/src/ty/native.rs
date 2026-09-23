@@ -565,6 +565,8 @@ fn write_function(
     }
     let mut optional = false;
     let mut keyword_only = matches!(kind, CallableKind::Rule(_)) && !callable.param.is_empty();
+    let legacy_prefix = matches!(kind, CallableKind::Method("repository_ctx" | "module_ctx"))
+        && matches!(value.name.as_str(), "download_and_extract" | "extract");
     if keyword_only {
         output.push_str(", *");
     }
@@ -587,7 +589,7 @@ fn write_function(
         let transitive = matches!(kind, CallableKind::Function)
             && value.name == "depset"
             && name == "transitive";
-        if ((*is_mandatory && optional) || transitive)
+        if ((*is_mandatory && optional) || transitive || (legacy_prefix && name == "stripPrefix"))
             && !keyword_only
             && !is_star_arg
             && !is_star_star_arg
@@ -685,6 +687,18 @@ fn write_function(
             };
             write!(output, " = {default}")?;
         }
+    }
+    // Bazel still accepts this undocumented spelling, which its inventory omits.
+    if legacy_prefix
+        && !callable
+            .param
+            .iter()
+            .any(|parameter| parameter.name == "stripPrefix")
+    {
+        if !keyword_only {
+            output.push_str(", *");
+        }
+        output.push_str(", stripPrefix: _starpls_builtins.str = ''");
     }
     let return_type = match (kind, value.name.as_str()) {
         (CallableKind::Function, "select") => Some("_starpls_types.select[_SelectValue]"),
@@ -1257,6 +1271,102 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
                 "{statement}: {diagnostic:?}"
             );
             assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+        }
+    }
+
+    #[test]
+    fn extraction_accepts_the_legacy_prefix_keyword() {
+        let mut builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        // An inventory that includes the alias already remains authoritative.
+        let extract = builtins
+            .r#type
+            .iter_mut()
+            .find(|class| class.name == "repository_ctx")
+            .unwrap()
+            .field
+            .iter_mut()
+            .find(|field| field.name == "extract")
+            .unwrap()
+            .callable
+            .as_mut()
+            .unwrap();
+        extract.param.push(Param {
+            name: "stripPrefix".to_owned(),
+            r#type: "string".to_owned(),
+            default_value: "''".to_owned(),
+            ..Default::default()
+        });
+        let declarations = generate(Dialect::Bazel, &builtins, &BuildLanguage::default()).unwrap();
+        let parsed = ruff_python_parser::parse_module(&declarations.contents).unwrap();
+        let types = parsed
+            .syntax()
+            .body
+            .iter()
+            .filter_map(Stmt::as_class_def_stmt)
+            .find(|class| class.name.as_str() == "_starpls_types")
+            .unwrap();
+        let mut keyword_aliases = BTreeSet::new();
+        for class in types.body.iter().filter_map(Stmt::as_class_def_stmt) {
+            for method in class.body.iter().filter_map(Stmt::as_function_def_stmt) {
+                if method
+                    .parameters
+                    .kwonlyargs
+                    .iter()
+                    .any(|parameter| parameter.parameter.name.as_str() == "stripPrefix")
+                {
+                    keyword_aliases.insert(format!("{}.{}", class.name, method.name));
+                }
+            }
+        }
+        assert_eq!(
+            keyword_aliases,
+            BTreeSet::from([
+                "repository_ctx.extract".to_owned(),
+                "repository_ctx.download_and_extract".to_owned(),
+                "module_ctx.extract".to_owned(),
+                "module_ctx.download_and_extract".to_owned(),
+            ])
+        );
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        for host in ["repository_ctx", "module_ctx"] {
+            for (method, arguments) in [
+                (
+                    "download_and_extract",
+                    "url='https://example.com/source.tar.gz'",
+                ),
+                ("extract", "archive='source.tar.gz'"),
+            ] {
+                let source = format!("def inspect(ctx: {host}):\n    ctx.{method}({arguments}, stripPrefix='pkg')\n    ctx.{method}({arguments}, strip_prefix='pkg')\n    ctx.{method}({arguments}, strip_prefix='', stripPrefix='pkg')\n");
+                let file = analysis
+                    .open_document(
+                        Path::new("/main.bzl"),
+                        Dialect::Bazel,
+                        None,
+                        source.clone(),
+                        1,
+                    )
+                    .unwrap();
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                assert!(diagnostics.is_empty(), "{host}.{method}: {diagnostics:?}");
+                for invalid in ["42", "None"] {
+                    analysis.update_file(
+                        file,
+                        format!("{source}    ctx.{method}({arguments}, stripPrefix={invalid})\n"),
+                    );
+                    let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                    let [diagnostic] = diagnostics.as_slice() else {
+                        panic!("{host}.{method}, {invalid}: {diagnostics:?}");
+                    };
+                    assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+                    assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+                }
+            }
         }
     }
 
