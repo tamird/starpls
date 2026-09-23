@@ -1029,6 +1029,56 @@ example(name='second', visibility=[Label('//visibility:public')])
     }
 
     #[test]
+    fn archive_override_forwards_repository_attributes() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(Default::default(), Default::default())
+            .unwrap();
+        let source = r#"archive_override(module_name='single', url='https://example.com/source.tar.gz', sha256='abc')
+archive_override(module_name='multiple', urls=['https://example.com/source.tar.gz'], files={'BUILD.bazel': '//:BUILD.example'})
+archive_override(module_name='patched', url='https://example.com/source.tar.gz', patches=['//:fix.patch'])
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/MODULE.bazel"),
+                Dialect::Bazel,
+                Some(starpls_common::FileInfo::Bazel {
+                    api_context: APIContext::Module,
+                    is_external: false,
+                }),
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (arguments, expected) in [
+            ("module_name=42", "invalid-argument-type"),
+            (
+                "url='https://example.com/source.tar.gz'",
+                "missing-argument",
+            ),
+            ("'example'", "too-many-positional-arguments"),
+            (
+                "module_name='example', patches=[42]",
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(file, format!("{source}archive_override({arguments})\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == expected),
+                "{arguments}: {diagnostics:?}"
+            );
+            assert!(diagnostics.iter().all(|diagnostic| usize::from(
+                diagnostic.range().unwrap().start()
+            ) >= source.len()));
+        }
+    }
+
+    #[test]
     fn action_tools_accept_providers_and_file_depsets() {
         let builtins = starpls_bazel::decode_builtins(include_bytes!(
             "../../../starpls/src/builtin/builtin.pb"

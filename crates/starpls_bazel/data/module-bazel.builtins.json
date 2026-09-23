@@ -6,6 +6,15 @@
       "callable": {
         "params": [
           {
+            "name": "",
+            "type": "",
+            "doc": "",
+            "default_value": "",
+            "is_mandatory": false,
+            "is_star_arg": true,
+            "is_star_star_arg": false
+          },
+          {
             "name": "module_name",
             "type": "string",
             "doc": "The name of the Bazel module dependency to apply this override to.",
@@ -15,35 +24,8 @@
             "is_star_star_arg": false
           },
           {
-            "name": "urls",
-            "type": "string; or Iterable of strings",
-            "doc": "The URLs of the archive; can be http(s):// or file:// URLs.",
-            "default_value": "",
-            "is_mandatory": true,
-            "is_star_arg": false,
-            "is_star_star_arg": false
-          },
-          {
-            "name": "integrity",
-            "type": "string",
-            "doc": "The expected checksum of the archive file, in Subresource Integrity format.",
-            "default_value": "''",
-            "is_mandatory": false,
-            "is_star_arg": false,
-            "is_star_star_arg": false
-          },
-          {
-            "name": "strip_prefix",
-            "type": "string",
-            "doc": "A directory prefix to strip from the extracted files.",
-            "default_value": "''",
-            "is_mandatory": false,
-            "is_star_arg": false,
-            "is_star_star_arg": false
-          },
-          {
             "name": "patches",
-            "type": "Iterable of strings",
+            "type": "sequence of strings",
             "doc": "A list of labels pointing to patch files to apply for this module. The patch files must exist in the source tree of the top level project. They are applied in the list order.",
             "default_value": "[]",
             "is_mandatory": false,
@@ -51,22 +33,13 @@
             "is_star_star_arg": false
           },
           {
-            "name": "patch_cmds",
-            "type": "Iterable of strings",
-            "doc": "Sequence of Bash commands to be applied on Linux/Macos after patches are applied.",
-            "default_value": "[]",
+            "name": "kwargs",
+            "type": "",
+            "doc": "Attributes passed to http_archive to create the repository.",
+            "default_value": "",
             "is_mandatory": false,
             "is_star_arg": false,
-            "is_star_star_arg": false
-          },
-          {
-            "name": "patch_strip",
-            "type": "int",
-            "doc": "Same as the `--strip` argument of Unix patch.",
-            "default_value": "0",
-            "is_mandatory": false,
-            "is_star_arg": false,
-            "is_star_star_arg": false
+            "is_star_star_arg": true
           }
         ],
         "return_type": "None"
