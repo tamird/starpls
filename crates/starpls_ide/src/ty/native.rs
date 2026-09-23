@@ -281,6 +281,13 @@ fn declarations(
             writeln!(body, "        @_starpls_typing.type_check_only")?;
             writeln!(body, "        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_typing.Any: ...")?;
         }
+        if class.name == "OutputGroupInfo" {
+            names.extend(["__getattr__", "__getitem__", "__contains__"]);
+            writeln!(body, "        @_starpls_typing.type_check_only")?;
+            writeln!(body, "        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_types.depset[_starpls_types.File]: ...")?;
+            writeln!(body, "        def __getitem__(self, name: _starpls_builtins.str) -> _starpls_types.depset[_starpls_types.File]: ...")?;
+            writeln!(body, "        def __contains__(self, name: _starpls_builtins.object) -> _starpls_builtins.bool: ...")?;
+        }
         if class.name == "ToolchainContext" {
             names.extend(["__getitem__", "__contains__"]);
             // Aspect toolchain contexts can return aspect providers, so the
@@ -609,6 +616,7 @@ fn write_function(
                 Some("_starpls_typing.Sequence[_starpls_types.depset[_DepsetElement]] | None")
             }
             (CallableKind::Function, "DefaultInfo", "files") => Some("_DefaultInfoFiles"),
+            (CallableKind::Function, "OutputGroupInfo", "kwargs") => Some("_starpls_typing.Sequence[_starpls_types.File] | _starpls_types.depset[_starpls_types.File]"),
             (CallableKind::Function, "macro", "inherit_attrs") => Some("_starpls_types.rule | _starpls_types.macro | _starpls_typing.Literal[\"common\"] | None"),
             // Both action constructors inspect each tool, including depset members.
             (CallableKind::Method("actions"), "run" | "run_shell", "tools") => Some("_starpls_typing.Sequence[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]] | _starpls_types.depset[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]]"),
@@ -1187,6 +1195,68 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
                 diagnostic.concise_message().to_string().contains("None"),
                 "{name}: {diagnostic:?}"
             );
+        }
+    }
+
+    #[test]
+    fn output_groups_expose_file_depsets() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = r#"def inspect(target: Target, file: File):
+    OutputGroupInfo(listed=[file], tupled=(file,), nested=depset([file]))
+    groups = target[OutputGroupInfo]
+    named: list[File] = groups.custom.to_list()
+    indexed: list[File] = groups['custom'].to_list()
+    present: bool = 'custom' in groups
+    absent: bool = 42 in groups
+    if hasattr(groups, 'custom'):
+        groups.custom.to_list()[0].path
+    (named, indexed, present, absent)
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (statement, expected) in [
+            ("target[OutputGroupInfo][42]", "invalid-argument-type"),
+            (
+                "bad: list[str] = target[OutputGroupInfo].custom.to_list(); bad",
+                "invalid-assignment",
+            ),
+            (
+                "bad: list[str] = target[OutputGroupInfo]['custom'].to_list(); bad",
+                "invalid-assignment",
+            ),
+            ("OutputGroupInfo(custom=[42])", "invalid-argument-type"),
+            (
+                "OutputGroupInfo(custom=depset(['bad']))",
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(file, format!("{source}    {statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{statement}: {diagnostics:?}");
+            };
+            assert_eq!(
+                diagnostic.id().as_str(),
+                expected,
+                "{statement}: {diagnostic:?}"
+            );
+            assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
         }
     }
 
