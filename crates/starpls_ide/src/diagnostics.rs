@@ -479,7 +479,7 @@ example(name="omitted", tool="//:tool", _private=None)
         }
         for (name, expected) in [
             ("srcs", "select[list[Label] | None]"),
-            ("combined", "select[list[Unknown] | None]"),
+            ("combined", "select[list[Label | Unknown] | None]"),
         ] {
             let hover = analysis
                 .snapshot()
@@ -502,6 +502,10 @@ example(name="omitted", tool="//:tool", _private=None)
             ("bad = srcs # type: list[Label]", "invalid-assignment"),
             (
                 "bad = srcs # type: select[list[int] | None]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = combined # type: select[list[int] | None]",
                 "invalid-assignment",
             ),
             ("bad = tool # type: str", "invalid-assignment"),
@@ -681,10 +685,10 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
         for (name, expected) in [
             ("known_mixed", "select[list[str | int]]"),
             ("declared_mixed", "select[list[str | int]]"),
-            ("nullable_mixed", "select[list[Unknown | int] | None]"),
+            ("nullable_mixed", "select[list[str | int] | None]"),
             ("known_empty", "select[list[str | Unknown]]"),
             ("known_empty_left", "select[list[str | Unknown]]"),
-            ("nullable_empty", "select[list[Unknown] | None]"),
+            ("nullable_empty", "select[list[str | Unknown] | None]"),
             (
                 "mapping_empty",
                 "select[dict[str | Unknown, int | Unknown]]",
@@ -734,6 +738,14 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
             ),
             (
                 "bad = nullable_mixed # type: select[list[str] | None]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = nullable_mixed # type: select[list[int] | None]",
+                "invalid-assignment",
+            ),
+            (
+                "bad = nullable_empty # type: select[list[int] | None]",
                 "invalid-assignment",
             ),
             (

@@ -121,18 +121,16 @@ Python-only syntax is diagnosed and its containing statement is omitted from ana
 neighboring statements are still checked; names introduced only by an omitted statement remain
 undefined.
 
-Concatenating selectors with nullable container payloads can lose element
-types. For example:
+Selector concatenation preserves known element types through nullable payloads:
 
 ```python
 parts = select({"//:enabled": ["a"], "//conditions:default": None})
-combined = parts + [42]  # inferred: select[list[Unknown | int] | None]
+combined = parts + [42]  # inferred: select[list[str | int] | None]
 ```
 
-The `Unknown` element can allow incompatible assignments to escape checking.
-This also affects macro label-list parameters: a parameter can retain
-`select[list[Label] | None]` while concatenating it with `[]` produces
-`select[list[Unknown] | None]`.
+Empty containers can still contribute `Unknown`: `parts + []` produces
+`select[list[str | Unknown] | None]`. Concatenating a macro label-list parameter
+with `[]` similarly retains `Label` in `select[list[Label | Unknown] | None]`.
 
 ## Batch checking
 
