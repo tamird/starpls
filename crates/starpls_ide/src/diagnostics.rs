@@ -791,6 +791,63 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
     }
 
     #[test]
+    fn sets_preserve_elements_and_starlark_operations() {
+        let source = r#"numbers = set([1, 2])
+copied: set[int] = numbers.union()
+mixed: set[int | str] = numbers.union(['a'], {'b': 1})
+combined: set[int | str] = numbers | set(['a'])
+changed: set[int | str] = numbers ^ set(['a'])
+shared: set[int] = numbers & set(['a'])
+remaining: set[int] = numbers - set(['a'])
+intersected: set[int] = numbers.intersection([1], {1: 'one'})
+difference: set[int] = numbers.difference(['a'])
+symmetric: set[int | str] = numbers.symmetric_difference(['a'])
+elements: list[int] = list(numbers)
+element: int = numbers.pop()
+characters: set[str] = set('abc'.elems())
+characters.update('def'.elems())
+more_characters: set[str] = characters.union('ghi'.elems())
+numbers.add(3)
+numbers.update([4], {5: 'five'})
+numbers.difference_update(['a'])
+numbers.intersection_update([1, 2])
+numbers.symmetric_difference_update([1, 3])
+numbers |= set([4])
+numbers ^= set([5])
+numbers &= set(['a'])
+numbers -= set(['a'])
+wide: set[int | str] = set([1, 'a'])
+wide |= numbers
+wide ^= numbers
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for statement in [
+            "numbers.add('bad')",
+            "numbers.update(['bad'])",
+            "numbers |= set(['bad'])",
+            "numbers ^= set(['bad'])",
+            "numbers |= [1]",
+            "numbers | [1]",
+            "numbers < set([2])",
+            "numbers.copy()",
+            "set(elements=[1])",
+            "set('abc')",
+            "bad: set[str] = numbers.union()",
+            "bad: str = numbers.pop()",
+        ] {
+            analysis.update_file(file, format!("{source}{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{statement}: {diagnostics:?}");
+            };
+            assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+        }
+    }
+
+    #[test]
     fn min_and_max_preserve_comparable_element_types() {
         for name in ["min", "max"] {
             let source = format!(

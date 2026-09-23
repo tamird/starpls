@@ -3,7 +3,7 @@
 # https://github.com/bazelbuild/starlark/blob/master/spec.md#built-in-methods
 # Special methods encode operations for Ty and are omitted from completion.
 
-from typing import TYPE_CHECKING
+from typing import Collection, TYPE_CHECKING
 
 @final
 @disjoint_base
@@ -58,8 +58,8 @@ class str:
         """Return the string with its first character uppercase and the rest lowercase."""
     def count(self, sub: str, start: int | None = 0, end: int | None = None, /) -> int:
         """Count occurrences of sub within the selected string slice."""
-    def elems(self) -> Iterable[str]:
-        """Return an opaque iterable of successive one-character substrings."""
+    def elems(self) -> Sequence[str]:
+        """Return a sequence of successive one-character substrings."""
     def endswith(self, suffix: str | tuple[str, ...], start: int | None = 0, end: int | None = None, /) -> bool:
         """Test whether the selected slice ends with one of the supplied suffixes."""
     def find(self, sub: str, start: int | None = 0, end: int | None = None, /) -> int:
@@ -204,6 +204,70 @@ class list(Sequence[_T]):
         """Remove and return an element; fail if the index is out of range."""
     def remove(self, value: object, /) -> None:
         """Remove the first equal element, or fail when no element matches."""
+
+@disjoint_base
+class set(AbstractSet[_T]):
+    if TYPE_CHECKING:
+        __hash__: ClassVar[None]
+    @type_check_only
+    def __init__(self, elements: Iterable[_T] = (), /) -> None: ...
+    @type_check_only
+    def __len__(self) -> int: ...
+    @type_check_only
+    def __iter__(self) -> Iterator[_T]: ...
+    @type_check_only
+    def __contains__(self, value: object, /) -> bool: ...
+    @type_check_only
+    def __or__(self, other: set[_S], /) -> set[_T | _S]: ...
+    @type_check_only
+    def __ior__(self, other: AbstractSet[_T], /) -> Self: ...
+    @type_check_only
+    def __and__(self, other: set[_S], /) -> set[_T]: ...
+    @type_check_only
+    def __iand__(self, other: set[_S], /) -> Self: ...
+    @type_check_only
+    def __sub__(self, other: set[_S], /) -> set[_T]: ...
+    @type_check_only
+    def __isub__(self, other: set[_S], /) -> Self: ...
+    @type_check_only
+    def __xor__(self, other: set[_S], /) -> set[_T | _S]: ...
+    @type_check_only
+    def __ixor__(self, other: AbstractSet[_T], /) -> Self: ...
+    def add(self, value: _T, /) -> None:
+        """Add a value to the set."""
+    def clear(self) -> None:
+        """Remove every element from the set."""
+    def difference(self, *others: Collection[object]) -> set[_T]:
+        """Return a new set excluding elements found in the other collections."""
+    def difference_update(self, *others: Collection[object]) -> None:
+        """Remove elements found in the other collections."""
+    def discard(self, value: object, /) -> None:
+        """Remove a value if present."""
+    def intersection(self, *others: Collection[object]) -> set[_T]:
+        """Return a new set containing elements present in every collection."""
+    def intersection_update(self, *others: Collection[object]) -> None:
+        """Remove elements absent from any of the other collections."""
+    def isdisjoint(self, other: Collection[object], /) -> bool:
+        """Test whether the collections have no common elements."""
+    def issubset(self, other: Collection[object], /) -> bool:
+        """Test whether every element is present in the other collection."""
+    def issuperset(self, other: Collection[object], /) -> bool:
+        """Test whether every element of the other collection is present."""
+    def pop(self) -> _T:
+        """Remove and return the first element; fail if the set is empty."""
+    def remove(self, value: object, /) -> None:
+        """Remove a value, failing if it is absent."""
+    def symmetric_difference(self, other: Collection[_S], /) -> set[_T | _S]:
+        """Return a new set of elements present in exactly one collection."""
+    def symmetric_difference_update(self, other: Collection[_T], /) -> None:
+        """Keep elements present in exactly one of the two collections."""
+    @overload
+    def union(self) -> set[_T]:
+        """Return a new set containing elements from every collection."""
+    @overload
+    def union(self, other: Collection[_S], /, *others: Collection[_S]) -> set[_T | _S]: ...
+    def update(self, *others: Collection[_T]) -> None:
+        """Add elements from the other collections."""
 
 @disjoint_base
 class dict(Mapping[_KT, _VT]):

@@ -367,7 +367,7 @@ element = values.pop()
             ("items", "list[tuple[str, int]]"),
             ("keys", "list[str]"),
             ("results", "list[int]"),
-            ("elements", "Iterable[str]"),
+            ("elements", "Sequence[str]"),
             ("split", "list[str]"),
             ("reverse_split", "list[str]"),
             ("offset", "int"),

@@ -80,6 +80,7 @@ pub const BUILTINS_VALUES_DENY_LIST: &[&str] = &[
     "range",
     "repr",
     "reversed",
+    "set",
     "sorted",
     "str",
     "tuple",

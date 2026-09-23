@@ -175,6 +175,7 @@ fn declarations(
                     | "int"
                     | "list"
                     | "range"
+                    | "set"
                     | "string"
                     | "tuple"
                     | "None"

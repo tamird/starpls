@@ -715,7 +715,9 @@ mod tests {
     #[test]
     fn native_annotation_completions_use_the_type_namespace() {
         let mut failures = Vec::new();
-        let types = &["Info", "Label", "list", "str", "string", "Sequence", "None"][..];
+        let types = &[
+            "Info", "Label", "list", "set", "str", "string", "Sequence", "None",
+        ][..];
         for (expression, expected) in [
             ("def f(value: $0): pass", types),
             ("def f() -> $0: pass", types),
@@ -760,6 +762,43 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn set_members_follow_starlark() {
+        let (analysis, fixture) = Analysis::from_single_file_fixture("set([1]).$0");
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let items = analysis
+            .snapshot()
+            .completions(FilePosition { file_id, pos }, None)
+            .unwrap()
+            .unwrap();
+        let mut names = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "add",
+                "clear",
+                "difference",
+                "difference_update",
+                "discard",
+                "intersection",
+                "intersection_update",
+                "isdisjoint",
+                "issubset",
+                "issuperset",
+                "pop",
+                "remove",
+                "symmetric_difference",
+                "symmetric_difference_update",
+                "union",
+                "update",
+            ]
+        );
     }
 
     #[test]
@@ -1306,6 +1345,7 @@ $0
                 CompletionItem { label: "repr", kind: Function, mode: None, filter_text: None, relevance: Builtin }
                 CompletionItem { label: "reversed", kind: Function, mode: None, filter_text: None, relevance: Builtin }
                 CompletionItem { label: "rule", kind: Function, mode: None, filter_text: None, relevance: Builtin }
+                CompletionItem { label: "set", kind: Function, mode: None, filter_text: None, relevance: Builtin }
                 CompletionItem { label: "sorted", kind: Function, mode: None, filter_text: None, relevance: Builtin }
                 CompletionItem { label: "str", kind: Function, mode: None, filter_text: None, relevance: Builtin }
                 CompletionItem { label: "struct", kind: Function, mode: None, filter_text: None, relevance: Builtin }
