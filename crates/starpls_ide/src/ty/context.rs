@@ -222,7 +222,13 @@ pub(super) fn parameter_type<'db>(
                 }
                 Type::unknown()
             } else if repository {
-                attribute_type(&attribute?.kind)?
+                let attribute = attribute?;
+                if attribute.kind == AttributeKind::Label && attribute.has_non_none_value() {
+                    factory::native_class(db, declarations, "Label")?
+                        .to_instance_approximation(db, &environment)?
+                } else {
+                    attribute_type(&attribute.kind)?
+                }
             } else {
                 let Some(ty) = field_type(db, &environment, declarations, view, attribute?) else {
                     continue;
@@ -807,32 +813,83 @@ example = rule(implementation=implementation, attrs={
     }
 
     #[test]
+    fn repository_labels_preserve_required_and_optional_values() {
+        let source = r#"def implementation(ctx):
+    ctx.read(ctx.attr.required)
+    ctx.attr.required.name
+    ctx.read(ctx.attr.defaulted)
+    ctx.attr.defaulted.name
+    ctx.attr.label_default.name
+    if ctx.attr.optional != None:
+        ctx.read(ctx.attr.optional)
+    ctx.attr.optional.name
+example = repository_rule(implementation=implementation, attrs={
+    "required": attr.label(mandatory=True),
+    "defaulted": attr.label(default="//:input"),
+    "label_default": attr.label(default=Label("//:input")),
+    "optional": attr.label(),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let snapshot = analysis.snapshot();
+        for (name, expected) in [
+            ("required", "Label"),
+            ("defaulted", "Label"),
+            ("label_default", "Label"),
+            ("optional", "Label | None"),
+        ] {
+            check_field(
+                &snapshot,
+                file,
+                source,
+                &format!("ctx.attr.{name}"),
+                expected,
+                &format!("\"{name}\""),
+            );
+        }
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+        assert_eq!(
+            usize::from(diagnostic.range().unwrap().start()),
+            source.find("ctx.attr.optional.name").unwrap()
+        );
+    }
+
+    #[test]
     fn context_presence_tracks_default_only_edits() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         enable_context(&mut analysis);
         let file = fixture.main_file();
-        for (default, expected, errors) in [
+        for (factory, access, present) in [
             (
-                "None   ",
-                "Target[FilesToRunProvider[File | None] | None] | None",
-                1,
-            ),
-            (
-                "'//:x' ",
+                "rule",
+                "[DefaultInfo]",
                 "Target[FilesToRunProvider[File | None] | None]",
-                0,
             ),
-            (
-                "None   ",
-                "Target[FilesToRunProvider[File | None] | None] | None",
-                1,
-            ),
+            ("repository_rule", ".name", "Label"),
         ] {
-            let source = format!("DEFAULT = {default}\ndef implementation(ctx):\n    ctx.attr.dep[DefaultInfo]\nexample = rule(implementation=implementation, attrs={{'dep': attr.label(default=DEFAULT)}})\n");
-            analysis.update_file(file, source.clone());
-            let snapshot = analysis.snapshot();
-            check_field(&snapshot, file, &source, "ctx.attr.dep", expected, "'dep'");
-            assert_eq!(snapshot.diagnostics(file).unwrap().len(), errors);
+            for (default, optional) in [("None   ", true), ("'//:x' ", false), ("None   ", true)] {
+                let source = format!("DEFAULT = {default}\ndef implementation(ctx):\n    ctx.attr.dep{access}\nexample = {factory}(implementation=implementation, attrs={{'dep': attr.label(default=DEFAULT)}})\n");
+                analysis.update_file(file, source.clone());
+                let snapshot = analysis.snapshot();
+                let expected = if optional {
+                    format!("{present} | None")
+                } else {
+                    present.to_owned()
+                };
+                check_field(&snapshot, file, &source, "ctx.attr.dep", &expected, "'dep'");
+                let diagnostics = snapshot.diagnostics(file).unwrap();
+                assert_eq!(
+                    diagnostics.len(),
+                    usize::from(optional),
+                    "{factory}: {diagnostics:?}"
+                );
+            }
         }
     }
 
