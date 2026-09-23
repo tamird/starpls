@@ -104,13 +104,11 @@ impl RuleData {
                 UnionType::from_elements(db, environment, [value, selected])
             }
         };
-        Some(
-            if !attribute.mandatory && attribute.default_value != DefaultValue::NonNone {
-                UnionType::from_elements(db, environment, [value, none])
-            } else {
-                value
-            },
-        )
+        Some(if !attribute.has_non_none_value() {
+            UnionType::from_elements(db, environment, [value, none])
+        } else {
+            value
+        })
     }
 }
 
@@ -135,6 +133,10 @@ pub(super) enum Configurability {
 }
 
 impl Attribute {
+    pub(super) fn has_non_none_value(&self) -> bool {
+        self.mandatory || self.default_value == DefaultValue::NonNone
+    }
+
     fn configurable(&self) -> Option<bool> {
         if matches!(self.kind, AttributeKind::Output | AttributeKind::OutputList) {
             return Some(false);

@@ -358,12 +358,19 @@ fn field_type<'db>(
         |key, value| KnownClass::Dict.to_specialized_instance(db, environment, &[key, value]);
     let optional =
         |ty| UnionType::from_elements(db, environment, [ty, Type::none(db, environment)]);
+    let present = |ty| {
+        if attribute.has_non_none_value() {
+            ty
+        } else {
+            optional(ty)
+        }
+    };
     let optional_file = |enabled| {
         if attribute.kind != AttributeKind::Label {
             return None;
         }
         match enabled {
-            Some(true) => Some(optional(native("File")?)),
+            Some(true) => Some(present(native("File")?)),
             Some(false) => None,
             None => Some(Type::unknown()),
         }
@@ -374,8 +381,11 @@ fn field_type<'db>(
                 match attribute.configuration {
                     AttributeConfiguration::Starlark => return Some(list(native("Target")?)),
                     AttributeConfiguration::Unknown => return Some(Type::unknown()),
-                    AttributeConfiguration::Ordinary => {}
+                    AttributeConfiguration::Ordinary => return Some(present(native("Target")?)),
                 }
+            }
+            if attribute.kind == AttributeKind::Output {
+                return Some(present(native("Label")?));
             }
             factory::attribute_value_type(
                 db,
@@ -391,7 +401,7 @@ fn field_type<'db>(
         View::File => optional_file(attribute.single_file),
         View::Executable => optional_file(attribute.executable),
         View::Outputs => match attribute.kind {
-            AttributeKind::Output => Some(optional(native("File")?)),
+            AttributeKind::Output => Some(present(native("File")?)),
             AttributeKind::OutputList => Some(list(native("File")?)),
             _ => None,
         },
@@ -612,6 +622,89 @@ example = macro(implementation=implementation, attrs={{
                 "str",
                 "",
             );
+        }
+    }
+
+    #[test]
+    fn required_and_defaulted_context_values_are_present() {
+        let source = r#"def computed(name):
+    return None
+def implementation(ctx):
+    ctx.attr.required[DefaultInfo]
+    ctx.attr.defaulted[DefaultInfo]
+    ctx.file.required.basename
+    ctx.file.defaulted.basename
+    ctx.executable.tool.path
+    ctx.attr.output.name
+    ctx.outputs.output.path
+    ctx.actions.run(executable=ctx.executable.tool, outputs=[])
+    ctx.attr.optional[DefaultInfo]
+    ctx.file.optional.basename
+    ctx.executable.optional_tool.path
+    ctx.attr.computed[DefaultInfo]
+example = rule(implementation=implementation, attrs={
+    "required": attr.label(mandatory=True, allow_single_file=True),
+    "defaulted": attr.label(default="//:input", allow_single_file=True),
+    "tool": attr.label(default=Label("//:tool"), executable=True, cfg="exec"),
+    "output": attr.output(mandatory=True),
+    "optional": attr.label(allow_single_file=True),
+    "optional_tool": attr.label(executable=True, cfg="exec"),
+    "computed": attr.label(default=computed),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let snapshot = analysis.snapshot();
+        for (expression, expected, key) in [
+            ("ctx.attr.required", "Target", "\"required\""),
+            ("ctx.attr.defaulted", "Target", "\"defaulted\""),
+            ("ctx.file.required", "File", "\"required\""),
+            ("ctx.file.defaulted", "File", "\"defaulted\""),
+            ("ctx.executable.tool", "File", "\"tool\""),
+            ("ctx.attr.output", "Label", "\"output\""),
+            ("ctx.outputs.output", "File", "\"output\""),
+            ("ctx.attr.optional", "Target | None", "\"optional\""),
+            ("ctx.file.optional", "File | None", "\"optional\""),
+            (
+                "ctx.executable.optional_tool",
+                "File | None",
+                "\"optional_tool\"",
+            ),
+            ("ctx.attr.computed", "Target | None", "\"computed\""),
+        ] {
+            check_field(&snapshot, file, source, expression, expected, key);
+        }
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        for diagnostic in diagnostics {
+            let range = diagnostic.range().unwrap();
+            assert!(
+                usize::from(range.start()) >= source.find("    ctx.attr.optional").unwrap(),
+                "{diagnostic:?}"
+            );
+            assert!(
+                usize::from(range.end()) < source.find("example =").unwrap(),
+                "{diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_presence_tracks_default_only_edits() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        for (default, expected, errors) in [
+            ("None   ", "Target | None", 1),
+            ("'//:x' ", "Target", 0),
+            ("None   ", "Target | None", 1),
+        ] {
+            let source = format!("DEFAULT = {default}\ndef implementation(ctx):\n    ctx.attr.dep[DefaultInfo]\nexample = rule(implementation=implementation, attrs={{'dep': attr.label(default=DEFAULT)}})\n");
+            analysis.update_file(file, source.clone());
+            let snapshot = analysis.snapshot();
+            check_field(&snapshot, file, &source, "ctx.attr.dep", expected, "'dep'");
+            assert_eq!(snapshot.diagnostics(file).unwrap().len(), errors);
         }
     }
 
