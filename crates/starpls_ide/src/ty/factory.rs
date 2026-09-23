@@ -152,6 +152,25 @@ impl Attribute {
 #[derive(Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
 struct StarlarkTransition;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(super) enum BuildSetting {
+    Bool,
+    Int,
+    String,
+    StringList,
+}
+
+impl BuildSetting {
+    fn attribute_kind(self) -> AttributeKind {
+        match self {
+            Self::Bool => AttributeKind::Bool,
+            Self::Int => AttributeKind::Int,
+            Self::String => AttributeKind::String,
+            Self::StringList => AttributeKind::StringList,
+        }
+    }
+}
+
 impl get_size2::GetSize for Attribute {
     fn get_heap_size(&self) -> usize {
         self.documentation.as_ref().map_or(0, |doc| doc.len())
@@ -203,6 +222,7 @@ fn doc_string(db: &Database, call: &CheckedCall<'_, '_>) -> Option<Box<str>> {
 
 pub(super) enum Factory {
     Attribute(AttributeKind),
+    BuildSetting(BuildSetting),
     Rule { repository: bool },
     Macro,
     Struct,
@@ -223,20 +243,35 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
     };
     let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
     let function = function.node(&parsed);
-    let attr_method = parsed.suite().iter().any(|statement| {
+    let namespace = parsed.suite().iter().find_map(|statement| {
         let Stmt::ClassDef(namespace) = statement else {
-            return false;
+            return None;
         };
-        namespace.name.as_str() == "_starpls_types"
-            && namespace.body.iter().any(|statement| {
-                let Stmt::ClassDef(class) = statement else {
-                    return false;
-                };
-                class.name.as_str() == "attr" && class.range().contains_range(function.range())
-            })
+        if namespace.name.as_str() != "_starpls_types" {
+            return None;
+        }
+        namespace.body.iter().find_map(|statement| {
+            let Stmt::ClassDef(class) = statement else {
+                return None;
+            };
+            class
+                .range()
+                .contains_range(function.range())
+                .then_some(class.name.as_str())
+        })
     });
-    if attr_method {
-        return attribute_kind(function.name.as_str()).map(Factory::Attribute);
+    match namespace {
+        Some("attr") => return attribute_kind(function.name.as_str()).map(Factory::Attribute),
+        Some("config") => {
+            return Some(Factory::BuildSetting(match function.name.as_str() {
+                "bool" => BuildSetting::Bool,
+                "int" => BuildSetting::Int,
+                "string" => BuildSetting::String,
+                "string_list" => BuildSetting::StringList,
+                _ => return None,
+            }));
+        }
+        _ => {}
     }
     // A same-named method is not the global factory declaration.
     if !parsed.suite().iter().any(|statement| {
@@ -261,6 +296,9 @@ pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<
 pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
     match declaration(db, call.declaration()?)? {
         Factory::Attribute(kind) => attribute(db, call, kind),
+        Factory::BuildSetting(kind) => {
+            descriptor(db, call, "BuildSetting", ProvidedData::new(kind))
+        }
         Factory::Rule { repository } => rule(
             db,
             call,
@@ -273,24 +311,36 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
         Factory::Macro => rule(db, call, RuleKind::Macro),
         Factory::Struct => structure(db, call),
         Factory::Provider => provider(db, call),
-        Factory::Transition => {
-            let environment = ProgramEnvironment::from_file(call.file());
-            call.class_type(
-                db,
-                ProvidedClass {
-                    name: Name::new("transition"),
-                    bases: declared_base(db, call, "transition"),
-                    class_members: Box::default(),
-                    instance_fields: ProvidedInstanceFields {
-                        fields: Box::default(),
-                        has_dynamic_fields: false,
-                        data: Some(ProvidedData::new(StarlarkTransition)),
-                    },
-                },
-            )
-            .to_instance_approximation(db, &environment)
-        }
+        Factory::Transition => descriptor(
+            db,
+            call,
+            "transition",
+            ProvidedData::new(StarlarkTransition),
+        ),
     }
+}
+
+fn descriptor<'db>(
+    db: &'db Database,
+    call: &CheckedCall<'_, 'db>,
+    name: &str,
+    data: ProvidedData,
+) -> Option<Type<'db>> {
+    let environment = ProgramEnvironment::from_file(call.file());
+    call.class_type(
+        db,
+        ProvidedClass {
+            name: Name::new(name),
+            bases: declared_base(db, call, name),
+            class_members: Box::default(),
+            instance_fields: ProvidedInstanceFields {
+                fields: Box::default(),
+                has_dynamic_fields: false,
+                data: Some(data),
+            },
+        },
+    )
+    .to_instance_approximation(db, &environment)
 }
 
 fn attribute_kind(name: &str) -> Option<AttributeKind> {
@@ -420,30 +470,22 @@ fn attribute<'db>(
         },
         CheckedArgument::Indeterminate => Configurability::Unknown,
     };
-    let class = call.class_type(
+    descriptor(
         db,
-        ProvidedClass {
-            name: Name::new("Attribute"),
-            bases: declared_base(db, call, "Attribute"),
-            class_members: Box::default(),
-            instance_fields: ProvidedInstanceFields {
-                fields: Box::default(),
-                has_dynamic_fields: false,
-                data: Some(ProvidedData::new(Attribute {
-                    kind,
-                    single_file,
-                    executable: flag("executable"),
-                    configuration,
-                    configurability,
-                    mandatory,
-                    default,
-                    default_value,
-                    documentation: doc_string(db, call),
-                })),
-            },
-        },
-    );
-    class.to_instance_approximation(db, &environment)
+        call,
+        "Attribute",
+        ProvidedData::new(Attribute {
+            kind,
+            single_file,
+            executable: flag("executable"),
+            configuration,
+            configurability,
+            mandatory,
+            default,
+            default_value,
+            documentation: doc_string(db, call),
+        }),
+    )
 }
 
 enum RuleKind {
@@ -457,7 +499,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     let common = starpls_bazel::attr::make_common_attributes();
     let inherit_common = matches!(call.argument("inherit_attrs"), CheckedArgument::Value { ty, expression: _ }
         if ty.string_literal_value(db) == Some("common"));
-    let common = match kind {
+    let mut common = match kind {
         RuleKind::Build => common.build,
         RuleKind::Repository => common.repository,
         RuleKind::Macro => common
@@ -468,6 +510,44 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             })
             .collect(),
     };
+    let build_setting = if matches!(kind, RuleKind::Build) {
+        match call.argument("build_setting") {
+            CheckedArgument::Omitted => None,
+            CheckedArgument::Value { ty, expression: _ } => (!ty.is_none(db)).then_some(ty),
+            CheckedArgument::Indeterminate => Some(Type::unknown()),
+        }
+    } else {
+        None
+    };
+    let setting_kind = build_setting.and_then(|ty| {
+        let data = ty.provided_data(db, &environment)?;
+        data.downcast_ref::<BuildSetting>().copied()
+    });
+    if let Some(setting_kind) = setting_kind {
+        for (name, attribute_kind, doc, mandatory) in [
+            (
+                "build_setting_default",
+                setting_kind.attribute_kind(),
+                "Default value of this build setting.",
+                true,
+            ),
+            (
+                "help",
+                AttributeKind::String,
+                "Help text for this build setting.",
+                false,
+            ),
+        ] {
+            common.push(starpls_bazel::attr::Attribute {
+                name: name.to_owned(),
+                r#type: attribute_kind,
+                doc: doc.to_owned(),
+                default_value: String::new(),
+                is_mandatory: mandatory,
+                configurable: false,
+            });
+        }
+    }
     let mut documentation = Documentation {
         text: doc_string(db, call),
         parameters: common
@@ -526,6 +606,20 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    if build_setting.is_some() && setting_kind.is_none() {
+        // An unresolved descriptor may be None. Admit its possible attributes
+        // without weakening other attributes or accepting arbitrary keywords.
+        for name in ["build_setting_default", "help"] {
+            let name = Name::new(name);
+            attributes.push(RuleAttribute {
+                parameter: Some(
+                    Parameter::keyword_only(name.clone()).with_default_type(Type::unknown()),
+                ),
+                name,
+                descriptor: None,
+            });
+        }
+    }
     let mut complete = !matches!(kind, RuleKind::Macro)
         || inherit_common
         || inherit_macro_attributes(db, call, &mut attributes, &mut documentation);
@@ -572,6 +666,10 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         let source = FileRange::new(call.file().file(db), source);
         let name = name.as_str();
         if matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility") {
+            continue;
+        }
+        if setting_kind.is_some() && matches!(name, "build_setting_default" | "help") {
+            // Bazel rejects declarations that collide with generated attributes.
             continue;
         }
         documentation
@@ -1331,6 +1429,225 @@ mod tests {
     use super::*;
     use crate::Analysis;
     use crate::FilePosition;
+
+    #[test]
+    fn loaded_build_settings_check_defaults_after_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let settings = fixture.add_file(&mut analysis.db, "//:settings.bzl", "");
+        fixture.add_file(
+            &mut analysis.db,
+            "//:defs.bzl",
+            r#"
+load("//:settings.bzl", "setting")
+def implementation(ctx): pass
+typed_rule = rule(implementation, build_setting=setting, attrs={"extra": attr.int()})
+"#,
+        );
+        let caller = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            "",
+            starpls_common::Dialect::Bazel,
+            Some(starpls_common::FileInfo::Bazel {
+                api_context: starpls_bazel::APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        for (factory, options, valid, invalid) in [
+            ("bool", "flag=True", "True", "\"yes\""),
+            ("int", "", "42", "\"42\""),
+            ("string", "allow_multiple=True", "\"value\"", "[\"value\"]"),
+            (
+                "string_list",
+                "flag=True, repeatable=True",
+                "[\"value\"]",
+                "[42]",
+            ),
+        ] {
+            analysis.update_file(
+                settings,
+                format!("make = config.{factory}\nsetting = make({options})\n"),
+            );
+            for (arguments, expected) in [
+                (
+                    format!("build_setting_default={valid}, help=\"description\", extra=1"),
+                    None,
+                ),
+                (
+                    format!("build_setting_default={invalid}"),
+                    Some("invalid-argument-type"),
+                ),
+                (String::new(), Some("missing-argument")),
+                (
+                    "build_setting_default=None".to_owned(),
+                    Some("invalid-argument-type"),
+                ),
+                (
+                    format!("build_setting_default=select({{\"//conditions:default\": {valid}}})"),
+                    Some("invalid-argument-type"),
+                ),
+                (
+                    format!("build_setting_default={valid}, help=1"),
+                    Some("invalid-argument-type"),
+                ),
+                (
+                    format!("build_setting_default={valid}, help=select({{\"//conditions:default\": \"text\"}})"),
+                    Some("invalid-argument-type"),
+                ),
+                (
+                    format!("build_setting_default={valid}, extra=\"bad\""),
+                    Some("invalid-argument-type"),
+                ),
+            ] {
+                analysis.update_file(caller, format!("load(\"//:defs.bzl\", \"typed_rule\")\ntyped_rule(name=\"value\", {arguments})\n"));
+                let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+                let ids: Vec<_> = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{factory}({options}), {arguments}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_build_settings_preserve_known_attributes() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            r#"
+def implementation(ctx): pass
+def make(setting):
+    target = rule(implementation, build_setting=setting, attrs={"extra": attr.int()})
+    target(name="omitted")
+    target(name="supplied", build_setting_default=True, help="description")
+    target(name="bad", extra="bad")
+    target(name="unknown", unrelated=1)
+ordinary = rule(implementation, build_setting=None)
+ordinary(name="bad", build_setting_default=True)
+ordinary(name="bad_help", help="description")
+def with_own_attributes(setting):
+    target = rule(implementation, build_setting=setting, attrs={"help": attr.int(), "build_setting_default": attr.string()})
+    target(name="valid", help=1, build_setting_default="value")
+    target(name="bad", help="text")
+def bool():
+    # type: () -> None
+    return None
+config = struct(bool=bool)
+shadowed = rule(implementation, build_setting=config.bool())
+shadowed(name="bad", build_setting_default=True)
+"#,
+        );
+        let snapshot = analysis.snapshot();
+        let mut diagnostics = snapshot.diagnostics(file).unwrap();
+        diagnostics
+            .sort_by_key(|diagnostic| diagnostic.primary_span().unwrap().range().unwrap().start());
+        let ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "invalid-argument-type",
+                "unknown-argument",
+                "unknown-argument",
+                "unknown-argument",
+                "invalid-argument-type",
+                "unknown-argument"
+            ],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn build_settings_supply_inherited_signatures() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            r#"
+def implementation(ctx): pass
+def macro_impl(name, visibility, **kwargs): pass
+setting = rule(implementation, build_setting=config.string_list())
+inherited = macro(implementation=macro_impl, inherit_attrs=setting)
+inherited(name="valid", build_setting_default=("a", "b"))
+inherited(name="missing")
+inherited(name="selected", build_setting_default=select({"//conditions:default": ["a"]}))
+inherited(name="wrong_help", build_setting_default=[], help=1)
+inherited(name="signature", build_setting_default=$0[])
+"#,
+        );
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let snapshot = analysis.snapshot();
+        let help = snapshot
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        let parameters = signature.parameters.as_ref().unwrap();
+        let default = parameters
+            .iter()
+            .find(|parameter| parameter.label.starts_with("build_setting_default:"))
+            .unwrap();
+        assert_eq!(default.label, "build_setting_default: Iterable[str]");
+        assert_eq!(
+            default.documentation.as_deref(),
+            Some("Default value of this build setting.")
+        );
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        let ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "missing-argument",
+                "invalid-argument-type",
+                "invalid-argument-type"
+            ],
+            "{diagnostics:?}"
+        );
+    }
 
     #[test]
     fn factories_keep_identity_and_callable_fields() {

@@ -119,6 +119,7 @@ pub(super) fn parameter_type<'db>(
         }
         Factory::Rule { repository } => repository,
         Factory::Attribute(_) => return None,
+        Factory::BuildSetting(_) => return None,
         Factory::Struct => return None,
         Factory::Provider => return None,
         Factory::Transition => return None,
