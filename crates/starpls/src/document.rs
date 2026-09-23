@@ -88,11 +88,11 @@ pub(crate) const DEPENDENCY_FILES: [&str; 7] = [
     ".bazelversion",
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum RepositoryFetch {
     Pending,
     Ready,
-    Failed,
+    Failed(String),
 }
 
 enum RepositoryMapping {
@@ -393,16 +393,15 @@ impl DefaultFileLoader {
     pub(crate) fn finish_fetch(
         &self,
         repositories: impl IntoIterator<Item = String>,
-        success: bool,
+        result: Result<(), String>,
     ) {
-        let state = if success {
-            RepositoryFetch::Ready
-        } else {
-            RepositoryFetch::Failed
+        let state = match result {
+            Ok(()) => RepositoryFetch::Ready,
+            Err(error) => RepositoryFetch::Failed(error),
         };
         self.repository_fetches
             .write()
-            .extend(repositories.into_iter().map(|name| (name, state)));
+            .extend(repositories.into_iter().map(|name| (name, state.clone())));
     }
 
     fn document_context(
@@ -588,14 +587,18 @@ impl DefaultFileLoader {
         if repository.name.is_empty() {
             return Ok(());
         }
-        if self.bzlmod_enabled {
-            self.bazel_client.fetch_repo(&repository.name)?;
+        let result = if self.bzlmod_enabled {
+            self.bazel_client.fetch_repo(&repository.name)
         } else {
             self.bazel_client
-                .null_query_external_repo_targets(&repository.name)?;
-        }
-        self.finish_fetch([repository.name.clone()], true);
-        Ok(())
+                .null_query_external_repo_targets(&repository.name)
+        };
+        let outcome = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!("{error:#}")),
+        };
+        self.finish_fetch([repository.name.clone()], outcome);
+        result
     }
 
     pub(crate) fn selected_module(
@@ -645,6 +648,10 @@ impl DefaultFileLoader {
                 }
             }
         };
+        self.canonical_repository(name)
+    }
+
+    pub(crate) fn canonical_repository(&self, name: String) -> anyhow::Result<Repository> {
         let root = if name.is_empty() {
             self.workspace.clone()
         } else {
@@ -777,9 +784,22 @@ impl DefaultFileLoader {
     }
 
     fn ensure_repository(&self, repository: &Repository) -> anyhow::Result<()> {
+        let fetches = self.repository_fetches.read();
+        if let Some(RepositoryFetch::Failed(error)) = fetches.get(&repository.name) {
+            // Legacy query --keep_going can materialize the repository despite
+            // errors in unrelated packages. The editor still requires a ready
+            // repository after configuration changes.
+            if !self.bzlmod_enabled
+                && self.configuration_revision.is_none()
+                && repository.root.is_dir()
+            {
+                return Ok(());
+            }
+            bail!("failed to fetch repository @@{}: {error}", repository.name);
+        }
         if !repository.name.is_empty()
             && self.configuration_revision.is_some()
-            && self.repository_fetches.read().get(&repository.name) != Some(&RepositoryFetch::Ready)
+            && fetches.get(&repository.name) != Some(&RepositoryFetch::Ready)
         {
             let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
                 FetchExternalRepoRequest {
@@ -841,7 +861,7 @@ impl DefaultFileLoader {
             {
                 if !canonical_repo.is_empty()
                     && self.external_output_base.as_ref().is_some_and(|base| {
-                        !base.join(&canonical_repo).try_exists().unwrap_or(false)
+                        matches!(base.join(&canonical_repo).try_exists(), Ok(false))
                     })
                 {
                     let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
@@ -1307,6 +1327,10 @@ pub(crate) mod source_tests {
     pub(crate) struct TestBazelClient {
         pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
         pub(crate) mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
+        pub(crate) fetch_requests: std::sync::Mutex<Vec<String>>,
+        pub(crate) fetch_files:
+            std::sync::Mutex<std::collections::HashMap<String, (std::path::PathBuf, String)>>,
+        pub(crate) fetch_failures: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl starpls_bazel::client::BazelClient for TestBazelClient {
@@ -1323,11 +1347,23 @@ pub(crate) mod source_tests {
             unimplemented!()
         }
         fn fetch_repo(&self, repo: &str) -> anyhow::Result<()> {
+            self.fetch_requests.lock().unwrap().push(repo.to_owned());
+            if let Some((path, contents)) = self.fetch_files.lock().unwrap().remove(repo) {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(path, contents)?;
+            }
+            if let Some(error) = self.fetch_failures.lock().unwrap().get(repo) {
+                anyhow::bail!("{error}");
+            }
             if repo == "rules+" {
                 if let Some((link, target)) = self.retarget.lock().unwrap().take() {
                     #[cfg(unix)]
                     {
-                        std::fs::remove_file(&link)?;
+                        if let Err(error) = std::fs::remove_file(&link) {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                return Err(error.into());
+                            }
+                        }
                         std::os::unix::fs::symlink(target, link)?;
                     }
                     #[cfg(not(unix))]

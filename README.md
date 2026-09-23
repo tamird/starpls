@@ -135,17 +135,26 @@ sources and `.bzli` interfaces and records other inputs as exclusions.
 Recursive discovery stops at nested repository roots. Explicit paths use
 their existing repository context, including Bazel's external directory.
 
-`--progress` reports load discovery, repository mapping batches, and file
-checking on stderr. The JSON report separates selected files, completed
-checks, loaded dependencies, exclusions, input failures, and unresolved
-loads. Configured implementation validation adds its checked source files
-to the completed checks. Repository names are canonical; the empty name
-denotes the main repository, and `null` denotes a source without a known
-Bazel repository context.
+Load discovery fetches missing external repositories through Bazel and
+retries their dependencies. Each repository is attempted once; missing
+files within an existing repository remain load failures.
+
+`--progress` reports load discovery, repository mapping batches, fetches,
+and file checking on stderr. The JSON report separates selected files,
+completed checks, loaded dependencies, exclusions, input failures, and
+unresolved loads. Configured implementation validation adds its checked
+source files to the completed checks. Repository names are canonical;
+the empty name denotes the main repository, and `null` denotes a source
+without a known Bazel repository context.
 
 `complete` means every selected file was checked and every discovered load
 resolved. Deliberate scope exclusions appear separately. Type errors,
 failed input paths, and unresolved loads produce a failing exit status.
+Failed Bzlmod fetches leave coverage incomplete, even if they created
+partial files. Without Bzlmod, a best-effort repository query may report
+unrelated package errors after creating readable sources; coverage then
+depends on whether the requested loads resolve. Native errors appear on
+stderr in either case.
 
 ## Stub files
 

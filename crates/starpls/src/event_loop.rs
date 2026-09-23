@@ -380,8 +380,11 @@ impl Server {
                         self.is_fetching_repos = false;
                         if revision == self.configuration.revision {
                             self.analysis.invalidate_loads();
-                            self.loader.finish_fetch(fetched, true);
-                            self.loader.finish_fetch(failed_repos.clone(), false);
+                            self.loader.finish_fetch(fetched, Ok(()));
+                            self.loader.finish_fetch(
+                                failed_repos.clone(),
+                                Err("Bazel repository fetch failed; see the server log".to_owned()),
+                            );
                             self.invalidate_diagnostics();
                             if self.open_repository_changed() {
                                 if let Err(error) = self.reload_configuration() {
@@ -932,7 +935,7 @@ mod tests {
             finish_reload(&mut server);
             server
                 .loader
-                .finish_fetch(["dep+".to_owned(), "child+".to_owned()], true);
+                .finish_fetch(["dep+".to_owned(), "child+".to_owned()], Ok(()));
             server
                 .open_document(&source, std::fs::read_to_string(&source).unwrap(), 1)
                 .unwrap();
@@ -1293,6 +1296,9 @@ mod tests {
             std::os::unix::fs::symlink(&old, external.join("rules+")).unwrap();
             std::os::unix::fs::symlink(&helper, external.join("helper+")).unwrap();
             server.bazel_client = Arc::new(crate::document::source_tests::TestBazelClient {
+                fetch_requests: Default::default(),
+                fetch_files: Default::default(),
+                fetch_failures: Default::default(),
                 retarget: std::sync::Mutex::new(
                     during_fetch.then(|| (external.join("rules+"), new.clone())),
                 ),

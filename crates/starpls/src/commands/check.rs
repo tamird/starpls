@@ -30,6 +30,8 @@ use crate::commands::InferenceOptions;
 use crate::document::is_ignored_name;
 use crate::document::DefaultFileLoader;
 use crate::document::{self};
+use crate::event_loop::FetchExternalRepoRequest;
+use crate::event_loop::Task;
 use crate::server::load_bazel_builtins;
 
 #[derive(Args, Default)]
@@ -84,6 +86,189 @@ mod tests {
     use crate::document::source_tests::TestBazelClient;
     use crate::document::DefaultFileLoader;
 
+    fn fetch_checker(
+        name: &str,
+        bzlmod_enabled: bool,
+    ) -> (Checker, Arc<TestBazelClient>, std::path::PathBuf) {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(name);
+        let external = root.join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let source = if bzlmod_enabled {
+            "load('@rules//:defs.bzl', 'value')\nprint(value)\n"
+        } else {
+            "load('@rules+//:defs.bzl', 'value')\nprint(value)\n"
+        };
+        let paths = ["BUILD", "second.bzl"].map(|name| {
+            let path = root.join(name);
+            std::fs::write(&path, source).unwrap();
+            path.to_str().unwrap().to_owned()
+        });
+        let client = Arc::new(TestBazelClient::default());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let loader = DefaultFileLoader::new(
+            client.clone(),
+            root.clone(),
+            None,
+            external.clone(),
+            sender,
+            bzlmod_enabled,
+        );
+        let info = starpls_bazel::client::BazelInfo {
+            workspace: root,
+            ..Default::default()
+        };
+        let options = CheckCommand::default();
+        let (analysis, loader) = options
+            .prepare_analysis(loader, &info, Default::default())
+            .unwrap();
+        let checker = Checker::new(
+            analysis,
+            info,
+            paths.to_vec(),
+            &[],
+            loader,
+            receiver,
+            &options,
+        )
+        .unwrap();
+        (checker, client, external)
+    }
+
+    #[test]
+    fn fetches_materialize_transitive_loads_once() {
+        let (mut checker, client, external) = fetch_checker("checker-fetch-transitive", true);
+        client.fetch_files.lock().unwrap().extend([
+            (
+                "rules+".to_owned(),
+                (
+                    external.join("rules+/defs.bzl"),
+                    "load('@dep//:child.bzl', 'value')\n".to_owned(),
+                ),
+            ),
+            (
+                "wrong+".to_owned(),
+                (external.join("wrong+/child.bzl"), "value = 42\n".to_owned()),
+            ),
+        ]);
+        let report_path = checker.bazel_info.workspace.join("coverage.json");
+        checker
+            .report_diagnostics(false, &[], Some(&report_path))
+            .unwrap();
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+", "wrong+"]);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["checked_files"].as_array().unwrap().len(), 2);
+        assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 2);
+        assert!(report["unresolved_loads"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_or_incomplete_fetches_terminate_with_load_errors() {
+        for mode in ["failed", "partial", "empty", "existing"] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-fetch-{mode}"), true);
+            if mode == "existing" {
+                std::fs::create_dir_all(external.join("rules+")).unwrap();
+            }
+            if mode == "partial" {
+                client.fetch_files.lock().unwrap().insert(
+                    "rules+".to_owned(),
+                    (external.join("rules+/defs.bzl"), "value = 42\n".to_owned()),
+                );
+            }
+            if matches!(mode, "failed" | "partial") {
+                client.fetch_failures.lock().unwrap().insert(
+                    "rules+".to_owned(),
+                    "download refused by test server".to_owned(),
+                );
+            }
+            let report_path = checker.bazel_info.workspace.join("coverage.json");
+            for _ in 0..2 {
+                assert!(checker
+                    .report_diagnostics(false, &[], Some(&report_path))
+                    .is_err());
+                let requests = client.fetch_requests.lock().unwrap();
+                assert_eq!(
+                    requests.len(),
+                    usize::from(mode != "existing"),
+                    "{mode}: {requests:?}"
+                );
+                let report: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+                assert_eq!(report["complete"], false);
+                let loads = report["unresolved_loads"].as_array().unwrap();
+                assert_eq!(loads.len(), 2, "{mode}: {loads:?}");
+                for load in loads {
+                    let message = load["message"].as_str().unwrap();
+                    if matches!(mode, "failed" | "partial") {
+                        assert!(
+                            message.contains("failed to fetch repository @@rules+"),
+                            "{mode}: {message}"
+                        );
+                        assert!(
+                            message.contains("download refused by test server"),
+                            "{mode}: {message}"
+                        );
+                    } else {
+                        assert!(message.contains("Not found"), "{mode}: {message}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_queries_can_materialize_repositories_despite_package_errors() {
+        let (mut checker, client, external) = fetch_checker("checker-fetch-legacy", false);
+        client.fetch_files.lock().unwrap().insert(
+            "rules+".to_owned(),
+            (external.join("rules+/defs.bzl"), "value = 42\n".to_owned()),
+        );
+        client.fetch_failures.lock().unwrap().insert(
+            "rules+".to_owned(),
+            "unrelated package failed to load".to_owned(),
+        );
+        let report_path = checker.bazel_info.workspace.join("coverage.json");
+        for _ in 0..2 {
+            checker
+                .report_diagnostics(false, &[], Some(&report_path))
+                .unwrap();
+            assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+            assert_eq!(report["complete"], true);
+            assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetched_symlinks_preserve_repository_context() {
+        let (mut checker, client, external) = fetch_checker("checker-fetch-symlink", true);
+        let physical = checker.bazel_info.workspace.join("physical");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::fs::write(
+            physical.join("defs.bzl"),
+            "load('//:helper.bzl', 'value')\n",
+        )
+        .unwrap();
+        std::fs::write(physical.join("helper.bzl"), "value = 42\n").unwrap();
+        *client.retarget.lock().unwrap() = Some((external.join("rules+"), physical.clone()));
+        let graph = checker.prepare_loads().unwrap();
+        let snapshot = checker.analysis.snapshot();
+        let report = checker
+            .coverage_report(&snapshot, &graph, &checker.files, Default::default())
+            .unwrap();
+        assert!(report.complete);
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+        assert_eq!(report.loaded_dependencies.len(), 2);
+        for file in report.loaded_dependencies {
+            assert_eq!(file.repository.as_deref(), Some("rules+"));
+            assert!(file.path.starts_with(physical.canonicalize().unwrap()));
+        }
+    }
+
     #[test]
     fn file_inventories_preserve_spaces_and_accept_crlf() {
         let mut paths = vec!["BUILD".to_owned()];
@@ -104,7 +289,7 @@ mod tests {
         std::fs::write(root.join("dep.bzl"), "load(':missing.bzl')\n").unwrap();
         std::fs::write(root.join("deploy.star"), "fail('excluded')\n").unwrap();
         std::fs::write(root.join("template.bzl.in"), "@@template@@\n").unwrap();
-        let (sender, _) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             Arc::new(TestBazelClient::default()),
             root.clone(),
@@ -133,7 +318,8 @@ mod tests {
         ]
         .map(|path| root.join(path).to_str().unwrap().to_owned())
         .to_vec();
-        let mut checker = Checker::new(analysis, info, paths, &["star"], loader, &options).unwrap();
+        let mut checker =
+            Checker::new(analysis, info, paths, &["star"], loader, receiver, &options).unwrap();
         let report_path = root.join("coverage.json");
         assert!(checker
             .report_diagnostics(false, &[], Some(&report_path))
@@ -173,7 +359,7 @@ mod tests {
         std::fs::write(root.join("BUILD"), "").unwrap();
         std::fs::write(root.join("nested/MODULE.bazel"), "").unwrap();
         std::fs::write(root.join("nested/defs.bzl"), "").unwrap();
-        let (sender, _) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             Arc::new(TestBazelClient::default()),
             root.clone(),
@@ -196,6 +382,7 @@ mod tests {
             vec![root.to_str().unwrap().to_owned()],
             &[],
             loader,
+            receiver,
             &options,
         )
         .unwrap();
@@ -216,7 +403,7 @@ mod tests {
         std::fs::write(root.join("source.bzl"), "value = 1\n").unwrap();
         std::fs::write(root.join("unsupported.py"), "value = 1\n").unwrap();
         std::os::unix::fs::symlink(root.join("source.bzl"), root.join("alias.bzl")).unwrap();
-        let (sender, _) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             Arc::new(TestBazelClient::default()),
             root.clone(),
@@ -236,7 +423,8 @@ mod tests {
         let paths = ["alias.bzl", "unsupported.py"]
             .map(|name| root.join(name).to_str().unwrap().to_owned())
             .to_vec();
-        let mut checker = Checker::new(analysis, info, paths, &[], loader, &options).unwrap();
+        let mut checker =
+            Checker::new(analysis, info, paths, &[], loader, receiver, &options).unwrap();
         assert_eq!(checker.files.len(), 1);
         assert_eq!(checker.input_errors.len(), 1);
         let graph = checker.prepare_loads().unwrap();
@@ -258,7 +446,7 @@ mod tests {
             .join("checker-pending");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("BUILD"), "load('@unknown//:defs.bzl')\n").unwrap();
-        let (sender, _) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             Arc::new(TestBazelClient::default()),
             root.clone(),
@@ -281,6 +469,7 @@ mod tests {
             vec![root.join("BUILD").to_str().unwrap().to_owned()],
             &[],
             loader,
+            receiver,
             &options,
         )
         .unwrap();
@@ -313,7 +502,6 @@ mod tests {
             &workspace,
             &external.join("stubs+"),
             &external.join("rules+"),
-            &external.join("wrong+"),
         ] {
             std::fs::create_dir_all(path).unwrap();
         }
@@ -334,9 +522,15 @@ mod tests {
             "load('@dep//:value.bzl', 'helper')\ndef value(): return helper\n",
         )
         .unwrap();
-        std::fs::write(external.join("wrong+/value.bzl"), "helper = 42\n").unwrap();
         let client = Arc::new(TestBazelClient::default());
-        let (sender, _) = crossbeam_channel::unbounded();
+        client.fetch_files.lock().unwrap().insert(
+            "wrong+".to_owned(),
+            (
+                external.join("wrong+/value.bzl"),
+                "helper = 42\n".to_owned(),
+            ),
+        );
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             client.clone(),
             workspace.clone(),
@@ -363,6 +557,7 @@ mod tests {
             Vec::new(),
             &[],
             loader,
+            receiver,
             &CheckCommand::default(),
         )
         .unwrap();
@@ -389,6 +584,10 @@ mod tests {
         assert_eq!(report["selected_files"].as_array().unwrap().len(), 1);
         assert_eq!(report["checked_files"].as_array().unwrap().len(), 2);
         assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            *client.fetch_requests.lock().unwrap(),
+            ["stubs+", "rules+", "wrong+"]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -411,7 +610,7 @@ impl CheckCommand {
         let bazel_client = Arc::new(BazelCLI::default());
         let bazel_cx = BazelContext::new(&*bazel_client)
             .map_err(|err| anyhow!("failed to initialize Bazel context: {}", err))?;
-        let (fetch_repo_sender, _) = crossbeam_channel::unbounded();
+        let (fetch_repo_sender, fetch_repo_receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
             bazel_client,
             bazel_cx.info.workspace.clone(),
@@ -435,7 +634,15 @@ impl CheckCommand {
             .chain(["star", "sky"])
             .collect::<Vec<_>>();
 
-        let mut checker = Checker::new(analysis, bazel_cx.info, paths, &extensions, loader, &self)?;
+        let mut checker = Checker::new(
+            analysis,
+            bazel_cx.info,
+            paths,
+            &extensions,
+            loader,
+            fetch_repo_receiver,
+            &self,
+        )?;
         checker.report_diagnostics(
             self.validate_stubs,
             &self.ignore_patterns,
@@ -537,6 +744,7 @@ struct Checker {
     exclusions: BTreeMap<PathBuf, Exclusion>,
     input_errors: Vec<InputError>,
     loader: Arc<DefaultFileLoader>,
+    fetch_repo_receiver: crossbeam_channel::Receiver<Task>,
     progress: bool,
 }
 
@@ -553,6 +761,7 @@ impl Checker {
         paths: Vec<String>,
         extensions: &[&str],
         loader: Arc<DefaultFileLoader>,
+        fetch_repo_receiver: crossbeam_channel::Receiver<Task>,
         options: &CheckCommand,
     ) -> anyhow::Result<Self> {
         let mut checker = Self {
@@ -562,6 +771,7 @@ impl Checker {
             exclusions: Default::default(),
             input_errors: Vec::new(),
             loader,
+            fetch_repo_receiver,
             progress: options.progress,
         };
 
@@ -736,10 +946,27 @@ impl Checker {
             }
             drop(snapshot);
             let mut repositories = self.loader.pending_repository_mappings();
-            if repositories.is_empty() {
+            let fetches: Vec<_> = self
+                .fetch_repo_receiver
+                .try_iter()
+                .map(|task| {
+                    let Task::FetchExternalRepoRequest(FetchExternalRepoRequest {
+                        repo,
+                        revision: _,
+                    }) = task
+                    else {
+                        unreachable!("CLI loader only sends repository fetch requests");
+                    };
+                    repo
+                })
+                .filter(|repo| self.loader.begin_fetch(repo.clone()))
+                .collect();
+            if repositories.is_empty() && fetches.is_empty() {
                 return Ok(graph);
             }
-            self.analysis.invalidate_loads();
+            if !repositories.is_empty() {
+                self.analysis.invalidate_loads();
+            }
             while !repositories.is_empty() {
                 if self.progress {
                     eprintln!(
@@ -750,7 +977,23 @@ impl Checker {
                 self.loader.resolve_repository_mappings(&repositories);
                 repositories = self.loader.pending_repository_mappings();
             }
-            frontier.extend(pending);
+            if fetches.is_empty() {
+                frontier.extend(pending);
+            } else {
+                for repo in fetches {
+                    if self.progress {
+                        eprintln!("Fetching repository @@{repo}");
+                    }
+                    let repository = self.loader.canonical_repository(repo.clone())?;
+                    if let Err(error) = self.loader.fetch_repository(&repository) {
+                        eprintln!("Failed to fetch repository @@{repo}: {error:#}");
+                    }
+                }
+                // Native fetches create filesystem inputs that earlier reads
+                // recorded as missing. Refresh them before retrying failed edges.
+                self.analysis.invalidate_loads();
+                frontier.extend(graph.unresolved.keys().copied());
+            }
         }
     }
 
