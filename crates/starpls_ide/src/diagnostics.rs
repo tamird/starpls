@@ -1220,6 +1220,132 @@ repeated = 2 * [1] # type: list[int]
     }
 
     #[test]
+    fn private_rule_bindings_can_be_required_exports() {
+        let source = r#"def implementation(ctx): pass
+factory = rule
+def make() -> rule:
+    return factory(implementation=implementation)
+def pair() -> tuple[rule, str]:
+    return make(), "unused"
+def maybe(enabled: bool) -> rule | None:
+    return make() if enabled else None
+def opaque():
+    return make()
+_direct = factory(implementation=implementation)
+_alias = _direct
+_repository = repository_rule(implementation=implementation)
+_helper_result = make()
+_optional = maybe(True)
+_unpacked, _scalar = pair()
+_unknown = opaque()
+_container = [make()]
+def local():
+    _local_rule, text = pair()
+    return text
+def _unused_function() -> rule:
+    return make()
+"#;
+        let (analysis, fixture) = native_analysis(source);
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "unused-definition"),
+            "{diagnostics:?}"
+        );
+        let mut names = diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.range().unwrap()])
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "_container",
+                "_local_rule",
+                "_scalar",
+                "_unknown",
+                "_unused_function"
+            ]
+        );
+    }
+
+    #[test]
+    fn private_rule_export_policy_follows_binding_edits() {
+        let source = "def implementation(ctx): pass\nfactory = rule\n_private = factory(implementation=implementation)\n";
+        let (mut analysis, fixture) = native_analysis(source);
+        for (source, expected) in [
+            (source.to_owned(), false),
+            (
+                source.replace(
+                    "factory = rule",
+                    "def factory(implementation) -> int: return 1",
+                ),
+                true,
+            ),
+            (source.to_owned(), false),
+            (
+                source.replace(
+                    "_private = factory(implementation=implementation)",
+                    "_private = 1",
+                ),
+                true,
+            ),
+        ] {
+            analysis.update_file(fixture.main_file(), source);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert_eq!(diagnostics.len(), usize::from(expected), "{diagnostics:?}");
+            assert!(diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "unused-definition"));
+        }
+    }
+
+    #[test]
+    fn build_bindings_do_not_export_loaded_rules() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        fixture.add_file(
+            &mut analysis.db,
+            "defs.bzl",
+            "def implementation(ctx): pass\nexisting = rule(implementation=implementation)\n",
+        );
+        let source = "load('defs.bzl', 'existing')\n_private = existing\n";
+        let file = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            source,
+            starpls_common::Dialect::Bazel,
+            Some(starpls_common::FileInfo::Bazel {
+                api_context: starpls_bazel::APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "unused-definition");
+        assert_eq!(&source[diagnostic.range().unwrap()], "_private");
+    }
+
+    #[test]
     fn host_diagnostics_share_type_ignore_suppression() {
         for source in [
             "_unused = 1 # type: ignore\n",

@@ -16,6 +16,8 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
+use starpls_bazel::APIContext;
+use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_hir::Db as _;
 use ty_python_core::definition::Definition;
@@ -35,6 +37,8 @@ use ty_python_semantic::types::check_types_with_diagnostics;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::unreachable_ranges;
 use ty_python_semantic::types::ide_support::unused_definitions;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::SemanticModel;
 
 use super::load;
@@ -151,10 +155,28 @@ pub(super) fn check_with_diagnostics(
     let program_file = db.starlark_program_file(file);
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let options = db.environment().options(db);
+    let model = SemanticModel::new(db, program_file);
     diagnostics.extend(load::diagnostics(db, program_file));
     diagnostics.extend(super::interface::diagnostics(db, file));
     if !options.allow_unused_definitions {
         let index = semantic_index(db, program_file);
+        let environment = model.program_environment();
+        let exportable = if file.dialect == Dialect::Bazel
+            && !file.is_type_interface(db)
+            && file
+                .api_context()
+                .is_none_or(|context| matches!(context, APIContext::Bzl | APIContext::Prelude))
+        {
+            ["rule", "repository_rule"]
+                .into_iter()
+                .filter_map(|name| {
+                    let class = db.annotation_builtin(file, name)?;
+                    class.to_instance_approximation(db, &environment)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for definition in unused_definitions(db, program_file) {
             let kind = definition.kind(db);
             if !matches!(
@@ -180,6 +202,19 @@ pub(super) fn check_with_diagnostics(
             {
                 continue;
             }
+            // Bazel's post-assignment hook exports rule values, including
+            // private names. The binding can be required without a source read.
+            if is_module
+                && !exportable.is_empty()
+                && may_export_rule(
+                    db,
+                    &environment,
+                    model.definition_type(definition),
+                    &exportable,
+                )
+            {
+                continue;
+            }
             diagnostics.push(tagged(
                 file,
                 kind.target_range(&parsed),
@@ -202,7 +237,6 @@ pub(super) fn check_with_diagnostics(
             ));
         }
     }
-    let model = SemanticModel::new(db, program_file);
     let fail = db
         .language_builtin(program_file, "fail", BuiltinUsage::Runtime)
         .and_then(|binding| binding.resolve_type(db))
@@ -220,6 +254,25 @@ pub(super) fn check_with_diagnostics(
         }
     }
     check_types_with_diagnostics(db, program_file, diagnostics)
+}
+
+fn may_export_rule<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    exportable: &[Type<'db>],
+) -> bool {
+    match ty {
+        Type::Dynamic(_) => false,
+        Type::Never => false,
+        Type::Union(union) => union
+            .elements(db)
+            .iter()
+            .any(|element| may_export_rule(db, environment, *element, exportable)),
+        _ => exportable
+            .iter()
+            .any(|base| ty.is_subtype_of(db, environment, *base)),
+    }
 }
 
 fn tagged(
