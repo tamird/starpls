@@ -85,6 +85,9 @@ checks field values and required keys, and preserves their types through
 indexing, `get`, and keyword expansion. Private helper classes describe the
 dictionary values of source exports.
 
+`class _Artifact(TypedDict, closed=True)` limits keys to the declared fields.
+The default open form permits additional fields when accepting existing values.
+
 ## Protocols
 
 A protocol describes values by their fields and methods:
@@ -108,7 +111,7 @@ without declaring a corresponding source export.
 stub exports. Missing function annotations come from the stub's scope. Source
 annotations, parameter names, parameter kinds, and defaults determine the
 implementation signature. Exported functions are followed through explicit
-reexports to check their bodies; variables use their inferred types.
+reexports to check their bodies.
 
 Missing exports and incompatible types are errors. Compatibility that depends on
 dynamic types and unsupported function correspondence produce an
@@ -121,9 +124,18 @@ independently of validation results.
 Function validation requires static expression and callable types throughout
 the checked body.
 
-Variable validation compares independently inferred source types. A
-`TypedDict` contract is incomplete when those types cannot establish its
-dictionary fields, including through lists and other containers.
+Module variables with one simple assignment can borrow the stub annotation.
+The contract must be fully static, with `closed=True` for any `TypedDict` it
+contains. The initializer must consist of fresh literal containers and statically
+typed literal values, and the source module must leave the variable unread and
+unmodified, including in nested functions. Ty checks the initializer against
+the borrowed annotation. Source annotations and type comments take precedence.
+
+Other variable contracts use independently inferred source types. A `TypedDict`
+contract is incomplete when those types cannot establish its dictionary fields,
+including through lists and other containers. Open `TypedDict` contracts use
+this independent inference because structural compatibility permits hidden
+fields that literal initialization rejects.
 
 Provider validation checks the original source's allowed fields and constructor
 inputs. A constructor that stores fields directly must require every declared

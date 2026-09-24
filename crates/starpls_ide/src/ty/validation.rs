@@ -9,10 +9,13 @@ use ruff_db::diagnostic::DiagnosticId;
 use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Parameter;
+use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtFunctionDef;
+use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
@@ -21,6 +24,7 @@ use starpls_common::File;
 use starpls_hir::Db as _;
 use starpls_hir::ProviderContract;
 use starpls_hir::StubValidation;
+use ty_python_core::definition::BindingsOwner;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::definition::DefinitionNodeKey;
@@ -35,6 +39,7 @@ use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::TypeDefinition;
+use ty_python_semantic::types::TypedDictOpenness;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
@@ -58,6 +63,7 @@ struct ValueContract {
     stub: File,
     name: Name,
     range: TextRange,
+    initializer_checked: bool,
 }
 
 struct Contract {
@@ -165,6 +171,9 @@ impl Analysis {
                     );
                 }
             }
+            for value in &mut values {
+                value.initializer_checked = value_annotation(db, value, &mut validation).is_some();
+            }
             validation
                 .files
                 .extend(reports.keys().map(|file| file.source));
@@ -177,7 +186,13 @@ impl Analysis {
                     stub,
                     name,
                     range,
+                    initializer_checked,
                 } = value;
+                if initializer_checked {
+                    // Ordinary assignment diagnostics check the initializer. Its contextual
+                    // binding type would only repeat the borrowed contract here.
+                    continue;
+                }
                 let actual = ProvidedBindingValue::Export {
                     file: db.starlark_program_file(source),
                     name: name.clone(),
@@ -230,7 +245,7 @@ impl Analysis {
                             db,
                             &environment,
                             expected,
-                            false,
+                            expected.is_fully_static(db, &environment),
                             |ty| matches!(ty, Type::TypedDict(_)),
                         ) {
                             ContractError::Incomplete(format!(
@@ -400,6 +415,7 @@ fn discover(
                 stub,
                 name: name.clone(),
                 range,
+                initializer_checked: false,
             });
         } else if let Some(TypeDefinition::Function(stub_definition)) =
             expected.definition(db, &model.program_environment())
@@ -452,8 +468,124 @@ fn discover(
                 stub,
                 name: name.clone(),
                 range,
+                initializer_checked: false,
             });
         }
+    }
+}
+
+/// Borrow context only after checking independent evidence and absence of shared values.
+fn value_annotation(
+    db: &Database,
+    value: &ValueContract,
+    validation: &mut StubValidation,
+) -> Option<()> {
+    let ValueContract {
+        source,
+        stub,
+        name,
+        range: _,
+        initializer_checked: _,
+    } = value;
+    let source_program = db.starlark_program_file(*source);
+    let table = place_table(db, global_scope(db, source_program));
+    let symbol = table.symbol_by_name(name)?;
+    if symbol.is_used() || symbol.is_reassigned() {
+        return None;
+    }
+    let definitions = export_definitions(db, source_program, name);
+    let [definition] = definitions.as_slice() else {
+        return None;
+    };
+    let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+        return None;
+    };
+    if assignment.owner() != BindingsOwner::Definition {
+        return None;
+    }
+    let parsed = ruff_db::parsed::parsed_module(db, source_program.python_file(db)).load(db);
+    let target = assignment.target(&parsed);
+    if starpls_hir::Source::new(db)
+        .type_comment_annotation(*source, target.node_index().load())
+        .is_some()
+    {
+        return None;
+    }
+    let model = SemanticModel::new(db, source_program);
+    let expected = ProvidedBindingValue::Export {
+        file: db.starlark_program_file(*stub),
+        name: name.clone(),
+    }
+    .resolve_type(db)?;
+    if !expected.is_fully_static(db, &model.program_environment()) {
+        return None;
+    }
+    // Literal initialization rejects hidden keys that an open structural contract permits.
+    if ty_python_semantic::types::any_over_type(
+        db,
+        &model.program_environment(),
+        expected,
+        true,
+        |ty| {
+            let Type::TypedDict(dictionary) = ty else {
+                return false;
+            };
+            matches!(dictionary.openness(db), TypedDictOpenness::ImplicitlyOpen)
+        },
+    ) {
+        return None;
+    }
+    if !has_fresh_literal_evidence(&model, assignment.value(&parsed)) {
+        return None;
+    }
+    let stub_program = db.starlark_program_file(*stub);
+    let declarations = export_definitions(db, stub_program, name);
+    let [declaration] = declarations.as_slice() else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, stub_program.python_file(db)).load(db);
+    let statement = parsed.suite().iter().find_map(|statement| {
+        let Stmt::AnnAssign(statement) = statement else {
+            return None;
+        };
+        (semantic_index(db, stub_program).try_definition(statement) == Some(*declaration))
+            .then_some(statement)
+    })?;
+    validation.annotations.insert(
+        (source.source, target.node_index().load()),
+        (*stub, statement.node_index().load()),
+    );
+    Some(())
+}
+
+/// Literal containers have fresh storage, including when empty; their children supply
+/// the independent value evidence before contextual checking introduces the stub shape.
+fn has_fresh_literal_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
+    match expression {
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .all(|item| has_fresh_literal_evidence(model, item)),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .all(|item| has_fresh_literal_evidence(model, item)),
+        Expr::Dict(dict) => dict.items.iter().all(|item| {
+            item.key
+                .as_ref()
+                .is_some_and(|key| has_fresh_literal_evidence(model, key))
+                && has_fresh_literal_evidence(model, &item.value)
+        }),
+        Expr::UnaryOp(unary) => {
+            matches!(unary.op, UnaryOp::UAdd | UnaryOp::USub)
+                && unary.operand.is_number_literal_expr()
+                && expression_has_static_evidence(model, expression)
+        }
+        Expr::StringLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_) => expression_has_static_evidence(model, expression),
+        _ => false,
     }
 }
 
@@ -982,19 +1114,7 @@ fn has_static_evidence(model: &SemanticModel<'_>, body: &[ruff_python_ast::Stmt]
     }
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
-            let model = self.model;
-            let environment = model.program_environment();
-            if !expression.inferred_type(model).is_some_and(|ty| {
-                let ty = ty
-                    .map_callable_signatures(
-                        model.db(),
-                        &environment,
-                        CallableTypeKind::FunctionLike,
-                        std::convert::identity,
-                    )
-                    .unwrap_or(ty);
-                ty.is_fully_static(model.db(), &environment)
-            }) {
+            if !expression_has_static_evidence(self.model, expression) {
                 self.complete = false;
             }
             visitor::walk_expr(self, expression);
@@ -1016,6 +1136,21 @@ fn has_static_evidence(model: &SemanticModel<'_>, body: &[ruff_python_ast::Stmt]
     };
     evidence.visit_body(body);
     evidence.complete
+}
+
+fn expression_has_static_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
+    let environment = model.program_environment();
+    expression.inferred_type(model).is_some_and(|ty| {
+        let ty = ty
+            .map_callable_signatures(
+                model.db(),
+                &environment,
+                CallableTypeKind::FunctionLike,
+                std::convert::identity,
+            )
+            .unwrap_or(ty);
+        ty.is_fully_static(model.db(), &environment)
+    })
 }
 
 impl ContractError {
@@ -1456,18 +1591,180 @@ mod tests {
     }
 
     #[test]
-    fn typed_dictionary_variables_require_field_evidence() {
-        let schema = "class _Row(TypedDict):\n    name: str\n";
+    fn typed_dictionary_variables_check_fresh_initializers() {
+        let schema = "class _Row(TypedDict, closed=True):\n    name: str\n    tags: NotRequired[list[str]]\n";
         for (source, annotation) in [
             ("ROWS = [{'name': 'ok'}]\n", "list[_Row]"),
-            ("ROWS = {'first': {'name': 'ok'}}\n", "dict[str, _Row]"),
-            ("ROWS = [{'name': 'ok'}, 1]\n", "list[_Row]"),
+            (
+                "ROWS = {'first': {'name': 'ok', 'tags': []}}\n",
+                "dict[str, _Row]",
+            ),
+            ("ROWS = {}\n", "dict[str, _Row]"),
+            ("ROWS = []\n", "list[_Row]"),
         ] {
             let diagnostics = validate(source, &format!("{schema}ROWS: {annotation}\n"));
-            assert_eq!(diagnostics, ["incomplete-stub-validation"], "{source}");
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
         }
+        for (source, expected) in [
+            ("ROWS = [{}]\n", "missing-typed-dict-key"),
+            ("ROWS = [{'name': 1}]\n", "invalid-argument-type"),
+            (
+                "ROWS = [{'name': 'ok', 'name': 1}]\n",
+                "invalid-argument-type",
+            ),
+            (
+                "ROWS = [{'name': 'ok', 'tags': [1]}]\n",
+                "invalid-argument-type",
+            ),
+            ("ROWS = [{'name': 'ok'}, 1]\n", "invalid-assignment"),
+        ] {
+            let diagnostics = validate(source, &format!("{schema}ROWS: list[_Row]\n"));
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{source}: {diagnostics:?}"
+            );
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+        assert!(validate("value = -1\n", "value: int\n").is_empty());
         let diagnostics = validate("other = 1\n", &format!("{schema}ROWS: list[_Row]\n"));
         assert_eq!(diagnostics, ["invalid-stub-implementation"]);
+    }
+
+    #[test]
+    fn typed_dictionary_variable_proofs_reject_shared_or_mutable_values() {
+        let stub = "class _Row(TypedDict, closed=True):\n    name: str\nROWS: list[_Row]\n";
+        for source in [
+            "def opaque(): pass\nROWS = [{'name': opaque()}]\n",
+            "SHARED = {'name': 'ok'}\nROWS = [SHARED]\n",
+            "SHARED = {'name': 'ok'}\nROWS = [dict(SHARED)]\n",
+            "ROWS = [{'name': 'ok'}]\nALIAS = ROWS\n",
+            "ALIAS, ROWS = (0, [{'name': 'ok'}])\n",
+            "ROWS = [{'name': 'ok'}]\nROWS = [{'name': 'again'}]\n",
+            "ROWS = [{'name': 'ok'}]\nROWS[0]['name'] = 1\n",
+            "ROWS = [{'name': 'ok'}]\ndef corrupt(rows): rows[0]['name'] = 1\ncorrupt(ROWS)\n",
+            "ROWS = [{'name': 'ok'}]\ndef corrupt(): ROWS[0]['name'] = 1\n",
+            "def corrupt(): ROWS[0]['name'] = 1\nROWS = [{'name': 'ok'}]\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_initializer_validation_tracks_edits_without_changing_source_analysis() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "ROWS = [{'name': 'ok'}]\n");
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        for field_type in ["str", "int", "str"] {
+            analysis.update_file(
+                stub,
+                format!("class _Row(TypedDict, closed=True):\n    name: {field_type}\nROWS: list[_Row]\n"),
+            );
+            assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let ids: Vec<_> = reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(ids.is_empty(), field_type == "str", "{reports:?}");
+            assert!(!ids.contains(&"incomplete-stub-validation"), "{reports:?}");
+            assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn variable_initializers_require_static_contracts() {
+        for (source, stub) in [
+            ("value = 1\n", "value: Any\n"),
+            ("ROWS = []\n", "ROWS: list[Any]\n"),
+            (
+                "ROWS = [{'name': 'ok'}]\n",
+                "class _Row(TypedDict, closed=True):\n    name: Any\nROWS: list[_Row]\n",
+            ),
+        ] {
+            assert_eq!(
+                validate(source, stub),
+                ["incomplete-stub-validation"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_typed_dictionary_variables_require_independent_evidence() {
+        let stub = "class _Row(TypedDict):\n    name: str\nROWS: list[_Row]\n";
+        for source in [
+            "ROWS = [{'name': 'ok'}]\n",
+            "ROWS = [{'name': 'ok', 'private': 1}]\n",
+        ] {
+            assert_eq!(
+                validate(source, stub),
+                ["incomplete-stub-validation"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_open_dictionary_contracts_require_independent_evidence() {
+        for (source, stub) in [
+            (
+                "ROWS = {'inner': {'name': 'ok', 'private': 1}}\n",
+                "class _Inner(TypedDict):\n    name: str\nclass _Outer(TypedDict, closed=True):\n    inner: _Inner\nROWS: _Outer\n",
+            ),
+            (
+                "ROWS = [{'name': 'ok', 'private': 1}]\n",
+                "class _Row(TypedDict):\n    name: str\nclass _Rows(Protocol):\n    def __getitem__(self, index: int) -> _Row: ...\nROWS: _Rows\n",
+            ),
+        ] {
+            assert_eq!(validate(source, stub), ["incomplete-stub-validation"], "{stub}");
+        }
+    }
+
+    #[test]
+    fn closed_interface_classes_require_dictionary_bases() {
+        for stub in [
+            "class _Value(closed=True):\n    value: int\n",
+            "class _Value(Protocol, closed=True):\n    value: int\n",
+        ] {
+            let diagnostics = validate("", stub);
+            assert_eq!(diagnostics, ["invalid-provider-interface"], "{stub}");
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            let file = fixture.add_file(&mut analysis.db, "source.bzli", stub);
+            loader.add_files_from_fixture(&fixture);
+            let diagnostics = super::super::interface::diagnostics(&analysis.db, file);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].headline_message(),
+                "Only TypedDict declarations accept class keywords"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_annotations_keep_source_precedence() {
+        for source in ["value: str = 'ok'\n", "value = 'ok' # type: str\n"] {
+            assert_eq!(
+                validate(source, "value: int\n"),
+                ["invalid-stub-implementation"],
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -1475,7 +1772,7 @@ mod tests {
         for (source, stub, expected) in [
             ("value = 1\n", "value: int\n", None),
             ("def helper(value):\n    return value\nvalue = helper(1)\n", "def helper(value: int) -> int: ...\nvalue: int\n", None),
-            ("value = 'bad'\n", "value: int\n", Some("invalid-stub-implementation")),
+            ("value = 'bad'\n", "value: int\n", Some("invalid-assignment")),
             ("other = 1\n", "value: int\n", Some("invalid-stub-implementation")),
             ("def helper(value):\n    return value\nvalue = helper(1)\n", "value: int\n", Some("incomplete-stub-validation")),
             ("def helper(value):\n    return value\ndef compute(value):\n    return helper(value)\n", "def compute(value: int) -> int: ...\n", Some("unsound-return-statement")),

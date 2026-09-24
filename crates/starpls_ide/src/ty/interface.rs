@@ -82,10 +82,20 @@ pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic:
                 continue;
             };
             let ty = model.definition_type(*definition);
-            if !matches!(
-                ty.to_instance_approximation(db, &model.program_environment()),
-                Some(Type::ProtocolInstance(_) | Type::TypedDict(_))
-            ) {
+            let instance = ty.to_instance_approximation(db, &model.program_environment());
+            if class
+                .arguments
+                .as_ref()
+                .is_some_and(|arguments| !arguments.keywords.is_empty())
+                && !instance.is_some_and(|instance| matches!(instance, Type::TypedDict(_)))
+            {
+                report(
+                    class.name.range,
+                    "Only TypedDict declarations accept class keywords".into(),
+                );
+            } else if !instance.is_some_and(|instance| {
+                matches!(instance, Type::ProtocolInstance(_) | Type::TypedDict(_))
+            }) {
                 report(
                     class.name.range,
                     "Interface classes with bases must declare a Protocol or TypedDict".into(),

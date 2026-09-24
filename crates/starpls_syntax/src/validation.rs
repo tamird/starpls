@@ -542,7 +542,11 @@ fn interface_statement(statement: &Stmt) -> bool {
             class.decorator_list.is_empty()
                 && class.type_params.is_none()
                 && class.arguments.as_ref().is_none_or(|arguments| {
-                    arguments.keywords.is_empty() && arguments.args.iter().all(Expr::is_name_expr)
+                    arguments.args.iter().all(Expr::is_name_expr)
+                        && arguments.keywords.iter().all(|keyword| {
+                            keyword.arg.as_ref().is_some_and(|name| name.id == "closed")
+                                && keyword.value.is_boolean_literal_expr()
+                        })
                 })
                 && class.body.iter().all(|statement| match statement {
                     Stmt::AnnAssign(_) => interface_statement(statement),
