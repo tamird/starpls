@@ -1,0 +1,17 @@
+class _DependencyData(TypedDict):
+    aliases: dict[str, str]
+    binaries: dict[str, str]
+    build_deps: list[str]
+    build_deps_by_platform: dict[str, list[str]]
+    crate_features: list[str]
+    crate_features_by_platform: dict[str, list[str]]
+    crate_name: str
+    deps: list[str]
+    deps_by_platform: dict[str, list[str]]
+    dev_deps: list[str]
+    dev_deps_by_platform: dict[str, list[str]]
+    edition: str
+    shared_libraries: dict[str, str]
+    lint_config: NotRequired[str]
+
+DEP_DATA: dict[str, _DependencyData]

@@ -674,6 +674,36 @@ mod tests {
     }
 
     #[test]
+    fn rules_rs_metadata_stub_preserves_field_types() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "data.bzl",
+            "DEP_DATA = {}\nEXTRA = 'source export'\n",
+        );
+        let interface = fixture.add_file(
+            &mut analysis.db,
+            "data.bzli",
+            include_str!("../../../../stubs/rules_rs/data.bzli"),
+        );
+        let caller_text = "load('data.bzl', 'DEP_DATA', 'EXTRA')\nrow = DEP_DATA['sample']\nname: str = row['crate_name']\nalias: str = row['aliases']['//:dep']\nbinary: str = row.get('binaries', {}).keys()[0]\nplatform_deps: list[str] = row.get('dev_deps_by_platform', {}).values()[0]\nfeatures: list[str] = row['crate_features']\nlint: str | None = row.get('lint_config')\nextra: str = EXTRA\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        for file in [interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        analysis.update_file(caller, format!("{caller_text}row['deps'].append(42)\n"));
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+    }
+
+    #[test]
     fn interface_bases_require_supported_type_identity() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
