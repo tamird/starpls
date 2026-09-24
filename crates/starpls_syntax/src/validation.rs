@@ -248,6 +248,9 @@ impl Validator<'_> {
             Stmt::ClassDef(class) => {
                 if self.annotation_mode == AnnotationMode::Interface {
                     self.visit_identifier(&class.name);
+                    if let Some(arguments) = &class.arguments {
+                        self.visit_arguments(arguments);
+                    }
                     self.visit_body(&class.body);
                 } else {
                     self.excluded.push(stmt.node_index().load());
@@ -532,16 +535,20 @@ impl Validator<'_> {
 fn interface_statement(statement: &Stmt) -> bool {
     match statement {
         Stmt::ClassDef(class) => {
+            let has_bases = class
+                .arguments
+                .as_ref()
+                .is_some_and(|arguments| !arguments.is_empty());
             class.decorator_list.is_empty()
                 && class.type_params.is_none()
-                && class
-                    .arguments
-                    .as_ref()
-                    .is_none_or(|arguments| arguments.is_empty())
+                && class.arguments.as_ref().is_none_or(|arguments| {
+                    arguments.keywords.is_empty() && arguments.args.iter().all(Expr::is_name_expr)
+                })
                 && class.body.iter().all(|statement| match statement {
                     Stmt::AnnAssign(_) => interface_statement(statement),
                     Stmt::FunctionDef(function) => {
-                        function.name.as_str() == "__init__" && interface_statement(statement)
+                        (has_bases || function.name.as_str() == "__init__")
+                            && interface_statement(statement)
                     }
                     Stmt::Expr(statement) => {
                         statement.value.is_string_literal_expr()
@@ -724,7 +731,17 @@ mod tests {
                 true,
             ),
             ("class Info:\n    value: Info | None", true),
-            ("class Info(Base):\n    value: int", false),
+            ("class Info(Base):\n    value: int", true),
+            (
+                "class Builder(Protocol):\n    def build(self) -> str: ...",
+                true,
+            ),
+            (
+                "class Builder(Protocol):\n    def build(self) -> str: return 'built'",
+                false,
+            ),
+            ("class Builder(factory()): pass", false),
+            ("class Builder(Protocol, metaclass=Meta): pass", false),
             ("class Info:\n    def method(self): ...", false),
             ("class Info:\n    value = 1", false),
             (

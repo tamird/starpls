@@ -523,7 +523,7 @@ fn declarations(
     for name in classes.keys() {
         writeln!(output, "_starpls_annotation_{name} = _starpls_types.{name}")?;
     }
-    output.push_str("_starpls_annotation_Final = _starpls_typing.Final\n_starpls_annotation_Callable = _starpls_typing.Callable\n");
+    output.push_str("_starpls_annotation_Final = _starpls_typing.Final\n_starpls_annotation_Callable = _starpls_typing.Callable\n_starpls_annotation_Protocol = _starpls_typing.Protocol\n");
     output.push_str(&rule_declarations);
     output.push_str(&exports);
     output.push('\n');

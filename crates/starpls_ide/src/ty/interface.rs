@@ -7,6 +7,7 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtClassDef;
 use ruff_text_size::Ranged;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
@@ -75,6 +76,23 @@ pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic:
         let Stmt::ClassDef(class) = statement else {
             continue;
         };
+        if !is_provider_class(class) {
+            let index = ty_python_core::semantic_index(db, program);
+            let [definition] = index.definitions(class) else {
+                continue;
+            };
+            let ty = model.definition_type(*definition);
+            if !matches!(
+                ty.to_instance_approximation(db, &model.program_environment()),
+                Some(Type::ProtocolInstance(_))
+            ) {
+                report(
+                    class.name.range,
+                    "Interface classes with bases must declare a Protocol".into(),
+                );
+            }
+            continue;
+        }
         if !class.body.iter().any(|statement| matches!(statement, Stmt::FunctionDef(function) if function.name.as_str() == "__init__")) {
             report(class.name.range, "Provider classes require an explicit __init__ declaration".into());
         }
@@ -288,7 +306,11 @@ fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definiti
             let [definition] = definitions.as_slice() else {
                 continue;
             };
-            if !matches!(definition.kind(db), DefinitionKind::Class(_)) {
+            let DefinitionKind::Class(class) = definition.kind(db) else {
+                continue;
+            };
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            if !is_provider_class(class.node(&parsed)) {
                 continue;
             }
             let implementations =
@@ -387,9 +409,7 @@ pub(super) fn provider_implementation<'db>(
     class: Type<'db>,
 ) -> Option<(ProgramFile<'db>, FileRange)> {
     let environment = ProgramEnvironment::from_file(db.starlark_program_file(source));
-    let TypeDefinition::StaticClass(class) = class.definition(db, &environment)? else {
-        return None;
-    };
+    let class = provider_definition(db, class, &environment)?;
     provider_export_origin(db, source, &class.name(db)?, ProviderPart::Constructor)
 }
 
@@ -426,9 +446,7 @@ pub(super) fn provider_fields<'db>(
     class: Type<'db>,
     environment: &ProgramEnvironment<'db>,
 ) -> Option<Vec<ProvidedField<'db>>> {
-    let TypeDefinition::StaticClass(definition) = class.definition(db, environment)? else {
-        return None;
-    };
+    let definition = provider_definition(db, class, environment)?;
     let DefinitionKind::Class(class) = definition.kind(db) else {
         return None;
     };
@@ -458,6 +476,30 @@ pub(super) fn provider_fields<'db>(
     Some(fields)
 }
 
+// Provider correspondence must remain independent of type inference: source
+// provider inference asks for this correspondence before constructing its type.
+fn is_provider_class(class: &StmtClassDef) -> bool {
+    class
+        .arguments
+        .as_ref()
+        .is_none_or(|arguments| arguments.is_empty())
+}
+
+pub(super) fn provider_definition<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    environment: &ProgramEnvironment<'db>,
+) -> Option<Definition<'db>> {
+    let TypeDefinition::StaticClass(definition) = ty.definition(db, environment)? else {
+        return None;
+    };
+    let DefinitionKind::Class(class) = definition.kind(db) else {
+        return None;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    is_provider_class(class.node(&parsed)).then_some(definition)
+}
+
 pub(crate) fn export_definitions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
@@ -484,6 +526,98 @@ mod tests {
     use crate::Analysis;
     use crate::FilePosition;
     use crate::LocationLink;
+
+    #[test]
+    fn protocol_methods_use_ordinary_types_and_editor_origins() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        // The private helper name also exists in the source, but it describes
+        // no provider identity in the interface.
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "_Builder = provider(fields=['value'])\noriginal = _Builder(value='source')\ndef make(): pass\n");
+        let interface_text = "class _Builder(Protocol):\n    def set(self, value: int) -> _Builder: ...\n    def build(self) -> str: ...\ndef make() -> _Builder: ...\n";
+        let interface = fixture.add_file(&mut analysis.db, "source.bzli", interface_text);
+        let caller_text = "load('source.bzl', 'make')\nresult: str = make().set(1).build()\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        for file in [source, interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        let locations = analysis
+            .snapshot()
+            .goto_definition(
+                FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.find(".build").unwrap() as u32 + 1).into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let [LocationLink::Local {
+            target_file_id,
+            target_selection_range,
+            origin_selection_range: _,
+            target_range: _,
+        }] = locations.as_slice()
+        else {
+            panic!("{locations:?}");
+        };
+        assert_eq!(*target_file_id, interface.source);
+        assert_eq!(&interface_text[*target_selection_range], "build");
+        for (source, expected) in [
+            (
+                caller_text.replace("set(1)", "set('bad')"),
+                "invalid-argument-type",
+            ),
+            (
+                caller_text.replace("result: str", "result: int"),
+                "invalid-assignment",
+            ),
+        ] {
+            analysis.update_file(caller, source);
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), expected);
+        }
+        analysis.update_file(caller, caller_text.into());
+        analysis.update_file(
+            interface,
+            interface_text.replace("value: int", "value: str"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+    }
+
+    #[test]
+    fn interface_bases_require_protocol_identity() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let file = fixture.add_file(&mut analysis.db, "types.bzli", "");
+        for source in [
+            "class Concrete:\n    def __init__(self) -> None: ...\nclass _Derived(Concrete): pass\n",
+            "def Protocol() -> int: ...\nclass _Derived(Protocol): pass\n",
+        ] {
+            analysis.update_file(file, source.into());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.headline_message() == "Interface classes with bases must declare a Protocol"), "{diagnostics:?}");
+        }
+    }
 
     #[test]
     fn provider_classes_share_source_identity_and_recursive_fields() {

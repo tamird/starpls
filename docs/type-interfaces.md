@@ -11,11 +11,12 @@ DEFAULT_TIMEOUT: int
 def fetch(name: string, timeout: int = ...) -> list[string]: ...
 ```
 
-A stub consists of variable annotations, function and provider declarations, loads,
-docstrings, and placeholders. Variable initializers and parameter defaults are
-omitted or `...`. A function body consists of an optional docstring followed by
-`...` or `pass`. Variables, functions, and provider classes declared in the stub define its exports;
-loaded names are available in annotation expressions.
+A stub consists of variable annotations, function, provider and protocol
+declarations, loads, docstrings, and placeholders. Variable initializers and
+parameter defaults are omitted or `...`. A function body consists of an optional
+docstring followed by `...` or `pass`. Variables, functions, and classes declared
+in the stub define its exports; loaded names are available in annotation
+expressions.
 
 For each name loaded from a mapped `.bzl` module, Starpls uses the stub declaration
 when present and source inference otherwise. Annotations are resolved in the
@@ -62,6 +63,23 @@ def raw_files(*, files: depset[File]) -> FilesInfo: ...
 Raw constructors accept field values directly. Each declared field is a required
 keyword argument. The source raw binding and the stub return type identify the
 same provider.
+
+## Protocols
+
+A protocol describes values by their fields and methods:
+
+```starlark
+class _Builder(Protocol):
+    def set(self, value: int) -> _Builder: ...
+    def build(self) -> str: ...
+
+def builder() -> _Builder: ...
+```
+
+Protocol bases are names resolved in the stub's scope. Method signatures use
+ordinary function annotations and declaration bodies. Ty checks compatibility
+structurally. Private helper protocols describe return values and parameters
+without declaring a corresponding source export.
 
 ## Implementation validation
 

@@ -193,10 +193,9 @@ impl Analysis {
                         db.starlark_program_file(stub),
                     );
                     let result = if matches!(expected, Type::ClassLiteral(_))
-                        && matches!(
-                            expected.definition(db, &environment),
-                            Some(TypeDefinition::StaticClass(_))
-                        ) {
+                        && super::interface::provider_definition(db, expected, &environment)
+                            .is_some()
+                    {
                         compare_provider(db, source, stub, &name, actual, expected, None)
                     } else if matches!(actual, Type::NominalInstance(_))
                         && actual.provided_data(db, &environment).is_some_and(|data| {
@@ -360,10 +359,8 @@ fn discover(
             continue;
         };
         if matches!(expected, Type::ClassLiteral(_))
-            && matches!(
-                expected.definition(db, &model.program_environment()),
-                Some(TypeDefinition::StaticClass(_))
-            )
+            && super::interface::provider_definition(db, expected, &model.program_environment())
+                .is_some()
         {
             match provider_initializer(db, source, stub, name, actual, expected) {
                 Ok(Some(contract)) => {
@@ -1346,6 +1343,7 @@ mod tests {
             ("other = 1\n", "value: int\n", Some("invalid-stub-implementation")),
             ("def helper(value):\n    return value\nvalue = helper(1)\n", "value: int\n", Some("incomplete-stub-validation")),
             ("def helper(value):\n    return value\ndef compute(value):\n    return helper(value)\n", "def compute(value: int) -> int: ...\n", Some("unsound-return-statement")),
+            ("def helper(): pass\ndef make():\n    return helper()\n", "class _Builder(Protocol):\n    def build(self) -> str: ...\ndef make() -> _Builder: ...\n", Some("unsound-return-statement")),
         ] {
             let diagnostics = validate(source, stub);
             if let Some(expected) = expected { assert!(diagnostics.iter().any(|id| id == expected), "{source}: {diagnostics:?}"); }
