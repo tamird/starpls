@@ -22,6 +22,7 @@ use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::CheckedArgument;
 use ty_python_semantic::types::CheckedCall;
+use ty_python_semantic::types::DictionaryExtraItems;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::KnownClass;
@@ -747,7 +748,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     let own_attributes = match call.argument("attrs") {
         CheckedArgument::Omitted => Some(DictionaryItems {
             items: Box::default(),
-            is_complete: true,
+            extra_items: DictionaryExtraItems::Closed,
         }),
         CheckedArgument::Value {
             ty: _,
@@ -755,10 +756,15 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         } => call.dictionary_argument("attrs"),
         CheckedArgument::Indeterminate => None,
     };
-    let DictionaryItems { items, is_complete } = own_attributes.unwrap_or(DictionaryItems {
+    let own_attributes = own_attributes.unwrap_or(DictionaryItems {
         items: Box::default(),
-        is_complete: false,
+        extra_items: DictionaryExtraItems::Unobserved,
     });
+    let is_complete = own_attributes.is_complete();
+    let DictionaryItems {
+        items,
+        extra_items: _,
+    } = own_attributes;
     let is_complete = is_complete && items.iter().all(|item| item.is_required);
     complete &= is_complete;
     if parent.is_some() && !is_complete {
@@ -1580,8 +1586,12 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
                         }
                     }
                 } else {
-                    let DictionaryItems { items, is_complete } =
-                        call.dictionary_argument("fields")?;
+                    let mapping = call.dictionary_argument("fields")?;
+                    let is_complete = mapping.is_complete();
+                    let DictionaryItems {
+                        items,
+                        extra_items: _,
+                    } = mapping;
                     open = !is_complete || items.iter().any(|item| !item.is_required);
                     for DictionaryItem {
                         name,

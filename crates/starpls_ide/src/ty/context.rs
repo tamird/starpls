@@ -23,6 +23,7 @@ use ty_python_semantic::provided::ProvidedField;
 use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
+use ty_python_semantic::types::DictionaryExtraItems;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::KnownClass;
@@ -167,17 +168,21 @@ pub(super) fn parameter_type<'db>(
         .and_then(|data| data.downcast_ref::<factory::RuleData>());
     let aspect_attributes;
     let (attributes, complete) = if context_kind == ContextKind::Aspect {
-        let DictionaryItems { items, is_complete } =
-            match argument(call, &signature, "attrs").ok()? {
-                Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
-                    items: Box::default(),
-                    is_complete: false,
-                }),
-                None => DictionaryItems {
-                    items: Box::default(),
-                    is_complete: true,
-                },
-            };
+        let mapping = match argument(call, &signature, "attrs").ok()? {
+            Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
+                items: Box::default(),
+                extra_items: DictionaryExtraItems::Unobserved,
+            }),
+            None => DictionaryItems {
+                items: Box::default(),
+                extra_items: DictionaryExtraItems::Closed,
+            },
+        };
+        let is_complete = mapping.is_complete();
+        let DictionaryItems {
+            items,
+            extra_items: _,
+        } = mapping;
         let is_complete = is_complete && items.iter().all(|item| item.is_required);
         aspect_attributes = items
             .iter()
@@ -287,7 +292,12 @@ pub(super) fn parameter_type<'db>(
                 .to_instance_approximation(db, &environment)?;
             if let Some(outputs) = argument(call, &signature, "outputs").ok()? {
                 match model.dictionary_items(outputs) {
-                    Some(DictionaryItems { items, is_complete }) => {
+                    Some(mapping) => {
+                        let is_complete = mapping.is_complete();
+                        let DictionaryItems {
+                            items,
+                            extra_items: _,
+                        } = mapping;
                         let is_complete = is_complete && items.iter().all(|item| item.is_required);
                         complete &= is_complete;
                         for DictionaryItem {
