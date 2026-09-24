@@ -654,6 +654,8 @@ fn write_function(
             (CallableKind::Function, "DefaultInfo", "files") => Some("_DefaultInfoFiles"),
             (CallableKind::Function, "OutputGroupInfo", "kwargs") => Some("_starpls_typing.Sequence[_starpls_types.File] | _starpls_types.depset[_starpls_types.File]"),
             (CallableKind::Function, "macro", "inherit_attrs") => Some("_starpls_types.rule | _starpls_types.macro | _starpls_typing.Literal[\"common\"] | None"),
+            // The inventory omits propagation_ctx, the callback's sole argument.
+            (CallableKind::Function, "aspect", "attr_aspects") => Some("_starpls_typing.Sequence[_starpls_builtins.str] | _starpls_typing.Callable[[_starpls_typing.Any], _starpls_builtins.list[_starpls_builtins.str]]"),
             // Both action constructors inspect each tool, including depset members.
             (CallableKind::Method("actions"), "run" | "run_shell", "tools") => Some("_starpls_typing.Sequence[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]] | _starpls_types.depset[_starpls_types.File | _starpls_types.FilesToRunProvider | _starpls_types.depset[_starpls_types.File]]"),
             _ => None,
@@ -1472,13 +1474,17 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
     info.tool
     selected: ToolchainInfo = target[platform_common.ToolchainInfo]
     setting: ConstraintSettingInfo = target[platform_common.ConstraintSettingInfo]
+    variables: TemplateVariableInfo = platform_common.TemplateVariableInfo({"CC": "clang"})
+    platform_common.TemplateVariableInfo(vars={"LD": "lld"})
+    selected_variables: TemplateVariableInfo = target[platform_common.TemplateVariableInfo]
+    visibility: list[Label] = native.package_default_visibility()
     files = target.files.to_list()
     files[0].basename
     metadata = ctx.repo_metadata(reproducible=True)
     ctx.repo_metadata(attrs_for_reproducibility={"checksum": "abc", "count": 1})
     attrs = {"checksum": "abc"}
     ctx.repo_metadata(attrs_for_reproducibility=attrs)
-    (available, selected, setting, metadata)
+    (available, selected, setting, metadata, variables, selected_variables, visibility)
 "#;
         let file = analysis
             .open_document(
@@ -1495,6 +1501,11 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
             "toolchains[42]",
             "42 in toolchains",
             "platform_common.ToolchainInfo(42)",
+            "platform_common.TemplateVariableInfo()",
+            "platform_common.TemplateVariableInfo({1: 'value'})",
+            "platform_common.TemplateVariableInfo({'CC': 1})",
+            "native.package_default_visibility(1)",
+            "_wrong: list[str] = native.package_default_visibility(); _wrong",
             "_wrong: CcInfo = platform_common.ToolchainInfo(); _wrong",
             "_wrong: CcInfo = target[platform_common.ConstraintSettingInfo]; _wrong",
             "InstrumentedFilesInfo()",
@@ -1522,6 +1533,70 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
                 usize::from(diagnostic.range().unwrap().start()) >= source.len(),
                 "{invalid}: {diagnostic:?}"
             );
+        }
+    }
+
+    #[test]
+    fn aspect_propagation_accepts_lists_and_callbacks() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = r#"def implementation(target, ctx):
+    return []
+def propagation(ctx):
+    return ["deps"]
+def no_context():
+    return ["deps"]
+def extra_context(ctx, other):
+    return ["deps"]
+def wrong_element(ctx) -> list[int]:
+    return [1]
+def wrong_container(ctx) -> tuple[str]:
+    return ("deps",)
+callback = propagation
+aspect(implementation=implementation, attr_aspects=["deps"])
+aspect(implementation=implementation, attr_aspects=("deps",))
+aspect(implementation=implementation, attr_aspects=callback)
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for invalid in [
+            "no_context",
+            "extra_context",
+            "wrong_element",
+            "wrong_container",
+            "[1]",
+        ] {
+            analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    format!(
+                        "{source}aspect(implementation=implementation, attr_aspects={invalid})\n"
+                    ),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{invalid}: {diagnostics:?}");
+            };
+            assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
         }
     }
 

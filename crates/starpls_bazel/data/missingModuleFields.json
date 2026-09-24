@@ -226,7 +226,35 @@
       }
     }
   ],
+  "native": [
+    {
+      "name": "package_default_visibility",
+      "doc": "Returns the default visibility of the current package.",
+      "callable": {
+        "params": [],
+        "return_type": "list of Labels"
+      }
+    }
+  ],
   "platform_common": [
+    {
+      "name": "TemplateVariableInfo",
+      "doc": "Creates a provider containing the supplied template variables.",
+      "callable": {
+        "params": [
+          {
+            "name": "vars",
+            "type": "Dictionary: string -> string",
+            "doc": "Template variable names and their values.",
+            "default_value": "",
+            "is_mandatory": true,
+            "is_star_arg": false,
+            "is_star_star_arg": false
+          }
+        ],
+        "return_type": "TemplateVariableInfo"
+      }
+    },
     {
       "name": "ToolchainInfo",
       "doc": "Creates a toolchain provider containing the supplied fields.",
