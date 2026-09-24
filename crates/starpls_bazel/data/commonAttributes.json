@@ -9,6 +9,14 @@
       "configurable": false
     },
     {
+      "name": "aspect_hints",
+      "type": "List of Labels",
+      "doc": "Targets providing hints for aspects that propagate along this rule.",
+      "default_value": "[]",
+      "is_mandatory": false,
+      "configurable": true
+    },
+    {
       "name": "compatible_with",
       "type": "List of Labels",
       "doc": "The list of environments this target can be built for, in addition to default-supported environments.\n\nThis is part of Bazel's constraint system, which lets users declare which targets can and cannot depend on each other. For example, externally deployable binaries shouldn't depend on libraries with company-secret code. See ConstraintSemantics for details.",
@@ -113,6 +121,56 @@
       "default_value": "",
       "is_mandatory": true,
       "configurable": false
+    }
+  ],
+  "test": [
+    {
+      "name": "size",
+      "type": "string",
+      "doc": "Expected resource usage of the test.",
+      "default_value": "medium",
+      "is_mandatory": false,
+      "configurable": false
+    },
+    {
+      "name": "timeout",
+      "type": "string",
+      "doc": "Maximum test duration, derived from size when omitted.",
+      "default_value": "",
+      "is_mandatory": false,
+      "configurable": false
+    },
+    {
+      "name": "flaky",
+      "type": "boolean",
+      "doc": "Whether a failed test may be retried.",
+      "default_value": "False",
+      "is_mandatory": false,
+      "configurable": false
+    },
+    {
+      "name": "shard_count",
+      "type": "int",
+      "doc": "Number of parallel test shards.",
+      "default_value": "-1",
+      "is_mandatory": false,
+      "configurable": true
+    },
+    {
+      "name": "local",
+      "type": "boolean",
+      "doc": "Whether the test must run locally.",
+      "default_value": "False",
+      "is_mandatory": false,
+      "configurable": false
+    },
+    {
+      "name": "args",
+      "type": "List of strings",
+      "doc": "Additional arguments passed to the test.",
+      "default_value": "[]",
+      "is_mandatory": false,
+      "configurable": true
     }
   ]
 }

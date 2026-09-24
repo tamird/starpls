@@ -4,6 +4,7 @@ use serde::Serialize;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommonAttributes {
     pub build: Vec<Attribute>,
+    pub test: Vec<Attribute>,
     pub repository: Vec<Attribute>,
 }
 

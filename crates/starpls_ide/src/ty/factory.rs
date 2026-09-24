@@ -59,7 +59,17 @@ enum DefaultValue {
 #[derive(Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub(super) struct RuleData {
     documentation: Documentation,
-    attributes: Box<[(Name, Attribute)]>,
+    pub(super) attributes: Box<[RuleAttributeData]>,
+    pub(super) complete: bool,
+    pub(super) executable: Option<bool>,
+    pub(super) build_setting: Option<BuildSetting>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(super) struct RuleAttributeData {
+    pub(super) name: Name,
+    pub(super) descriptor: Option<Attribute>,
+    pub(super) source: Option<FileRange>,
 }
 
 impl RuleData {
@@ -70,7 +80,8 @@ impl RuleData {
         declarations: ProgramFile<'db>,
         name: &str,
     ) -> Option<Type<'db>> {
-        let (_, attribute) = self.attributes.iter().find(|(key, _)| key == name)?;
+        let attribute = self.attributes.iter().find(|entry| entry.name == name)?;
+        let attribute = attribute.descriptor.as_ref()?;
         let none = Type::none(db, environment);
         if name.starts_with('_') && attribute.default_value == DefaultValue::None {
             return Some(none);
@@ -116,6 +127,7 @@ struct RuleAttribute<'db> {
     name: Name,
     parameter: Option<Parameter<'db>>,
     descriptor: Option<Attribute>,
+    source: Option<FileRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -558,6 +570,20 @@ enum RuleKind {
 fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
     let common = starpls_bazel::attr::make_common_attributes();
+    let test = if matches!(kind, RuleKind::Build) {
+        any_enabled([
+            boolean_argument(call, "test"),
+            boolean_argument(call, "analysis_test"),
+        ])
+    } else {
+        Some(false)
+    };
+    let executable = if matches!(kind, RuleKind::Build) {
+        any_enabled([test, boolean_argument(call, "executable")])
+    } else {
+        Some(false)
+    };
+    let mut test_attributes = common.test;
     let inherit_common = matches!(call.argument("inherit_attrs"), CheckedArgument::Value { ty, expression: _ }
         if ty.string_literal_value(db) == Some("common"));
     let mut common = match kind {
@@ -586,6 +612,9 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     });
     if let Some(setting_kind) = setting_kind {
         common.extend(setting_kind.attributes());
+    }
+    if test == Some(true) {
+        common.append(&mut test_attributes);
     }
     let mut documentation = Documentation {
         text: doc_string(db, call),
@@ -624,6 +653,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             Some(RuleAttribute {
                 name,
                 parameter: Some(parameter),
+                source: None,
                 descriptor: Some(Attribute {
                     kind: attribute.r#type,
                     single_file: Some(false),
@@ -656,6 +686,20 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                 ),
                 name,
                 descriptor: None,
+                source: None,
+            });
+        }
+    }
+    if test.is_none() {
+        for attribute in test_attributes {
+            let name = Name::new(attribute.name);
+            attributes.push(RuleAttribute {
+                parameter: Some(
+                    Parameter::keyword_only(name.clone()).with_default_type(Type::unknown()),
+                ),
+                name,
+                descriptor: None,
+                source: None,
             });
         }
     }
@@ -684,6 +728,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             name,
             parameter,
             descriptor,
+            source: _,
         } in &mut attributes
         {
             if !matches!(name.as_str(), "name" | "visibility") {
@@ -771,6 +816,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         let attribute = RuleAttribute {
             name: Name::new(name),
             parameter,
+            source: Some(source),
             descriptor: if is_complete {
                 attribute.cloned()
             } else {
@@ -792,12 +838,15 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         name,
         parameter,
         descriptor,
+        source,
     } in attributes
     {
         parameters.extend(parameter);
-        if let Some(descriptor) = descriptor {
-            descriptors.push((name, descriptor));
-        }
+        descriptors.push(RuleAttributeData {
+            name,
+            descriptor,
+            source,
+        });
     }
     if !complete {
         // Partial mappings and unknown parents can contain additional names.
@@ -830,11 +879,32 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                 data: Some(ProvidedData::new(RuleData {
                     documentation,
                     attributes: descriptors.into_boxed_slice(),
+                    complete,
+                    executable,
+                    build_setting: setting_kind,
                 })),
             },
         },
     )
     .to_instance_approximation(db, &environment)
+}
+
+fn boolean_argument(call: &CheckedCall<'_, '_>, name: &str) -> Option<bool> {
+    match call.argument(name) {
+        CheckedArgument::Omitted => Some(false),
+        CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal(),
+        CheckedArgument::Indeterminate => None,
+    }
+}
+
+fn any_enabled(flags: [Option<bool>; 2]) -> Option<bool> {
+    if flags.contains(&Some(true)) {
+        Some(true)
+    } else if flags.contains(&None) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Compose the parent's public attributes from its existing callable contract.
@@ -932,8 +1002,8 @@ fn inherit_macro_attributes<'db>(
             documentation.parameters.push((name.clone(), doc));
         }
         let mut descriptor = parent_data
-            .and_then(|data| data.attributes.iter().find(|(key, _)| key == name))
-            .map(|(_, attribute)| attribute.clone())
+            .and_then(|data| data.attributes.iter().find(|entry| entry.name == *name))
+            .and_then(|entry| entry.descriptor.clone())
             .or_else(|| inherited_native_attribute(db, definition?, name.as_str()));
         if let Some(descriptor) = &mut descriptor {
             if !descriptor.mandatory {
@@ -945,6 +1015,9 @@ fn inherit_macro_attributes<'db>(
             name: name.clone(),
             parameter: Some(parameter),
             descriptor,
+            source: parent_data
+                .and_then(|data| data.attributes.iter().find(|entry| entry.name == *name))
+                .and_then(|entry| entry.source),
         });
     }
     complete

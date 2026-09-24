@@ -37,8 +37,8 @@ use super::factory;
 use super::factory::Attribute;
 use super::factory::AttributeConfiguration;
 use super::factory::AttributeUse;
-use super::factory::BuildSetting;
 use super::factory::Factory;
+use super::factory::RuleAttributeData;
 use crate::Database;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,51 +161,41 @@ pub(super) fn parameter_type<'db>(
             return target.to_instance_approximation(db, &environment);
         }
     }
-    let build_setting = if context_kind == ContextKind::Build {
-        let argument = argument(call, &signature, "build_setting").ok()?;
-        argument
-            .and_then(|argument| argument.inferred_type(&model))
-            .filter(|ty| !ty.is_none(db))
-    } else {
-        None
-    };
-    let setting_kind = build_setting.and_then(|ty| {
-        let data = ty.provided_data(db, &environment)?;
-        data.downcast_ref::<BuildSetting>().copied()
-    });
-    let mut common = match context_kind {
-        ContextKind::Build => starpls_bazel::attr::make_common_attributes().build,
-        ContextKind::Repository => starpls_bazel::attr::make_common_attributes().repository,
-        ContextKind::Aspect => Vec::new(),
-    };
-    if let Some(setting_kind) = setting_kind {
-        common.extend(setting_kind.attributes());
-    }
-    let attribute_type = |kind| {
-        factory::attribute_value_type(
-            db,
-            &environment,
-            declarations,
-            kind,
-            if context_kind == ContextKind::Repository {
-                AttributeUse::RepositoryContext
-            } else {
-                AttributeUse::BuildContext(
-                    factory::native_class(db, declarations, "Target")?
-                        .to_instance_approximation(db, &environment)?,
-                )
+    let result = call.inferred_type(&model)?;
+    let rule = result
+        .provided_data(db, &environment)
+        .and_then(|data| data.downcast_ref::<factory::RuleData>());
+    let aspect_attributes;
+    let (attributes, complete) = if context_kind == ContextKind::Aspect {
+        let schema = match argument(call, &signature, "attrs").ok()? {
+            Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
+                items: Box::default(),
+                is_complete: false,
+            }),
+            None => DictionaryItems {
+                items: Box::default(),
+                is_complete: true,
             },
-        )
-    };
-    let schema = match argument(call, &signature, "attrs").ok()? {
-        Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
-            items: Box::default(),
-            is_complete: false,
-        }),
-        None => DictionaryItems {
-            items: Box::default(),
-            is_complete: true,
-        },
+        };
+        aspect_attributes = schema
+            .items
+            .iter()
+            .map(|DictionaryItem { name, ty, source }| RuleAttributeData {
+                name: name.clone(),
+                descriptor: if schema.is_complete {
+                    ty.provided_data(db, &environment)
+                        .and_then(|data| data.downcast_ref::<Attribute>())
+                        .cloned()
+                } else {
+                    None
+                },
+                source: Some(FileRange::new(file.file(db), *source)),
+            })
+            .collect::<Vec<_>>();
+        (aspect_attributes.as_slice(), schema.is_complete)
+    } else {
+        let rule = rule?;
+        (rule.attributes.as_ref(), rule.complete)
     };
     let make_class = |name, base, fields, has_dynamic_fields| {
         let class = model.provided_class_at_call(
@@ -238,69 +228,50 @@ pub(super) fn parameter_type<'db>(
         if context_kind == ContextKind::Aspect && matches!(view, View::Outputs | View::SplitAttr) {
             continue;
         }
-        let mut complete = schema.is_complete;
-        let mut fields = common
-            .iter()
-            .filter_map(|attribute| {
-                let ty = match view {
-                    View::Attr => attribute_type(&attribute.r#type),
-                    View::Files => dependency(&attribute.r#type)
-                        .then(|| native_file_list(db, &environment, declarations))
-                        .flatten(),
-                    View::File => None,
-                    View::Executable => None,
-                    View::Outputs => None,
-                    View::SplitAttr => None,
-                }?;
-                Some(ProvidedField {
-                    name: Name::new(&attribute.name),
-                    ty,
-                    source: None,
-                })
-            })
-            .collect::<Vec<_>>();
-        if view == View::Attr && build_setting.is_some() && setting_kind.is_none() {
-            fields.extend(BuildSetting::ATTRIBUTE_NAMES.map(|name| ProvidedField {
-                name: Name::new(name),
-                ty: Type::unknown(),
-                source: None,
-            }));
-        }
-        for DictionaryItem { name, ty, source } in &schema.items {
-            if setting_kind.is_some() && BuildSetting::ATTRIBUTE_NAMES.contains(&name.as_str()) {
+        let mut complete = complete;
+        let mut fields = Vec::new();
+        for RuleAttributeData {
+            name,
+            descriptor,
+            source,
+        } in attributes
+        {
+            // Bazel accepts hints at rule call sites but hides them from ctx.attr.
+            if context_kind == ContextKind::Build && name == "aspect_hints" {
                 continue;
             }
-            let attribute = ty
-                .provided_data(db, &environment)
-                .and_then(|data| data.downcast_ref::<Attribute>());
-            let ty = if !schema.is_complete || attribute.is_none() {
-                complete = false;
+            let ty = if let Some(attribute) = descriptor {
+                if context_kind == ContextKind::Repository {
+                    if attribute.kind == AttributeKind::Label && attribute.has_non_none_value() {
+                        factory::native_class(db, declarations, "Label")?
+                            .to_instance_approximation(db, &environment)?
+                    } else {
+                        factory::attribute_value_type(
+                            db,
+                            &environment,
+                            declarations,
+                            &attribute.kind,
+                            AttributeUse::RepositoryContext,
+                        )?
+                    }
+                } else {
+                    let Some(ty) = field_type(db, &environment, declarations, view, attribute)
+                    else {
+                        continue;
+                    };
+                    ty
+                }
+            } else {
                 if view != View::Attr {
                     continue;
                 }
                 Type::unknown()
-            } else if context_kind == ContextKind::Repository {
-                let attribute = attribute?;
-                if attribute.kind == AttributeKind::Label && attribute.has_non_none_value() {
-                    factory::native_class(db, declarations, "Label")?
-                        .to_instance_approximation(db, &environment)?
-                } else {
-                    attribute_type(&attribute.kind)?
-                }
-            } else {
-                let Some(ty) = field_type(db, &environment, declarations, view, attribute?) else {
-                    continue;
-                };
-                ty
             };
-            insert_field(
-                &mut fields,
-                ProvidedField {
-                    name: name.clone(),
-                    ty,
-                    source: Some(FileRange::new(file.file(db), *source)),
-                },
-            );
+            fields.push(ProvidedField {
+                name: name.clone(),
+                ty,
+                source: *source,
+            });
         }
         if view == View::Outputs {
             let output = factory::native_class(db, declarations, "File")?
@@ -328,22 +299,17 @@ pub(super) fn parameter_type<'db>(
                     None => complete = false,
                 }
             }
-            for option in ["executable", "test"] {
-                let Some(option) = argument(call, &signature, option).ok()? else {
-                    continue;
-                };
-                match option.inferred_type(&model).and_then(Type::as_bool_literal) {
-                    Some(true) => insert_field(
-                        &mut fields,
-                        ProvidedField {
-                            name: Name::new("executable"),
-                            ty: output,
-                            source: None,
-                        },
-                    ),
-                    Some(false) => {}
-                    None => complete = false,
-                }
+            match rule?.executable {
+                Some(true) => insert_field(
+                    &mut fields,
+                    ProvidedField {
+                        name: Name::new("executable"),
+                        ty: output,
+                        source: None,
+                    },
+                ),
+                Some(false) => {}
+                None => complete = false,
             }
         }
         let ty = make_class(
@@ -363,7 +329,7 @@ pub(super) fn parameter_type<'db>(
     } else {
         "ctx"
     };
-    let base = match setting_kind {
+    let base = match rule.and_then(|rule| rule.build_setting) {
         Some(setting_kind) => factory::specialized_native_class(
             db,
             declarations,
@@ -666,6 +632,129 @@ mod tests {
             };
             assert_eq!(*target_file_id, file.source);
             assert_eq!(&source[*target_selection_range], key);
+        }
+    }
+
+    #[test]
+    fn test_rule_attributes_share_the_call_and_context_schema() {
+        for option in [
+            "test=True",
+            "analysis_test=True",
+            "test=False, analysis_test=True",
+        ] {
+            let source = format!(
+                r#"def implementation(ctx):
+    timeout: str = ctx.attr.timeout
+    size: str = ctx.attr.size
+    flaky: bool = ctx.attr.flaky
+    shards: int = ctx.attr.shard_count
+    local: bool = ctx.attr.local
+    args: list[str] = ctx.attr.args
+    ctx.outputs.executable.basename
+    (timeout, size, flaky, shards, local, args)
+example_test = rule(implementation=implementation, {option})
+example_test(name="test", timeout="short", size="small", flaky=True, shard_count=2, local=True, args=["--flag"], aspect_hints=["//:hint"])
+"#
+            );
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            enable_context(&mut analysis);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert!(diagnostics.is_empty(), "{option}: {diagnostics:?}");
+            for (expression, expected) in
+                [("ctx.attr.timeout", "str"), ("ctx.attr.args", "list[str]")]
+            {
+                check_field(
+                    &analysis.snapshot(),
+                    fixture.main_file(),
+                    &source,
+                    expression,
+                    expected,
+                    "",
+                );
+            }
+            for invalid in [
+                "timeout=1",
+                "timeout=select({'//conditions:default': 'short'})",
+                "aspect_hints=[1]",
+            ] {
+                analysis
+                    .open_document(
+                        std::path::Path::new("/main.bzl"),
+                        starpls_common::Dialect::Bazel,
+                        None,
+                        format!("{source}example_test(name='bad', {invalid})\n"),
+                        2,
+                    )
+                    .unwrap();
+                let diagnostics = analysis
+                    .snapshot()
+                    .diagnostics(fixture.main_file())
+                    .unwrap();
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("{invalid}: {diagnostics:?}");
+                };
+                assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+            }
+        }
+    }
+
+    #[test]
+    fn generated_rule_attributes_have_bounded_visibility() {
+        for (options, name, field, argument, errors) in [
+            ("", "example", "timeout", "timeout='short'", 1),
+            ("test=False", "example", "timeout", "timeout='short'", 1),
+            (
+                "test=True",
+                "example_test",
+                "aspect_hints",
+                "timeout='short'",
+                0,
+            ),
+            (
+                "test=unknown()",
+                "example_test",
+                "timeout",
+                "timeout='short'",
+                0,
+            ),
+            (
+                "analysis_test=unknown()",
+                "example_test",
+                "timeout",
+                "timeout='short'",
+                0,
+            ),
+            (
+                "test=unknown()",
+                "example_test",
+                "missing",
+                "nonexistent=True",
+                1,
+            ),
+        ] {
+            let source = format!("def unknown() -> bool: return True\ndef implementation(ctx):\n    ctx.attr.{field}\n{name} = rule(implementation=implementation, {options})\n{name}(name='test', {argument})\n");
+            let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            enable_context(&mut analysis);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert_eq!(
+                diagnostics.len(),
+                errors,
+                "{options}, {field}: {diagnostics:?}"
+            );
+            check_field(
+                &analysis.snapshot(),
+                fixture.main_file(),
+                &source,
+                &format!("ctx.attr.{field}"),
+                "Unknown",
+                "",
+            );
         }
     }
 
