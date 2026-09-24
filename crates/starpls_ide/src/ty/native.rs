@@ -362,15 +362,34 @@ fn declarations(
                 continue;
             }
             match &field.callable {
-                Some(callable) => write_function(
-                    &mut body,
-                    "        ",
-                    field,
-                    callable,
-                    CallableKind::Method(&class.name),
-                    AnnotationUse::Value,
-                    &declared_classes,
-                )?,
+                Some(callable) => {
+                    if matches!(class.name.as_str(), "repository_ctx" | "module_ctx")
+                        && field.name == "getenv"
+                    {
+                        // The inventory omits allowReturnNones. A supplied string
+                        // default still guarantees a string result.
+                        let documentation = callable_documentation(field, callable)?;
+                        for (default, result) in [
+                            ("None = None", "_starpls_builtins.str | None"),
+                            ("_starpls_builtins.str", "_starpls_builtins.str"),
+                        ] {
+                            writeln!(body, "        @_starpls_typing.overload")?;
+                            writeln!(body, "        def getenv(_starpls_self, name: _starpls_builtins.str, default: {default}) -> {result}:")?;
+                            writeln!(body, "            {}", quoted(&documentation))?;
+                            writeln!(body, "            ...")?;
+                        }
+                    } else {
+                        write_function(
+                            &mut body,
+                            "        ",
+                            field,
+                            callable,
+                            CallableKind::Method(&class.name),
+                            AnnotationUse::Value,
+                            &declared_classes,
+                        )?;
+                    }
+                }
                 None => {
                     let field_type = if class.name == "ctx" {
                         match field.name.as_str() {
@@ -998,6 +1017,55 @@ mod tests {
                 diagnostics[0].range().unwrap(),
                 ruff_text_size::TextRange::new(invalid.into(), (invalid + 1).into()),
             );
+        }
+    }
+
+    #[test]
+    fn getenv_preserves_absence_and_supplied_defaults() {
+        for context in ["repository_ctx", "module_ctx"] {
+            let builtins = starpls_bazel::decode_builtins(include_bytes!(
+                "../../../starpls/src/builtin/builtin.pb"
+            ))
+            .unwrap();
+            let (mut analysis, _) = Analysis::new_for_test();
+            analysis
+                .set_builtin_defs(builtins, Default::default())
+                .unwrap();
+            let source = format!(
+                r#"def read(ctx: {context}, fallback: str | None):
+    value = ctx.getenv("MISSING")
+    if value == None:
+        value = "default"
+    value.upper()
+    ctx.getenv("MISSING", "default").upper()
+    ctx.getenv(name="MISSING", default="default").upper()
+    optional = ctx.getenv("MISSING", fallback)
+    if optional != None:
+        optional.upper()
+"#
+            );
+            let file = analysis
+                .open_document(
+                    Path::new("/main.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    source.clone(),
+                    1,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{context}: {diagnostics:?}");
+
+            for call in [
+                "ctx.getenv('MISSING')",
+                "ctx.getenv('MISSING', None)",
+                "ctx.getenv('MISSING', fallback)",
+            ] {
+                analysis.update_file(file, format!("{source}    {call}.upper()\n"));
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                assert_eq!(diagnostics.len(), 1, "{context}, {call}: {diagnostics:?}");
+                assert_eq!(diagnostics[0].id().as_str(), "unresolved-attribute");
+            }
         }
     }
 
