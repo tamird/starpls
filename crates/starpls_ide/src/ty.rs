@@ -641,6 +641,7 @@ consume(**invalid)
                             ("tags", Discriminator::StringList, false, false),
                             ("testonly", Discriminator::Boolean, false, false),
                             ("deprecation", Discriminator::String, false, false),
+                            ("visibility", Discriminator::StringList, false, false),
                         ]
                         .into_iter()
                         .map(
@@ -659,19 +660,34 @@ consume(**invalid)
             )
             .unwrap();
         let file = fixture.main_file();
-        for (extra_keyword, escape, valid) in [
+        for (extra_keyword, update, valid) in [
             ("", "", true),
             ("", "    mutate(options)\n", false),
             ("", "", true),
             (", deprecation=1", "", false),
+            (
+                "",
+                "    if visibility != None:\n        options[\"visibility\"] = visibility\n",
+                true,
+            ),
+            (
+                "",
+                "    if visibility != None:\n        options[\"visibility\"] = True\n",
+                false,
+            ),
+            (
+                "",
+                "    if visibility != None:\n        options[\"visibility\"] = visibility\n",
+                true,
+            ),
         ] {
             let source = format!(
                 r#"def mutate(value):
     value["deprecation"] = 1
 
-def register(name: str):
+def register(name: str, visibility: list[str] | None):
     options = dict(tags=["manual"], testonly=True{extra_keyword})
-{escape}    native.alias(name=name, actual="//:target", **options)
+{update}    native.alias(name=name, actual="//:target", **options)
     native.alias(name=name + "_again", actual="//:target", **options)
 "#
             );

@@ -759,6 +759,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         items: Box::default(),
         is_complete: false,
     });
+    let is_complete = is_complete && items.iter().all(|item| item.is_required);
     complete &= is_complete;
     if parent.is_some() && !is_complete {
         // Unseen overrides can replace a public label's default, but not its
@@ -790,8 +791,12 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         name,
         ty: value,
         source,
+        is_required,
     } in items
     {
+        if !is_required {
+            continue;
+        }
         let source = FileRange::new(call.file().file(db), source);
         let name = name.as_str();
         if matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility") {
@@ -2091,6 +2096,49 @@ raw(field=1)
             &snapshot.db,
             snapshot.db.starlark_program_file(file_id),
         );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn conditional_attributes_do_not_promise_parameters() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"def implementation(ctx): return []
+def make_rule(flag: bool):
+    attributes = {}
+    if flag:
+        attributes["dep"] = attr.label(mandatory=True, allow_single_file=True)
+    generated = rule(implementation=implementation, attrs=attributes)
+    def register(name):
+        if flag:
+            generated(name=name, dep="//:input")
+        else:
+            generated($0name=name)
+    return generated, register
+example, register = make_rule(False)
+"#,
+        );
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let snapshot = analysis.snapshot();
+        let help = snapshot
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert!(signature.label.contains("name: str"), "{help:?}");
+        assert!(signature.label.contains("**kwargs"), "{help:?}");
+        assert!(!signature.label.contains("dep:"), "{help:?}");
+        let diagnostics = snapshot.diagnostics(file_id).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 

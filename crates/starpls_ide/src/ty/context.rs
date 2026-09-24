@@ -167,32 +167,41 @@ pub(super) fn parameter_type<'db>(
         .and_then(|data| data.downcast_ref::<factory::RuleData>());
     let aspect_attributes;
     let (attributes, complete) = if context_kind == ContextKind::Aspect {
-        let schema = match argument(call, &signature, "attrs").ok()? {
-            Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
-                items: Box::default(),
-                is_complete: false,
-            }),
-            None => DictionaryItems {
-                items: Box::default(),
-                is_complete: true,
-            },
-        };
-        aspect_attributes = schema
-            .items
-            .iter()
-            .map(|DictionaryItem { name, ty, source }| RuleAttributeData {
-                name: name.clone(),
-                descriptor: if schema.is_complete {
-                    ty.provided_data(db, &environment)
-                        .and_then(|data| data.downcast_ref::<Attribute>())
-                        .cloned()
-                } else {
-                    None
+        let DictionaryItems { items, is_complete } =
+            match argument(call, &signature, "attrs").ok()? {
+                Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
+                    items: Box::default(),
+                    is_complete: false,
+                }),
+                None => DictionaryItems {
+                    items: Box::default(),
+                    is_complete: true,
                 },
-                source: Some(FileRange::new(file.file(db), *source)),
-            })
+            };
+        let is_complete = is_complete && items.iter().all(|item| item.is_required);
+        aspect_attributes = items
+            .iter()
+            .filter(|item| item.is_required)
+            .map(
+                |DictionaryItem {
+                     name,
+                     ty,
+                     source,
+                     is_required: _,
+                 }| RuleAttributeData {
+                    name: name.clone(),
+                    descriptor: if is_complete {
+                        ty.provided_data(db, &environment)
+                            .and_then(|data| data.downcast_ref::<Attribute>())
+                            .cloned()
+                    } else {
+                        None
+                    },
+                    source: Some(FileRange::new(file.file(db), *source)),
+                },
+            )
             .collect::<Vec<_>>();
-        (aspect_attributes.as_slice(), schema.is_complete)
+        (aspect_attributes.as_slice(), is_complete)
     } else {
         let rule = rule?;
         (rule.attributes.as_ref(), rule.complete)
@@ -279,13 +288,18 @@ pub(super) fn parameter_type<'db>(
             if let Some(outputs) = argument(call, &signature, "outputs").ok()? {
                 match model.dictionary_items(outputs) {
                     Some(DictionaryItems { items, is_complete }) => {
+                        let is_complete = is_complete && items.iter().all(|item| item.is_required);
                         complete &= is_complete;
                         for DictionaryItem {
                             name,
                             ty: _,
                             source,
+                            is_required,
                         } in items
                         {
+                            if !is_required {
+                                continue;
+                            }
                             insert_field(
                                 &mut fields,
                                 ProvidedField {
