@@ -570,7 +570,25 @@ enum RuleKind {
 fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> Option<Type<'db>> {
     let environment = ProgramEnvironment::from_file(call.file());
     let common = starpls_bazel::attr::make_common_attributes();
-    let test = if matches!(kind, RuleKind::Build) {
+    let parent = if matches!(kind, RuleKind::Build) {
+        match call.argument("parent") {
+            CheckedArgument::Omitted => None,
+            CheckedArgument::Value { ty, expression: _ } => (!ty.is_none(db)).then_some(ty),
+            CheckedArgument::Indeterminate => Some(Type::unknown()),
+        }
+    } else {
+        None
+    };
+    let parent_data = parent.and_then(|parent| {
+        let base = declared_class(db, call, "rule")?;
+        let base = base.to_instance_approximation(db, &environment)?;
+        if !parent.is_subtype_of(db, &environment, base) {
+            return None;
+        }
+        let data = parent.provided_data(db, &environment)?;
+        data.downcast_ref::<RuleData>()
+    });
+    let test = if matches!(kind, RuleKind::Build) && parent.is_none() {
         any_enabled([
             boolean_argument(call, "test"),
             boolean_argument(call, "analysis_test"),
@@ -578,7 +596,9 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     } else {
         Some(false)
     };
-    let executable = if matches!(kind, RuleKind::Build) {
+    let executable = if parent.is_some() {
+        parent_data.and_then(|data| data.executable)
+    } else if matches!(kind, RuleKind::Build) {
         any_enabled([test, boolean_argument(call, "executable")])
     } else {
         Some(false)
@@ -703,9 +723,27 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             });
         }
     }
-    let mut complete = !matches!(kind, RuleKind::Macro)
-        || inherit_common
-        || inherit_macro_attributes(db, call, &mut attributes, &mut documentation);
+    let mut complete = match kind {
+        RuleKind::Build => match parent {
+            Some(parent) => parent_data.is_some_and(|data| {
+                inherit_rule_attributes(
+                    db,
+                    &environment,
+                    parent,
+                    data,
+                    &mut attributes,
+                    &mut documentation,
+                )
+            }),
+            None => true,
+        },
+        RuleKind::Repository => true,
+        RuleKind::Macro => {
+            inherit_common
+                || inherit_macro_attributes(db, call, &mut attributes, &mut documentation)
+        }
+    };
+    let uncertain_parent = parent.is_some() && !complete;
     let own_attributes = match call.argument("attrs") {
         CheckedArgument::Omitted => Some(DictionaryItems {
             items: Box::default(),
@@ -722,6 +760,13 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         is_complete: false,
     });
     complete &= is_complete;
+    if parent.is_some() && !is_complete {
+        // Unseen overrides can replace a public label's default, but not its
+        // inherited flags or requiredness.
+        for attribute in &mut attributes {
+            override_rule_attribute(attribute, None, None);
+        }
+    }
     if matches!(kind, RuleKind::Macro) && !is_complete {
         // Unknown own attributes can override or remove any inherited contract.
         for RuleAttribute {
@@ -756,6 +801,40 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             // Bazel rejects declarations that collide with generated attributes.
             continue;
         }
+        let attribute = value
+            .provided_data(db, &environment)
+            .and_then(|data| data.downcast_ref::<Attribute>());
+        if parent.is_some() {
+            if let Some(inherited) = attributes.iter_mut().find(|entry| entry.name == name) {
+                if is_complete {
+                    override_rule_attribute(inherited, attribute, Some(source));
+                }
+                continue;
+            }
+        }
+        // An unseen parent may already declare this label attribute. Overrides
+        // retain its flags, so the child's descriptor cannot establish them.
+        let uncertain_attribute = attribute
+            .filter(|attribute| {
+                uncertain_parent
+                    && !name.starts_with('_')
+                    && matches!(
+                        attribute.kind,
+                        AttributeKind::Label | AttributeKind::LabelList
+                    )
+            })
+            .map(|attribute| Attribute {
+                kind: attribute.kind.clone(),
+                single_file: None,
+                executable: None,
+                configuration: AttributeConfiguration::Unknown,
+                configurability: Configurability::Unknown,
+                mandatory: false,
+                default: None,
+                default_value: DefaultValue::Unknown,
+                documentation: attribute.documentation.clone(),
+            });
+        let attribute = uncertain_attribute.as_ref().or(attribute);
         documentation
             .parameters
             .retain(|(existing, _)| existing.as_str() != name);
@@ -763,9 +842,6 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             attributes.retain(|attribute| attribute.name.as_str() != name);
             continue;
         }
-        let attribute = value
-            .provided_data(db, &environment)
-            .and_then(|data| data.downcast_ref::<Attribute>());
         let mut parameter = Parameter::keyword_only(Name::new(name)).with_source_range(source);
         if !is_complete {
             parameter = parameter
@@ -889,6 +965,122 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     .to_instance_approximation(db, &environment)
 }
 
+fn inherit_rule_attributes<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    parent: Type<'db>,
+    data: &RuleData,
+    attributes: &mut Vec<RuleAttribute<'db>>,
+    documentation: &mut Documentation,
+) -> bool {
+    let Some(signature) = callable_signature(db, environment, parent) else {
+        return false;
+    };
+    attributes.clear();
+    documentation
+        .parameters
+        .clone_from(&data.documentation.parameters);
+    let mut complete = data.complete;
+    for RuleAttributeData {
+        name,
+        descriptor,
+        source,
+    } in &data.attributes
+    {
+        let parameter = if name.starts_with('_') {
+            None
+        } else {
+            let parameter = signature
+                .parameters()
+                .iter()
+                .find(|parameter| match parameter.kind() {
+                    ParameterKind::KeywordOnly {
+                        name: parameter_name,
+                        default_type: _,
+                    } => parameter_name == name,
+                    _ => false,
+                })
+                .cloned();
+            complete &= parameter.is_some();
+            parameter
+        };
+        attributes.push(RuleAttribute {
+            name: name.clone(),
+            parameter,
+            descriptor: descriptor.clone(),
+            source: *source,
+        });
+    }
+    complete
+}
+
+fn override_rule_attribute(
+    inherited: &mut RuleAttribute<'_>,
+    attribute: Option<&Attribute>,
+    source: Option<FileRange>,
+) {
+    let RuleAttribute {
+        name,
+        parameter,
+        descriptor,
+        source: origin,
+    } = inherited;
+    let Some(parent) = descriptor else {
+        return;
+    };
+    // Bazel permits only public Starlark label attributes to be overridden.
+    // The parent retains all flags; only a non-null default and aspects change.
+    if origin.is_none()
+        || name.starts_with('_')
+        || !matches!(parent.kind, AttributeKind::Label | AttributeKind::LabelList)
+        || attribute.is_some_and(|attribute| parent.kind != attribute.kind)
+    {
+        return;
+    }
+    if let Some(source) = source {
+        *origin = Some(source);
+        if let Some(parameter) = parameter {
+            *parameter = parameter.clone().with_source_range(source);
+        }
+    }
+    if let Some(attribute) = attribute {
+        if attribute.default_value == DefaultValue::None {
+            return;
+        }
+        parent.default = attribute.default;
+        parent.default_value = attribute.default_value;
+    } else {
+        // An unknown descriptor may supply a computed default returning None.
+        parent.default = None;
+        parent.default_value = DefaultValue::Unknown;
+    }
+    if !parent.mandatory {
+        if let Some(parameter) = parameter {
+            *parameter = match parent.default {
+                Some(source) => parameter.clone().with_default(ParameterDefault::Source {
+                    ty: parameter.annotated_type(),
+                    source,
+                }),
+                None => parameter.clone().with_default_type(Type::unknown()),
+            };
+        }
+    }
+}
+
+fn callable_signature<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    parent: Type<'db>,
+) -> Option<Signature<'db>> {
+    let mut signatures = Vec::new();
+    parent.map_callable_signatures(db, environment, CallableTypeKind::Regular, |signature| {
+        signatures.push(signature.clone());
+        signature
+    });
+    let [signature] = signatures.try_into().ok()?;
+    Some(signature)
+}
+
 fn boolean_argument(call: &CheckedCall<'_, '_>, name: &str) -> Option<bool> {
     match call.argument(name) {
         CheckedArgument::Omitted => Some(false),
@@ -932,12 +1124,7 @@ fn inherit_macro_attributes<'db>(
     }) {
         return false;
     }
-    let mut signatures = Vec::new();
-    parent.map_callable_signatures(db, &environment, CallableTypeKind::Regular, |signature| {
-        signatures.push(signature.clone());
-        signature
-    });
-    let [signature] = signatures.as_slice() else {
+    let Some(signature) = callable_signature(db, &environment, parent) else {
         return false;
     };
     let parent_documentation = parent

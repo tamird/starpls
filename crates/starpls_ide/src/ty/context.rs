@@ -636,6 +636,245 @@ mod tests {
     }
 
     #[test]
+    fn inherited_rule_attributes_preserve_contracts_and_origins() {
+        let parent = r#"def implementation(ctx): return []
+base_test = rule(implementation=implementation, test=True, extendable=True, attrs={
+    "deps": attr.label_list(mandatory=True),
+    "tool": attr.label(default="//:tool", executable=True, cfg="exec"),
+    "single": attr.label(default="//:input", allow_single_file=True),
+    "_private": attr.string(default="private"),
+})
+"#;
+        let source = r#"load("parent.bzl", imported="base_test")
+alias = imported
+def implementation(ctx):
+    ctx.attr.deps
+    ctx.attr.tool
+    ctx.attr._private
+    ctx.attr.timeout
+    ctx.executable.tool
+    ctx.file.single
+    ctx.outputs.executable
+example_test = rule(parent=alias, implementation=implementation, attrs={
+    "own": attr.string(mandatory=True),
+    "deps": attr.label_list(),
+    "tool": attr.label(default="//:replacement"),
+})
+example_test(name="ok", own="value", deps=["//:dep"], timeout="short")
+example_test(name="selected", own="value", deps=select({"//conditions:default": []}))
+"#;
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let parent_file = fixture.add_file(&mut analysis.db, "parent.bzl", parent);
+        let file = fixture.add_file(&mut analysis.db, "defs.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        enable_context(&mut analysis);
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (expression, expected, key) in [
+            (
+                "ctx.attr.deps",
+                "list[Target[FilesToRunProvider[File | None] | None]]",
+                "\"deps\"",
+            ),
+            (
+                "ctx.attr.tool",
+                "Target[FilesToRunProvider[File]]",
+                "\"tool\"",
+            ),
+            ("ctx.attr.timeout", "str", ""),
+            ("ctx.executable.tool", "File", "\"tool\""),
+            ("ctx.file.single", "File", ""),
+            ("ctx.outputs.executable", "File", ""),
+            ("ctx.attr._private", "str", ""),
+        ] {
+            check_field(&snapshot, file, source, expression, expected, key);
+        }
+        let position = FilePosition {
+            file_id: file,
+            pos: (source.find("ctx.attr._private").unwrap() as u32 + 16).into(),
+        };
+        let locations = snapshot.goto_definition(position, false).unwrap().unwrap();
+        let [LocationLink::Local {
+            target_file_id,
+            target_selection_range,
+            origin_selection_range: _,
+            target_range: _,
+        }] = locations.as_slice()
+        else {
+            panic!("{locations:?}");
+        };
+        assert_eq!(*target_file_id, parent_file.source);
+        assert_eq!(&parent[*target_selection_range], "\"_private\"");
+        drop(snapshot);
+        for invalid in [
+            "example_test(name='bad', own='value')",
+            "example_test(name='bad', own='value', deps=[1])",
+            "example_test(name='bad', deps=[])",
+            "example_test(name='bad', own='value', deps=[], _private='value')",
+        ] {
+            analysis
+                .open_document(
+                    std::path::Path::new("/defs.bzl"),
+                    starpls_common::Dialect::Bazel,
+                    None,
+                    format!("{source}{invalid}\n"),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{invalid}: {diagnostics:?}");
+            };
+            assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+        }
+        let edited = source.replace("    \"deps\": attr.label_list(),\n", "");
+        analysis
+            .open_document(
+                std::path::Path::new("/defs.bzl"),
+                starpls_common::Dialect::Bazel,
+                None,
+                edited.clone(),
+                3,
+            )
+            .unwrap();
+        analysis
+            .open_document(
+                std::path::Path::new("/parent.bzl"),
+                starpls_common::Dialect::Bazel,
+                None,
+                parent.replace(
+                    "attr.label_list(mandatory=True)",
+                    "attr.string(mandatory=True)",
+                ),
+                2,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        check_field(&snapshot, file, &edited, "ctx.attr.deps", "str", "");
+        assert_eq!(snapshot.diagnostics(file).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn inherited_label_defaults_account_for_computed_overrides() {
+        let parent = "def implementation(ctx): return []\nbase = rule(implementation=implementation, extendable=True, attrs={'dep': attr.label(default='//:input', allow_single_file=True)})\n";
+        for (attrs, expected) in [
+            ("{'dep': attr.label(default=None)}", "File"),
+            ("{'dep': attr.label(default=computed)}", "File | None"),
+            (
+                "{'dep': opaque(attr.label(default=computed))}",
+                "File | None",
+            ),
+            (
+                "opaque({'dep': attr.label(default=computed)})",
+                "File | None",
+            ),
+        ] {
+            let source = format!(
+                r#"load("parent.bzl", "base")
+def opaque(value): return value
+def computed(): return None
+def implementation(ctx):
+    ctx.file.dep
+example = rule(parent=base, implementation=implementation, attrs={attrs})
+example(name="test", dep="//:explicit")
+"#
+            );
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+            fixture.add_file(&mut analysis.db, "parent.bzl", parent);
+            let file = fixture.add_file(&mut analysis.db, "main.bzl", &source);
+            loader.add_files_from_fixture(&fixture);
+            enable_context(&mut analysis);
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{attrs}: {diagnostics:?}");
+            check_field(&snapshot, file, &source, "ctx.file.dep", expected, "");
+            if expected == "File" {
+                check_field(&snapshot, file, &source, "ctx.file.dep", expected, "'dep'");
+                let position = FilePosition {
+                    file_id: file,
+                    pos: (source.rfind("dep=").unwrap() as u32).into(),
+                };
+                let locations = snapshot.goto_definition(position, false).unwrap().unwrap();
+                let [LocationLink::Local {
+                    target_file_id,
+                    target_selection_range,
+                    origin_selection_range: _,
+                    target_range: _,
+                }] = locations.as_slice()
+                else {
+                    panic!("{locations:?}");
+                };
+                assert_eq!(*target_file_id, file.source);
+                assert_eq!(&source[*target_selection_range], "'dep'");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_rule_parents_preserve_only_proven_own_contracts() {
+        let parent = "def implementation(ctx): return []\nbase = rule(implementation=implementation, extendable=True, attrs={'dep': attr.label(), 'unseen': attr.bool()})\n";
+        let source = r#"load("parent.bzl", "base")
+def opaque(value): return value
+def implementation(ctx):
+    ctx.attr.dep
+    ctx.attr.own
+    ctx.executable.dep
+example = rule(parent=opaque(base), implementation=implementation, attrs={
+    "dep": attr.label(default="//:dep"),
+    "own": attr.string(mandatory=True),
+})
+example(name="ok", own="value", unseen=True)
+"#;
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "parent.bzl", parent);
+        let file = fixture.add_file(&mut analysis.db, "main.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        enable_context(&mut analysis);
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "ctx.attr.dep",
+            "Unknown",
+            "\"dep\"",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "ctx.executable.dep",
+            "Unknown",
+            "\"dep\"",
+        );
+        check_field(&snapshot, file, source, "ctx.attr.own", "str", "\"own\"");
+        drop(snapshot);
+        for invalid in [
+            "example(name='bad', own=1)",
+            "example(name='bad')",
+            "example(name='bad', own='value', dep=1)",
+        ] {
+            analysis
+                .open_document(
+                    std::path::Path::new("/main.bzl"),
+                    starpls_common::Dialect::Bazel,
+                    None,
+                    format!("{source}{invalid}\n"),
+                    2,
+                )
+                .unwrap();
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{invalid}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
     fn test_rule_attributes_share_the_call_and_context_schema() {
         for option in [
             "test=True",
