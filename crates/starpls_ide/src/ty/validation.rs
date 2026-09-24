@@ -226,6 +226,21 @@ impl Analysis {
                         compare(db, stub, &name, actual, expected)
                     };
                     if let Err(error) = result {
+                        let error = if ty_python_semantic::types::any_over_type(
+                            db,
+                            &environment,
+                            expected,
+                            false,
+                            |ty| matches!(ty, Type::TypedDict(_)),
+                        ) {
+                            ContractError::Incomplete(format!(
+                                "Cannot prove `{name}`: inferred type `{}` does not establish the dictionary fields of `{}`",
+                                actual.display(db, &environment),
+                                expected.display(db, &environment),
+                            ))
+                        } else {
+                            error
+                        };
                         error.report(&mut reports, stub, range);
                     }
                 } else {
@@ -1382,6 +1397,77 @@ mod tests {
                 assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
             }
         }
+    }
+
+    #[test]
+    fn typed_dictionary_returns_validate_source_values() {
+        let stub = "class _Row(TypedDict):\n    name: str\n    count: NotRequired[int]\ndef make() -> _Row: ...\n";
+        for (source, expected) in [
+            ("def make(): return {'name': 'ok'}\n", None),
+            ("def make(): return {'name': 'ok', 'count': 1}\n", None),
+            ("def make(): return {}\n", Some("missing-typed-dict-key")),
+            (
+                "def make(): return {'name': 1}\n",
+                Some("invalid-argument-type"),
+            ),
+            (
+                "def make(): return {'name': 'ok', 'count': 'bad'}\n",
+                Some("invalid-argument-type"),
+            ),
+            (
+                "def opaque(): pass\ndef make(): return opaque()\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def opaque(): pass\ndef make(): return {'name': opaque()}\n",
+                Some("incomplete-stub-validation"),
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+        let diagnostics = validate(
+            "def opaque(): pass\ndef make(): return [{'name': opaque()}]\n",
+            &stub.replace("-> _Row", "-> list[_Row]"),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        let diagnostics = validate(
+            "def identity(value): return value\ndef make(): return {'callback': identity}\n",
+            "class _Row(TypedDict):\n    callback: Callable[[int], int]\ndef make() -> _Row: ...\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn typed_dictionary_variables_require_field_evidence() {
+        let schema = "class _Row(TypedDict):\n    name: str\n";
+        for (source, annotation) in [
+            ("ROWS = [{'name': 'ok'}]\n", "list[_Row]"),
+            ("ROWS = {'first': {'name': 'ok'}}\n", "dict[str, _Row]"),
+            ("ROWS = [{'name': 'ok'}, 1]\n", "list[_Row]"),
+        ] {
+            let diagnostics = validate(source, &format!("{schema}ROWS: {annotation}\n"));
+            assert_eq!(diagnostics, ["incomplete-stub-validation"], "{source}");
+        }
+        let diagnostics = validate("other = 1\n", &format!("{schema}ROWS: list[_Row]\n"));
+        assert_eq!(diagnostics, ["invalid-stub-implementation"]);
     }
 
     #[test]

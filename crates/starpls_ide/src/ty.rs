@@ -232,8 +232,19 @@ impl Database {
                 .map(|class| class.name.as_str())
                 .chain(starpls_bazel::BUILTINS_VALUES_DENY_LIST.iter().copied())
                 .chain([
-                    "str", "string", "Any", "Unknown", "unknown", "NoneType", "Sequence",
-                    "Iterable", "Final", "Callable", "Protocol",
+                    "str",
+                    "string",
+                    "Any",
+                    "Unknown",
+                    "unknown",
+                    "NoneType",
+                    "Sequence",
+                    "Iterable",
+                    "Final",
+                    "Callable",
+                    "Protocol",
+                    "TypedDict",
+                    "NotRequired",
                 ]);
             return candidates
                 .filter(|name| {
@@ -258,6 +269,7 @@ impl Database {
             .collect();
         if file.is_type_interface(self) {
             names.insert("Protocol".to_owned(), false);
+            names.insert("TypedDict".to_owned(), false);
         }
         if let Some(context) = file.api_context() {
             let definitions = self.get_builtin_defs(&file.dialect);
@@ -284,7 +296,7 @@ impl Database {
         use starpls_hir::Db;
 
         let source_file = self.starlark_file(file)?;
-        if name == "Protocol" && !source_file.is_type_interface(self) {
+        if matches!(name, "Protocol" | "TypedDict") && !source_file.is_type_interface(self) {
             return Some(ProvidedBindingValue::Unresolved);
         }
         if name == "string" {
@@ -365,7 +377,7 @@ impl Database {
             .files
             .try_virtual_file(&native::path(source_file.dialect))?;
         let name = if matches!(usage, BuiltinUsage::Annotation)
-            || (source_file.is_type_interface(self) && name == "Protocol")
+            || (source_file.is_type_interface(self) && matches!(name, "Protocol" | "TypedDict"))
         {
             Name::new(format!("_starpls_annotation_{name}"))
         } else {

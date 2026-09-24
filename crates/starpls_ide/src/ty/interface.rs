@@ -84,11 +84,11 @@ pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic:
             let ty = model.definition_type(*definition);
             if !matches!(
                 ty.to_instance_approximation(db, &model.program_environment()),
-                Some(Type::ProtocolInstance(_))
+                Some(Type::ProtocolInstance(_) | Type::TypedDict(_))
             ) {
                 report(
                     class.name.range,
-                    "Interface classes with bases must declare a Protocol".into(),
+                    "Interface classes with bases must declare a Protocol or TypedDict".into(),
                 );
             }
             continue;
@@ -605,17 +605,87 @@ mod tests {
     }
 
     #[test]
-    fn interface_bases_require_protocol_identity() {
+    fn typed_dictionary_contracts_retain_keys_across_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "def make(): return {'name': 'example'}\n",
+        );
+        let stub = "class _Row(TypedDict):\n    name: str\n    count: NotRequired[int]\ndef make() -> _Row: ...\n";
+        let interface = fixture.add_file(&mut analysis.db, "source.bzli", stub);
+        let caller_text = "load('source.bzl', 'make')\nrow = make()\nvalue = row['name']\nname: str = value\ncount: int | None = row.get('count')\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        for file in [interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        for (declaration, expected_type, valid) in [
+            (stub.to_owned(), "str", true),
+            (stub.replace("name: str", "name: int"), "int", false),
+            (stub.to_owned(), "str", true),
+        ] {
+            analysis.update_file(interface, declaration);
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(caller).unwrap();
+            if valid {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            } else {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("{diagnostics:?}");
+                };
+                assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+            }
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.find("value =").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("value: {expected_type}")),
+                "{}",
+                hover.contents.value
+            );
+            let completions = snapshot
+                .completions(
+                    FilePosition {
+                        file_id: caller,
+                        pos: (caller_text.find("'name'").unwrap() as u32 + 2).into(),
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            for name in ["name", "count"] {
+                assert!(
+                    completions.iter().any(|item| item.label == name),
+                    "{completions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interface_bases_require_supported_type_identity() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
         let file = fixture.add_file(&mut analysis.db, "types.bzli", "");
         for source in [
             "class Concrete:\n    def __init__(self) -> None: ...\nclass _Derived(Concrete): pass\n",
             "def Protocol() -> int: ...\nclass _Derived(Protocol): pass\n",
+            "def TypedDict() -> int: ...\nclass _Derived(TypedDict): pass\n",
         ] {
             analysis.update_file(file, source.into());
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
-            assert!(diagnostics.iter().any(|diagnostic| diagnostic.headline_message() == "Interface classes with bases must declare a Protocol"), "{diagnostics:?}");
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.headline_message() == "Interface classes with bases must declare a Protocol or TypedDict"), "{diagnostics:?}");
         }
     }
 

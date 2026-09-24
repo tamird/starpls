@@ -11,12 +11,12 @@ DEFAULT_TIMEOUT: int
 def fetch(name: string, timeout: int = ...) -> list[string]: ...
 ```
 
-A stub consists of variable annotations, function, provider and protocol
-declarations, loads, docstrings, and placeholders. Variable initializers and
-parameter defaults are omitted or `...`. A function body consists of an optional
-docstring followed by `...` or `pass`. Variables, functions, and classes declared
-in the stub define its exports; loaded names are available in annotation
-expressions.
+A stub consists of variable annotations, function declarations, provider,
+TypedDict and protocol classes, loads, docstrings, and placeholders. Variable
+initializers and parameter defaults are omitted or `...`. A function body
+consists of an optional docstring followed by `...` or `pass`. Variables,
+functions, and classes declared in the stub define its exports; loaded names
+are available in annotation expressions.
 
 For each name loaded from a mapped `.bzl` module, Starpls uses the stub declaration
 when present and source inference otherwise. Annotations are resolved in the
@@ -64,6 +64,27 @@ Raw constructors accept field values directly. Each declared field is a required
 keyword argument. The source raw binding and the stub return type identify the
 same provider.
 
+## Dictionaries
+
+A `TypedDict` describes string-keyed dictionaries whose values have different
+types:
+
+```starlark
+class _Artifact(TypedDict):
+    path: str
+    checksum: NotRequired[str]
+
+ARTIFACTS: list[_Artifact]
+
+def artifact() -> _Artifact: ...
+```
+
+Fields are required unless annotated with `NotRequired[T]`. A field of type
+`T | None` permits a `None` value; `NotRequired[T]` permits an absent key. Ty
+checks field values and required keys, and preserves their types through
+indexing, `get`, and keyword expansion. Private helper classes describe the
+dictionary values of source exports.
+
 ## Protocols
 
 A protocol describes values by their fields and methods:
@@ -99,6 +120,10 @@ independently of validation results.
 
 Function validation requires static expression and callable types throughout
 the checked body.
+
+Variable validation compares independently inferred source types. A
+`TypedDict` contract is incomplete when those types cannot establish its
+dictionary fields, including through lists and other containers.
 
 Provider validation checks the original source's allowed fields and constructor
 inputs. A constructor that stores fields directly must require every declared
