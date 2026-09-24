@@ -439,7 +439,7 @@ fn string_context(
                 {
                     let model = SemanticModel::new(db, db.starlark_program_file(file));
                     let keys: Vec<_> = model
-                        .expected_string_literal_completions(expr)
+                        .expected_string_literal_completions(expr, Some(index))
                         .into_iter()
                         .map(|candidate| candidate.value)
                         .collect();
