@@ -14,6 +14,7 @@ use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use rustc_hash::FxHashMap;
 use starpls_common::Db;
+use starpls_hir::Db as _;
 use starpls_syntax::source::string_value;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -261,6 +262,49 @@ fn direct_loads(
         dialect,
         info,
     };
+    statement_locations(db, file)
+        .iter()
+        .map(|(module, range)| LoadDependency {
+            module: module.clone(),
+            range: *range,
+            resolution: resolve_dependency(db, file, module),
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_dependency(
+    db: &dyn Db,
+    file: starpls_common::File,
+    module: &str,
+) -> LoadResolution {
+    salsa::Database::unwind_if_revision_cancelled(db);
+    match db.load_file(module, file.dialect, file) {
+        Ok(Some(file)) => LoadResolution::Resolved(file),
+        Ok(None) => LoadResolution::Pending,
+        Err(error) => LoadResolution::Failed(format!("{error:#}")),
+    }
+}
+
+/// Reading source locations must not resolve other loads in the same file.
+pub(crate) fn statement_locations(
+    db: &dyn Db,
+    file: starpls_common::File,
+) -> &[(Box<str>, TextRange)] {
+    load_statements(db, file.source, (file.dialect, file.info))
+}
+
+#[salsa::tracked(returns(ref))]
+fn load_statements(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+) -> Vec<(Box<str>, TextRange)> {
+    let (dialect, info) = context;
+    let file = starpls_common::File {
+        source,
+        dialect,
+        info,
+    };
     let parsed = starpls_common::parsed_module(db, file).load(db);
     let source = file.contents(db);
     parsed
@@ -274,16 +318,7 @@ fn direct_loads(
             let call = load_call(&statement.value)?;
             let module = call.arguments.args.first()?;
             let (name, _) = string_value(&source[module.range()])?;
-            let resolution = match db.load_file(&name, dialect, file) {
-                Ok(Some(file)) => LoadResolution::Resolved(file),
-                Ok(None) => LoadResolution::Pending,
-                Err(error) => LoadResolution::Failed(format!("{error:#}")),
-            };
-            Some(LoadDependency {
-                module: name,
-                range: module.range(),
-                resolution,
-            })
+            Some((name, module.range()))
         })
         .collect()
 }
@@ -347,6 +382,8 @@ pub(super) fn diagnostics(db: &Database, file: ProgramFile<'_>) -> Vec<Diagnosti
             LoadResolution::Resolved(loaded) => {
                 if loaded.source == source_file.source {
                     "Cannot load the current file".to_owned()
+                } else if db.environment().options(db).skip_load_cycle_checks {
+                    continue;
                 } else if let Some(cycle) = cycle_path(db, *loaded) {
                     format!("Detected circular import\n{}", cycle.join("\n"))
                 } else {

@@ -179,6 +179,9 @@ pub(crate) struct DefaultFileLoader {
     repository_fetches: RwLock<HashMap<String, RepositoryFetch>>,
     repository_mappings: RwLock<HashMap<String, RepositoryMapping>>,
     paused: AtomicBool,
+    // CLI invocations retain requests across revisions: cached queries may not
+    // request their dependencies again after repository work completes.
+    load_requests: Option<RwLock<indexmap::IndexSet<(File, String)>>>,
 }
 
 impl DefaultFileLoader {
@@ -205,6 +208,7 @@ impl DefaultFileLoader {
             repository_fetches: Default::default(),
             repository_mappings: Default::default(),
             paused: AtomicBool::new(false),
+            load_requests: None,
         };
         loader.watch_repository(&loader.workspace);
         loader
@@ -234,6 +238,18 @@ impl DefaultFileLoader {
     pub(crate) fn with_deferred_mappings(mut self) -> Self {
         self.defer_mappings = true;
         self
+    }
+
+    pub(crate) fn with_load_recording(mut self) -> Self {
+        self.load_requests = Some(Default::default());
+        self
+    }
+
+    pub(crate) fn recorded_loads(&self) -> Vec<(File, String)> {
+        self.load_requests
+            .as_ref()
+            .map(|requests| requests.read().iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// A bounded batch leaves room for the command and environment on every
@@ -946,6 +962,9 @@ impl FileLoader for DefaultFileLoader {
         dialect: Dialect,
         from: File,
     ) -> anyhow::Result<Option<File>> {
+        if let Some(requests) = &self.load_requests {
+            requests.write().insert((from, path.to_owned()));
+        }
         let (path, info, repository) = match dialect {
             Dialect::Standard => {
                 // Find the importing file's directory.

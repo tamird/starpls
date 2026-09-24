@@ -710,6 +710,7 @@ example = {factory}(
                         infer_ctx_attributes: enabled,
                         use_code_flow_analysis: false,
                         allow_unused_definitions: false,
+                        skip_load_cycle_checks: false,
                     },
                 );
                 let snapshot = analysis.snapshot();
@@ -797,6 +798,7 @@ example = {factory}(
                     infer_ctx_attributes: true,
                     use_code_flow_analysis: false,
                     allow_unused_definitions: false,
+                    skip_load_cycle_checks: false,
                 });
             let file_id = fixture.main_file();
             let start = source.find("context.attr._tool").unwrap() + "context.attr.".len();
@@ -914,6 +916,7 @@ other = rule(implementation=unknown_callback)",
                     infer_ctx_attributes: true,
                     use_code_flow_analysis: false,
                     allow_unused_definitions: false,
+                    skip_load_cycle_checks: false,
                 });
             let (file_id, pos) = fixture.cursor_pos.unwrap();
             let hover = analysis

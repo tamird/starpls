@@ -23,6 +23,7 @@ pub struct InferenceOptions {
     pub infer_ctx_attributes: bool,
     pub use_code_flow_analysis: bool,
     pub allow_unused_definitions: bool,
+    pub skip_load_cycle_checks: bool,
 }
 
 #[salsa::input(debug)]

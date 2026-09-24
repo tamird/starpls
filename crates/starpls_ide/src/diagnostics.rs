@@ -471,6 +471,7 @@ example(name="omitted", tool="//:tool", _private=None)
                 infer_ctx_attributes: true,
                 use_code_flow_analysis: false,
                 allow_unused_definitions: true,
+                skip_load_cycle_checks: false,
             });
         let file = fixture.main_file();
         for _ in 0..2 {

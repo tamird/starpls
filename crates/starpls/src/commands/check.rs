@@ -47,6 +47,10 @@ pub(crate) struct CheckCommand {
     #[clap(long)]
     bazel_only: bool,
 
+    /// Audit every transitive load and report load cycles.
+    #[clap(long)]
+    audit_loads: bool,
+
     /// Report dependency discovery and checked-file progress on stderr.
     #[clap(long)]
     progress: bool,
@@ -134,6 +138,145 @@ mod tests {
         (checker, client, external)
     }
 
+    fn local_checker(name: &str, sources: &[(&str, &str)], audit_loads: bool) -> Checker {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, contents) in sources {
+            std::fs::write(root.join(path), contents).unwrap();
+        }
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let loader = DefaultFileLoader::new(
+            Arc::new(TestBazelClient::default()),
+            root.clone(),
+            None,
+            None,
+            sender,
+            false,
+        );
+        let info = starpls_bazel::client::BazelInfo {
+            workspace: root.clone(),
+            ..Default::default()
+        };
+        let options = CheckCommand {
+            audit_loads,
+            ..Default::default()
+        };
+        let (analysis, loader) = options
+            .prepare_analysis(loader, &info, Default::default())
+            .unwrap();
+        Checker::new(
+            analysis,
+            info,
+            vec![root.join("BUILD").to_str().unwrap().to_owned()],
+            &[],
+            loader,
+            receiver,
+            &options,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn demand_checking_skips_unused_transitive_loads() {
+        for audit in [false, true] {
+            let mut checker = local_checker(
+                &format!("checker-unused-load-{audit}"),
+                &[
+                    ("BUILD", "load(':dep.bzl', 'value')\nprint(value)\n"),
+                    ("dep.bzl", "load(':missing.bzl', 'unused')\nvalue = 42\n"),
+                ],
+                audit,
+            );
+            let report_path = checker.bazel_info.workspace.join("coverage.json");
+            let result = checker.report_diagnostics(false, &[], Some(&report_path));
+            assert_eq!(result.is_err(), audit, "{result:?}");
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            assert_eq!(report["version"], 2);
+            assert_eq!(
+                report["load_scope"],
+                if audit { "transitive" } else { "requested" }
+            );
+            assert_eq!(report["complete"], !audit);
+            assert_eq!(
+                report["unresolved_loads"].as_array().unwrap().len(),
+                usize::from(audit)
+            );
+        }
+    }
+
+    #[test]
+    fn demanded_transitive_failures_survive_cached_queries() {
+        let (mut checker, client, external) = fetch_checker("checker-demanded-failure", true);
+        client.fetch_files.lock().unwrap().insert(
+            "rules+".to_owned(),
+            (
+                external.join("rules+/defs.bzl"),
+                "load('@dep//:child.bzl', 'child')\nvalue = child\n".to_owned(),
+            ),
+        );
+        client
+            .fetch_failures
+            .lock()
+            .unwrap()
+            .insert("wrong+".to_owned(), "access refused".to_owned());
+        let report_path = checker.bazel_info.workspace.join("coverage.json");
+        for _ in 0..2 {
+            assert!(checker
+                .report_diagnostics(false, &[], Some(&report_path))
+                .is_err());
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+            assert_eq!(report["complete"], false);
+            assert_eq!(report["checked_files"].as_array().unwrap().len(), 2);
+            let loads = report["unresolved_loads"].as_array().unwrap();
+            let [load] = loads.as_slice() else {
+                panic!("expected demanded failure: {loads:?}")
+            };
+            assert_eq!(load["module"], "@dep//:child.bzl");
+            assert!(load["message"].as_str().unwrap().contains("access refused"));
+            assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+", "wrong+"]);
+        }
+    }
+
+    #[test]
+    fn load_cycles_are_audited_without_blocking_demand_inference() {
+        for recursive_values in [false, true] {
+            for audit in [false, true] {
+                let value = if recursive_values { "other" } else { "42" };
+                let a = format!("load(':b.bzl', other='value')\nvalue = {value}\n");
+                let b = "load(':a.bzl', other='value')\nvalue = other\n";
+                let mut checker = local_checker(
+                    &format!("checker-cycle-{recursive_values}-{audit}"),
+                    &[
+                        ("BUILD", "load(':a.bzl', 'value')\nprint(value)\n"),
+                        ("a.bzl", &a),
+                        ("b.bzl", b),
+                    ],
+                    audit,
+                );
+                let super::CheckResult {
+                    loads: graph,
+                    diagnostics,
+                } = checker.check_files(false, &[]).unwrap();
+                assert!(graph.unresolved.is_empty());
+                assert_eq!(
+                    graph
+                        .files
+                        .iter()
+                        .any(|file| { checker.analysis.snapshot().path(*file).ends_with("b.bzl") }),
+                    audit || recursive_values,
+                );
+                let cycles = diagnostics
+                    .iter()
+                    .flat_map(|(_, diagnostics)| diagnostics)
+                    .filter(|diagnostic| diagnostic.headline_message().contains("circular import"))
+                    .count();
+                assert_eq!(cycles, usize::from(audit));
+            }
+        }
+    }
+
     #[test]
     fn fetches_materialize_transitive_loads_once() {
         let (mut checker, client, external) = fetch_checker("checker-fetch-transitive", true);
@@ -142,7 +285,7 @@ mod tests {
                 "rules+".to_owned(),
                 (
                     external.join("rules+/defs.bzl"),
-                    "load('@dep//:child.bzl', 'value')\n".to_owned(),
+                    "load('@dep//:child.bzl', child='value')\nvalue = child\n".to_owned(),
                 ),
             ),
             (
@@ -365,6 +508,7 @@ mod tests {
         };
         let options = CheckCommand {
             bazel_only: true,
+            audit_loads: true,
             ..Default::default()
         };
         let (analysis, loader) = options
@@ -538,7 +682,7 @@ mod tests {
             &options,
         )
         .unwrap();
-        let graph = checker.prepare_loads().unwrap();
+        let graph = checker.check_files(false, &[]).unwrap().loads;
         assert!(checker.loader.pending_repository_mappings().is_empty());
         let report = checker
             .coverage_report(
@@ -615,7 +759,6 @@ mod tests {
             client.mapping_requests.lock().unwrap().as_slice(),
             &[vec![String::new()], vec!["stubs+".to_owned()]]
         );
-        let source = analysis.type_interface_sources();
         let mut checker = Checker::new(
             analysis,
             info,
@@ -626,19 +769,8 @@ mod tests {
             &CheckCommand::default(),
         )
         .unwrap();
-        let graph = checker.prepare_loads().unwrap();
-        assert!(graph.unresolved.values().all(Vec::is_empty));
-        assert!(source.iter().all(|source| graph.files.contains(source)));
-        assert_eq!(graph.files.len(), 3);
-        assert_eq!(
-            client.mapping_requests.lock().unwrap().last().unwrap(),
-            &["rules+"]
-        );
-        let diagnostics = checker.analysis.validate_stubs(|_| true).unwrap();
-        assert!(diagnostics
-            .iter()
-            .flat_map(|(_, diagnostics)| diagnostics)
-            .all(|diagnostic| diagnostic.id().as_str() != "load-error"));
+        checker.report_diagnostics(false, &[], None).unwrap();
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["stubs+", "rules+"]);
         let report_path = root.join("coverage.json");
         checker
             .report_diagnostics(true, &[], Some(&report_path))
@@ -725,12 +857,13 @@ impl CheckCommand {
         // external annotation repository. Finish those synchronous queries
         // before deferring mappings discovered through the source graph.
         let prepared = self.type_interfaces.prepare(&loader, &info.workspace)?;
-        let loader = Arc::new(loader.with_deferred_mappings());
+        let loader = Arc::new(loader.with_deferred_mappings().with_load_recording());
         let mut analysis = Analysis::new(
             loader.clone(),
             starpls_ide::InferenceOptions {
                 infer_ctx_attributes: self.inference_options.infer_ctx_attributes,
                 use_code_flow_analysis: self.inference_options.use_code_flow_analysis,
+                skip_load_cycle_checks: !self.audit_loads,
                 ..Default::default()
             },
         )?;
@@ -790,6 +923,7 @@ struct DiagnosticCounts {
 #[derive(Serialize)]
 struct CoverageReport<'a> {
     version: u32,
+    load_scope: LoadScope,
     workspace: &'a Path,
     bazel_release: &'a str,
     selected_files: Vec<ReportFile>,
@@ -811,6 +945,19 @@ struct Checker {
     loader: Arc<DefaultFileLoader>,
     fetch_repo_receiver: crossbeam_channel::Receiver<Task>,
     progress: bool,
+    load_scope: LoadScope,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LoadScope {
+    Requested,
+    Transitive,
+}
+
+struct CheckResult {
+    loads: LoadGraph,
+    diagnostics: Vec<(File, Vec<Diagnostic>)>,
 }
 
 #[derive(Default)]
@@ -838,6 +985,11 @@ impl Checker {
             loader,
             fetch_repo_receiver,
             progress: options.progress,
+            load_scope: if options.audit_loads {
+                LoadScope::Transitive
+            } else {
+                LoadScope::Requested
+            },
         };
 
         checker
@@ -977,7 +1129,6 @@ impl Checker {
         let mut visited = 0;
         loop {
             let snapshot = self.analysis.snapshot();
-            let mut pending = indexmap::IndexSet::new();
             while let Some(file) = frontier.pop() {
                 visited += 1;
                 if self.progress && (visited == 1 || visited % 100 == 0) {
@@ -995,10 +1146,7 @@ impl Checker {
                                 frontier.push(*loaded);
                             }
                         }
-                        LoadResolution::Pending => {
-                            pending.insert(file);
-                            unresolved.push(edge);
-                        }
+                        LoadResolution::Pending => unresolved.push(edge),
                         LoadResolution::Failed(_) => unresolved.push(edge),
                     }
                 }
@@ -1009,55 +1157,142 @@ impl Checker {
                 }
             }
             drop(snapshot);
-            let mut repositories = self.loader.pending_repository_mappings();
-            let fetches: Vec<_> = self
-                .fetch_repo_receiver
-                .try_iter()
-                .map(|task| {
-                    let Task::FetchExternalRepoRequest(FetchExternalRepoRequest {
-                        repo,
-                        revision: _,
-                    }) = task
-                    else {
-                        unreachable!("CLI loader only sends repository fetch requests");
-                    };
-                    repo
-                })
-                .filter(|repo| self.loader.begin_fetch(repo.clone()))
-                .collect();
-            if repositories.is_empty() && fetches.is_empty() {
+            if !self.resolve_pending_loads() {
                 return Ok(graph);
             }
-            if !repositories.is_empty() {
-                self.analysis.invalidate_loads();
+            frontier.extend(graph.unresolved.keys().copied());
+        }
+    }
+
+    /// Finish native work after all snapshots have drained. A new revision
+    /// makes pending queries retry, including inputs created by repository fetches.
+    fn resolve_pending_loads(&mut self) -> bool {
+        let mut repositories = self.loader.pending_repository_mappings();
+        let fetches: Vec<_> = self
+            .fetch_repo_receiver
+            .try_iter()
+            .map(|task| {
+                let Task::FetchExternalRepoRequest(FetchExternalRepoRequest { repo, revision: _ }) =
+                    task
+                else {
+                    unreachable!("CLI loader only sends repository fetch requests");
+                };
+                repo
+            })
+            .filter(|repo| self.loader.begin_fetch(repo.clone()))
+            .collect();
+        if repositories.is_empty() && fetches.is_empty() {
+            return false;
+        }
+        if !repositories.is_empty() {
+            self.analysis.invalidate_loads();
+        }
+        while !repositories.is_empty() {
+            if self.progress {
+                eprintln!(
+                    "Resolving repository mappings: {} repositories",
+                    repositories.len()
+                );
             }
-            while !repositories.is_empty() {
+            self.loader.resolve_repository_mappings(&repositories);
+            repositories = self.loader.pending_repository_mappings();
+        }
+        if !fetches.is_empty() {
+            let results = self.loader.fetch_repositories(&fetches, |message| {
                 if self.progress {
+                    eprintln!("{message}");
+                }
+            });
+            for document::RepositoryFetchResult { name: repo, result } in results {
+                if let Err(error) = result {
+                    eprintln!("Failed to fetch repository @@{repo}: {error:#}");
+                }
+            }
+            self.analysis.invalidate_loads();
+        }
+        true
+    }
+
+    fn requested_loads(&self) -> anyhow::Result<LoadGraph> {
+        let snapshot = self.analysis.snapshot();
+        let mut graph = LoadGraph {
+            files: self.files.clone(),
+            unresolved: Default::default(),
+        };
+        for (file, module) in self.loader.recorded_loads() {
+            graph.files.insert(file);
+            let resolution = snapshot.resolve_load(file, &module)?;
+            if let LoadResolution::Resolved(loaded) = resolution {
+                graph.files.insert(loaded);
+                continue;
+            }
+            let ranges = snapshot.load_statement_ranges(file, &module)?;
+            anyhow::ensure!(
+                !ranges.is_empty(),
+                "requested load {module:?} is no longer present in {}",
+                snapshot.path(file).display()
+            );
+            graph
+                .unresolved
+                .entry(file)
+                .or_default()
+                .extend(ranges.into_iter().map(|range| LoadDependency {
+                    module: module.clone().into_boxed_str(),
+                    range,
+                    resolution: resolution.clone(),
+                }));
+        }
+        Ok(graph)
+    }
+
+    fn check_files(
+        &mut self,
+        validate_stubs: bool,
+        ignore_patterns: &[String],
+    ) -> anyhow::Result<CheckResult> {
+        loop {
+            let mut graph = if self.load_scope == LoadScope::Transitive {
+                self.prepare_loads()?
+            } else {
+                LoadGraph::default()
+            };
+            let mut diagnostics = if validate_stubs {
+                if self.progress {
+                    eprintln!("Validating configured stub implementations");
+                }
+                self.analysis.validate_stubs(|path| {
+                    !path
+                        .components()
+                        .any(|component| is_ignored_name(component.as_os_str(), ignore_patterns))
+                })?
+            } else {
+                Vec::new()
+            };
+            let validated: HashSet<_> = diagnostics.iter().map(|(file, _)| *file).collect();
+            let snapshot = self.analysis.snapshot();
+            for (index, file) in self.files.iter().copied().enumerate() {
+                if validated.contains(&file) {
+                    continue;
+                }
+                if self.progress && (index == 0 || (index + 1) % 100 == 0) {
                     eprintln!(
-                        "Resolving repository mappings: {} repositories",
-                        repositories.len()
+                        "Checking {}/{}: {}",
+                        index + 1,
+                        self.files.len(),
+                        snapshot.path(file).display()
                     );
                 }
-                self.loader.resolve_repository_mappings(&repositories);
-                repositories = self.loader.pending_repository_mappings();
+                diagnostics.push((file, snapshot.diagnostics(file)?));
             }
-            if fetches.is_empty() {
-                frontier.extend(pending);
-            } else {
-                let results = self.loader.fetch_repositories(&fetches, |message| {
-                    if self.progress {
-                        eprintln!("{message}");
-                    }
+            drop(snapshot);
+            let requested = self.requested_loads()?;
+            graph.files.extend(requested.files);
+            graph.unresolved = requested.unresolved;
+            if !self.resolve_pending_loads() {
+                return Ok(CheckResult {
+                    loads: graph,
+                    diagnostics,
                 });
-                for document::RepositoryFetchResult { name: repo, result } in results {
-                    if let Err(error) = result {
-                        eprintln!("Failed to fetch repository @@{repo}: {error:#}");
-                    }
-                }
-                // Native fetches create filesystem inputs that earlier reads
-                // recorded as missing. Refresh them before retrying failed edges.
-                self.analysis.invalidate_loads();
-                frontier.extend(graph.unresolved.keys().copied());
             }
         }
     }
@@ -1068,66 +1303,19 @@ impl Checker {
         ignore_patterns: &[String],
         report_path: Option<&Path>,
     ) -> anyhow::Result<()> {
-        let graph = self.prepare_loads()?;
-        if self.progress {
-            eprintln!(
-                "Load discovery finished: {} selected files, {} dependency files",
-                self.files.len(),
-                graph.files.len() - self.files.len()
-            );
-        }
-        let validated = if validate_stubs {
-            if self.progress {
-                eprintln!("Validating configured stub implementations");
-            }
-            self.analysis.validate_stubs(|path| {
-                !path
-                    .components()
-                    .any(|component| is_ignored_name(component.as_os_str(), ignore_patterns))
-            })?
-        } else {
-            Vec::new()
-        };
-        let validated_files: HashSet<_> = validated.iter().map(|(file, _)| *file).collect();
+        let CheckResult {
+            loads: graph,
+            diagnostics,
+        } = self.check_files(validate_stubs, ignore_patterns)?;
         let snapshot = self.analysis.snapshot();
         let mut counts = DiagnosticCounts::default();
         let mut checked = indexmap::IndexSet::new();
         for InputError { path, message } in &self.input_errors {
             eprintln!("Cannot select {}: {message}", path.display());
         }
-        let total = self.files.len()
-            + validated_files
-                .iter()
-                .filter(|file| !self.files.contains(*file))
-                .count();
-        for file_id in &self.files {
-            if validated_files.contains(file_id) {
-                continue;
-            }
-            if self.progress {
-                eprintln!(
-                    "Checking {}/{}: {}",
-                    checked.len() + 1,
-                    total,
-                    snapshot.path(*file_id).display()
-                );
-            }
-            let diagnostics = snapshot.diagnostics(*file_id)?;
-            Self::report_diagnostics_for_file(&snapshot, &diagnostics, &mut counts)?;
-            checked.insert(*file_id);
-        }
-
-        for (file, diagnostics) in validated {
+        for (file, diagnostics) in diagnostics {
             Self::report_diagnostics_for_file(&snapshot, &diagnostics, &mut counts)?;
             checked.insert(file);
-            if self.progress {
-                eprintln!(
-                    "Checked {}/{}: {}",
-                    checked.len(),
-                    total,
-                    snapshot.path(file).display()
-                );
-            }
         }
 
         let report = self.coverage_report(&snapshot, &graph, &checked, counts)?;
@@ -1224,7 +1412,8 @@ impl Checker {
             }
         }
         Ok(CoverageReport {
-            version: 1,
+            version: 2,
+            load_scope: self.load_scope,
             workspace: &self.bazel_info.workspace,
             bazel_release: &self.bazel_info.release,
             selected_files: self

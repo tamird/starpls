@@ -146,9 +146,17 @@ sources and `.bzli` interfaces and records other inputs as exclusions.
 Recursive discovery stops at nested repository roots. Explicit paths use
 their existing repository context, including Bazel's external directory.
 
-Load discovery fetches missing external repositories through Bazel and
-retries their dependencies. Bzlmod repositories are fetched in bounded
-batches; a failed multi-repository batch retries each member individually
+Checking resolves loads requested by the selected files and by inference of
+their dependencies. `--validate-stubs` also resolves loads requested by
+implementation validation. Generated dependency trees can contain many
+files whose exports selected analysis never needs; resolving loads on
+demand avoids their Bazel repository mapping queries. `--audit-loads`
+traverses the entire transitive load graph, including unused imports, and
+reports load cycles. Editors continue to check load cycles.
+
+Missing external repositories are fetched through Bazel and their loads
+retried. Bzlmod repositories are fetched in bounded batches; a failed
+multi-repository batch retries each member individually
 to determine its outcome. Completed attempts are cached for the check,
 including failures. Missing files within an existing repository remain
 load failures.
@@ -161,9 +169,18 @@ source files to the completed checks. Repository names are canonical;
 the empty name denotes the main repository, and `null` denotes a source
 without a known Bazel repository context.
 
-`complete` means every selected file was checked and every discovered load
-resolved. Deliberate scope exclusions appear separately. Type errors,
-failed input paths, and unresolved loads produce a failing exit status.
+Report version 2 names the load coverage in `load_scope`: `requested` for
+ordinary checking and `transitive` for `--audit-loads`. Requested loads
+include those encountered during earlier inference passes in the same
+invocation. `complete` means every selected file was checked and every
+load in that scope resolved.
+`loaded_dependencies` lists successfully resolved dependencies and sources
+whose loads were requested; `checked_files` lists selected files and
+validated implementations. Requested-load coverage includes failed and
+pending loads encountered while inferring dependency exports. Cycle diagnostics are
+warnings, separate from load resolution. Deliberate scope exclusions
+appear separately. Type errors, failed input paths, and unresolved loads
+produce a failing exit status.
 Failed Bzlmod fetches leave coverage incomplete, even if they created
 partial files. Without Bzlmod, a best-effort repository query may report
 unrelated package errors after creating readable sources; coverage then
