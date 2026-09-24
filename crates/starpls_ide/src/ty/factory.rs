@@ -1559,35 +1559,47 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             if ty.is_none(db) {
                 open = true;
             } else {
-                let names: Vec<_> = match expression? {
-                    Expr::List(list) => list.elts.iter().collect(),
-                    Expr::Tuple(tuple) => tuple.elts.iter().collect(),
-                    Expr::Dict(dict) => {
-                        for item in &dict.items {
-                            let name = call
-                                .expression_type(item.key.as_ref()?)?
-                                .string_literal_value(db)?;
-                            if let Some(doc) =
-                                call.expression_type(&item.value)?.string_literal_value(db)
-                            {
-                                documentation.parameters.push((Name::new(name), doc.into()));
-                            }
-                        }
-                        dict.items
-                            .iter()
-                            .map(|item| item.key.as_ref())
-                            .collect::<Option<_>>()?
-                    }
-                    _ => return None,
+                let names: Option<Vec<_>> = match expression? {
+                    Expr::List(list) => Some(list.elts.iter().collect()),
+                    Expr::Tuple(tuple) => Some(tuple.elts.iter().collect()),
+                    _ => None,
                 };
-                for expression in names {
-                    let ty = call.expression_type(expression)?;
-                    let name = Name::new(ty.string_literal_value(db)?);
-                    if !fields.iter().any(|field| field.name == name) {
+                if let Some(names) = names {
+                    for expression in names {
+                        let ty = call.expression_type(expression)?;
+                        let name = Name::new(ty.string_literal_value(db)?);
+                        if !fields.iter().any(|field| field.name == name) {
+                            fields.push(ProvidedField {
+                                name,
+                                ty: Type::unknown(),
+                                source: Some(FileRange::new(
+                                    call.file().file(db),
+                                    expression.range(),
+                                )),
+                            });
+                        }
+                    }
+                } else {
+                    let DictionaryItems { items, is_complete } =
+                        call.dictionary_argument("fields")?;
+                    open = !is_complete || items.iter().any(|item| !item.is_required);
+                    for DictionaryItem {
+                        name,
+                        ty,
+                        source,
+                        is_required,
+                    } in items
+                    {
+                        if !is_required {
+                            continue;
+                        }
+                        if let Some(doc) = ty.string_literal_value(db) {
+                            documentation.parameters.push((name.clone(), doc.into()));
+                        }
                         fields.push(ProvidedField {
                             name,
                             ty: Type::unknown(),
-                            source: Some(FileRange::new(call.file().file(db), expression.range())),
+                            source: Some(FileRange::new(call.file().file(db), source)),
                         });
                     }
                 }
@@ -2096,6 +2108,126 @@ raw(field=1)
             &snapshot.db,
             snapshot.db.starlark_program_file(file_id),
         );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn provider_mapping_fields_keep_documentation_and_origins() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        for field in ["value", "renamed", "value"] {
+            for complete in [true, false] {
+                let (prefix, fields) = if complete {
+                    (
+                        String::new(),
+                        format!("{{'{field}': 'Field documentation'}}"),
+                    )
+                } else {
+                    (
+                        format!("FIELDS = dict({field}='Field documentation')\n"),
+                        "FIELDS".to_owned(),
+                    )
+                };
+                let source = format!("{prefix}Info = provider(fields={fields})\nInfo({field}=1)\nInfo(unexpected=1)\n");
+                analysis.update_file(file, source.clone());
+                let snapshot = analysis.snapshot();
+                let diagnostics = snapshot.diagnostics(file).unwrap();
+                let ids: Vec<_> = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    if complete {
+                        vec!["unknown-argument"]
+                    } else {
+                        vec![]
+                    },
+                    "{source}: {diagnostics:?}"
+                );
+                let position = FilePosition {
+                    file_id: file,
+                    pos: (source.find(&format!("Info({field}")).unwrap() as u32 + 5).into(),
+                };
+                let help = snapshot.signature_help(position.clone()).unwrap().unwrap();
+                let [signature] = help.signatures.as_slice() else {
+                    panic!("{help:?}");
+                };
+                assert_eq!(signature.label.contains("**kwargs"), !complete, "{help:?}");
+                let parameter = &signature.parameters.as_ref().unwrap()[0];
+                assert!(
+                    parameter.label.starts_with(&format!("{field}:")),
+                    "{help:?}"
+                );
+                assert_eq!(
+                    parameter.documentation.as_deref(),
+                    Some("Field documentation")
+                );
+                let locations = snapshot.goto_definition(position, false).unwrap().unwrap();
+                let [crate::LocationLink::Local {
+                    target_file_id,
+                    target_selection_range,
+                    origin_selection_range: _,
+                    target_range: _,
+                }] = locations.as_slice()
+                else {
+                    panic!("{locations:?}");
+                };
+                assert_eq!(*target_file_id, file.source);
+                let key = if complete {
+                    format!("'{field}'")
+                } else {
+                    field.to_owned()
+                };
+                assert_eq!(&source[*target_selection_range], key);
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_provider_fields_remain_open() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"def make_provider(flag: bool):
+    fields = {'always': 'Always present'}
+    if flag:
+        fields['conditional'] = 'Sometimes present'
+    Info = provider(fields=fields)
+    Info($0always=1, conditional=2)
+    return Info
+Example = make_provider(True)
+"#,
+        );
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let snapshot = analysis.snapshot();
+        let help = snapshot
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert!(signature.label.contains("always:"), "{help:?}");
+        assert!(signature.label.contains("**kwargs"), "{help:?}");
+        assert!(!signature.label.contains("conditional:"), "{help:?}");
+        let diagnostics = snapshot.diagnostics(file_id).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 

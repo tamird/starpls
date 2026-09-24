@@ -478,8 +478,8 @@ info.fo$0o
             (
                 r#"value = provider(fields = {
     "\x66oo": "first",
-    #^^^^^^^
     "foo": "second",
+    #^^^^
 })
 "#,
                 "alias().fo$0o",

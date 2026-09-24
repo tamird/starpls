@@ -614,6 +614,54 @@ mod tests {
             });
     }
 
+    #[test]
+    fn provider_field_mappings_preserve_list_inference() {
+        let providers = r#"FIELDS = dict(value='Value documentation')
+SecondInfo = provider(fields=FIELDS)
+ThirdInfo = provider(fields=FIELDS)
+"#;
+        let source = r#"load('providers.bzl', 'SecondInfo', 'ThirdInfo')
+FirstInfo = provider(fields=['value'])
+def implementation(ctx):
+    image = ctx.attr.image
+    result = [image[DefaultInfo], FirstInfo(value=1)]
+    for provider_type in [SecondInfo, ThirdInfo, OutputGroupInfo]:
+        if provider_type in image:
+            result.append(image[provider_type])
+    return result
+example = rule(implementation=implementation, attrs={'image': attr.label(mandatory=True)})
+"#;
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        fixture.add_file(&mut analysis.db, "providers.bzl", providers);
+        let file = fixture.add_file(&mut analysis.db, "defs.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        enable_context(&mut analysis);
+        let snapshot = analysis.snapshot();
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let hover = snapshot
+            .hover(FilePosition {
+                file_id: file,
+                pos: (source.find("return result").unwrap() as u32 + 7).into(),
+            })
+            .unwrap()
+            .unwrap();
+        for name in [
+            "DefaultInfo[",
+            "FirstInfo",
+            "SecondInfo",
+            "ThirdInfo",
+            "OutputGroupInfo",
+        ] {
+            assert!(
+                hover.contents.value.contains(name),
+                "{}",
+                hover.contents.value
+            );
+        }
+    }
+
     fn check_field(
         snapshot: &crate::AnalysisSnapshot,
         file: starpls_common::File,
