@@ -1,7 +1,8 @@
 # Starlark stubs
 
-A *stub file* (`.bzli`) declares types for a Starlark module (`.bzl`). A *stub
-package* contains stub files and a manifest mapping them to source files.
+A *stub file* (`.bzli`) declares types for a Starlark module (`.bzl`) or variables
+in a BUILD file. A *stub package* contains stub files and a manifest mapping
+them to source files.
 
 ## Stub files
 
@@ -22,6 +23,29 @@ For each name loaded from a mapped `.bzl` module, Starpls uses the stub declarat
 when present and source inference otherwise. Annotations are resolved in the
 stub's scope. Stubs are trusted contracts; implementation validation is a
 separate check.
+
+## BUILD annotations
+
+An explicit mapping such as `BUILD.bazel=BUILD.bzli` applies variable annotations
+to the BUILD file's module assignments, including private names:
+
+```starlark
+class _Case(TypedDict):
+    name: str
+    enabled: bool
+
+_CASES: list[_Case]
+```
+
+Each annotated variable requires one direct assignment to that name in the BUILD
+file and one declaration in the stub. Missing, unsupported, and ambiguous
+bindings are errors. Helper classes and loads supply annotation types; top-level
+function declarations are unsupported. Source type comments take precedence.
+Ty checks the initializer, subsequent uses, and mutations against the annotation
+in the BUILD host context.
+
+Implementation validation applies to `.bzl` export contracts. BUILD annotations
+participate in ordinary source checking.
 
 ## Providers
 

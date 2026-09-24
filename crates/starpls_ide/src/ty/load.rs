@@ -116,12 +116,9 @@ pub(crate) fn bindings(db: &Database, file: starpls_common::File) -> Vec<Load<'_
     loads
 }
 
-pub(super) fn statements(db: &Database, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
-    let Some(source_file) = db.starlark_file(file) else {
-        return Vec::new();
-    };
-    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
-    let source = source_file.contents(db);
+pub(super) fn statements(db: &dyn Db, file: starpls_common::File) -> Vec<ProvidedStatement> {
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let source = file.contents(db);
     parsed
         .suite()
         .iter()

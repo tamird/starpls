@@ -6,8 +6,6 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use clap::Args;
-use starpls_bazel::APIContext;
-use starpls_common::Dialect;
 use starpls_common::FileInfo;
 use starpls_ide::Analysis;
 
@@ -15,7 +13,7 @@ use super::stub_package::Registration;
 
 #[derive(Args, Clone, Default)]
 pub(crate) struct TypeInterfaceOptions {
-    /// Trust declarations in INTERFACE for exports of SOURCE; repeat for more files.
+    /// Apply INTERFACE to SOURCE exports or BUILD variable bindings; repeat for more files.
     #[clap(long = "type_interface", value_name = "SOURCE=INTERFACE")]
     mappings: Vec<TypeInterfaceMapping>,
 }
@@ -119,11 +117,16 @@ impl PreparedInterfaces {
         } in registrations
         {
             let open = |path: &Path| {
+                let (dialect, context) =
+                    crate::document::dialect_and_api_context_for_workspace_path(workspace, path)
+                        .with_context(|| {
+                            format!("cannot classify type interface path {}", path.display())
+                        })?;
                 analysis.file(
                     path,
-                    Dialect::Bazel,
-                    Some(FileInfo::Bazel {
-                        api_context: APIContext::Bzl,
+                    dialect,
+                    context.map(|api_context| FileInfo::Bazel {
+                        api_context,
                         is_external: !path.starts_with(workspace),
                     }),
                 )
@@ -166,6 +169,60 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn build_mapping_registration_preserves_host_context() {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("build-annotations");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("BUILD.bazel");
+        let stub = root.join("BUILD.bzli");
+        std::fs::write(&source, "_VALUE = 1\n").unwrap();
+        std::fs::write(&stub, "_VALUE: str\n").unwrap();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
+            std::sync::Arc::new(starpls_bazel::client::BazelCLI::default()),
+            root.clone(),
+            None,
+            root.join("external"),
+            sender,
+            false,
+        ));
+        let mut analysis = starpls_ide::Analysis::new(loader, Default::default()).unwrap();
+        analysis
+            .set_builtin_defs(crate::server::load_bazel_builtins(), Default::default())
+            .unwrap();
+        super::PreparedInterfaces {
+            registrations: vec![super::Registration {
+                source,
+                interface: stub,
+                origin: "test mapping".into(),
+            }],
+        }
+        .install(&mut analysis, &root)
+        .unwrap();
+        let sources = analysis.type_interface_sources();
+        let [source] = sources.as_slice() else {
+            panic!("{sources:?}");
+        };
+        assert_eq!(source.api_context(), Some(starpls_bazel::APIContext::Build));
+        let diagnostics = analysis.snapshot().diagnostics(*source).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.id().as_str() == "invalid-assignment"),
+            "{diagnostics:?}"
+        );
+        analysis.update_file(*source, "_VALUE: str = 'ok'\n".into());
+        let diagnostics = analysis.snapshot().diagnostics(*source).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.id().as_str() == "invalid-syntax"),
+            "{diagnostics:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn checked_in_with_cfg_package_matches_its_source_version() {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())

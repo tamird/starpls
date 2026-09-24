@@ -419,7 +419,8 @@ impl ty_python_core::Db for Database {
     }
 
     fn provided_statements(&self, file: ProgramFile<'_>) -> Vec<ProvidedStatement> {
-        load::statements(self, file)
+        self.starlark_file(file)
+            .map_or_else(Vec::new, |file| load::statements(self, file))
     }
 
     fn provided_annotation<'db>(
@@ -442,6 +443,7 @@ impl ty_python_core::Db for Database {
                     owner,
                 })
             })
+            .or_else(|| interface::build_annotation(self, file, owner))
     }
 }
 

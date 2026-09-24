@@ -88,6 +88,7 @@ impl Analysis {
         let sources: Vec<_> = interfaces
             .values()
             .map(|(source, _)| *source)
+            .filter(|source| source.api_context() != Some(starpls_bazel::APIContext::Build))
             .filter(|source| selected(source.path(db)))
             .collect();
         if sources.is_empty() {
@@ -95,7 +96,13 @@ impl Analysis {
         }
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let mut reports = Reports::default();
-            environment.set_type_interfaces(db).to(FxHashMap::default());
+            environment.set_type_interfaces(db).to(interfaces
+                .iter()
+                .filter(|(_, (source, _))| {
+                    source.api_context() == Some(starpls_bazel::APIContext::Build)
+                })
+                .map(|(path, pair)| (*path, *pair))
+                .collect());
             environment
                 .set_stub_validation(db)
                 .to(StubValidation::default());

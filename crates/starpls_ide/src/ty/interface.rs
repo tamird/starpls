@@ -3,16 +3,23 @@
 use std::collections::hash_map::Entry;
 
 use ruff_db::files::FileRange;
+use ruff_python_ast::name::Name;
+use ruff_python_ast::statement_visitor;
+use ruff_python_ast::statement_visitor::StatementVisitor;
 use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtClassDef;
 use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use salsa::Setter;
+use starpls_bazel::APIContext;
+use starpls_common::Dialect;
 use starpls_common::File;
+use starpls_common::FileInfo;
 use starpls_hir::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -61,6 +68,30 @@ pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic:
     let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
     let model = SemanticModel::new(db, program);
     let mut diagnostics = Vec::new();
+    for (source, interface) in db.environment().type_interfaces(db).values() {
+        if *interface != file {
+            continue;
+        }
+        let Some(BuildAnnotations {
+            interface: _,
+            owners: _,
+            errors,
+        }) = build_annotations(db, *source)
+        else {
+            continue;
+        };
+        for (range, message) in errors {
+            let mut diagnostic = Diagnostic::new(
+                DiagnosticId::Lint(super::diagnostics::INVALID_BUILD_ANNOTATION.name()),
+                Severity::Error,
+                message.clone(),
+            );
+            diagnostic.annotate(Annotation::primary(
+                Span::from(file.source).with_range(*range),
+            ));
+            diagnostics.push(diagnostic);
+        }
+    }
     let mut report = |range, message: String| {
         let mut diagnostic = Diagnostic::new(
             DiagnosticId::Lint(super::diagnostics::INVALID_PROVIDER_INTERFACE.name()),
@@ -173,6 +204,213 @@ pub(super) fn pairing_diagnostics(
     diagnostics
 }
 
+/// BUILD annotations describe source bindings, so correspondence must be available
+/// while Ty indexes those bindings, before semantic inference can run.
+#[derive(Debug, PartialEq, Eq)]
+struct BuildAnnotations {
+    interface: File,
+    owners: FxHashMap<NodeIndex, NodeIndex>,
+    errors: Vec<(TextRange, String)>,
+}
+
+fn build_annotations(db: &dyn Db, file: File) -> Option<&BuildAnnotations> {
+    if file.dialect != Dialect::Bazel || file.api_context() != Some(APIContext::Build) {
+        return None;
+    }
+    build_annotations_query(db, file.source, (file.dialect, file.info)).as_ref()
+}
+
+#[salsa::tracked(returns(ref))]
+fn build_annotations_query(
+    db: &dyn Db,
+    source: ruff_db::files::File,
+    context: (Dialect, Option<FileInfo>),
+) -> Option<BuildAnnotations> {
+    let (dialect, info) = context;
+    let file = File {
+        source,
+        dialect,
+        info,
+    };
+    let &(implementation, interface) = db.environment().type_interfaces(db).get(&source)?;
+    if implementation != file {
+        return None;
+    }
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let source_names = module_bindings(db, file);
+    let stub_names = module_bindings(db, interface);
+    let mut candidates = FxHashMap::default();
+    for statement in parsed.suite() {
+        let target = match statement {
+            Stmt::Assign(assignment) => {
+                let [target] = assignment.targets.as_slice() else {
+                    continue;
+                };
+                target
+            }
+            Stmt::AnnAssign(assignment) => &assignment.target,
+            _ => continue,
+        };
+        if let Expr::Name(name) = target {
+            candidates.insert(&name.id, name.node_index().load());
+        }
+    }
+    let mut result = BuildAnnotations {
+        interface,
+        owners: FxHashMap::default(),
+        errors: Vec::new(),
+    };
+    let stub = starpls_common::parsed_module(db, interface).load(db);
+    for statement in stub.suite() {
+        let annotation = match statement {
+            Stmt::AnnAssign(annotation) => annotation,
+            Stmt::FunctionDef(function) => {
+                result.errors.push((
+                    function.name.range(),
+                    format!(
+                        "Function declaration `{}` cannot annotate a BUILD binding",
+                        function.name.id,
+                    ),
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        let Expr::Name(name) = annotation.target.as_ref() else {
+            continue;
+        };
+        let error = if stub_names.get(&name.id) != Some(&1) {
+            Some("the stub binds this name more than once")
+        } else {
+            match source_names.get(&name.id).copied().unwrap_or(0) {
+                0 => Some("the BUILD file does not bind this name"),
+                1 => {
+                    if let Some(&owner) = candidates.get(&name.id) {
+                        result.owners.insert(owner, annotation.node_index().load());
+                        None
+                    } else {
+                        Some("the BUILD binding must be a direct assignment to a name")
+                    }
+                }
+                _ => Some("the BUILD file binds this name more than once"),
+            }
+        };
+        if let Some(error) = error {
+            result.errors.push((
+                name.range(),
+                format!(
+                    "Cannot apply annotation for `{}` to `{}`: {error}",
+                    name.id,
+                    file.path(db).display(),
+                ),
+            ));
+        }
+    }
+    Some(result)
+}
+
+fn module_bindings(db: &dyn Db, file: File) -> FxHashMap<Name, usize> {
+    #[derive(Default)]
+    struct Bindings(FxHashMap<Name, usize>);
+    impl Bindings {
+        fn name(&mut self, name: &Name) {
+            let Self(bindings) = self;
+            *bindings.entry(name.clone()).or_default() += 1;
+        }
+        fn target(&mut self, target: &Expr) {
+            match target {
+                Expr::Name(name) => self.name(&name.id),
+                Expr::Tuple(tuple) => tuple.elts.iter().for_each(|target| self.target(target)),
+                Expr::List(list) => list.elts.iter().for_each(|target| self.target(target)),
+                Expr::Starred(starred) => self.target(&starred.value),
+                _ => {}
+            }
+        }
+    }
+    impl<'a> StatementVisitor<'a> for Bindings {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::FunctionDef(function) => {
+                    self.name(&function.name.id);
+                    return;
+                }
+                Stmt::ClassDef(class) => {
+                    self.name(&class.name.id);
+                    return;
+                }
+                Stmt::Assign(assignment) => assignment
+                    .targets
+                    .iter()
+                    .for_each(|target| self.target(target)),
+                Stmt::AnnAssign(assignment) => self.target(&assignment.target),
+                Stmt::AugAssign(assignment) => self.target(&assignment.target),
+                Stmt::For(statement) => self.target(&statement.target),
+                _ => {}
+            }
+            statement_visitor::walk_stmt(self, statement);
+        }
+    }
+    let mut bindings = Bindings::default();
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    bindings.visit_body(parsed.suite());
+    for statement in super::load::statements(db, file) {
+        for binding in statement.bindings {
+            bindings.name(&binding.name);
+        }
+    }
+    let Bindings(names) = bindings;
+    names
+}
+
+pub(super) fn build_annotation<'db>(
+    db: &'db Database,
+    file: File,
+    owner: NodeIndex,
+) -> Option<ty_python_core::ProvidedAnnotation<'db>> {
+    let BuildAnnotations {
+        interface,
+        owners,
+        errors: _,
+    } = build_annotations(db, file)?;
+    let &owner = owners.get(&owner)?;
+    Some(ty_python_core::ProvidedAnnotation::External {
+        file: db.starlark_program_file(*interface),
+        owner,
+    })
+}
+
+pub(super) fn used_build_annotations(db: &Database, file: File) -> FxHashSet<TextRange> {
+    if !file.is_type_interface(db) {
+        return FxHashSet::default();
+    }
+    let parsed = starpls_common::parsed_module(db, file).load(db);
+    let mut used = FxHashSet::default();
+    for (source, interface) in db.environment().type_interfaces(db).values() {
+        if *interface != file {
+            continue;
+        }
+        let Some(BuildAnnotations {
+            interface: _,
+            owners,
+            errors: _,
+        }) = build_annotations(db, *source)
+        else {
+            continue;
+        };
+        for owner in owners.values() {
+            let ruff_python_ast::AnyRootNodeRef::Stmt(statement) = parsed.get_by_index(*owner)
+            else {
+                unreachable!("BUILD annotations refer to stub statements");
+            };
+            let Stmt::AnnAssign(annotation) = statement else {
+                unreachable!("BUILD annotations refer to annotated assignments");
+            };
+            used.insert(annotation.target.range());
+        }
+    }
+    used
+}
+
 impl Analysis {
     /// Replace the explicit trusted contracts atomically after validating every mapping.
     pub fn set_type_interfaces(
@@ -182,14 +420,16 @@ impl Analysis {
         let Self { db } = self;
         let mut mappings = FxHashMap::default();
         for (source, interface) in interfaces {
-            if !source.allows_native_annotations(db)
-                || source
+            let is_bzl = source.allows_native_annotations(db)
+                && source
                     .path(db)
                     .extension()
-                    .is_none_or(|extension| extension != "bzl")
-            {
+                    .is_some_and(|extension| extension == "bzl");
+            let is_build =
+                source.dialect == Dialect::Bazel && source.api_context() == Some(APIContext::Build);
+            if !is_bzl && !is_build {
                 anyhow::bail!(
-                    "type interface source must be a .bzl file: {}",
+                    "type interface source must be a .bzl or BUILD file: {}",
                     source.path(db).display()
                 );
             }
@@ -263,7 +503,10 @@ impl Database {
         if mappings.is_empty() {
             return None;
         }
-        let (_, interface) = mappings.get(&source.source)?;
+        let (implementation, interface) = mappings.get(&source.source)?;
+        if implementation.api_context() == Some(APIContext::Build) {
+            return None;
+        }
         // An interface may import the implementation's existing nominal providers.
         // It must not resolve that import back to its own declaration of the name.
         (interface.source != from.source).then_some(*interface)
@@ -310,6 +553,9 @@ impl Database {
 fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definition<'_>>> {
     let mut pairs: FxHashMap<_, Vec<_>> = FxHashMap::default();
     for (implementation, interface) in db.environment().type_interfaces(db).values() {
+        if implementation.api_context() == Some(APIContext::Build) {
+            continue;
+        }
         let file = db.starlark_program_file(*interface);
         for symbol in place_table(db, global_scope(db, file)).symbols() {
             let definitions = export_definitions(db, file, symbol.name());
@@ -536,6 +782,214 @@ mod tests {
     use crate::Analysis;
     use crate::FilePosition;
     use crate::LocationLink;
+
+    #[test]
+    fn build_annotations_check_private_tables_and_follow_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let text = "_CASES = [{'name': 'ok', 'enabled': True}]\nvalue = _CASES[0].get('name')\n";
+        let source = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            text,
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let schema =
+            "class _Case(TypedDict):\n    name: str\n    enabled: bool\n_CASES: list[_Case]\n";
+        let stub = fixture.add_file(&mut analysis.db, "BUILD.bzli", schema);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        for (source_text, stub_text, expected_type, error) in [
+            (text.to_owned(), schema.to_owned(), "str", None),
+            (
+                text.replace(
+                    "{'name': 'ok', 'enabled': True}",
+                    "dict(name='ok', enabled=True)",
+                ),
+                schema.to_owned(),
+                "str",
+                None,
+            ),
+            (
+                text.replace(
+                    "{'name': 'ok', 'enabled': True}",
+                    "dict(name=1, enabled=True)",
+                ),
+                schema.to_owned(),
+                "str",
+                Some("invalid-argument-type"),
+            ),
+            (
+                text.to_owned(),
+                schema.replace("name: str", "name: int"),
+                "int",
+                Some("invalid-assignment"),
+            ),
+            (
+                text.replace("'ok'", "1"),
+                schema.replace("name: str", "name: int"),
+                "int",
+                None,
+            ),
+            (text.to_owned(), schema.to_owned(), "str", None),
+        ] {
+            analysis.update_file(source, source_text.clone());
+            analysis.update_file(stub, stub_text);
+            let snapshot = analysis.snapshot();
+            let diagnostics = snapshot.diagnostics(source).unwrap();
+            if let Some(error) = error {
+                assert!(
+                    diagnostics.iter().any(|d| d.id().as_str() == error),
+                    "{diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+            let diagnostics = snapshot.diagnostics(stub).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let hover = snapshot
+                .hover(FilePosition {
+                    file_id: source,
+                    pos: (source_text.find("value =").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover
+                    .contents
+                    .value
+                    .contains(&format!("value: {expected_type}")),
+                "{}",
+                hover.contents.value
+            );
+        }
+        analysis.update_file(source, format!("{text}_CASES[0]['name'] = True\n"));
+        assert!(analysis
+            .snapshot()
+            .diagnostics(source)
+            .unwrap()
+            .iter()
+            .any(|d| d.id().as_str() == "invalid-assignment"));
+        analysis.set_type_interfaces([]).unwrap();
+        assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
+        assert!(analysis
+            .snapshot()
+            .diagnostics(stub)
+            .unwrap()
+            .iter()
+            .any(|d| d.id().as_str() == "unused-definition"));
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        assert!(analysis.snapshot().diagnostics(stub).unwrap().is_empty());
+        assert!(analysis
+            .snapshot()
+            .diagnostics(source)
+            .unwrap()
+            .iter()
+            .any(|d| d.id().as_str() == "invalid-assignment"));
+    }
+
+    #[test]
+    fn build_annotations_require_unique_direct_bindings() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD",
+            "",
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        let stub = fixture.add_file(&mut analysis.db, "BUILD.bzli", "_VALUE: int\n");
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        for (text, expected) in [
+            ("other = 1\n", "does not bind"),
+            ("_VALUE = 1\n_VALUE = 2\n", "more than once"),
+            ("_VALUE = 1\n_VALUE += 2\n", "more than once"),
+            ("_VALUE, other = (1, 2)\n", "direct assignment"),
+            (
+                "load('dep.bzl', _VALUE='value')\n_VALUE = 1\n",
+                "more than once",
+            ),
+            ("load('dep.bzl', '_VALUE')\n_VALUE = 1\n", "more than once"),
+        ] {
+            analysis.update_file(source, text.into());
+            let diagnostics = super::diagnostics(&analysis.db, stub);
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{text}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "invalid-build-annotation");
+            assert!(
+                diagnostic.headline_message().contains(expected),
+                "{diagnostic:?}"
+            );
+        }
+        analysis.update_file(source, "_VALUE = 1\n".into());
+        analysis.update_file(stub, "_VALUE: int\n_VALUE: str\n".into());
+        let diagnostics = super::diagnostics(&analysis.db, stub);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics.iter().all(|d| d
+            .headline_message()
+            .contains("stub binds this name more than once")));
+        analysis.update_file(stub, "def macro() -> None: ...\n".into());
+        let diagnostics = super::diagnostics(&analysis.db, stub);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-build-annotation");
+        assert!(diagnostic
+            .headline_message()
+            .contains("cannot annotate a BUILD binding"));
+        analysis.update_file(stub, "_VALUE: int\n".into());
+        // Local scopes do not make a module assignment ambiguous. This query
+        // tests syntax correspondence independently of BUILD's statement rules.
+        for text in [
+            "_VALUE = 1\nitems = [_VALUE for _VALUE in []]\n",
+            "_VALUE = 1\ndef helper():\n    _VALUE = 'local'\n",
+        ] {
+            analysis.update_file(source, text.into());
+            let correspondence = super::build_annotations(&analysis.db, source).unwrap();
+            assert!(correspondence.errors.is_empty(), "{correspondence:?}");
+            assert_eq!(correspondence.owners.len(), 1);
+        }
+    }
+
+    #[test]
+    fn build_comments_take_precedence_over_sidecars() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            "_VALUE = 'ok' # type: str\nvalue = _VALUE\n",
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        let stub = fixture.add_file(&mut analysis.db, "BUILD.bzli", "_VALUE: int\n");
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
+        assert!(analysis.validate_stubs(|_| true).unwrap().is_empty());
+    }
 
     #[test]
     fn protocol_methods_use_ordinary_types_and_editor_origins() {

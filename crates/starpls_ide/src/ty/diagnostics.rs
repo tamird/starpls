@@ -76,6 +76,10 @@ pub(super) static INCOMPLETE_STUB_VALIDATION: LintMetadata = lint(
     "incomplete-stub-validation",
     "Reports stub contracts that could not be proved.",
 );
+pub(super) static INVALID_BUILD_ANNOTATION: LintMetadata = lint(
+    "invalid-build-annotation",
+    "Reports BUILD annotations without a unique source assignment.",
+);
 pub(super) static INVALID_PROVIDER_INTERFACE: LintMetadata = lint(
     "invalid-provider-interface",
     "Reports invalid or conflicting provider declarations in stubs.",
@@ -93,6 +97,7 @@ pub(super) fn registry() -> &'static LintRegistry {
             &INVALID_STUB_IMPLEMENTATION,
             &INCOMPLETE_STUB_VALIDATION,
             &INVALID_PROVIDER_INTERFACE,
+            &INVALID_BUILD_ANNOTATION,
         ] {
             builder.register_lint(lint);
         }
@@ -161,6 +166,7 @@ pub(super) fn check_with_diagnostics(
     if !options.allow_unused_definitions {
         let index = semantic_index(db, program_file);
         let environment = model.program_environment();
+        let build_annotations = super::interface::used_build_annotations(db, file);
         let exportable = if file.dialect == Dialect::Bazel
             && !file.is_type_interface(db)
             && file
@@ -199,6 +205,7 @@ pub(super) fn check_with_diagnostics(
             if name == "_"
                 || (is_module && !name.starts_with('_'))
                 || (file.is_type_interface(db) && index.scope(scope).kind() == ScopeKind::Class)
+                || build_annotations.contains(&kind.target_range(&parsed))
             {
                 continue;
             }

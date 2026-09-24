@@ -177,6 +177,69 @@ mod tests {
     }
 
     #[test]
+    fn stub_validation_preserves_build_source_diagnostics() {
+        let mut checker = local_checker(
+            "build-stub-validation",
+            &[
+                ("BUILD", "_VALUE = 'wrong'\n"),
+                ("BUILD.bzli", "_VALUE: int\n"),
+                ("source.bzl", "value = 'wrong'\n"),
+                ("source.bzli", "value: int\n"),
+            ],
+            false,
+        );
+        assert_eq!(checker.files.len(), 1);
+        let build = checker.files[0];
+        let mut mapped = Vec::new();
+        for name in ["BUILD.bzli", "source.bzl", "source.bzli"] {
+            mapped.push(
+                checker
+                    .analysis
+                    .file(
+                        &checker.bazel_info.workspace.join(name),
+                        starpls_common::Dialect::Bazel,
+                        Some(starpls_common::FileInfo::Bazel {
+                            api_context: starpls_bazel::APIContext::Bzl,
+                            is_external: false,
+                        }),
+                    )
+                    .unwrap(),
+            );
+        }
+        let [build_stub, bzl, bzl_stub] = mapped.as_slice() else {
+            panic!("{mapped:?}");
+        };
+        checker
+            .analysis
+            .set_type_interfaces([(build, *build_stub), (*bzl, *bzl_stub)])
+            .unwrap();
+        checker.files.extend(mapped.iter().copied());
+        let result = checker.check_files(true, &[]).unwrap();
+        for expected in [build, *bzl] {
+            let (_, diagnostics) = result
+                .diagnostics
+                .iter()
+                .find(|(file, _)| *file == expected)
+                .unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.id().as_str() == "invalid-assignment"),
+                "{diagnostics:?}"
+            );
+        }
+        assert!(!result
+            .diagnostics
+            .iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .any(|d| matches!(
+                d.id().as_str(),
+                "invalid-stub-implementation" | "incomplete-stub-validation"
+            )));
+        std::fs::remove_dir_all(&checker.bazel_info.workspace).unwrap();
+    }
+
+    #[test]
     fn demand_checking_skips_unused_transitive_loads() {
         for audit in [false, true] {
             let mut checker = local_checker(
