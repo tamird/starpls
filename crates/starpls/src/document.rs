@@ -1327,6 +1327,10 @@ pub(crate) mod source_tests {
 
     #[derive(Default)]
     pub(crate) struct TestBazelClient {
+        pub(crate) repository_mappings:
+            std::collections::HashMap<String, starpls_bazel::client::RepoMapping>,
+        pub(crate) selected_modules:
+            std::collections::HashMap<String, starpls_bazel::client::SelectedModule>,
         pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
         pub(crate) mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
         pub(crate) fetch_requests: std::sync::Mutex<Vec<String>>,
@@ -1428,6 +1432,9 @@ pub(crate) mod source_tests {
             Ok(repositories
                 .iter()
                 .map(|from| {
+                    if let Some(mapping) = self.repository_mappings.get(*from) {
+                        return mapping.clone();
+                    }
                     Arc::new(
                         [
                             (
@@ -1449,9 +1456,15 @@ pub(crate) mod source_tests {
         }
         fn selected_module(
             &self,
-            _: &str,
+            repository: &str,
         ) -> anyhow::Result<Option<starpls_bazel::client::SelectedModule>> {
-            Ok(None)
+            Ok(self.selected_modules.get(repository).map(|module| {
+                let starpls_bazel::client::SelectedModule { name, version } = module;
+                starpls_bazel::client::SelectedModule {
+                    name: name.clone(),
+                    version: version.clone(),
+                }
+            }))
         }
     }
 

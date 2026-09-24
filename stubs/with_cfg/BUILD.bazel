@@ -1,0 +1,7 @@
+exports_files([
+    "LICENSE-MIT",
+    "MODULE.bazel",
+    "README.md",
+    "stubs.toml",
+    "with_cfg.bzli",
+])

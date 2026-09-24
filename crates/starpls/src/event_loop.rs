@@ -1320,6 +1320,8 @@ mod tests {
                     during_fetch.then(|| (external.join("rules+"), new.clone())),
                 ),
                 mapping_requests: Default::default(),
+                repository_mappings: Default::default(),
+                selected_modules: Default::default(),
             });
             server.loader = Arc::new(DefaultFileLoader::new(
                 server.bazel_client.clone(),

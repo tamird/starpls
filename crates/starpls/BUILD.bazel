@@ -18,6 +18,10 @@ rust_binary(
 
 rust_test(
     name = "starpls_test",
+    compile_data = [
+        "//stubs/with_cfg:stubs.toml",
+        "//stubs/with_cfg:with_cfg.bzli",
+    ],
     crate = ":starpls",
 )
 

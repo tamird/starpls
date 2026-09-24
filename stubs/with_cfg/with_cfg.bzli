@@ -1,0 +1,25 @@
+class _Builder(Protocol):
+    def set(
+        self,
+        setting: str | Label,
+        value: str | Label | int | bool | list[Any] | None | select[str | Label | int | bool | list[Any] | None],
+    ) -> _Builder: ...
+
+    def extend(
+        self,
+        setting: str | Label,
+        value: list[Any] | select[list[Any] | None],
+    ) -> _Builder: ...
+
+    def resettable(self, label: Label) -> _Builder: ...
+    def reset_on_attrs(self, *attrs: str) -> _Builder: ...
+    def clone(self) -> _Builder: ...
+    def build(self) -> tuple[Callable[..., None], rule | None]: ...
+
+def with_cfg(
+    kind: Callable[..., Any],
+    *,
+    executable: bool | None = ...,
+    implicit_targets: Iterable[str] | None = ...,
+    extra_providers: Iterable[Provider[Any] | Callable[..., Any]] | None = ...,
+) -> _Builder: ...

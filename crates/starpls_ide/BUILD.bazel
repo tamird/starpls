@@ -32,6 +32,7 @@ rust_test(
         "//crates/starpls:src/builtin/builtin.pb",
         "//stubs/bazel_skylib:rules/copy_file.bzli",
         "//stubs/bazel_skylib:rules/write_file.bzli",
+        "//stubs/with_cfg:with_cfg.bzli",
     ],
     crate = ":starpls_ide",
     deps = all_crate_deps(normal_dev = True),

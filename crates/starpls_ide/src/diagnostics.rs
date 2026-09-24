@@ -1511,6 +1511,64 @@ def _unused_function() -> rule:
     }
 
     #[test]
+    fn with_cfg_stub_preserves_fluent_types_and_rule_exports() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let implementation = fixture.add_file(
+            &mut analysis.db,
+            "with_cfg.bzl",
+            "def with_cfg(kind): pass\n",
+        );
+        let interface = fixture.add_file(
+            &mut analysis.db,
+            "with_cfg.bzli",
+            include_str!("../../../stubs/with_cfg/with_cfg.bzli"),
+        );
+        let source = "load('with_cfg.bzl', wrap='with_cfg')\ndef macro(**kwargs): pass\nwrapped, _internal = wrap(macro).set('compilation_mode', 'dbg').set('platforms', select({'//conditions:default': [Label('//:platform')]})).extend('copt', select({'//conditions:default': ['-O0']})).resettable(Label('//:saved')).reset_on_attrs('deps').clone().build()\ndef use():\n    wrapped(name='target')\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", source);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis
+            .set_type_interfaces([(implementation, interface)])
+            .unwrap();
+        for file in [interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        for invalid in [
+            "wrap(42)",
+            "wrap(macro).set(42, 'value')",
+            "wrap(macro).set('mode', {})",
+            "wrap(macro).extend('copt', '-O0')",
+            "wrap(macro).resettable('//:saved')",
+        ] {
+            analysis.update_file(caller, format!("{source}{invalid}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{invalid}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        }
+        analysis.update_file(
+            caller,
+            format!("{source}def use_internal():\n    _internal(name='optional')\n"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "call-non-callable");
+    }
+
+    #[test]
     fn renderer_uses_snapshot_source() {
         let (analysis, fixture) = Analysis::from_single_file_fixture("value = 1 # type: string\n");
         let snapshot = analysis.snapshot();

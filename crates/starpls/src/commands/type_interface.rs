@@ -167,6 +167,84 @@ mod tests {
         }
     }
     #[test]
+    fn checked_in_with_cfg_package_matches_its_source_version() {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("with-cfg-stubs");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        let source = external.join("with_cfg.bzl+");
+        let stubs = external.join("with_cfg_stubs+");
+        for directory in [&workspace, &source, &stubs] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(source.join("with_cfg.bzl"), "def with_cfg(kind): pass\n").unwrap();
+        std::fs::write(
+            stubs.join("stubs.toml"),
+            include_str!("../../../../stubs/with_cfg/stubs.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("with_cfg.bzli"),
+            include_str!("../../../../stubs/with_cfg/with_cfg.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("starpls.toml"),
+            "[[stub-packages]]\nmanifest = '@with_cfg_stubs//:stubs.toml'\n",
+        )
+        .unwrap();
+        for version in ["0.14.6", "0.14.7"] {
+            let mut client = crate::document::source_tests::TestBazelClient::default();
+            client.repository_mappings.insert(
+                "".into(),
+                std::sync::Arc::new([("with_cfg_stubs".into(), "with_cfg_stubs+".into())].into()),
+            );
+            client.repository_mappings.insert(
+                "with_cfg_stubs+".into(),
+                std::sync::Arc::new([("with_cfg.bzl".into(), "with_cfg.bzl+".into())].into()),
+            );
+            client.selected_modules.insert(
+                "with_cfg.bzl+".into(),
+                starpls_bazel::client::SelectedModule {
+                    name: "with_cfg.bzl".into(),
+                    version: Some(version.into()),
+                },
+            );
+            let (sender, _) = crossbeam_channel::unbounded();
+            let loader = crate::document::DefaultFileLoader::new(
+                std::sync::Arc::new(client),
+                workspace.clone(),
+                None,
+                external.clone(),
+                sender,
+                true,
+            );
+            let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
+            if version == "0.14.6" {
+                let prepared = prepared.unwrap();
+                let [super::Registration {
+                    source: actual_source,
+                    interface,
+                    origin: _,
+                }] = prepared.registrations.as_slice()
+                else {
+                    panic!("{prepared:?}");
+                };
+                assert_eq!(*actual_source, source.join("with_cfg.bzl"));
+                assert_eq!(*interface, stubs.join("with_cfg.bzli"));
+            } else {
+                let message = format!("{:#}", prepared.unwrap_err());
+                assert!(
+                    message.contains("selected version 0.14.7")
+                        && message.contains("accepts 0.14.6"),
+                    "{message}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn packages_compose_and_reject_conflicts_atomically() {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
             .join("stub-packages");
