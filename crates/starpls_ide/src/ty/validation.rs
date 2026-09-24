@@ -261,7 +261,7 @@ impl Analysis {
                 {
                     compare_initializer(db, source, stub, &name, file, class)
                 } else {
-                    compare_function(db, source.file, &name, actual, expected)
+                    compare_function_body(db, source, &name, actual, expected)
                 };
                 if let Err(error) = result {
                     error.report(&mut reports, source.file, range);
@@ -870,9 +870,6 @@ fn compare_initializer<'db>(
     class_file: File,
     class_node: NodeIndex,
 ) -> Result<(), ContractError> {
-    use ruff_python_ast::visitor::Visitor;
-    use ruff_python_ast::visitor::{self};
-
     let model = SemanticModel::new(db, db.starlark_program_file(source.file));
     let environment = model.program_environment();
     let definition = function_definition(db, source);
@@ -953,6 +950,17 @@ fn compare_initializer<'db>(
             )));
         }
     }
+    if !has_static_evidence(&model, &function.body) {
+        return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer contains dynamic or unavailable expression types")));
+    }
+    Ok(())
+}
+
+/// Contextual checking of structural returns can hide gradual child types.
+fn has_static_evidence(model: &SemanticModel<'_>, body: &[ruff_python_ast::Stmt]) -> bool {
+    use ruff_python_ast::visitor::Visitor;
+    use ruff_python_ast::visitor::{self};
+
     struct Evidence<'a, 'db> {
         model: &'a SemanticModel<'db>,
         complete: bool,
@@ -960,25 +968,19 @@ fn compare_initializer<'db>(
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
             let model = self.model;
+            let environment = model.program_environment();
             if !expression.inferred_type(model).is_some_and(|ty| {
-                let environment = model.program_environment();
-                ty.is_fully_static(model.db(), &environment)
-            }) {
-                self.complete = false;
-            }
-            if let ruff_python_ast::Expr::Call(call) = expression {
-                let environment = model.program_environment();
-                let signature = call.func.inferred_type(model).and_then(|ty| {
-                    ty.map_callable_signatures(
+                let ty = ty
+                    .map_callable_signatures(
                         model.db(),
                         &environment,
                         CallableTypeKind::FunctionLike,
                         std::convert::identity,
                     )
-                });
-                if !signature.is_some_and(|ty| ty.is_fully_static(model.db(), &environment)) {
-                    self.complete = false;
-                }
+                    .unwrap_or(ty);
+                ty.is_fully_static(model.db(), &environment)
+            }) {
+                self.complete = false;
             }
             visitor::walk_expr(self, expression);
         }
@@ -994,14 +996,11 @@ fn compare_initializer<'db>(
         }
     }
     let mut evidence = Evidence {
-        model: &model,
+        model,
         complete: true,
     };
-    evidence.visit_body(&function.body);
-    if !evidence.complete {
-        return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer contains dynamic or unavailable expression types")));
-    }
-    Ok(())
+    evidence.visit_body(body);
+    evidence.complete
 }
 
 impl ContractError {
@@ -1011,6 +1010,28 @@ impl ContractError {
             Self::Incomplete(message) => report(reports, file, range, true, message),
         }
     }
+}
+
+fn compare_function_body<'db>(
+    db: &'db Database,
+    source: Function,
+    name: &str,
+    actual: Type<'db>,
+    expected: Type<'db>,
+) -> Result<(), ContractError> {
+    compare_function(db, source.file, name, actual, expected)?;
+    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+    let definition = function_definition(db, source);
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        unreachable!("function contracts originate in a function declaration");
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    if !has_static_evidence(&model, &function.node(&parsed).body) {
+        return Err(ContractError::Incomplete(format!(
+            "Cannot prove `{name}`: its body contains dynamic or unavailable expression types"
+        )));
+    }
+    Ok(())
 }
 
 fn compare_function<'db>(
@@ -1373,6 +1394,13 @@ mod tests {
             ("def helper(value):\n    return value\nvalue = helper(1)\n", "value: int\n", Some("incomplete-stub-validation")),
             ("def helper(value):\n    return value\ndef compute(value):\n    return helper(value)\n", "def compute(value: int) -> int: ...\n", Some("unsound-return-statement")),
             ("def helper(): pass\ndef make():\n    return helper()\n", "class _Builder(Protocol):\n    def build(self) -> str: ...\ndef make() -> _Builder: ...\n", Some("unsound-return-statement")),
+            ("def helper(): pass\ndef make(): return [helper()]\n", "def make() -> list[int]: ...\n", Some("incomplete-stub-validation")),
+            ("def helper(): pass\ndef make(): return {'name': helper()}\n", "def make() -> dict[str, int]: ...\n", Some("incomplete-stub-validation")),
+            ("def identity(value): return value\ndef make(): return identity\n", "def make() -> Callable[[int], int]: ...\n", Some("incomplete-stub-validation")),
+            ("def identity(value): return value\nCALLBACKS = [identity]\ndef make(): return CALLBACKS\n", "def make() -> list[Callable[[int], int]]: ...\n", Some("incomplete-stub-validation")),
+            ("def helper() -> int: return 1\ndef make(): return [helper()]\n", "def make() -> list[int]: ...\n", None),
+            ("def make(): return {'name': 1}\n", "def make() -> dict[str, int]: ...\n", None),
+            ("def identity(value: int) -> int: return value\ndef make(): return identity\n", "def make() -> Callable[[int], int]: ...\n", None),
         ] {
             let diagnostics = validate(source, stub);
             if let Some(expected) = expected { assert!(diagnostics.iter().any(|id| id == expected), "{source}: {diagnostics:?}"); }
