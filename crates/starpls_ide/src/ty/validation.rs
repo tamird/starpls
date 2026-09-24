@@ -700,7 +700,7 @@ fn parameter_pairs_with_receiver<'a>(
         let Some(annotation) = stub
             .kwonlyargs
             .iter()
-            .find(|stub| stub.parameter.name == parameter.parameter.name)
+            .find(|stub| stub.parameter.name.id == parameter.parameter.name.id)
         else {
             return Err("keyword-only parameter names differ");
         };
@@ -1332,6 +1332,35 @@ mod tests {
             "def compute(*args: int, **kwargs: string) -> int: ...\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn keyword_parameters_match_names_across_source_locations() {
+        let stub = "def compute(*, label: str, count: int) -> str: ...\n";
+        for (source, expected) in [
+            (
+                "# Source and stub have different offsets and parameter orders.\ndef compute(*, count, label):\n    return label * count\n",
+                None,
+            ),
+            (
+                "def compute(*, count, label):\n    return count + label\n",
+                Some("unsupported-operator"),
+            ),
+            (
+                "def compute(*, count, renamed):\n    return renamed * count\n",
+                Some("incomplete-stub-validation"),
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
     }
 
     #[test]
