@@ -269,17 +269,9 @@ fn may_export_rule<'db>(
     ty: Type<'db>,
     exportable: &[Type<'db>],
 ) -> bool {
-    match ty {
-        Type::Dynamic(_) => false,
-        Type::Never => false,
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .any(|element| may_export_rule(db, environment, *element, exportable)),
-        _ => exportable
-            .iter()
-            .any(|base| ty.is_subtype_of(db, environment, *base)),
-    }
+    exportable
+        .iter()
+        .any(|base| !ty.is_disjoint_from(db, environment, *base))
 }
 
 fn tagged(

@@ -1231,6 +1231,14 @@ def maybe(enabled: bool) -> rule | None:
     return make() if enabled else None
 def opaque():
     return make()
+def opaque_pair():
+    return pair()
+def dynamic() -> Any:
+    return make()
+def broad_callable() -> Callable[..., None]:
+    return make()
+def mixed(enabled: bool) -> rule | str:
+    return make() if enabled else "unused"
 _direct = factory(implementation=implementation)
 _alias = _direct
 _repository = repository_rule(implementation=implementation)
@@ -1238,6 +1246,10 @@ _helper_result = make()
 _optional = maybe(True)
 _unpacked, _scalar = pair()
 _unknown = opaque()
+_unknown_unpacked, text = opaque_pair()
+_dynamic = dynamic()
+_callable = broad_callable()
+_mixed = mixed(True)
 _container = [make()]
 def local():
     _local_rule, text = pair()
@@ -1263,13 +1275,7 @@ def _unused_function() -> rule:
         names.sort();
         assert_eq!(
             names,
-            [
-                "_container",
-                "_local_rule",
-                "_scalar",
-                "_unknown",
-                "_unused_function"
-            ]
+            ["_container", "_local_rule", "_scalar", "_unused_function"]
         );
     }
 
@@ -1279,6 +1285,13 @@ def _unused_function() -> rule:
         let (mut analysis, fixture) = native_analysis(source);
         for (source, expected) in [
             (source.to_owned(), false),
+            (
+                source.replace(
+                    "factory = rule",
+                    "def factory(implementation): return rule(implementation=implementation)",
+                ),
+                false,
+            ),
             (
                 source.replace(
                     "factory = rule",
