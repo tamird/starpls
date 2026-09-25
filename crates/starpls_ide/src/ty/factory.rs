@@ -758,7 +758,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     };
     let own_attributes = own_attributes.unwrap_or(DictionaryItems {
         items: Box::default(),
-        extra_items: DictionaryExtraItems::Unobserved,
+        extra_items: DictionaryExtraItems::Value(Type::unknown()),
     });
     let is_complete = own_attributes.is_complete();
     let DictionaryItems {
@@ -2129,8 +2129,8 @@ raw(field=1)
             .unwrap();
         let file = fixture.main_file();
         for field in ["value", "renamed", "value"] {
-            for complete in [true, false] {
-                let (prefix, fields) = if complete {
+            for inline in [true, false] {
+                let (prefix, fields) = if inline {
                     (
                         String::new(),
                         format!("{{'{field}': 'Field documentation'}}"),
@@ -2149,15 +2149,7 @@ raw(field=1)
                     .iter()
                     .map(|diagnostic| diagnostic.id().as_str())
                     .collect();
-                assert_eq!(
-                    ids,
-                    if complete {
-                        vec!["unknown-argument"]
-                    } else {
-                        vec![]
-                    },
-                    "{source}: {diagnostics:?}"
-                );
+                assert_eq!(ids, ["unknown-argument"], "{source}: {diagnostics:?}");
                 let position = FilePosition {
                     file_id: file,
                     pos: (source.find(&format!("Info({field}")).unwrap() as u32 + 5).into(),
@@ -2166,7 +2158,7 @@ raw(field=1)
                 let [signature] = help.signatures.as_slice() else {
                     panic!("{help:?}");
                 };
-                assert_eq!(signature.label.contains("**kwargs"), !complete, "{help:?}");
+                assert!(!signature.label.contains("**kwargs"), "{help:?}");
                 let parameter = &signature.parameters.as_ref().unwrap()[0];
                 assert!(
                     parameter.label.starts_with(&format!("{field}:")),
@@ -2187,7 +2179,7 @@ raw(field=1)
                     panic!("{locations:?}");
                 };
                 assert_eq!(*target_file_id, file.source);
-                let key = if complete {
+                let key = if inline {
                     format!("'{field}'")
                 } else {
                     field.to_owned()
@@ -2279,7 +2271,7 @@ example, register = make_rule(False)
     }
 
     #[test]
-    fn observed_rule_attributes_are_optional_and_gradual() {
+    fn mutated_rule_attributes_keep_types_and_requiredness() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
         analysis
@@ -2291,20 +2283,15 @@ example, register = make_rule(False)
                 Default::default(),
             )
             .unwrap();
-        fixture.add_file(
-            &mut analysis.db,
-            "main.bzl",
-            r#"
+        let source = r#"
 def implementation(ctx): pass
 attrs = {"before": attr.string()}
 attrs["after"] = attr.int(mandatory=True)
 attrs.update({"before": attr.int()})
 target = rule(implementation, attrs=attrs)
-target(name="empty")
-target(name="changed", before=1, after="unknown", extra=True)
-target($0)
-"#,
-        );
+target($0name="valid", before=1, after=2)
+"#;
+        fixture.add_file(&mut analysis.db, "main.bzl", source);
         let (file_id, pos) = fixture.cursor_pos.unwrap();
         let snapshot = analysis.snapshot();
         let help = snapshot
@@ -2314,18 +2301,40 @@ target($0)
         let [signature] = help.signatures.as_slice() else {
             panic!("{help:?}");
         };
-        assert!(signature.label.contains("before: Unknown ="), "{help:?}");
-        assert!(signature.label.contains("after: Unknown ="), "{help:?}");
-        assert!(signature.label.contains("**kwargs"), "{help:?}");
+        let parameters = signature.parameters.as_ref().unwrap();
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter.label == "before: int | select[int | None] | None = ..."),
+            "{help:?}"
+        );
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter.label == "after: int | select[int | None]"),
+            "{help:?}"
+        );
+        assert!(!signature.label.contains("**kwargs"), "{help:?}");
         let diagnostics = ty_python_semantic::check_file_unwrap(
             &snapshot.db,
             snapshot.db.starlark_program_file(file_id),
         );
-        // The final incomplete call still requires the common name attribute.
-        let ids: Vec<_> = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.id().to_string())
-            .collect();
-        assert_eq!(ids, ["missing-argument"], "{diagnostics:?}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(snapshot);
+        let source = source.replace("$0", "");
+        for (call, expected) in [
+            ("target(name='missing')", "missing-argument"),
+            ("target(name='wrong', after='bad')", "invalid-argument-type"),
+            (
+                "target(name='extra', after=1, extra=True)",
+                "unknown-argument",
+            ),
+            ("target(after=1)", "missing-argument"),
+        ] {
+            analysis.update_file(file_id, format!("{source}\n{call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file_id).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), expected, "{call}");
+        }
     }
 }

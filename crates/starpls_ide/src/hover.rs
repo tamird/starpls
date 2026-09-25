@@ -782,7 +782,7 @@ example = {factory}(
             (
                 "attrs = {'_tool': attr.label()}\nattrs.update({'_tool': attr.string()})\n",
                 "attrs",
-                "Unknown",
+                "str",
             ),
         ] {
             let source = format!(
@@ -842,7 +842,7 @@ example = {factory}(
             };
             assert_eq!(*target_file_id, file_id.into());
             assert_eq!(&source[*target_selection_range], "'_tool'");
-            let expected_start = source.find("'_tool'").unwrap();
+            let expected_start = source.rfind("'_tool'").unwrap();
             assert_eq!(
                 u32::from(target_selection_range.start()) as usize,
                 expected_start
@@ -882,7 +882,7 @@ example = rule(implementation=implementation, attrs={'value': attr.string()})",
                 "",
                 "attrs = {'value': attr.string()}
 example = rule(implementation=implementation, attrs=attrs)",
-                "Unknown",
+                "str",
             ),
             (
                 "",

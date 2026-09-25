@@ -171,7 +171,7 @@ pub(super) fn parameter_type<'db>(
         let mapping = match argument(call, &signature, "attrs").ok()? {
             Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
                 items: Box::default(),
-                extra_items: DictionaryExtraItems::Unobserved,
+                extra_items: DictionaryExtraItems::Value(Type::unknown()),
             }),
             None => DictionaryItems {
                 items: Box::default(),

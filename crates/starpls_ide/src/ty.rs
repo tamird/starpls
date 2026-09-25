@@ -676,7 +676,9 @@ consume(**invalid)
         let file = fixture.main_file();
         for (extra_keyword, update, valid) in [
             ("", "", true),
-            ("", "    mutate(options)\n", false),
+            // An opaque call leaves added fields unknown.
+            ("", "    mutate(options)\n", true),
+            ("", "    options[\"deprecation\"] = True\n", false),
             ("", "", true),
             (", deprecation=1", "", false),
             (

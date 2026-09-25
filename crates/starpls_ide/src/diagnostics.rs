@@ -374,14 +374,18 @@ partial(name="ok", anything=42)
 partial_child(name="ok")
 partial_child(name="ok", required=42)
 partial_common(name="ok", tags=42)
-mutable(name="ok")
-mutable(name="ok", observed="unproved")
+mutable(name="ok", observed=1)
 "#;
         let (mut analysis, fixture) = native_analysis(source);
         let file = fixture.main_file();
         let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         for (call, expected) in [
+            ("mutable(name='bad')", "missing-argument"),
+            (
+                "mutable(name='bad', observed='unproved')",
+                "invalid-argument-type",
+            ),
             (
                 "child(name='bad', required=42, own='ok')",
                 "invalid-argument-type",
