@@ -28,9 +28,11 @@ manifest = "@with_cfg_stubs//:stubs.toml"
 The manifest checks the selected source version. Starpls uses the trusted
 contract to check callers; `starpls check --validate-stubs` checks the
 implementation separately. The private module interface declares
-`is_executable` and `get_implicit_targets`; implementation validation checks
-their bodies. The fluent builder's gradual body types and recursive return
-values can still leave its full validation incomplete.
+`get_rule_name`, `is_executable`, `is_test`, `_is_native`,
+`_supports_inheritance`, and `get_implicit_targets`;
+implementation validation checks their bodies. The fluent builder's
+gradual body types and recursive return values can still leave its full
+validation incomplete.
 
 Setting values depend on Bazel's selected configuration. The declarations
 check supported scalar and list forms; list element conversion and builder
