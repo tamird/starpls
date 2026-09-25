@@ -56,13 +56,24 @@ pub trait Db: starpls_common::Db {
 /// Syntax correspondence used by a synchronous stub validation pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StubValidation {
-    pub annotations: FxHashMap<
-        (ruff_db::files::File, ruff_python_ast::NodeIndex),
-        (File, ruff_python_ast::NodeIndex),
-    >,
+    pub annotations:
+        FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ValidationAnnotation>,
     pub provider_returns:
         FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
     pub files: FxHashSet<ruff_db::files::File>,
+}
+
+/// The kind of source check selected by the validation overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationAnnotation {
+    Declaration {
+        file: File,
+        owner: ruff_python_ast::NodeIndex,
+    },
+    ValueContract {
+        file: File,
+        owner: ruff_python_ast::NodeIndex,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

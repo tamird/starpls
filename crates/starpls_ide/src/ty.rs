@@ -441,14 +441,24 @@ impl ty_python_core::Db for Database {
             .type_comment_annotation(file, owner)
             .map(ty_python_core::ProvidedAnnotation::Range)
             .or_else(|| {
-                let &(target, owner) = self
+                let annotation = self
                     .environment()
                     .stub_validation(self)
                     .annotations
                     .get(&(file.source, owner))?;
-                Some(ty_python_core::ProvidedAnnotation::External {
-                    file: self.starlark_program_file(target),
-                    owner,
+                Some(match *annotation {
+                    starpls_hir::ValidationAnnotation::Declaration { file, owner } => {
+                        ty_python_core::ProvidedAnnotation::External {
+                            file: self.starlark_program_file(file),
+                            owner,
+                        }
+                    }
+                    starpls_hir::ValidationAnnotation::ValueContract { file, owner } => {
+                        ty_python_core::ProvidedAnnotation::ExternalValueContract {
+                            file: self.starlark_program_file(file),
+                            owner,
+                        }
+                    }
                 })
             })
             .or_else(|| interface::build_annotation(self, file, owner))

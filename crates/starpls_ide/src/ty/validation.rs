@@ -24,6 +24,7 @@ use starpls_common::File;
 use starpls_hir::Db as _;
 use starpls_hir::ProviderContract;
 use starpls_hir::StubValidation;
+use starpls_hir::ValidationAnnotation;
 use ty_python_core::definition::BindingsOwner;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
@@ -39,7 +40,6 @@ use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::TypeDefinition;
-use ty_python_semantic::types::TypedDictOpenness;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
@@ -531,21 +531,6 @@ fn value_annotation(
     if !expected.is_fully_static(db, &model.program_environment()) {
         return None;
     }
-    // Literal initialization rejects hidden keys that an open structural contract permits.
-    if ty_python_semantic::types::any_over_type(
-        db,
-        &model.program_environment(),
-        expected,
-        true,
-        |ty| {
-            let Type::TypedDict(dictionary) = ty else {
-                return false;
-            };
-            matches!(dictionary.openness(db), TypedDictOpenness::ImplicitlyOpen)
-        },
-    ) {
-        return None;
-    }
     if !has_fresh_literal_evidence(&model, assignment.value(&parsed)) {
         return None;
     }
@@ -564,7 +549,10 @@ fn value_annotation(
     })?;
     validation.annotations.insert(
         (source.source, target.node_index().load()),
-        (*stub, statement.node_index().load()),
+        ValidationAnnotation::ValueContract {
+            file: *stub,
+            owner: statement.node_index().load(),
+        },
     );
     Some(())
 }
@@ -809,7 +797,10 @@ fn annotations(
     } else if stub_node.returns.is_some() {
         validation.annotations.insert(
             (source.file.source, source_node.node_index().load()),
-            (stub.file, stub_node.node_index().load()),
+            ValidationAnnotation::Declaration {
+                file: stub.file,
+                owner: stub_node.node_index().load(),
+            },
         );
     }
     for (parameter, annotation) in pairs {
@@ -818,7 +809,10 @@ fn annotations(
         }
         validation.annotations.insert(
             (source.file.source, parameter.node_index().load()),
-            (stub.file, annotation.node_index().load()),
+            ValidationAnnotation::Declaration {
+                file: stub.file,
+                owner: annotation.node_index().load(),
+            },
         );
     }
     Ok(())
@@ -1724,6 +1718,31 @@ mod tests {
     }
 
     #[test]
+    fn implicitly_open_value_contracts_check_fresh_storage() {
+        let stub = "class _Row(TypedDict):\n    name: str\nROWS: list[_Row]\n";
+        for source in [
+            "ROWS = [{'name': 'ok'}]\n",
+            "ROWS = [{'name': 'ok', 'hidden': []}]\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+        for source in [
+            "SHARED = ['linux']\nROWS = [{'name': 'ok', 'hidden': SHARED}]\n",
+            "def opaque(): pass\nROWS = [{'name': 'ok', 'hidden': opaque()}]\n",
+            "ROWS = [{'name': 'ok'}]\nALIAS = ROWS\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn readonly_extra_items_validate_fresh_dictionary_values() {
         let stub = "class _Row(TypedDict, extra_items=ReadOnly[object]):\n    name: str\nROWS: dict[str, _Row]\n";
         for extra_items in ["object", "ReadOnly[object]", "ReadOnly[Iterable[str]]"] {
@@ -1800,14 +1819,18 @@ mod tests {
     fn variable_initializer_validation_tracks_edits_without_changing_source_analysis() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
-        let source = fixture.add_file(&mut analysis.db, "source.bzl", "ROWS = [{'name': 'ok'}]\n");
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "ROWS = [{'name': 'ok', 'hidden': []}]\n",
+        );
         let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
         loader.add_files_from_fixture(&fixture);
         analysis.set_type_interfaces([(source, stub)]).unwrap();
         for field_type in ["str", "int", "str"] {
             analysis.update_file(
                 stub,
-                format!("class _Row(TypedDict, closed=True):\n    name: {field_type}\nROWS: list[_Row]\n"),
+                format!("class _Row(TypedDict):\n    name: {field_type}\nROWS: list[_Row]\n"),
             );
             assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
             let reports = analysis.validate_stubs(|_| true).unwrap();
@@ -1841,22 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn open_typed_dictionary_variables_require_independent_evidence() {
-        let stub = "class _Row(TypedDict):\n    name: str\nROWS: list[_Row]\n";
-        for source in [
-            "ROWS = [{'name': 'ok'}]\n",
-            "ROWS = [{'name': 'ok', 'private': 1}]\n",
-        ] {
-            assert_eq!(
-                validate(source, stub),
-                ["incomplete-stub-validation"],
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_open_dictionary_contracts_require_independent_evidence() {
+    fn nested_open_dictionary_contracts_use_literal_context() {
         for (source, stub) in [
             (
                 "ROWS = {'inner': {'name': 'ok', 'private': 1}}\n",
@@ -1864,11 +1872,18 @@ mod tests {
             ),
             (
                 "ROWS = [{'name': 'ok', 'private': 1}]\n",
-                "class _Row(TypedDict):\n    name: str\nclass _Rows(Protocol):\n    def __getitem__(self, index: int) -> _Row: ...\nROWS: _Rows\n",
+                "class _Row(TypedDict):\n    name: str\nclass _Rows(Protocol):\n    def __getitem__(self, __index: int) -> _Row: ...\nROWS: _Rows\n",
             ),
         ] {
-            assert_eq!(validate(source, stub), ["incomplete-stub-validation"], "{stub}");
+            let diagnostics = validate(source, stub);
+            assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}");
         }
+
+        let diagnostics = validate(
+            "ROWS = [{'name': 'ok', 'private': 1}]\n",
+            "class _Row(TypedDict):\n    name: str\nclass _Rows(Protocol):\n    def __getitem__(self, index: int) -> _Row: ...\nROWS: _Rows\n",
+        );
+        assert_eq!(diagnostics, ["invalid-assignment"]);
     }
 
     #[test]
