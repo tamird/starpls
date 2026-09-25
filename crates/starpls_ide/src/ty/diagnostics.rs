@@ -167,6 +167,16 @@ pub(super) fn check_with_diagnostics(
         let index = semantic_index(db, program_file);
         let environment = model.program_environment();
         let build_annotations = super::interface::used_build_annotations(db, file);
+        let contract_sources = if file.is_type_interface(db) {
+            db.environment()
+                .type_interfaces(db)
+                .values()
+                .filter(|(_, interface)| *interface == file)
+                .map(|(source, _)| db.starlark_program_file(*source))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let exportable = if file.dialect == Dialect::Bazel
             && !file.is_type_interface(db)
             && file
@@ -206,6 +216,10 @@ pub(super) fn check_with_diagnostics(
                 || (is_module && !name.starts_with('_'))
                 || (file.is_type_interface(db) && index.scope(scope).kind() == ScopeKind::Class)
                 || build_annotations.contains(&kind.target_range(&parsed))
+                || (is_module
+                    && contract_sources.iter().any(|source| {
+                        super::interface::is_function_contract(db, definition, *source)
+                    }))
             {
                 continue;
             }

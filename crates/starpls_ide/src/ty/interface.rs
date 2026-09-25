@@ -756,6 +756,18 @@ pub(super) fn provider_definition<'db>(
     is_provider_class(class.node(&parsed)).then_some(definition)
 }
 
+/// A function contract describes an existing binding; validation checks its type.
+pub(super) fn is_function_contract<'db>(
+    db: &'db dyn Db,
+    declaration: Definition<'db>,
+    implementation: ProgramFile<'db>,
+) -> bool {
+    matches!(declaration.kind(db), DefinitionKind::Function(_))
+        && declaration
+            .name(db)
+            .is_some_and(|name| !export_definitions(db, implementation, &name).is_empty())
+}
+
 pub(crate) fn export_definitions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,

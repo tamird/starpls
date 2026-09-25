@@ -345,9 +345,6 @@ fn discover(
     let model = SemanticModel::new(db, source_program);
     for symbol in table.symbols() {
         let name = symbol.name();
-        if name.starts_with('_') {
-            continue;
-        }
         let definitions = export_definitions(db, stub_program, name);
         let Some(declaration) = definitions.first() else {
             continue;
@@ -355,6 +352,13 @@ fn discover(
         let parsed = ruff_db::parsed::parsed_module(db, stub_program.python_file(db)).load(db);
         let range = declaration.kind(db).target_range(&parsed);
         let actual_definitions = export_definitions(db, source_program, name);
+        if name.starts_with('_') {
+            // Private helper types belong only to the stub. A function declaration
+            // can also describe a private implementation when that name exists.
+            if !super::interface::is_function_contract(db, *declaration, source_program) {
+                continue;
+            }
+        }
         if actual_definitions.is_empty() {
             report(
                 reports,
@@ -1510,6 +1514,83 @@ mod tests {
             "def compute(*args: int, **kwargs: string) -> int: ...\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn private_function_contracts_check_bodies_and_callers() {
+        let stub = "class _Row(TypedDict):\n    value: int\ndef _compute(value: int) -> int: ...\ndef public(value: int) -> int: ...\n";
+        for (implementation, expected) in [
+            ("def _compute(value): return value + 1\n", None),
+            (
+                "def _compute(value): return 'bad'\n",
+                Some("invalid-return-type"),
+            ),
+            ("_compute = 1\n", Some("invalid-stub-implementation")),
+        ] {
+            let source =
+                format!("{implementation}def public(value):\n    return _compute(value)\n");
+            let diagnostics = validate(&source, stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+                assert!(
+                    diagnostics.iter().all(|id| id != "unused-definition"),
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn private_contract_usage_follows_edits_and_validation_lifetime() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "");
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let previous = analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .clone();
+        for (prefix, name, expected_unused) in [
+            ("", "_compute", 0),
+            ("# moved\n", "_compute", 0),
+            ("", "_other", 1),
+            ("\n", "_compute", 0),
+        ] {
+            analysis.update_file(
+                source,
+                format!("def {name}(value): return value + 1\nresult = {name}(1)\n"),
+            );
+            analysis.update_file(
+                stub,
+                format!("{prefix}def _compute(value: int) -> int: ...\n"),
+            );
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous
+            );
+            let diagnostics: Vec<_> = reports
+                .into_iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .collect();
+            assert_eq!(diagnostics.len(), expected_unused, "{diagnostics:?}");
+            assert!(diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "unused-definition"));
+            let diagnostics = analysis.snapshot().diagnostics(stub).unwrap();
+            assert_eq!(diagnostics.len(), expected_unused, "{diagnostics:?}");
+            assert!(diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "unused-definition"));
+        }
     }
 
     #[test]

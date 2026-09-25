@@ -15,7 +15,7 @@ def fetch(name: string, timeout: int = ...) -> list[string]: ...
 A stub consists of variable annotations, function declarations, provider,
 TypedDict and protocol classes, loads, docstrings, and placeholders. Variable
 initializers and parameter defaults are omitted or `...`. A function body
-consists of an optional docstring followed by `...` or `pass`. Variables,
+consists of an optional docstring followed by `...` or `pass`. Public variables,
 functions, and classes declared in the stub define its exports; loaded names
 are available in annotation expressions.
 
@@ -44,7 +44,7 @@ function declarations are unsupported. Source type comments take precedence.
 Ty checks the initializer, subsequent uses, and mutations against the annotation
 in the BUILD host context.
 
-Implementation validation applies to `.bzl` export contracts. BUILD annotations
+Implementation validation applies to `.bzl` contracts. BUILD annotations
 participate in ordinary source checking.
 
 ## Providers
@@ -132,10 +132,14 @@ without declaring a corresponding source export.
 ## Implementation validation
 
 `starpls check --validate-stubs` checks the selected implementations against their
-stub exports. Missing function annotations come from the stub's scope. Source
+stub declarations. Missing function annotations come from the stub's scope. Source
 annotations, parameter names, parameter kinds, and defaults determine the
 implementation signature. Exported functions are followed through explicit
 reexports to check their bodies.
+
+Private function declarations also supply contracts when the implementation
+defines the same name. Private helper types and unmatched private names are
+local to the stub.
 
 Missing exports and incompatible types are errors. Compatibility that depends on
 dynamic types and unsupported function correspondence produce an
