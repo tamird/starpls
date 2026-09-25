@@ -10,6 +10,7 @@ use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprName;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
 use ruff_python_ast::Parameter;
@@ -19,6 +20,7 @@ use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use salsa::Setter;
 use starpls_common::File;
 use starpls_hir::Db as _;
@@ -485,7 +487,7 @@ fn discover(
     }
 }
 
-/// Borrow context only after checking independent evidence and absence of shared values.
+/// Borrow context after checking independent evidence and confined storage references.
 fn value_annotation(
     db: &Database,
     value: &ValueContract,
@@ -531,7 +533,7 @@ fn value_annotation(
     if !expected.is_fully_static(db, &model.program_environment()) {
         return None;
     }
-    if !has_fresh_literal_evidence(&model, assignment.value(&parsed)) {
+    if !has_fresh_literal_evidence(db, *source, &model, assignment.value(&parsed)) {
         return None;
     }
     let stub_program = db.starlark_program_file(*stub);
@@ -557,33 +559,97 @@ fn value_annotation(
     Some(())
 }
 
-/// Literal containers have fresh storage, including when empty; their children supply
-/// the independent value evidence before contextual checking introduces the stub shape.
-fn has_fresh_literal_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
+/// Fresh container spines can contain confined, independently inferred list leaves.
+/// Starlark freezes module values before import; the shared proof covers only in-file uses.
+fn has_fresh_literal_evidence(
+    db: &Database,
+    source: File,
+    model: &SemanticModel<'_>,
+    expression: &Expr,
+) -> bool {
+    if expression.is_name_expr() {
+        return false;
+    }
+    let mut names = Vec::new();
+    if !collect_fresh_literal_evidence(model, expression, &mut names) {
+        return false;
+    }
+    let Some(definitions) = model.confined_name_definitions(&names) else {
+        return false;
+    };
+    let parsed =
+        ruff_db::parsed::parsed_module(db, db.starlark_program_file(source).python_file(db))
+            .load(db);
+    let mut checked = FxHashSet::default();
+    for definition in definitions {
+        if !checked.insert(definition) {
+            continue;
+        }
+        let DefinitionKind::Assignment(assignment) = definition.kind(db) else {
+            return false;
+        };
+        if assignment.owner() != BindingsOwner::Definition
+            || starpls_hir::Source::new(db)
+                .type_comment_annotation(source, assignment.target(&parsed).node_index().load())
+                .is_some()
+        {
+            return false;
+        }
+        let Expr::List(list) = assignment.value(&parsed) else {
+            return false;
+        };
+        if list.elts.is_empty()
+            || !list
+                .elts
+                .iter()
+                .all(|item| has_static_scalar_evidence(model, item))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Children provide independent evidence before the stub supplies a contextual shape.
+fn collect_fresh_literal_evidence<'ast>(
+    model: &SemanticModel<'_>,
+    expression: &'ast Expr,
+    names: &mut Vec<&'ast ExprName>,
+) -> bool {
     match expression {
         Expr::List(list) => list
             .elts
             .iter()
-            .all(|item| has_fresh_literal_evidence(model, item)),
+            .all(|item| collect_fresh_literal_evidence(model, item, names)),
         Expr::Tuple(tuple) => tuple
             .elts
             .iter()
-            .all(|item| has_fresh_literal_evidence(model, item)),
+            .all(|item| collect_fresh_literal_evidence(model, item, names)),
         Expr::Dict(dict) => dict.items.iter().all(|item| {
             item.key
                 .as_ref()
-                .is_some_and(|key| has_fresh_literal_evidence(model, key))
-                && has_fresh_literal_evidence(model, &item.value)
+                .is_some_and(|key| collect_fresh_literal_evidence(model, key, names))
+                && collect_fresh_literal_evidence(model, &item.value, names)
         }),
+        Expr::Name(name) => {
+            names.push(name);
+            true
+        }
+        _ => has_static_scalar_evidence(model, expression),
+    }
+}
+
+fn has_static_scalar_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
+    match expression {
         Expr::UnaryOp(unary) => {
             matches!(unary.op, UnaryOp::UAdd | UnaryOp::USub)
                 && unary.operand.is_number_literal_expr()
                 && expression_has_static_evidence(model, expression)
         }
-        Expr::StringLiteral(_)
-        | Expr::NumberLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::NoneLiteral(_) => expression_has_static_evidence(model, expression),
+        Expr::StringLiteral(_) => expression_has_static_evidence(model, expression),
+        Expr::NumberLiteral(_) => expression_has_static_evidence(model, expression),
+        Expr::BooleanLiteral(_) => expression_has_static_evidence(model, expression),
+        Expr::NoneLiteral(_) => expression_has_static_evidence(model, expression),
         _ => false,
     }
 }
@@ -1723,12 +1789,13 @@ mod tests {
         for source in [
             "ROWS = [{'name': 'ok'}]\n",
             "ROWS = [{'name': 'ok', 'hidden': []}]\n",
+            "SHARED = ['linux']\nROWS = [{'name': 'ok', 'hidden': SHARED}]\n",
         ] {
             let diagnostics = validate(source, stub);
             assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
         }
         for source in [
-            "SHARED = ['linux']\nROWS = [{'name': 'ok', 'hidden': SHARED}]\n",
+            "SHARED = ['linux']\nALIAS = SHARED\nROWS = [{'name': 'ok', 'hidden': SHARED}]\n",
             "def opaque(): pass\nROWS = [{'name': 'ok', 'hidden': opaque()}]\n",
             "ROWS = [{'name': 'ok'}]\nALIAS = ROWS\n",
         ] {
@@ -1739,6 +1806,133 @@ mod tests {
                     .any(|id| id == "incomplete-stub-validation"),
                 "{source}: {diagnostics:?}"
             );
+        }
+    }
+
+    #[test]
+    fn confined_list_leaves_keep_independent_element_types() {
+        let stub = "class _Row(TypedDict):\n    tags: list[str]\nROWS: list[_Row]\n";
+        let source = "tags = ['linux']\nROWS = [{'tags': tags}, {'tags': tags, 'hidden': tags}]\n";
+        assert!(validate(source, stub).is_empty());
+        let diagnostics = validate(&source.replace("['linux']", "[1]"), stub);
+        assert!(
+            diagnostics.iter().any(|id| id == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+
+        let diagnostics = validate(
+            "tags = ['linux']\nROWS = [{'tags': tags, 'numbers': tags}]\n",
+            &stub.replace(
+                "    tags: list[str]",
+                "    tags: list[str]\n    numbers: list[int]",
+            ),
+        );
+        assert!(
+            diagnostics.iter().any(|id| id == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        assert!(validate(
+            "tags = [-1, +2]\nROWS = [{'tags': tags}]\n",
+            &stub.replace("list[str]", "list[int]"),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn named_list_leaves_require_fresh_unannotated_storage() {
+        let stub = "class _Row(TypedDict):\n    tags: list[str]\nROWS: list[_Row]\n";
+        for source in [
+            "tags = []\nROWS = [{'tags': tags}]\n",
+            "tags = [['linux']]\nROWS = [{'tags': tags}]\n",
+            "def opaque(): return ['linux']\ntags = opaque()\nROWS = [{'tags': tags}]\n",
+            "tags = ['linux'] # type: list[str]\nROWS = [{'tags': tags}]\n",
+            "tags: list[str] = ['linux']\nROWS = [{'tags': tags}]\n",
+            "tags, other = (['linux'], 1)\nROWS = [{'tags': tags}]\n",
+            "row = {'tags': ['linux']}\nROWS = [row]\n",
+            "tags = ['linux']\nalias = tags\nROWS = [{'tags': tags}]\n",
+            "tags = ['linux']\ndef corrupt(value): value.append(1)\ncorrupt(tags)\nROWS = [{'tags': tags}]\n",
+            "tags = ['linux']\nROWS = [{'tags': tags}]\ndef corrupt(value): value.append(1)\ncorrupt(tags)\n",
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+        let diagnostics = validate(
+            "tags = [1] # type: list[str]\nROWS = [{'tags': tags}]\n",
+            stub,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|id| id == "invalid-assignment"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn named_list_evidence_tracks_edits_without_changing_source_diagnostics() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "");
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "class _Row(TypedDict):\n    tags: list[str]\nROWS: list[_Row]\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        for (text, expected) in [
+            (
+                "tags = ['linux']\nROWS = [{'tags': tags}, {'tags': tags}]\n",
+                None,
+            ),
+            (
+                "tags = ['linux']\nROWS = [{'tags': tags}, {'tags': tags}]\nmethod = tags.append\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "tags = ['linux']\nROWS = [{'tags': tags}, {'tags': tags}]\n",
+                None,
+            ),
+            (
+                "tags = [1]\nROWS = [{'tags': tags}, {'tags': tags}]\n",
+                Some("invalid-argument-type"),
+            ),
+        ] {
+            analysis.update_file(source, text.to_owned());
+            assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let ids: Vec<_> = reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            if let Some(expected) = expected {
+                assert!(ids.contains(&expected), "{reports:?}");
+            } else {
+                assert!(ids.is_empty(), "{reports:?}");
+            }
+            assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
         }
     }
 

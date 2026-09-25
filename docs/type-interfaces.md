@@ -155,19 +155,24 @@ independently of validation results.
 Function validation requires static expression and callable types throughout
 the checked body.
 
-Module variables with one simple assignment can borrow the stub annotation.
-The contract must be fully static, with `closed=True` or an explicit
-`extra_items` type for any `TypedDict` it contains. The initializer must consist
-of fresh literal containers and statically typed literal values, and the source
-module must leave the variable unread and
-unmodified, including in nested functions. Ty checks the initializer against
-the borrowed annotation. Source annotations and type comments take precedence.
+Module variables with one simple assignment can borrow a fully static stub
+annotation. The source module must leave the variable unread and unmodified,
+including in nested functions. Fresh literal containers and statically typed
+literal values provide independent evidence for checking the initializer.
+Source annotations and type comments take precedence.
 
-Other variable contracts use independently inferred source types. A `TypedDict`
-contract is incomplete when those types cannot establish its dictionary fields,
-including through lists and other containers. Implicitly open `TypedDict`
-contracts use this independent inference because structural compatibility
-permits hidden fields that literal initialization rejects.
+Fresh container initializers can include named list leaves whose references are
+confined to that initializer. Each leaf must have one unannotated simple
+assignment to a nonempty list of static scalar literals. These lists use their
+independently inferred types while the root initializer receives the stub
+context. Starlark freezes module values before import.
+
+Structural checking enforces required fields and declared value types.
+Implicitly open `TypedDict` contracts allow additional fields; `closed=True`
+forbids them and `extra_items` specifies their types. Other variable contracts
+use independently inferred source types; validation is incomplete when those
+types cannot establish the required dictionary fields, including through
+containers.
 
 Provider validation checks the original source's allowed fields and constructor
 inputs. A constructor that stores fields directly must require every declared
