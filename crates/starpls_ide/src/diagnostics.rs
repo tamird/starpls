@@ -1264,6 +1264,71 @@ repeated = 2 * [1] # type: list[int]
     }
 
     #[test]
+    fn named_discards_are_limited_to_iteration_and_partial_unpacking() {
+        let source = r#"_module_discard, exported = (1, 2)
+_module_first, _module_second = (1, 2)
+def unpack(values):
+    kept, (_nested_first, _nested_second) = (1, (2, 3))
+    [_list_discard, listed] = [1, 2]
+    unused, _unused_sibling = (1, 2)
+    _all_first, [_all_second, _] = (1, [2, 3])
+    _single, = (1,)
+    _stored, values[0] = (1, 2)
+    return kept, listed
+def iterate(rows):
+    for _loop in rows:
+        pass
+    for _outer, (_inner, value) in [(1, (2, 3))]:
+        print(value)
+    for ordinary in rows:
+        pass
+    plain = [1 for _comp in rows]
+    nested = [value for _outer, (_inner, value) in [(1, (2, 3))]]
+    mapping = {value: value for _key, value in [(1, 2)]}
+    _shadowed = [1 for _shadowed in rows]
+    return plain, nested, mapping
+"#;
+        let (analysis, fixture) = Analysis::from_single_file_fixture(source);
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "unused-definition"),
+            "{diagnostics:?}"
+        );
+        let mut names: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| &source[diagnostic.range().unwrap()])
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "_all_first",
+                "_all_second",
+                "_module_first",
+                "_module_second",
+                "_shadowed",
+                "_single",
+                "_stored",
+                "ordinary",
+                "unused",
+            ]
+        );
+        let shadowed = diagnostics
+            .iter()
+            .find(|diagnostic| &source[diagnostic.range().unwrap()] == "_shadowed")
+            .unwrap();
+        assert_eq!(
+            usize::from(shadowed.range().unwrap().start()),
+            source.find("_shadowed =").unwrap()
+        );
+    }
+
+    #[test]
     fn private_rule_bindings_can_be_required_exports() {
         let source = r#"def implementation(ctx): pass
 factory = rule
@@ -1296,8 +1361,7 @@ _callable = broad_callable()
 _mixed = mixed(True)
 _container = [make()]
 def local():
-    _local_rule, text = pair()
-    return text
+    _local_rule = make()
 def _unused_function() -> rule:
     return make()
 "#;

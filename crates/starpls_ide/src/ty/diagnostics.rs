@@ -212,7 +212,20 @@ pub(super) fn check_with_diagnostics(
             };
             let name = index.place_table(scope).symbol(symbol).name();
             let is_module = index.scope(scope).kind() == ScopeKind::Module;
+            // Named discards follow Buildifier's loop and partial-unpack convention.
+            let is_discard = name.starts_with('_')
+                && match kind {
+                    DefinitionKind::For(_) => true,
+                    DefinitionKind::Comprehension(_) => true,
+                    DefinitionKind::Assignment(assignment) => {
+                        assignment.unpack().is_some_and(|unpack| {
+                            has_non_underscore_binding(unpack.target(db, &parsed))
+                        })
+                    }
+                    _ => false,
+                };
             if name == "_"
+                || is_discard
                 || (is_module && !name.starts_with('_'))
                 || (file.is_type_interface(db) && index.scope(scope).kind() == ScopeKind::Class)
                 || build_annotations.contains(&kind.target_range(&parsed))
@@ -275,6 +288,49 @@ pub(super) fn check_with_diagnostics(
         }
     }
     check_types_with_diagnostics(db, program_file, diagnostics)
+}
+
+fn has_non_underscore_binding(target: &Expr) -> bool {
+    match target {
+        Expr::Name(name) => {
+            let ruff_python_ast::ExprName {
+                node_index: _,
+                range: _,
+                id,
+                ctx: _,
+            } = name;
+            !id.starts_with('_')
+        }
+        Expr::Tuple(tuple) => {
+            let ruff_python_ast::ExprTuple {
+                node_index: _,
+                range: _,
+                elts,
+                ctx: _,
+                parenthesized: _,
+            } = tuple;
+            elts.iter().any(has_non_underscore_binding)
+        }
+        Expr::List(list) => {
+            let ruff_python_ast::ExprList {
+                node_index: _,
+                range: _,
+                elts,
+                ctx: _,
+            } = list;
+            elts.iter().any(has_non_underscore_binding)
+        }
+        Expr::Starred(starred) => {
+            let ruff_python_ast::ExprStarred {
+                node_index: _,
+                range: _,
+                value,
+                ctx: _,
+            } = starred;
+            has_non_underscore_binding(value)
+        }
+        _ => false,
+    }
 }
 
 fn may_export_rule<'db>(
