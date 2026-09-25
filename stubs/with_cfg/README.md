@@ -29,10 +29,12 @@ The manifest checks the selected source version. Starpls uses the trusted
 contract to check callers; `starpls check --validate-stubs` checks the
 implementation separately. The private module interface declares
 `get_rule_name`, `is_executable`, `is_test`, `_is_native`,
-`_supports_inheritance`, `_supports_extension`, and `get_implicit_targets`;
-implementation validation checks their bodies. The fluent builder's
-gradual body types and recursive return values can still leave its full
-validation incomplete.
+`_supports_inheritance`, `_supports_extension`, `get_implicit_targets`, and
+`_all_providers`; implementation validation checks their bodies. The collector
+accepts iterable values and exposes its result as a readonly sequence of
+objects. Provider-specific operations require a more specific element contract.
+The fluent builder's gradual body types and recursive return values can still
+leave its full validation incomplete.
 
 Setting values depend on Bazel's selected configuration. The declarations
 check supported scalar and list forms; list element conversion and builder
