@@ -103,15 +103,15 @@ pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic:
         ));
         diagnostics.push(diagnostic);
     };
+    let index = ty_python_core::semantic_index(db, program);
     for statement in parsed.suite() {
         let Stmt::ClassDef(class) = statement else {
             continue;
         };
+        let Some([definition]) = index.try_definitions(class.into()) else {
+            continue;
+        };
         if !is_provider_class(class) {
-            let index = ty_python_core::semantic_index(db, program);
-            let [definition] = index.definitions(class) else {
-                continue;
-            };
             let ty = model.definition_type(*definition);
             let instance = ty.to_instance_approximation(db, &model.program_environment());
             if class
@@ -1177,6 +1177,36 @@ mod tests {
             panic!("{diagnostics:?}");
         };
         assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+    }
+
+    #[test]
+    fn excluded_interface_classes_preserve_sibling_diagnostics() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let file = fixture.add_file(&mut analysis.db, "types.bzli", "");
+        for invalid in [
+            "class Broken(Protocol, metaclass=Meta): pass",
+            "class Broken(TypedDict, closed=1): pass",
+            "class Broken:\n    value = 1",
+        ] {
+            analysis.update_file(
+                file,
+                format!("{invalid}\nclass Sibling(Protocol, closed=True): pass\n"),
+            );
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 2, "{invalid}: {diagnostics:?}");
+            for message in [
+                "Interfaces contain declarations, not executable statements",
+                "Only TypedDict declarations accept class keywords",
+            ] {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.headline_message() == message),
+                    "{invalid}: {diagnostics:?}"
+                );
+            }
+        }
     }
 
     #[test]
