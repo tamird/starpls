@@ -44,6 +44,24 @@ mod tests {
     }
 
     #[test]
+    fn repeated_host_boolean_guards_preserve_boundness() {
+        let (analysis, fixture) = native_analysis(
+            r#"def inspect(value):
+    flag = bool(value)
+    if flag:
+        result = 1
+    if flag:
+        print(result)
+"#,
+        );
+        let diagnostics = analysis
+            .snapshot()
+            .diagnostics(fixture.main_file())
+            .unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn native_function_annotations_check_bodies_and_build_calls() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
