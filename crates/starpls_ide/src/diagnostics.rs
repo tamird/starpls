@@ -436,6 +436,46 @@ mutable(name="ok", observed=1)
     }
 
     #[test]
+    fn rule_kwargs_preserve_dictionary_snapshot_keys() {
+        let source = r#"
+def implementation(ctx):
+    return []
+example = rule(implementation=implementation, attrs={
+    "first": attr.string_list(),
+    "second": attr.string_list(),
+    "enabled": attr.bool(),
+})
+def wrapper(targets: list[str] | None):
+    attributes = {"first": targets, "second": targets}
+    options = {name: value for name, value in attributes.items() if value != None}
+    example(name="target", **options)
+    entries = attributes.items() # type: list[tuple[str, list[str] | None]]
+    entries.append(("additional", None))
+"#;
+        let (mut analysis, fixture) = native_analysis(source);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let source = source.replace("list[str]", "list[int]");
+        analysis.update_file(file, source.clone());
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(
+            !diagnostics.is_empty(),
+            "integer attribute values were accepted"
+        );
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+            let range = diagnostic.range().unwrap();
+            assert!(source[range.start().to_usize()..range.end().to_usize()].contains("options"));
+            let message = diagnostic.concise_message().to_string();
+            assert!(message.contains("list[int]"), "{message}");
+            assert!(message.contains("str"), "{message}");
+            assert!(!message.contains("bool"), "{message}");
+        }
+    }
+
+    #[test]
     fn macro_implementation_parameters_use_converted_attributes() {
         let source = r#"
 def rule_impl(ctx):
