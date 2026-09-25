@@ -257,7 +257,14 @@ pub(super) fn parameter_type<'db>(
                 continue;
             }
             let ty = if let Some(attribute) = descriptor {
-                if context_kind == ContextKind::Repository {
+                let finite = if view == View::Attr {
+                    attribute.finite_value_type(db, &environment)
+                } else {
+                    None
+                };
+                if let Some(ty) = finite {
+                    ty
+                } else if context_kind == ContextKind::Repository {
                     if attribute.kind == AttributeKind::Label && attribute.has_non_none_value() {
                         factory::native_class(db, declarations, "Label")?
                             .to_instance_approximation(db, &environment)?
@@ -947,13 +954,155 @@ example = rule(implementation=implementation, attrs={'image': attr.label(mandato
     }
 
     #[test]
+    fn scalar_attribute_values_include_permitted_defaults() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        for (descriptor, expected) in [
+            (
+                "attr.string(values=['fast', 'slow'], default='fast')",
+                "Literal[\"fast\", \"slow\"]",
+            ),
+            (
+                "attr.string(values=('fast', 'slow'), mandatory=True)",
+                "Literal[\"fast\", \"slow\"]",
+            ),
+            (
+                "make(values=['fast', 'fast'], mandatory=True)",
+                "Literal[\"fast\"]",
+            ),
+            ("attr.string(values=['fast'])", "Literal[\"fast\", \"\"]"),
+            (
+                "attr.string(values=['fast'], default='other')",
+                "Literal[\"fast\", \"other\"]",
+            ),
+            ("attr.string(values=['fast'], default=dynamic())", "str"),
+            (
+                "attr.string(values=['fast'], default=dynamic(), mandatory=True)",
+                "Literal[\"fast\"]",
+            ),
+            ("attr.string(values=['fast', dynamic()])", "str"),
+            ("attr.string(values=allowed)", "str"),
+            ("attr.string(values=[])", "str"),
+            ("attr.string(values=())", "str"),
+            ("attr.string()", "str"),
+            ("attr.string(values=unknown())", "str"),
+            ("attr.int(values=[-1, 1, 1], default=-1)", "Literal[-1, 1]"),
+            (
+                "attr.int(values=(-2147483648, 2147483647), mandatory=True)",
+                "Literal[-2147483648, 2147483647]",
+            ),
+            ("attr.int(values=[1])", "Literal[1, 0]"),
+            ("attr.int(values=[1], default=2)", "Literal[1, 2]"),
+            ("attr.int(values=[1], default=number())", "int"),
+            ("attr.int(values=[1, number()])", "int"),
+            ("attr.int(values=[2147483648], mandatory=True)", "int"),
+            ("attr.int(values=[1], default=-2147483649)", "int"),
+            ("attr.int(values=[])", "int"),
+            ("attr.int()", "int"),
+            (
+                "attr.string(values=['fast']) if flag() else attr.string(values=['slow'])",
+                "Unknown",
+            ),
+            ("fake(values=['fast'], mandatory=True)", "Unknown"),
+        ] {
+            let source = format!(
+                "def dynamic() -> str: return 'other'\ndef number() -> int: return 2\ndef flag() -> bool: return True\ndef unknown(): pass\ndef fake(**kwargs): return None\nallowed = ['fast']\nmake = attr.string\ndef implementation(ctx):\n    ctx.attr.mode\nexample = rule(implementation=implementation, attrs={{'mode': {descriptor}}})\n"
+            );
+            analysis.update_file(file, source.clone());
+            let snapshot = analysis.snapshot();
+            check_field(
+                &snapshot,
+                file,
+                &source,
+                "ctx.attr.mode",
+                expected,
+                "'mode'",
+            );
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{descriptor}: {diagnostics:?}");
+        }
+        let source = "def implementation(ctx):\n    ctx.attr.mode\nexample = rule(implementation=implementation, attrs={'mode': attr.int(values=[True], mandatory=True)})\n";
+        analysis.update_file(file, source.to_owned());
+        let snapshot = analysis.snapshot();
+        check_field(&snapshot, file, source, "ctx.attr.mode", "int", "'mode'");
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn finite_attribute_guards_follow_descriptor_edits() {
+        let source = r#"def dynamic() -> str: return "zstd"
+def implementation(ctx):
+    if ctx.attr.mode == "zstd":
+        pass
+    elif ctx.attr.mode == "gzip":
+        pass
+    else:
+        print(ctx.attrs)
+    print(ctx.missing)
+    return []
+example = rule(implementation=implementation, attrs={
+    "mode": attr.string(values=["zstd", "gzip"], default="zstd"),
+})
+example(name="dynamic", mode=dynamic())
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        for (edited, errors, redundant_conditions) in [
+            (source.to_owned(), vec!["ctx.missing"], 1),
+            (
+                source.replace("values=[\"zstd\", \"gzip\"]", "values=[]"),
+                vec!["ctx.attrs", "ctx.missing"],
+                0,
+            ),
+            (
+                source.replace("default=\"zstd\"", "default=dynamic()"),
+                vec!["ctx.attrs", "ctx.missing"],
+                0,
+            ),
+            (source.to_owned(), vec!["ctx.missing"], 1),
+        ] {
+            analysis.update_file(file, edited.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.id().as_str() == "redundant-condition")
+                    .count(),
+                redundant_conditions,
+                "{diagnostics:?}"
+            );
+            let errors_found: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.id().as_str() != "redundant-condition")
+                .collect();
+            assert_eq!(errors_found.len(), errors.len(), "{diagnostics:?}");
+            for (diagnostic, expression) in errors_found.into_iter().zip(errors) {
+                assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+                assert_eq!(
+                    usize::from(diagnostic.range().unwrap().start()),
+                    edited.find(expression).unwrap(),
+                    "{diagnostic:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn inherited_rule_attributes_preserve_contracts_and_origins() {
         let parent = r#"def implementation(ctx): return []
 base_test = rule(implementation=implementation, test=True, extendable=True, attrs={
     "deps": attr.label_list(mandatory=True),
     "tool": attr.label(default="//:tool", executable=True, cfg="exec"),
     "single": attr.label(default="//:input", allow_single_file=True),
-    "_private": attr.string(default="private"),
+    "_private": attr.string(default="private", values=["private", "other"]),
 })
 "#;
         let source = r#"load("parent.bzl", imported="base_test")
@@ -998,7 +1147,7 @@ example_test(name="selected", own="value", deps=select({"//conditions:default": 
             ("ctx.executable.tool", "File", "\"tool\""),
             ("ctx.file.single", "File", ""),
             ("ctx.outputs.executable", "File", ""),
-            ("ctx.attr._private", "str", ""),
+            ("ctx.attr._private", "Literal[\"private\", \"other\"]", ""),
         ] {
             check_field(&snapshot, file, source, expression, expected, key);
         }
@@ -1344,7 +1493,7 @@ example = make_aspect(implementation=implementation, attrs={
             file,
             source,
             "    context.attr.mode",
-            "str",
+            "Literal[\"fast\", \"slow\"]",
             "\"mode\"",
         );
         check_field(
@@ -1387,9 +1536,9 @@ example = make_aspect(implementation=implementation, attrs={
         enable_context(&mut analysis);
         let file = fixture.main_file();
         for (parameters, extra, registration, expected) in [
-            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "str"),
-            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.int(default=1, values=[1])})", "int"),
-            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "str"),
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "Literal[\"fast\"]"),
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.int(default=1, values=[1])})", "Literal[1]"),
+            ("item, env", "", "aspect(implementation=implementation, attrs={'mode': attr.string(default='fast', values=['fast'])})", "Literal[\"fast\"]"),
             ("item, env", "other = aspect(implementation=implementation)", "aspect(implementation=implementation)", "Unknown"),
             ("item, *, env", "", "aspect(implementation=implementation)", "Unknown"),
             ("item, env, *rest", "", "aspect(implementation=implementation)", "Unknown"),
@@ -1578,6 +1727,8 @@ example = macro(implementation=implementation, attrs={{
             }
         }
         for (parameter, annotation, registrations, expected) in [
+            ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.string(configurable=False, values=['fast'], default='fast')})", "str"),
+            ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.int(configurable=False, values=[1], default=1)})", "int"),
             ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.string(configurable=False)})", "str"),
             ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.int(configurable=False)})", "int"),
             ("value", "", "example = macro(implementation=implementation, attrs={'value': attr.string(configurable=False)})", "str"),
@@ -1775,11 +1926,13 @@ example = rule(implementation=implementation, attrs={
     if ctx.attr.optional != None:
         ctx.read(ctx.attr.optional)
     ctx.attr.optional.name
+    ctx.attr.mode
 example = repository_rule(implementation=implementation, attrs={
     "required": attr.label(mandatory=True),
     "defaulted": attr.label(default="//:input"),
     "label_default": attr.label(default=Label("//:input")),
     "optional": attr.label(),
+    "mode": attr.string(values=["fast"], default="other"),
 })
 "#;
         let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
@@ -1791,6 +1944,7 @@ example = repository_rule(implementation=implementation, attrs={
             ("defaulted", "Label"),
             ("label_default", "Label"),
             ("optional", "Label | None"),
+            ("mode", "Literal[\"fast\", \"other\"]"),
         ] {
             check_field(
                 &snapshot,

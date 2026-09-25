@@ -47,7 +47,14 @@ pub(super) struct Attribute {
     mandatory: bool,
     default: Option<FileRange>,
     default_value: DefaultValue,
+    values: Option<ScalarValues>,
     documentation: Option<Box<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+enum ScalarValues {
+    String(Box<[Box<str>]>),
+    Int(Box<[i32]>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -146,6 +153,42 @@ pub(super) enum Configurability {
 }
 
 impl Attribute {
+    pub(super) fn finite_value_type<'db>(
+        &self,
+        db: &'db Database,
+        environment: &ProgramEnvironment<'db>,
+    ) -> Option<Type<'db>> {
+        let Self {
+            kind: _,
+            single_file: _,
+            executable: _,
+            configuration: _,
+            configurability: _,
+            mandatory: _,
+            default: _,
+            default_value: _,
+            values,
+            documentation: _,
+        } = self;
+        let values = values.as_ref()?;
+        Some(match values {
+            ScalarValues::String(values) => UnionType::from_elements(
+                db,
+                environment,
+                values
+                    .iter()
+                    .map(|value| Type::string_literal(db, value.as_ref())),
+            ),
+            ScalarValues::Int(values) => UnionType::from_elements(
+                db,
+                environment,
+                values
+                    .iter()
+                    .map(|value| Type::int_literal(i64::from(*value))),
+            ),
+        })
+    }
+
     pub(super) fn has_non_none_value(&self) -> bool {
         self.mandatory || self.default_value == DefaultValue::NonNone
     }
@@ -235,7 +278,20 @@ impl BuildSetting {
 
 impl get_size2::GetSize for Attribute {
     fn get_heap_size(&self) -> usize {
-        self.documentation.as_ref().map_or(0, |doc| doc.len())
+        let Self {
+            kind: _,
+            single_file: _,
+            executable: _,
+            configuration: _,
+            configurability: _,
+            mandatory: _,
+            default: _,
+            default_value: _,
+            values,
+            documentation,
+        } = self;
+        documentation.as_ref().map_or(0, |doc| doc.len())
+            + get_size2::GetSize::get_heap_size(values)
     }
 }
 
@@ -448,6 +504,18 @@ fn attribute<'db>(
         CheckedArgument::Value { ty, expression: _ } => ty.as_bool_literal()?,
         CheckedArgument::Indeterminate => return None,
     };
+    let values = match kind {
+        AttributeKind::String => scalar_values(call, mandatory, Box::from(""), |ty| {
+            ty.string_literal_value(db).map(Box::from)
+        })
+        .map(ScalarValues::String),
+        AttributeKind::Int => scalar_values(call, mandatory, 0, |ty| {
+            let value = ty.as_int_literal()?;
+            i32::try_from(value).ok()
+        })
+        .map(ScalarValues::Int),
+        _ => None,
+    };
     // Output descriptors expose no default parameter in Bazel's API.
     let default = match kind {
         AttributeKind::Output => CheckedArgument::Omitted,
@@ -558,9 +626,66 @@ fn attribute<'db>(
             mandatory,
             default,
             default_value,
+            values,
             documentation: doc_string(db, call),
         }),
     )
+}
+
+fn scalar_values<'db, T>(
+    call: &CheckedCall<'_, 'db>,
+    mandatory: bool,
+    implicit_default: T,
+    literal: impl Fn(Type<'db>) -> Option<T>,
+) -> Option<Box<[T]>> {
+    let CheckedArgument::Value { ty: _, expression } = call.argument("values") else {
+        return None;
+    };
+    let expression = expression?;
+    let elements = match expression {
+        Expr::List(list) => {
+            let ruff_python_ast::ExprList {
+                elts,
+                ctx: _,
+                range: _,
+                node_index: _,
+            } = list;
+            elts
+        }
+        Expr::Tuple(tuple) => {
+            let ruff_python_ast::ExprTuple {
+                elts,
+                ctx: _,
+                range: _,
+                node_index: _,
+                parenthesized: _,
+            } = tuple;
+            elts
+        }
+        _ => return None,
+    };
+    // Bazel treats an empty values sequence as unrestricted. Its length must be known,
+    // including when the inferred homogeneous element type happens to be a literal.
+    if elements.is_empty() || elements.iter().any(Expr::is_starred_expr) {
+        return None;
+    }
+    let mut values = elements
+        .iter()
+        .map(|element| {
+            let ty = call.expression_type(element)?;
+            literal(ty)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if !mandatory {
+        // Rule and repository defaults are filled after explicit allowed-value validation.
+        let default = match call.argument("default") {
+            CheckedArgument::Omitted => implicit_default,
+            CheckedArgument::Value { ty, expression: _ } => literal(ty)?,
+            CheckedArgument::Indeterminate => return None,
+        };
+        values.push(default);
+    }
+    Some(values.into_boxed_slice())
 }
 
 enum RuleKind {
@@ -692,6 +817,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                     } else {
                         DefaultValue::NonNone
                     },
+                    values: None,
                     documentation: Some(attribute.doc.into_boxed_str()),
                 }),
             })
@@ -841,6 +967,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
                 mandatory: false,
                 default: None,
                 default_value: DefaultValue::Unknown,
+                values: None,
                 documentation: attribute.documentation.clone(),
             });
         let attribute = uncertain_attribute.as_ref().or(attribute);
@@ -1295,6 +1422,7 @@ fn inherited_native_attribute(
         mandatory: attribute.mandatory(),
         default: None,
         default_value: DefaultValue::Unknown,
+        values: None,
         documentation: attribute.documentation.as_deref().map(Into::into),
     })
 }
