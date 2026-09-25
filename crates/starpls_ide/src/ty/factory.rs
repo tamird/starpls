@@ -410,6 +410,7 @@ fn descriptor<'db>(
             instance_fields: ProvidedInstanceFields {
                 fields: Box::default(),
                 has_dynamic_fields: false,
+                implications: Box::default(),
                 data: Some(data),
             },
         },
@@ -960,6 +961,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
             instance_fields: ProvidedInstanceFields {
                 fields: Box::default(),
                 has_dynamic_fields: false,
+                implications: Box::default(),
                 data: Some(ProvidedData::new(RuleData {
                     documentation,
                     attributes: descriptors.into_boxed_slice(),
@@ -1513,6 +1515,7 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
             instance_fields: ProvidedInstanceFields {
                 fields: fields.into_boxed_slice(),
                 has_dynamic_fields,
+                implications: Box::default(),
                 data: None,
             },
         },
@@ -1679,6 +1682,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             instance_fields: ProvidedInstanceFields {
                 fields: fields.into_boxed_slice(),
                 has_dynamic_fields: open,
+                implications: Box::default(),
                 data: Some(ProvidedData::new(data.clone())),
             },
         },

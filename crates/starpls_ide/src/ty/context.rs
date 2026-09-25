@@ -20,6 +20,7 @@ use ty_python_core::definition::ParameterDefinitionNodeKind;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedClass;
 use ty_python_semantic::provided::ProvidedField;
+use ty_python_semantic::provided::ProvidedFieldImplication;
 use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
@@ -211,7 +212,7 @@ pub(super) fn parameter_type<'db>(
         let rule = rule?;
         (rule.attributes.as_ref(), rule.complete)
     };
-    let make_class = |name, base, fields, has_dynamic_fields| {
+    let make_class = |name, base, fields, has_dynamic_fields, implications| {
         let class = model.provided_class_at_call(
             call,
             ProvidedClass {
@@ -221,6 +222,7 @@ pub(super) fn parameter_type<'db>(
                 instance_fields: ProvidedInstanceFields {
                     fields,
                     has_dynamic_fields,
+                    implications,
                     data: None,
                 },
             },
@@ -339,6 +341,7 @@ pub(super) fn parameter_type<'db>(
             factory::native_class(db, declarations, "struct")?,
             fields.into_boxed_slice(),
             !complete,
+            Box::default(),
         )?;
         context_fields.push(ProvidedField {
             name: Name::new(view.name()),
@@ -360,7 +363,49 @@ pub(super) fn parameter_type<'db>(
         )?,
         None => factory::native_class(db, declarations, name)?,
     };
-    make_class(name, base, context_fields.into_boxed_slice(), false)
+    let mut implications = Vec::new();
+    // Bazel validates single-file and executable prerequisites before invoking the rule.
+    // A present target therefore has a File in each enabled view of that attribute.
+    if context_kind != ContextKind::Repository {
+        for RuleAttributeData {
+            name,
+            descriptor,
+            source: _,
+        } in attributes
+        {
+            let Some(attribute) = descriptor else {
+                continue;
+            };
+            if attribute.kind != AttributeKind::Label
+                || attribute.configuration != AttributeConfiguration::Ordinary
+                || attribute.has_non_none_value()
+            {
+                continue;
+            }
+            for (view, enabled) in [
+                (View::File, attribute.single_file),
+                (View::Executable, attribute.executable),
+            ] {
+                if enabled != Some(true) {
+                    continue;
+                }
+                let file_class = factory::native_class(db, declarations, "File")?;
+                let ty = file_class.to_instance_approximation(db, &environment)?;
+                implications.push(ProvidedFieldImplication {
+                    guard: Box::from([Name::new("attr"), name.clone()]),
+                    target: Box::from([Name::new(view.name()), name.clone()]),
+                    ty,
+                });
+            }
+        }
+    }
+    make_class(
+        name,
+        base,
+        context_fields.into_boxed_slice(),
+        false,
+        implications.into_boxed_slice(),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -699,6 +744,105 @@ example = rule(implementation=implementation, attrs={
                 &source[range.start().to_usize()..range.end().to_usize()],
                 expression,
             );
+        }
+    }
+
+    #[test]
+    fn attribute_guards_refine_matching_file_views() {
+        let source = r#"def implementation(ctx):
+    if ctx.attr.jar:
+        print(ctx.file.jar.path)
+        if ctx.attr.tool:
+            print(ctx.file.jar.path, ctx.executable.tool.path)
+    selected = ctx.file.jar if ctx.attr.jar else ctx.files.jars[0]
+    print(selected.path)
+    if ctx.attr.tool:
+        print(ctx.executable.tool.path)
+    return []
+example = rule(implementation=implementation, attrs={
+    "jar": attr.label(allow_single_file=True),
+    "jars": attr.label_list(allow_files=True),
+    "other": attr.label(allow_single_file=True),
+    "tool": attr.label(executable=True, cfg="exec"),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        for (expression, key) in [
+            ("ctx.file.jar", "\"jar\""),
+            ("ctx.executable.tool", "\"tool\""),
+        ] {
+            check_field(&analysis.snapshot(), file, source, expression, "File", key);
+        }
+
+        for (statement, expression) in [
+            ("    print(ctx.file.jar.path)", "ctx.file.jar.path"),
+            (
+                "    if not ctx.attr.jar:\n        print(ctx.file.jar.path)",
+                "ctx.file.jar.path",
+            ),
+            (
+                "    if ctx.attr.jar:\n        print(ctx.file.other.path)",
+                "ctx.file.other.path",
+            ),
+            (
+                "    if ctx.attr.jar:\n        print(ctx.executable.tool.path)",
+                "ctx.executable.tool.path",
+            ),
+            (
+                "    if ctx.attr.tool:\n        print(ctx.file.jar.path)",
+                "ctx.file.jar.path",
+            ),
+        ] {
+            let changed = source.replace("    return []", &format!("{statement}\n    return []"));
+            analysis.update_file(file, changed.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{statement}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+            assert!(diagnostic.concise_message().to_string().contains("None"));
+            assert_eq!(&changed[diagnostic.range().unwrap()], expression);
+        }
+        analysis.update_file(
+            file,
+            source.replace("allow_single_file=True", "allow_single_file=False"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (option, replacement, expression, key) in [
+            (
+                "allow_single_file=True",
+                "allow_single_file=None",
+                "ctx.file.jar",
+                "\"jar\"",
+            ),
+            (
+                "executable=True",
+                "executable=False",
+                "ctx.executable.tool",
+                "\"tool\"",
+            ),
+        ] {
+            let changed = source.replace(option, replacement);
+            analysis.update_file(file, changed.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{option}: {diagnostics:?}");
+            // Disabled views use the native struct's generic field fallback.
+            check_field(
+                &analysis.snapshot(),
+                file,
+                &changed,
+                expression,
+                "Unknown",
+                "",
+            );
+            analysis.update_file(file, source.to_owned());
+            check_field(&analysis.snapshot(), file, source, expression, "File", key);
         }
     }
 
