@@ -460,12 +460,28 @@ fn field_type<'db>(
                 "FilesToRunProvider",
                 native("File")?,
             )?
-        } else if attribute.single_file == Some(true) {
-            native("FilesToRunProvider")?
         } else {
-            return native("Target");
+            native("FilesToRunProvider")?
         };
-        factory::specialized_native_instance(db, environment, declarations, "Target", provider)
+        let target = factory::specialized_native_instance(
+            db,
+            environment,
+            declarations,
+            "Target",
+            provider,
+        )?;
+        if attribute.executable == Some(true) || attribute.single_file == Some(true) {
+            Some(target)
+        } else {
+            let group = factory::specialized_native_instance(
+                db,
+                environment,
+                declarations,
+                "Target",
+                Type::none(db, environment),
+            )?;
+            Some(UnionType::from_elements(db, environment, [target, group]))
+        }
     };
     match view {
         View::Attr => {
@@ -595,8 +611,11 @@ impl<'a> Visitor<'a> for RegistrationCalls<'a> {
 
 #[cfg(test)]
 mod tests {
+    use ruff_python_ast::Stmt;
     use salsa::Setter;
     use starpls_hir::Db as _;
+    use ty_python_semantic::HasType;
+    use ty_python_semantic::SemanticModel;
 
     use crate::Analysis;
     use crate::FilePosition;
@@ -636,6 +655,7 @@ def implementation(ctx):
     for provider_type in [SecondInfo, ThirdInfo, OutputGroupInfo]:
         if provider_type in image:
             result.append(image[provider_type])
+    _ = result[0]
     return result
 example = rule(implementation=implementation, attrs={'image': attr.label(mandatory=True)})
 "#;
@@ -648,26 +668,42 @@ example = rule(implementation=implementation, attrs={'image': attr.label(mandato
         let snapshot = analysis.snapshot();
         let diagnostics = snapshot.diagnostics(file).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let hover = snapshot
-            .hover(FilePosition {
-                file_id: file,
-                pos: (source.find("return result").unwrap() as u32 + 7).into(),
-            })
-            .unwrap()
-            .unwrap();
-        for name in [
-            "DefaultInfo[",
-            "FirstInfo",
-            "SecondInfo",
-            "ThirdInfo",
-            "OutputGroupInfo",
-        ] {
-            assert!(
-                hover.contents.value.contains(name),
-                "{}",
-                hover.contents.value
-            );
-        }
+        let db = &snapshot.db;
+        let program = db.starlark_program_file(file);
+        let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+        let model = SemanticModel::new(db, program);
+        let [_load, _provider, implementation, _rule] = parsed.suite().as_slice() else {
+            panic!("expected provider fixture declarations");
+        };
+        let Stmt::FunctionDef(function) = implementation else {
+            panic!("expected implementation function");
+        };
+        let [_image, _initial, _loop, observation, _return] = function.body.as_slice() else {
+            panic!("expected list construction, appends, and observation");
+        };
+        let Stmt::Assign(assignment) = observation else {
+            panic!("expected list element observation");
+        };
+        let ty = assignment.value.inferred_type(&model).unwrap();
+        let mut elements: Vec<_> = ty
+            .as_union()
+            .expect("expected a union of provider instances")
+            .elements(db)
+            .iter()
+            .map(|ty| ty.display(db, &model.program_environment()).to_string())
+            .collect();
+        elements.sort();
+        assert_eq!(
+            elements,
+            [
+                "DefaultInfo[depset[File], FilesToRunProvider[File | None]]",
+                "DefaultInfo[depset[File], None]",
+                "FirstInfo",
+                "OutputGroupInfo",
+                "SecondInfo",
+                "ThirdInfo",
+            ]
+        );
     }
 
     fn check_field(
@@ -745,7 +781,7 @@ example_test(name="selected", own="value", deps=select({"//conditions:default": 
         for (expression, expected, key) in [
             (
                 "ctx.attr.deps",
-                "list[Target[FilesToRunProvider[File | None] | None]]",
+                "list[Target[FilesToRunProvider[File | None]] | Target[None]]",
                 "\"deps\"",
             ),
             (
@@ -1502,7 +1538,7 @@ example = rule(implementation=implementation, attrs={
             ),
             (
                 "ctx.attr.computed",
-                "Target[FilesToRunProvider[File | None] | None] | None",
+                "Target[FilesToRunProvider[File | None]] | Target[None] | None",
                 "\"computed\"",
             ),
         ] {
@@ -1580,7 +1616,7 @@ example = repository_rule(implementation=implementation, attrs={
             (
                 "rule",
                 "[DefaultInfo]",
-                "Target[FilesToRunProvider[File | None] | None]",
+                "Target[FilesToRunProvider[File | None]] | Target[None]",
             ),
             ("repository_rule", ".name", "Label"),
         ] {
@@ -1718,14 +1754,14 @@ example = rule(implementation=implementation, executable=True, outputs={"implici
         for (expression, expected, key) in [
             (
                 "ctx.attr.dep",
-                "Target[FilesToRunProvider[File | None] | None] | None",
+                "Target[FilesToRunProvider[File | None]] | Target[None] | None",
                 "\"dep\"",
             ),
             ("ctx.attr.out", "Label | None", "\"out\""),
             ("ctx.attr.outs", "list[Label]", "\"outs\""),
             (
                 "ctx.attr.split",
-                "list[Target[FilesToRunProvider[File | None] | None]]",
+                "list[Target[FilesToRunProvider[File | None]] | Target[None]]",
                 "\"split\"",
             ),
             ("ctx.files.srcs", "list[File]", "\"srcs\""),
@@ -1741,22 +1777,22 @@ example = rule(implementation=implementation, executable=True, outputs={"implici
             ("ctx.outputs.executable", "File", ""),
             (
                 "ctx.split_attr.split",
-                "dict[str | None, Target[FilesToRunProvider[File | None] | None]]",
+                "dict[str | None, Target[FilesToRunProvider[File | None]] | Target[None]]",
                 "\"split\"",
             ),
             (
                 "ctx.split_attr.split_list",
-                "dict[str | None, list[Target[FilesToRunProvider[File | None] | None]]]",
+                "dict[str | None, list[Target[FilesToRunProvider[File | None]] | Target[None]]]",
                 "\"split_list\"",
             ),
             (
                 "ctx.split_attr.split_keyed",
-                "dict[str | None, list[Target[FilesToRunProvider[File | None] | None]]]",
+                "dict[str | None, list[Target[FilesToRunProvider[File | None]] | Target[None]]]",
                 "\"split_keyed\"",
             ),
             (
                 "ctx.split_attr.split_named",
-                "dict[str | None, dict[str, Target[FilesToRunProvider[File | None] | None]]]",
+                "dict[str | None, dict[str, Target[FilesToRunProvider[File | None]] | Target[None]]]",
                 "\"split_named\"",
             ),
         ] {

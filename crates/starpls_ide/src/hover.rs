@@ -777,7 +777,7 @@ example = {factory}(
             (
                 "",
                 "{'_tool': attr.label()}",
-                "Target[FilesToRunProvider[File | None] | None] | None",
+                "Target[FilesToRunProvider[File | None]] | Target[None] | None",
             ),
             (
                 "attrs = {'_tool': attr.label()}\nattrs.update({'_tool': attr.string()})\n",

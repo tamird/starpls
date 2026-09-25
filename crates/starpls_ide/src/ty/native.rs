@@ -315,7 +315,20 @@ fn declarations(
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
                 body,
-                "        def __getitem__(self, key: _starpls_typing.Callable[..., _starpls_types.DefaultInfo]) -> _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File], _DefaultInfoFilesToRun]: ..."
+                "        def __getitem__(self, key: _starpls_types.Provider[_starpls_types.DefaultInfo] | _starpls_typing.Callable[..., _starpls_types.DefaultInfo]) -> _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File], _DefaultInfoFilesToRun]: ..."
+            )?;
+            // Package groups provide PackageSpecificationInfo. Both package
+            // and environment groups lack FilesToRunProvider, and their other
+            // provider lookups fail.
+            writeln!(body, "        @_starpls_typing.overload")?;
+            writeln!(
+                body,
+                "        def __getitem__(self, key: _starpls_types.Provider[_starpls_types.PackageSpecificationInfo] | _starpls_typing.Callable[..., _starpls_types.PackageSpecificationInfo]) -> _starpls_types.PackageSpecificationInfo: ..."
+            )?;
+            writeln!(body, "        @_starpls_typing.overload")?;
+            writeln!(
+                body,
+                "        def __getitem__(self: _starpls_types.Target[None], key: _starpls_types.Provider[_ProviderValue] | _starpls_typing.Callable[..., _ProviderValue]) -> _starpls_typing.Never: ..."
             )?;
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
@@ -1299,6 +1312,122 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
                 diagnostic.concise_message().to_string().contains("None"),
                 "{name}: {diagnostic:?}"
             );
+        }
+    }
+
+    #[test]
+    fn provider_lookup_distinguishes_group_targets() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                None,
+                String::new(),
+                1,
+            )
+            .unwrap();
+        for (receiver, key, expression, expected) in [
+            ("Target[None]", "Unknown", "target[Info]", "Never"),
+            (
+                "Target[FilesToRunProvider]",
+                "Unknown",
+                "target[Info]",
+                "Info",
+            ),
+            (
+                "Target[FilesToRunProvider] | Target[None]",
+                "Unknown",
+                "target[Info]",
+                "Info",
+            ),
+            ("Target", "Unknown", "target[Info]", "Info"),
+            (
+                "Target[None]",
+                "Unknown",
+                "target[DefaultInfo].files_to_run",
+                "None",
+            ),
+            (
+                "Target[None]",
+                "Unknown",
+                "target[PackageSpecificationInfo]",
+                "PackageSpecificationInfo",
+            ),
+            (
+                "Target[None]",
+                "Provider[Info] | Provider[PackageSpecificationInfo]",
+                "target[key]",
+                "PackageSpecificationInfo",
+            ),
+            (
+                "Target[None]",
+                "Provider[DefaultInfo]",
+                "target[key].files_to_run",
+                "None",
+            ),
+            (
+                "Target[None]",
+                "Provider[DefaultInfo] | Provider[Info]",
+                "target[key].files_to_run",
+                "None",
+            ),
+            (
+                "Target[None]",
+                "Provider[Info] | Callable[..., DefaultInfo]",
+                "target[key].files_to_run",
+                "None",
+            ),
+            ("Target[None]", "Unknown", "target[key]", "Unknown"),
+            ("Target[None]", "Any", "target[key]", "Unknown"),
+            (
+                "Target[None]",
+                "Callable[..., Any]",
+                "target[key]",
+                "Unknown",
+            ),
+        ] {
+            let source = format!(
+                "Info = provider(fields=['message'])\ndef inspect(target: {receiver}, key: {key}):\n    return {expression}\n"
+            );
+            analysis.update_file(file, source);
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let file = db.starlark_program_file(file);
+            let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+            let model = SemanticModel::new(db, file);
+            let [_provider, inspect] = parsed.suite().as_slice() else {
+                panic!("expected provider and inspection declarations");
+            };
+            let Stmt::FunctionDef(function) = inspect else {
+                panic!("expected function");
+            };
+            let [statement] = function.body.as_slice() else {
+                panic!("expected one return statement");
+            };
+            let Stmt::Return(statement) = statement else {
+                panic!("expected return");
+            };
+            let ty = statement
+                .value
+                .as_ref()
+                .unwrap()
+                .inferred_type(&model)
+                .unwrap();
+            assert_eq!(
+                ty.display(db, &model.program_environment()).to_string(),
+                expected,
+                "{receiver}, {key}: {expression}"
+            );
+            let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
     }
 
