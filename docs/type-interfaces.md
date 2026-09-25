@@ -152,8 +152,9 @@ contracts produce an incomplete result. `--ignore_pattern` selects implementatio
 files and reexported bodies to exclude. Callers use the trusted stub contracts
 independently of validation results.
 
-Function validation requires static expression and callable types throughout
-the checked body.
+Equivalent function signatures may include `Any` when their other type
+components are fully known. Function validation requires static expression and
+callable types throughout the checked body.
 
 Module variables with one simple assignment can borrow a fully static stub
 annotation. The source module must leave the variable unread and unmodified,

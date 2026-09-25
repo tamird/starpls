@@ -1274,7 +1274,22 @@ fn compare_function<'db>(
         )
         .unwrap_or(ty)
     };
-    compare(db, file, name, signature(actual), signature(expected))
+    let actual = signature(actual);
+    let expected = signature(expected);
+    let error = match compare(db, file, name, actual, expected) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    // Equivalent gradual signatures describe the same contract. Unknown and provisional
+    // components cannot establish that correspondence; body evidence is checked separately.
+    if matches!(&error, ContractError::Incomplete(_))
+        && actual.is_fully_static_except_any(db, &environment)
+        && expected.is_fully_static_except_any(db, &environment)
+        && actual.is_equivalent_to(db, &environment, expected)
+    {
+        return Ok(());
+    }
+    Err(error)
 }
 
 fn compare<'db>(
@@ -2191,6 +2206,88 @@ mod tests {
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
         }
+    }
+
+    #[test]
+    fn gradual_signatures_require_matching_contracts_and_static_bodies() {
+        for annotation in ["Any", "list[Any]", "Callable[..., Any]"] {
+            let stub = format!("def compute(value: {annotation}) -> int: ...\n");
+            assert!(
+                validate("def compute(value): return 1\n", &stub).is_empty(),
+                "{annotation}"
+            );
+        }
+        assert!(validate(
+            "def compute(value: Any) -> int: return 1\n",
+            "def compute(value: Any) -> int: ...\n"
+        )
+        .is_empty());
+        for (source, stub) in [
+            (
+                "def compute(value: int) -> int: return 1\n",
+                "def compute(value: Any) -> int: ...\n",
+            ),
+            (
+                "def compute(value: list[str]) -> int: return 1\n",
+                "def compute(value: list[Any]) -> int: ...\n",
+            ),
+            (
+                "def compute(value): return 1\n",
+                "def compute(value) -> int: ...\n",
+            ),
+            (
+                "def compute(value): return 1\n",
+                "def compute(value: Any): ...\n",
+            ),
+            (
+                "def compute(value): return len(value)\n",
+                "def compute(value: list[Any]) -> int: ...\n",
+            ),
+            (
+                "def compute(value):\n    value.append('x')\n    return 1\n",
+                "def compute(value: list[Any]) -> int: ...\n",
+            ),
+            (
+                "def compute(value):\n    value(1, unexpected=True)\n    return 1\n",
+                "def compute(value: Callable[..., Any]) -> int: ...\n",
+            ),
+            (
+                "def compute(value):\n    value.missing()\n    return 1\n",
+                "def compute(value: Any) -> int: ...\n",
+            ),
+            (
+                "def helper(value): return 1\ndef compute(value): return helper(value)\n",
+                "def helper(value: Any) -> int: ...\ndef compute(value: Any) -> int: ...\n",
+            ),
+            (
+                "def wants_int(value): return value\ndef compute(value): return wants_int(value)\n",
+                "def wants_int(value: int) -> int: ...\ndef compute(value: Any) -> int: ...\n",
+            ),
+            (
+                "def helper(): return 1\ndef compute(value): return helper()\n",
+                "def compute(value: Any) -> int: ...\n",
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "incomplete-stub-validation"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+        assert_eq!(
+            validate(
+                "def compute(value): return 'wrong'\n",
+                "def compute(value: Any) -> int: ...\n"
+            ),
+            ["invalid-return-type"]
+        );
+        assert!(validate(
+            "def compute(value): return len(value)\n",
+            "def compute(value: list[object]) -> int: ...\n"
+        )
+        .is_empty());
     }
 
     #[test]
