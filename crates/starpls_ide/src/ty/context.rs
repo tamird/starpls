@@ -642,6 +642,67 @@ mod tests {
     }
 
     #[test]
+    fn successful_provider_lookup_establishes_files_to_run() {
+        let source = r#"Info = provider(fields=["message"])
+def implementation(ctx):
+    target = ctx.attr.dep
+    info = target[Info]
+    print(info)
+    executable = target[DefaultInfo].files_to_run.executable # type: File | None
+    if executable != None:
+        print(executable.path)
+    for dependency in ctx.attr.deps:
+        for artifact in dependency[OutputGroupInfo]["exe"].to_list():
+            print(artifact.path)
+        manifest = dependency[DefaultInfo].files_to_run.runfiles_manifest # type: File | None
+        if manifest != None:
+            print(manifest.path)
+    return []
+example = rule(implementation=implementation, attrs={
+    "dep": attr.label(mandatory=True),
+    "deps": attr.label_list(),
+})
+"#;
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
+        enable_context(&mut analysis);
+        let file = fixture.main_file();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        for (original, replacement, expression) in [
+            (
+                "    if executable != None:\n        print(executable.path)",
+                "    print(executable.path)",
+                "executable.path",
+            ),
+            (
+                "        if manifest != None:\n            print(manifest.path)",
+                "        print(manifest.path)",
+                "manifest.path",
+            ),
+            (
+                "info = target[Info]",
+                "info = target[DefaultInfo]",
+                "target[DefaultInfo].files_to_run.executable",
+            ),
+        ] {
+            let source = source.replace(original, replacement);
+            analysis.update_file(file, source.clone());
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{expression}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
+            assert!(diagnostic.concise_message().to_string().contains("None"));
+            let range = diagnostic.range().unwrap();
+            assert_eq!(
+                &source[range.start().to_usize()..range.end().to_usize()],
+                expression,
+            );
+        }
+    }
+
+    #[test]
     fn provider_field_mappings_preserve_list_inference() {
         let providers = r#"FIELDS = dict(value='Value documentation')
 SecondInfo = provider(fields=FIELDS)
