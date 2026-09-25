@@ -5,6 +5,9 @@
 
 from typing import Collection, TYPE_CHECKING
 
+# Every Starlark value is an object; this top type guarantees no attributes.
+class object: ...
+
 @final
 @disjoint_base
 class bool:

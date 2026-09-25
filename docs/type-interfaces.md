@@ -144,11 +144,24 @@ class _Builder(Protocol):
     def set(self) -> _Set: ...
 ```
 
-This form describes immutable `struct` fields containing functions. Method
-declarations also require the member on the value's class. A property getter
+Undecorated special methods for Starlark operations specify their call
+signatures: for example, `__call__` describes `value(...)`, `__getitem__`
+describes indexing, and `__len__` describes `len(value)`. The same rule applies
+to iteration, containment, conversions, and Starlark unary and binary operators.
+A readonly property specifies an immutable stored field, including callable
+fields and fields named `__call__`.
+Attribute interception and Python class lifecycle methods use ordinary member
+requirements.
+
+Other method declarations also require the member on the value's class. A property getter
 uses the same declaration body as a method. Only a single bare `@property`
 decorator is supported; provider declarations and runtime files do not support
 decorators.
+
+`struct[T]` bounds the values of existing fields. Required protocol fields need
+independent presence evidence, such as explicit constructor keywords or required
+keys in an unpacked dictionary. Every Starlark value is assignable to `object`;
+attribute access requires a more specific type.
 
 ## Implementation validation
 

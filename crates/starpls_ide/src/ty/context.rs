@@ -39,7 +39,7 @@ use super::factory;
 use super::factory::Attribute;
 use super::factory::AttributeConfiguration;
 use super::factory::AttributeUse;
-use super::factory::Factory;
+use super::factory::BuiltinFunction;
 use super::factory::RuleAttributeData;
 use crate::Database;
 
@@ -95,7 +95,9 @@ pub(super) fn parameter_type<'db>(
         };
         if !matches!(
             factory,
-            Factory::Rule { repository: _ } | Factory::Aspect | Factory::Macro
+            BuiltinFunction::Rule { repository: _ }
+                | BuiltinFunction::Aspect
+                | BuiltinFunction::Macro
         ) {
             continue;
         }
@@ -123,25 +125,26 @@ pub(super) fn parameter_type<'db>(
     let (call, signature, declaration, factory) = registration?;
     let declarations = declaration.program_file(db);
     let context_kind = match factory {
-        Factory::Macro => {
+        BuiltinFunction::Macro => {
             let result = call.inferred_type(&model)?;
             let data = result.provided_data(db, &environment)?;
             let data = data.downcast_ref::<factory::RuleData>()?;
             return data.parameter_type(db, &environment, declarations, parameter.name().as_str());
         }
-        Factory::Rule { repository } => {
+        BuiltinFunction::Rule { repository } => {
             if repository {
                 ContextKind::Repository
             } else {
                 ContextKind::Build
             }
         }
-        Factory::Aspect => ContextKind::Aspect,
-        Factory::Attribute(_) => return None,
-        Factory::BuildSetting(_) => return None,
-        Factory::Struct => return None,
-        Factory::Provider => return None,
-        Factory::Transition => return None,
+        BuiltinFunction::Aspect => ContextKind::Aspect,
+        BuiltinFunction::Attribute(_) => return None,
+        BuiltinFunction::BuildSetting(_) => return None,
+        BuiltinFunction::Struct => return None,
+        BuiltinFunction::StructGetattr => return None,
+        BuiltinFunction::Provider => return None,
+        BuiltinFunction::Transition => return None,
     };
     let parameter_count = if context_kind == ContextKind::Aspect {
         2

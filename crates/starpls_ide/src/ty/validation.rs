@@ -1364,6 +1364,162 @@ mod tests {
     }
 
     #[test]
+    fn struct_signature_validation_requires_present_fields() {
+        for field in ["run", "__repr__", "__class__", "__getattr__"] {
+            for source in [
+                "def make(): return struct()",
+                "def make(data: dict[str, int]): return struct(**data)",
+                "def make(value: struct[object]): return value\nmake(struct())",
+                "def make(value: object): return value\nmake(struct())",
+            ] {
+                let parameters = if source.contains("data:") {
+                    "data: dict[str, int]"
+                } else if source.contains("value: struct") {
+                    "value: struct[object]"
+                } else if source.contains("value: object") {
+                    "value: object"
+                } else {
+                    ""
+                };
+                let stub = format!("class _Required(Protocol):\n    @property\n    def {field}(self) -> object: ...\ndef make({parameters}) -> _Required: ...\n");
+                assert_eq!(
+                    validate(source, &stub),
+                    ["invalid-return-type"],
+                    "{field}: {source}"
+                );
+            }
+        }
+        for (annotation, expected) in [
+            ("int", vec![]),
+            ("NotRequired[int]", vec!["invalid-return-type"]),
+        ] {
+            let stub = format!("class _Row(TypedDict):\n    run: {annotation}\nclass _Required(Protocol):\n    @property\n    def run(self) -> int: ...\ndef make(row: _Row) -> _Required: ...\n");
+            assert_eq!(
+                validate("def make(row): return struct(**row)\n", &stub),
+                expected
+            );
+        }
+        let higher_order_source = "def use(factory): return factory(text='x')\nuse(struct)\n";
+        let higher_order_stub = "class _Factory(Protocol):\n    def __call__(self, **kwargs: str) -> struct[str]: ...\ndef use(factory: _Factory) -> struct[str]: ...\n";
+        assert!(validate(higher_order_source, higher_order_stub).is_empty());
+        assert!(validate(
+            "def make(): return struct()",
+            "class _Empty(Protocol): ...\ndef make() -> _Empty: ...\n"
+        )
+        .is_empty());
+        for (source, parameters, required, expected) in [
+            ("def make(): return struct(run=1)", "", "int", vec![]),
+            ("def make(): return struct(**{'run': 1})", "", "int", vec![]),
+            (
+                "def make(): return struct(run='wrong')",
+                "",
+                "int",
+                vec!["invalid-return-type"],
+            ),
+            (
+                "def make(value: Any): return struct(run=value)",
+                "value: Any",
+                "object",
+                vec!["incomplete-stub-validation"],
+            ),
+            (
+                "def make(value: Any): return struct(run=value)",
+                "value: Any",
+                "int",
+                vec!["unsound-return-statement", "incomplete-stub-validation"],
+            ),
+            (
+                "def make(kwargs): return struct(run=_known, **kwargs)",
+                "kwargs: Any",
+                "_Run",
+                vec!["incomplete-stub-validation"],
+            ),
+        ] {
+            let source = if source.contains("_known") {
+                format!("def _known(value: int) -> int: return value\n{source}\n")
+            } else {
+                source.to_owned()
+            };
+            let stub = format!("class _Run(Protocol):\n    def __call__(self, value: int) -> int: ...\nclass _Required(Protocol):\n    @property\n    def run(self) -> {required}: ...\ndef make({parameters}) -> _Required: ...\n");
+            assert_eq!(validate(&source, &stub), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn struct_signature_typing_only_members_require_runtime_evidence() {
+        let stub = "class _Getter(Protocol):\n    def __getattr__(self, name: str) -> int: ...\ndef make() -> _Getter: ...\n";
+        assert_eq!(
+            validate("def make(): return struct(value=1)", stub),
+            ["invalid-return-type"]
+        );
+        let stub = "def make(value: struct[int]) -> Callable[[str], int]: ...\n";
+        assert!(!validate("def make(value): return value.__getattr__", stub).is_empty());
+        let stub = "class _Required(Protocol):\n    @property\n    def __getattr__(self) -> int: ...\ndef make() -> _Required: ...\n";
+        assert!(validate("def make(): return struct(__getattr__=1)", stub).is_empty());
+        let stub = "class _Required(Protocol):\n    @property\n    def __len__(self) -> object: ...\ndef make() -> _Required: ...\n";
+        assert_eq!(
+            validate("def make(): return 'value'", stub),
+            ["invalid-return-type"]
+        );
+        let stub = "def make() -> Callable[[], int]: ...\n";
+        assert!(!validate("def make(): return 'value'.__len__", stub).is_empty());
+        let stub = "class _Rows(Protocol):\n    def __getitem__(self, index: int) -> int: ...\ndef read(value: _Rows) -> int: ...\n";
+        assert!(validate("def read(value): return value[0]", stub).is_empty());
+        assert_eq!(
+            validate("def read(value): return value['wrong']", stub),
+            ["invalid-argument-type"]
+        );
+        let stub = "class _Rows(Protocol):\n    def __getitem__(self, index: int) -> int: ...\ndef extract(value: _Rows) -> Callable[[int], int]: ...\n";
+        assert_eq!(
+            validate("def extract(value): return value.__getitem__", stub),
+            [
+                "unresolved-attribute",
+                "unsound-return-statement",
+                "incomplete-stub-validation"
+            ]
+        );
+    }
+
+    #[test]
+    fn struct_signature_callback_runtime_member() {
+        let source = "def known(value: int) -> int: return value\ndef extract(callback): return callback.__call__\nextract(known)\n";
+        for annotation in ["_Callback", "Callable[[int], int]"] {
+            let stub = format!("class _Callback(Protocol):\n    def __call__(self, value: int) -> int: ...\ndef extract(callback: {annotation}) -> Callable[[int], int]: ...\n");
+            let diagnostics = validate(source, &stub);
+            assert_eq!(
+                diagnostics,
+                [
+                    "unresolved-attribute",
+                    "unsound-return-statement",
+                    "incomplete-stub-validation"
+                ],
+                "{annotation}"
+            );
+        }
+        let stub = "def invoke(callback: Callable[[int], int]) -> int: ...\n";
+        assert!(validate("def invoke(callback): return callback(1)", stub).is_empty());
+        assert_eq!(
+            validate("def invoke(callback): return callback('wrong')", stub),
+            ["invalid-argument-type"]
+        );
+        let stub = "def extract() -> Callable[[int], int]: ...\n";
+        assert_eq!(
+            validate(
+                "def known(value: int) -> int: return value\ndef extract(): return known.__call__",
+                stub
+            ),
+            [
+                "unresolved-attribute",
+                "unsound-return-statement",
+                "incomplete-stub-validation"
+            ]
+        );
+        let source = "def known(value: int) -> int: return value\ndef make(): return struct(__call__=known)\n";
+        let stub = "class _Callback(Protocol):\n    def __call__(self, value: int) -> int: ...\nclass _Required(Protocol):\n    @property\n    def __call__(self) -> _Callback: ...\ndef make() -> _Required: ...\n";
+        assert!(validate(source, stub).is_empty());
+    }
+
+    #[test]
     fn readonly_protocol_fields_check_named_callbacks() {
         let stub = r#"
 class _Run(Protocol):
@@ -1382,12 +1538,10 @@ def make() -> _Runner: ...
             let source = format!("{callback}\ndef make(): return struct(run=_known)\n");
             let diagnostics = validate(&source, stub);
             let expected = if compatible {
-                vec!["incomplete-stub-validation"]
+                vec![]
             } else {
-                vec!["invalid-return-type", "incomplete-stub-validation"]
+                vec!["invalid-return-type"]
             };
-            // The native struct constructor still has a gradual signature.
-            // Property compatibility does not complete its body evidence.
             assert_eq!(diagnostics, expected, "{callback}");
         }
     }

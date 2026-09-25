@@ -26,6 +26,125 @@ const PRIMITIVES: &str = include_str!("primitives.pyi");
 const COLLECTIONS: &str = include_str!("collections.pyi");
 const SCALARS: [&str; 4] = ["int", "float", "tuple", "range"];
 
+/// Members used by Starlark syntax and builtins. Attribute interception,
+/// descriptors, and Python class lifecycle hooks describe a different surface.
+pub(super) fn is_operation_member(name: &str) -> bool {
+    matches!(
+        name,
+        "__call__"
+            | "__len__"
+            | "__iter__"
+            | "__next__"
+            | "__reversed__"
+            | "__contains__"
+            | "__getitem__"
+            | "__setitem__"
+            | "__bool__"
+            | "__int__"
+            | "__float__"
+            | "__index__"
+            | "__str__"
+            | "__repr__"
+            | "__pos__"
+            | "__neg__"
+            | "__invert__"
+            | "__eq__"
+            | "__ne__"
+            | "__lt__"
+            | "__le__"
+            | "__gt__"
+            | "__ge__"
+            | "__add__"
+            | "__radd__"
+            | "__iadd__"
+            | "__sub__"
+            | "__rsub__"
+            | "__isub__"
+            | "__mul__"
+            | "__rmul__"
+            | "__imul__"
+            | "__truediv__"
+            | "__rtruediv__"
+            | "__itruediv__"
+            | "__floordiv__"
+            | "__rfloordiv__"
+            | "__ifloordiv__"
+            | "__mod__"
+            | "__rmod__"
+            | "__imod__"
+            | "__and__"
+            | "__rand__"
+            | "__iand__"
+            | "__or__"
+            | "__ror__"
+            | "__ior__"
+            | "__xor__"
+            | "__rxor__"
+            | "__ixor__"
+            | "__lshift__"
+            | "__rlshift__"
+            | "__ilshift__"
+            | "__rshift__"
+            | "__rrshift__"
+            | "__irshift__"
+    )
+}
+
+/// Pinned capability declarations describe operations on Starlark values.
+#[salsa::tracked(returns(copy))]
+pub(super) fn is_operation_declaration<'db>(
+    db: &'db dyn ty_python_core::Db,
+    definition: ty_python_core::definition::Definition<'db>,
+) -> bool {
+    use ruff_db::files::FilePath;
+    use ty_python_core::definition::DefinitionKind;
+    use ty_python_core::scope::NodeWithScopeKind;
+
+    let file = definition.program_file(db);
+    let FilePath::Vendored(path) = file.file(db).path(db) else {
+        return false;
+    };
+    if !matches!(
+        path.as_str(),
+        "stdlib/types.pyi" | "stdlib/typing.pyi" | "stdlib/_typeshed/__init__.pyi"
+    ) {
+        return false;
+    }
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        return false;
+    };
+    let scope = definition.scope(db);
+    let NodeWithScopeKind::Class(class) = scope.node(db) else {
+        return false;
+    };
+    let Some(parent) = scope.scope(db).parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.to_scope_id(db, file).node(db),
+        NodeWithScopeKind::Module
+    ) {
+        return false;
+    }
+    let module = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let function = function.node(&module);
+    let class = class.node(&module);
+    if path.as_str() == "stdlib/types.pyi" {
+        return function.name.as_str() == "__call__"
+            && matches!(class.name.as_str(), "FunctionType" | "MethodType");
+    }
+    is_operation_member(function.name.as_str())
+        && class.arguments.as_ref().is_some_and(|arguments| {
+            arguments.args.iter().any(|base| {
+                let base = match base {
+                    ast::Expr::Subscript(subscript) => subscript.value.as_ref(),
+                    _ => base,
+                };
+                matches!(base, ast::Expr::Name(name) if name.id == "Protocol")
+            })
+        })
+}
+
 pub(crate) fn file_system() -> &'static VendoredFileSystem {
     static FILE_SYSTEM: LazyLock<VendoredFileSystem> = LazyLock::new(|| {
         build(ty_vendored::file_system()).expect("bundled Starlark support declarations are valid")

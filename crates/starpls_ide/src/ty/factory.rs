@@ -13,6 +13,7 @@ use starpls_bazel::attr::AttributeKind;
 use starpls_hir::Db as _;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
+use ty_python_core::scope::NodeWithScopeKind;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingValue;
 use ty_python_semantic::provided::ProvidedClass;
@@ -338,87 +339,87 @@ fn doc_string(db: &Database, call: &CheckedCall<'_, '_>) -> Option<Box<str>> {
     ty.string_literal_value(db).map(Into::into)
 }
 
-pub(super) enum Factory {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum BuiltinFunction {
     Attribute(AttributeKind),
     BuildSetting(BuildSetting),
     Rule { repository: bool },
     Aspect,
     Macro,
     Struct,
+    StructGetattr,
     Provider,
     Transition,
 }
 
-pub(super) fn declaration(db: &Database, declaration: Definition<'_>) -> Option<Factory> {
-    let file = declaration.program_file(db);
+// Keep parse and lexical-owner dependencies behind a small, backdated declaration identity.
+#[salsa::tracked(returns(clone))]
+pub(super) fn declaration<'db>(
+    db: &'db dyn ty_python_core::Db,
+    definition: Definition<'db>,
+) -> Option<BuiltinFunction> {
+    let file = definition.program_file(db);
     let FilePath::SystemVirtual(path) = file.file(db).path(db) else {
         return None;
     };
     if !path.as_str().starts_with("starpls-native:") {
         return None;
     }
-    let DefinitionKind::Function(function) = declaration.kind(db) else {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
         return None;
     };
     let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
     let function = function.node(&parsed);
-    let namespace = parsed.suite().iter().find_map(|statement| {
-        let Stmt::ClassDef(namespace) = statement else {
+    let scope = definition.scope(db);
+    let owner = scope.node(db);
+    if let NodeWithScopeKind::Class(class) = owner {
+        let parent = scope.scope(db).parent()?.to_scope_id(db, file);
+        let NodeWithScopeKind::Class(namespace) = parent.node(db) else {
             return None;
         };
-        if namespace.name.as_str() != "_starpls_types" {
+        if namespace.node(&parsed).name.as_str() != "_starpls_types" {
             return None;
         }
-        namespace.body.iter().find_map(|statement| {
-            let Stmt::ClassDef(class) = statement else {
-                return None;
-            };
-            class
-                .range()
-                .contains_range(function.range())
-                .then_some(class.name.as_str())
-        })
-    });
-    match namespace {
-        Some("attr") => return attribute_kind(function.name.as_str()).map(Factory::Attribute),
-        Some("config") => {
-            return Some(Factory::BuildSetting(match function.name.as_str() {
-                "bool" => BuildSetting::Bool,
-                "int" => BuildSetting::Int,
-                "string" => BuildSetting::String {
-                    allow_multiple: Some(false),
+        return match class.node(&parsed).name.as_str() {
+            "struct" => {
+                (function.name.as_str() == "__getattr__").then_some(BuiltinFunction::StructGetattr)
+            }
+            "attr" => Some(BuiltinFunction::Attribute(attribute_kind(
+                function.name.as_str(),
+            )?)),
+            "config" => Some(BuiltinFunction::BuildSetting(
+                match function.name.as_str() {
+                    "bool" => BuildSetting::Bool,
+                    "int" => BuildSetting::Int,
+                    "string" => BuildSetting::String {
+                        allow_multiple: Some(false),
+                    },
+                    "string_list" => BuildSetting::StringList,
+                    _ => return None,
                 },
-                "string_list" => BuildSetting::StringList,
-                _ => return None,
-            }));
-        }
-        _ => {}
-    }
-    // A same-named method is not the global factory declaration.
-    if !parsed.suite().iter().any(|statement| {
-        let Stmt::FunctionDef(candidate) = statement else {
-            return false;
+            )),
+            _ => None,
         };
-        candidate.range() == function.range()
-    }) {
+    }
+    if !matches!(owner, NodeWithScopeKind::Module) {
         return None;
     }
-    match function.name.as_str() {
-        "rule" => Some(Factory::Rule { repository: false }),
-        "repository_rule" => Some(Factory::Rule { repository: true }),
-        "aspect" => Some(Factory::Aspect),
-        "macro" => Some(Factory::Macro),
-        "struct" => Some(Factory::Struct),
-        "provider" => Some(Factory::Provider),
-        "transition" => Some(Factory::Transition),
-        _ => None,
-    }
+    Some(match function.name.as_str() {
+        "rule" => BuiltinFunction::Rule { repository: false },
+        "repository_rule" => BuiltinFunction::Rule { repository: true },
+        "aspect" => BuiltinFunction::Aspect,
+        "macro" => BuiltinFunction::Macro,
+        "struct" => BuiltinFunction::Struct,
+        "provider" => BuiltinFunction::Provider,
+        "transition" => BuiltinFunction::Transition,
+        _ => return None,
+    })
 }
 
 pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
     match declaration(db, call.declaration()?)? {
-        Factory::Attribute(kind) => attribute(db, call, kind),
-        Factory::BuildSetting(mut kind) => {
+        BuiltinFunction::Attribute(kind) => attribute(db, call, kind),
+        BuiltinFunction::BuildSetting(mut kind) => {
             if let BuildSetting::String { allow_multiple } = &mut kind {
                 *allow_multiple = match call.argument("allow_multiple") {
                     CheckedArgument::Omitted => Some(false),
@@ -428,7 +429,7 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
             }
             descriptor(db, call, "BuildSetting", ProvidedData::new(kind))
         }
-        Factory::Rule { repository } => rule(
+        BuiltinFunction::Rule { repository } => rule(
             db,
             call,
             if repository {
@@ -437,11 +438,12 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
                 RuleKind::Build
             },
         ),
-        Factory::Macro => rule(db, call, RuleKind::Macro),
-        Factory::Aspect => None,
-        Factory::Struct => structure(db, call),
-        Factory::Provider => provider(db, call),
-        Factory::Transition => descriptor(
+        BuiltinFunction::Macro => rule(db, call, RuleKind::Macro),
+        BuiltinFunction::Aspect => None,
+        BuiltinFunction::Struct => structure(db, call),
+        BuiltinFunction::StructGetattr => None,
+        BuiltinFunction::Provider => provider(db, call),
+        BuiltinFunction::Transition => descriptor(
             db,
             call,
             "transition",
@@ -880,7 +882,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         CheckedArgument::Value {
             ty: _,
             expression: _,
-        } => call.dictionary_argument("attrs"),
+        } => call.dictionary_argument(db, "attrs"),
         CheckedArgument::Indeterminate => None,
     };
     let own_attributes = own_attributes.unwrap_or(DictionaryItems {
@@ -1621,9 +1623,11 @@ pub(super) fn attribute_value_type<'db>(
 }
 
 fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+    if call.has_binding_errors() {
+        return None;
+    }
     let environment = ProgramEnvironment::from_file(call.file());
     let mut fields = Vec::new();
-    let mut has_dynamic_fields = false;
     for keyword in &call.call().arguments.keywords {
         match &keyword.arg {
             Some(name) => fields.push(ProvidedField {
@@ -1631,7 +1635,31 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
                 ty: call.expression_type(&keyword.value)?,
                 source: Some(FileRange::new(call.file().file(db), name.range())),
             }),
-            None => has_dynamic_fields = true,
+            None => {
+                let Some(DictionaryItems {
+                    items,
+                    extra_items: _,
+                }) = call.dictionary_items(db, &keyword.value)
+                else {
+                    continue;
+                };
+                for item in items {
+                    if !item.is_required() {
+                        continue;
+                    }
+                    let DictionaryItem {
+                        name,
+                        ty,
+                        kind: _,
+                        source,
+                    } = item;
+                    fields.push(ProvidedField {
+                        name,
+                        ty,
+                        source: Some(FileRange::new(call.file().file(db), source)),
+                    });
+                }
+            }
         }
     }
     let class = call.class_type(
@@ -1642,7 +1670,8 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
             class_members: Box::default(),
             instance_fields: ProvidedInstanceFields {
                 fields: fields.into_boxed_slice(),
-                has_dynamic_fields,
+                // Unlisted names use the native getter's possibly-missing field contract.
+                has_dynamic_fields: false,
                 implications: Box::default(),
                 data: None,
             },
@@ -1714,7 +1743,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
                         }
                     }
                 } else {
-                    let mapping = call.dictionary_argument("fields")?;
+                    let mapping = call.dictionary_argument(db, "fields")?;
                     let is_complete = mapping.is_complete();
                     let DictionaryItems {
                         items,
@@ -2107,6 +2136,119 @@ inherited(name="signature", build_setting_default=$0[])
                 "invalid-argument-type",
                 "invalid-argument-type"
             ],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn struct_signature_preserves_fields_and_host_operations() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let file = fixture.add_file(
+            &mut analysis.db,
+            "main.bzl",
+            r#"
+def increment(value: int) -> int:
+    return value + 1
+empty = struct()
+record = struct(callback=increment)
+mixed = struct(text="x", number=1)
+params = {"value": "x"}
+spread = struct(**params)
+callback = record.callback
+result = record.callback(1)
+text = mixed.text
+number = mixed.number
+spread_value = spread.value
+opaque: dict[str, int] = {}
+uncertain = struct(**opaque)
+uncertain_repr = uncertain.__repr__
+uncertain_str = uncertain.__str__
+uncertain_class = uncertain.__class__
+known_repr = struct(__repr__=1).__repr__
+rendered = repr(empty)
+stringified = str(empty)
+equal = empty == struct()
+label = Label("//:target")
+items = depset([1])
+integer = int("1")
+boolean = bool(empty)
+sequence = list((1,))
+wrong_argument = record.callback("wrong")
+"#,
+        );
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let program = db.starlark_program_file(file);
+        let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+        let model = SemanticModel::new(db, program);
+        let environment = model.program_environment();
+        let mut values = std::collections::BTreeMap::new();
+        for statement in parsed.suite() {
+            let Stmt::Assign(assignment) = statement else {
+                continue;
+            };
+            let [target] = assignment.targets.as_slice() else {
+                panic!("one target");
+            };
+            let Expr::Name(name) = target else {
+                panic!("named target");
+            };
+            let ty = assignment.value.inferred_type(&model).unwrap();
+            values.insert(name.id.as_str(), ty.display(db, &environment).to_string());
+            if let Expr::Call(call) = assignment.value.as_ref() {
+                if let Expr::Name(name) = call.func.as_ref() {
+                    if name.id == "struct" {
+                        let ty = call.func.inferred_type(&model).unwrap();
+                        let normalized = ty
+                            .map_callable_signatures(
+                                db,
+                                &environment,
+                                ty_python_semantic::types::CallableTypeKind::FunctionLike,
+                                std::convert::identity,
+                            )
+                            .unwrap();
+                        assert!(normalized.is_fully_static(db, &environment));
+                    }
+                }
+            }
+        }
+        for (name, expected) in [
+            ("empty", "struct"),
+            ("callback", "def increment(value: int) -> int"),
+            ("result", "int"),
+            ("text", "Literal[\"x\"]"),
+            ("number", "Literal[1]"),
+            ("spread_value", "Literal[\"x\"]"),
+            ("uncertain_repr", "Unknown"),
+            ("uncertain_str", "Unknown"),
+            ("uncertain_class", "Unknown"),
+            ("known_repr", "Literal[1]"),
+            ("rendered", "str"),
+            ("stringified", "str"),
+            ("equal", "bool"),
+            ("label", "Label"),
+            ("items", "depset[int]"),
+            ("integer", "int"),
+            ("boolean", "bool"),
+            ("sequence", "list[int]"),
+        ] {
+            assert_eq!(values[name], expected, "{name}");
+        }
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-argument-type"],
             "{diagnostics:?}"
         );
     }

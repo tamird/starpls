@@ -55,6 +55,34 @@ impl Db for Database {
     }
 }
 
+/// Operation declarations specify Starlark syntax and builtin capabilities.
+#[salsa::tracked(returns(copy))]
+pub(super) fn is_operation_declaration<'db>(db: &'db dyn Db, definition: Definition<'db>) -> bool {
+    let program_file = definition.program_file(db);
+    let Some(file) = db.starlark_file(program_file) else {
+        return false;
+    };
+    if !file.is_type_interface(db) {
+        return false;
+    }
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        return false;
+    };
+    let ty_python_core::scope::NodeWithScopeKind::Class(class) = definition.scope(db).node(db)
+    else {
+        return false;
+    };
+    let module = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
+    let function = function.node(&module);
+    let class = class.node(&module);
+    super::support::is_operation_member(function.name.as_str())
+        && function.decorator_list.is_empty()
+        && class
+            .arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.args.is_empty())
+}
+
 pub(super) fn diagnostics(db: &Database, file: File) -> Vec<ruff_db::diagnostic::Diagnostic> {
     use ruff_db::diagnostic::Annotation;
     use ruff_db::diagnostic::Diagnostic;

@@ -669,6 +669,7 @@ fn write_function(
             output.push('*');
         }
         let parameter_type = match (kind, value.name.as_str(), name) {
+            (CallableKind::Function, "struct", "kwargs") => Some("_StructField"),
             (CallableKind::Function, "select", "x") => Some("_starpls_typing.Mapping[_SelectCondition, _SelectValue]"),
             (CallableKind::Function, "depset", "direct") => {
                 Some("_starpls_typing.Sequence[_DepsetElement] | None")
@@ -762,6 +763,7 @@ fn write_function(
         output.push_str(", stripPrefix: _starpls_builtins.str = ''");
     }
     let return_type = match (kind, value.name.as_str()) {
+        (CallableKind::Function, "struct") => Some("_starpls_types.struct[_StructField]"),
         (CallableKind::Function, "select") => Some("_starpls_types.select[_SelectValue]"),
         (CallableKind::Function, "depset") => Some("_starpls_types.depset[_DepsetElement]"),
         (CallableKind::Function, "DefaultInfo") => {

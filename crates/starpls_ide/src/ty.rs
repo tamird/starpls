@@ -499,6 +499,18 @@ impl ty_python_semantic::Db for Database {
         factory::result(self, call)
     }
 
+    fn provided_function_type_check_only(&self, definition: Definition<'_>) -> bool {
+        interface::is_operation_declaration(self, definition)
+            || support::is_operation_declaration(self, definition)
+    }
+
+    fn provided_getattr_may_be_missing(&self, definition: Definition<'_>) -> bool {
+        matches!(
+            factory::declaration(self, definition),
+            Some(factory::BuiltinFunction::StructGetattr)
+        )
+    }
+
     fn provided_type_test<'db>(
         &'db self,
         file: ProgramFile<'db>,
