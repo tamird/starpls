@@ -146,6 +146,19 @@ sources and `.bzli` interfaces and records other inputs as exclusions.
 Recursive discovery stops at nested repository roots. Explicit paths use
 their existing repository context, including Bazel's external directory.
 
+For `starpls check`, repeat `--ignore_pattern` to exclude inputs. A bare name
+such as `vendor` matches that file or directory name anywhere in a path.
+A path such as `project/tools/vendor` uses exact components to exclude that
+workspace-relative file or subtree. Use `./vendor` to limit a single name to
+the workspace root. Patterns are literal names and paths; paths use lexical
+normalization and must stay within the workspace. These CLI exclusions
+apply to recursive discovery, explicit paths, `--files-from`, configured
+interface roots, and implementation validation, and appear in `excluded_inputs`.
+Excluded files can still be loaded as dependencies of selected files or used
+as contracts during validation. Validating a selected implementation can
+therefore report diagnostics in its excluded stub. Installed stub declarations
+remain available to callers.
+
 Checking resolves loads requested by the selected files and by inference of
 their dependencies. `--validate-stubs` also resolves loads requested by
 implementation validation. Generated dependency trees can contain many

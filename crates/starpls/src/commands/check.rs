@@ -67,7 +67,7 @@ pub(crate) struct CheckCommand {
     #[clap(long = "output_base")]
     pub(crate) output_base: Option<String>,
 
-    /// Specify patterns of files/directories to ignore.
+    /// Exclude a basename anywhere, or a workspace-relative file/directory path.
     #[clap(long = "ignore_pattern")]
     pub(crate) ignore_patterns: Vec<String>,
 
@@ -139,10 +139,28 @@ mod tests {
     }
 
     fn local_checker(name: &str, sources: &[(&str, &str)], audit_loads: bool) -> Checker {
+        local_checker_with_options(
+            name,
+            sources,
+            CheckCommand {
+                paths: vec!["BUILD".to_owned()],
+                audit_loads,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn local_checker_with_options(
+        name: &str,
+        sources: &[(&str, &str)],
+        mut options: CheckCommand,
+    ) -> Checker {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(name);
         std::fs::create_dir_all(&root).unwrap();
         for (path, contents) in sources {
-            std::fs::write(root.join(path), contents).unwrap();
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
         let loader = DefaultFileLoader::new(
@@ -157,23 +175,19 @@ mod tests {
             workspace: root.clone(),
             ..Default::default()
         };
-        let options = CheckCommand {
-            audit_loads,
-            ..Default::default()
-        };
+        if let Some(path) = &mut options.files_from {
+            *path = root.join(&*path);
+        }
+        let paths = options
+            .input_paths()
+            .unwrap()
+            .iter()
+            .map(|path| root.join(path).to_str().unwrap().to_owned())
+            .collect();
         let (analysis, loader) = options
             .prepare_analysis(loader, &info, Default::default())
             .unwrap();
-        Checker::new(
-            analysis,
-            info,
-            vec![root.join("BUILD").to_str().unwrap().to_owned()],
-            &[],
-            loader,
-            receiver,
-            &options,
-        )
-        .unwrap()
+        Checker::new(analysis, info, paths, &[], loader, receiver, &options).unwrap()
     }
 
     #[test]
@@ -214,7 +228,7 @@ mod tests {
             .set_type_interfaces([(build, *build_stub), (*bzl, *bzl_stub)])
             .unwrap();
         checker.files.extend(mapped.iter().copied());
-        let result = checker.check_files(true, &[]).unwrap();
+        let result = checker.check_files(true).unwrap();
         for expected in [build, *bzl] {
             let (_, diagnostics) = result
                 .diagnostics
@@ -251,7 +265,7 @@ mod tests {
                 audit,
             );
             let report_path = checker.bazel_info.workspace.join("coverage.json");
-            let result = checker.report_diagnostics(false, &[], Some(&report_path));
+            let result = checker.report_diagnostics(false, Some(&report_path));
             assert_eq!(result.is_err(), audit, "{result:?}");
             let report: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
@@ -286,7 +300,7 @@ mod tests {
         let report_path = checker.bazel_info.workspace.join("coverage.json");
         for _ in 0..2 {
             assert!(checker
-                .report_diagnostics(false, &[], Some(&report_path))
+                .report_diagnostics(false, Some(&report_path))
                 .is_err());
             let report: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
@@ -321,7 +335,7 @@ mod tests {
                 let super::CheckResult {
                     loads: graph,
                     diagnostics,
-                } = checker.check_files(false, &[]).unwrap();
+                } = checker.check_files(false).unwrap();
                 assert!(graph.unresolved.is_empty());
                 assert_eq!(
                     graph
@@ -358,7 +372,7 @@ mod tests {
         ]);
         let report_path = checker.bazel_info.workspace.join("coverage.json");
         checker
-            .report_diagnostics(false, &[], Some(&report_path))
+            .report_diagnostics(false, Some(&report_path))
             .unwrap();
         assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+", "wrong+"]);
         let report: serde_json::Value =
@@ -392,7 +406,7 @@ mod tests {
             let report_path = checker.bazel_info.workspace.join("coverage.json");
             for _ in 0..2 {
                 assert!(checker
-                    .report_diagnostics(false, &[], Some(&report_path))
+                    .report_diagnostics(false, Some(&report_path))
                     .is_err());
                 let requests = client.fetch_requests.lock().unwrap();
                 assert_eq!(
@@ -459,7 +473,7 @@ mod tests {
             }
             let report_path = checker.bazel_info.workspace.join("coverage.json");
             for _ in 0..2 {
-                let result = checker.report_diagnostics(false, &[], Some(&report_path));
+                let result = checker.report_diagnostics(false, Some(&report_path));
                 assert_eq!(result.is_err(), failed, "{result:?}");
                 let requests = client.fetch_requests.lock().unwrap();
                 assert_eq!(requests.len(), if failed { 6 } else { 3 });
@@ -499,7 +513,7 @@ mod tests {
         let report_path = checker.bazel_info.workspace.join("coverage.json");
         for _ in 0..2 {
             checker
-                .report_diagnostics(false, &[], Some(&report_path))
+                .report_diagnostics(false, Some(&report_path))
                 .unwrap();
             assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
             let report: serde_json::Value =
@@ -548,6 +562,264 @@ mod tests {
     }
 
     #[test]
+    fn exclusions_agree_across_recursive_explicit_and_inventory_inputs() {
+        let sources = [
+            (
+                "BUILD",
+                "load('//project/sky/repos:defs.bzl', 'value')\nlen(value)\n",
+            ),
+            ("project/sky/BUILD.bazel", ""),
+            ("project/sky/repos/defs.bzl", "value = 42\n"),
+            ("project/sky/repos/deep/bad.bzl", "excluded_name\n"),
+            ("project/sky/repos_extra/bad.bzl", "selected_name\n"),
+            ("other/repos/bad.bzl", "def broken(:\n"),
+            ("project/fragment.BUILD.bazel", "excluded_name\n"),
+            ("other/fragment.BUILD.bazel", "selected_name\n"),
+            ("cache/deep/bad.bzl", "excluded_name\n"),
+            ("other/cache/deep/bad.bzl", "excluded_name\n"),
+            ("only.bzl", "excluded_name\n"),
+            ("other/only.bzl", "selected_name\n"),
+        ];
+        for mode in ["recursive", "explicit", "inventory"] {
+            let inventory = sources
+                .iter()
+                .map(|(path, _)| *path)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut inputs = sources.to_vec();
+            inputs.push(("inputs.txt", &inventory));
+            let mut options = CheckCommand {
+                ignore_patterns: [
+                    "project/sky/unused/../repos/",
+                    "./project/fragment.BUILD.bazel",
+                    "cache",
+                    "./only.bzl",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                ..Default::default()
+            };
+            match mode {
+                "recursive" => options.paths.push(".".to_owned()),
+                "explicit" => {
+                    options.paths = sources.iter().map(|(path, _)| (*path).to_owned()).collect();
+                    // Input normalization must not turn the lexical parent into an exclusion.
+                    options
+                        .paths
+                        .push("project/sky/repos/../BUILD.bazel".to_owned());
+                }
+                "inventory" => options.files_from = Some("inputs.txt".into()),
+                _ => unreachable!(),
+            }
+            let mut checker =
+                local_checker_with_options(&format!("checker-exclusions-{mode}"), &inputs, options);
+            let root = checker.bazel_info.workspace.clone();
+            let report_path = root.join("coverage.json");
+            assert!(checker
+                .report_diagnostics(false, Some(&report_path))
+                .is_err());
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            let selected: std::collections::BTreeSet<_> = report["selected_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["path"].as_str().unwrap().to_owned())
+                .collect();
+            let expected = [
+                "BUILD",
+                "project/sky/BUILD.bazel",
+                "project/sky/repos_extra/bad.bzl",
+                "other/repos/bad.bzl",
+                "other/fragment.BUILD.bazel",
+                "other/only.bzl",
+            ]
+            .map(|path| root.join(path).to_str().unwrap().to_owned())
+            .into_iter()
+            .collect();
+            assert_eq!(selected, expected, "{mode}: {report}");
+            assert_eq!(
+                report["checked_files"].as_array().unwrap().len(),
+                selected.len()
+            );
+            assert_eq!(report["complete"], true, "{report}");
+            assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                report["loaded_dependencies"][0]["path"],
+                root.join("project/sky/repos/defs.bzl").to_str().unwrap()
+            );
+            let excluded = if mode == "recursive" {
+                "project/sky/repos"
+            } else {
+                "project/sky/repos/deep/bad.bzl"
+            };
+            assert_eq!(
+                report["excluded_inputs"][root.join(excluded).to_str().unwrap()],
+                "ignored"
+            );
+            let checked = checker.check_files(false).unwrap();
+            let snapshot = checker.analysis.snapshot();
+            for (file, diagnostics) in &checked.diagnostics {
+                if snapshot.path(*file) == root.join("project/sky/BUILD.bazel") {
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                } else {
+                    assert!(
+                        !diagnostics.is_empty(),
+                        "missing diagnostics for {}",
+                        snapshot.path(*file).display()
+                    );
+                }
+                if snapshot.path(*file) == root.join("BUILD") {
+                    assert!(
+                        diagnostics
+                            .iter()
+                            .any(|d| d.id().as_str() == "invalid-argument-type"),
+                        "{diagnostics:?}"
+                    );
+                }
+            }
+            drop(snapshot);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn exclusions_preserve_stub_contracts_and_selected_validation() {
+        let matches = <CheckCommand as clap::Args>::augment_args(clap::Command::new("check"))
+            .try_get_matches_from([
+                "check",
+                "BUILD",
+                "--type_interface",
+                "impl/hidden.bzl=types/hidden.bzli",
+                "--type_interface",
+                "other/hidden.bzl=types/other.bzli",
+                "--type_interface",
+                "impl/unused.bzl=types/unused.bzli",
+                "--ignore_pattern",
+                "impl/",
+                "--ignore_pattern",
+                "types/",
+                "--audit-loads",
+            ])
+            .unwrap();
+        let options = <CheckCommand as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+        let mut checker = local_checker_with_options(
+            "checker-excluded-stub-validation",
+            &[
+                ("BUILD", "load('//impl:hidden.bzl', 'value')\nlen(value)\n"),
+                ("impl/hidden.bzl", "value = 'wrong'\n"),
+                (
+                    "impl/unused.bzl",
+                    "load(':missing.bzl', 'unused')\nvalue = 'wrong'\n",
+                ),
+                ("types/unused.bzli", "value: int\n"),
+                ("types/hidden.bzli", "value: int\nunrelated = missing\n"),
+                ("other/hidden.bzl", "value = 'wrong'\n"),
+                ("types/other.bzli", "value: int\n"),
+            ],
+            options,
+        );
+        let root = checker.bazel_info.workspace.clone();
+        assert_eq!(checker.files.len(), 1);
+        let checked = checker.check_files(false).unwrap();
+        let [(file, diagnostics)] = checked.diagnostics.as_slice() else {
+            panic!("expected only selected caller diagnostics");
+        };
+        assert_eq!(checker.analysis.snapshot().path(*file), root.join("BUILD"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.id().as_str() == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+        let checked = checker.check_files(true).unwrap();
+        assert!(
+            checked.loads.unresolved.is_empty(),
+            "{:?}",
+            checked.loads.unresolved
+        );
+        let snapshot = checker.analysis.snapshot();
+        assert!(!checked
+            .diagnostics
+            .iter()
+            .any(|(file, _)| snapshot.path(*file) == root.join("impl/hidden.bzl")));
+        assert!(!checked
+            .diagnostics
+            .iter()
+            .any(|(file, _)| snapshot.path(*file) == root.join("types/hidden.bzli")));
+        assert!(checked
+            .diagnostics
+            .iter()
+            .any(
+                |(file, diagnostics)| snapshot.path(*file) == root.join("other/hidden.bzl")
+                    && !diagnostics.is_empty()
+            ));
+        assert!(checked
+            .diagnostics
+            .iter()
+            .any(|(file, _)| snapshot.path(*file) == root.join("types/other.bzli")));
+        for path in ["impl/hidden.bzl", "types/hidden.bzli", "types/other.bzli"] {
+            assert!(matches!(
+                checker.exclusions.get(&root.join(path)),
+                Some(super::Exclusion::Ignored)
+            ));
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusion_paths_must_stay_workspace_relative() {
+        let workspace = std::env::current_dir().unwrap();
+        for pattern in [
+            "../outside",
+            "nested/../../outside",
+            workspace.to_str().unwrap(),
+        ] {
+            assert!(
+                super::IgnoredPaths::new(&workspace, &[pattern.to_owned()]).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_dependencies_still_report_requested_load_failures() {
+        let mut checker = local_checker_with_options(
+            "checker-excluded-load-failure",
+            &[
+                (
+                    "BUILD",
+                    "load('//ignored:defs.bzl', 'value')\nprint(value)\n",
+                ),
+                (
+                    "ignored/defs.bzl",
+                    "load(':missing.bzl', 'imported')\nvalue = imported\n",
+                ),
+            ],
+            CheckCommand {
+                paths: vec!["BUILD".to_owned(), "ignored/defs.bzl".to_owned()],
+                ignore_patterns: vec!["./ignored".to_owned()],
+                ..Default::default()
+            },
+        );
+        let root = checker.bazel_info.workspace.clone();
+        let report_path = root.join("coverage.json");
+        assert!(checker
+            .report_diagnostics(false, Some(&report_path))
+            .is_err());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["unresolved_loads"][0]["module"], ":missing.bzl");
+        assert_eq!(
+            report["excluded_inputs"][root.join("ignored/defs.bzl").to_str().unwrap()],
+            "ignored"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn coverage_reports_transitive_failures_and_completed_roots() {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
             .join("checker-coverage");
@@ -590,7 +862,7 @@ mod tests {
             Checker::new(analysis, info, paths, &["star"], loader, receiver, &options).unwrap();
         let report_path = root.join("coverage.json");
         assert!(checker
-            .report_diagnostics(false, &[], Some(&report_path))
+            .report_diagnostics(false, Some(&report_path))
             .is_err());
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
@@ -745,7 +1017,7 @@ mod tests {
             &options,
         )
         .unwrap();
-        let graph = checker.check_files(false, &[]).unwrap().loads;
+        let graph = checker.check_files(false).unwrap().loads;
         assert!(checker.loader.pending_repository_mappings().is_empty());
         let report = checker
             .coverage_report(
@@ -832,11 +1104,11 @@ mod tests {
             &CheckCommand::default(),
         )
         .unwrap();
-        checker.report_diagnostics(false, &[], None).unwrap();
+        checker.report_diagnostics(false, None).unwrap();
         assert_eq!(*client.fetch_requests.lock().unwrap(), ["stubs+", "rules+"]);
         let report_path = root.join("coverage.json");
         checker
-            .report_diagnostics(true, &[], Some(&report_path))
+            .report_diagnostics(true, Some(&report_path))
             .unwrap();
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
@@ -853,7 +1125,7 @@ mod tests {
 }
 
 impl CheckCommand {
-    pub(crate) fn run(self) -> anyhow::Result<()> {
+    fn input_paths(&self) -> anyhow::Result<Vec<String>> {
         let mut paths = self.paths.clone();
         if let Some(path) = &self.files_from {
             if path == Path::new("-") {
@@ -864,6 +1136,11 @@ impl CheckCommand {
                 read_file_list(std::io::BufReader::new(file), &mut paths)?;
             }
         }
+        Ok(paths)
+    }
+
+    pub(crate) fn run(self) -> anyhow::Result<()> {
+        let paths = self.input_paths()?;
         if self.progress {
             eprintln!("Initializing Bazel context");
         }
@@ -903,11 +1180,7 @@ impl CheckCommand {
             fetch_repo_receiver,
             &self,
         )?;
-        checker.report_diagnostics(
-            self.validate_stubs,
-            &self.ignore_patterns,
-            self.report.as_deref(),
-        )
+        checker.report_diagnostics(self.validate_stubs, self.report.as_deref())
     }
 
     fn prepare_analysis(
@@ -1005,10 +1278,55 @@ struct Checker {
     files: indexmap::IndexSet<File>,
     exclusions: BTreeMap<PathBuf, Exclusion>,
     input_errors: Vec<InputError>,
+    ignored_paths: IgnoredPaths,
     loader: Arc<DefaultFileLoader>,
     fetch_repo_receiver: crossbeam_channel::Receiver<Task>,
     progress: bool,
     load_scope: LoadScope,
+}
+
+/// CLI selection only: dependencies can still load excluded source paths.
+#[derive(Default)]
+struct IgnoredPaths {
+    names: Vec<String>,
+    paths: Vec<PathBuf>,
+}
+
+impl IgnoredPaths {
+    fn new(workspace: &Path, patterns: &[String]) -> anyhow::Result<Self> {
+        let workspace = starpls_common::absolute_path(workspace)?;
+        let mut ignored = Self::default();
+        for pattern in patterns {
+            let path = Path::new(pattern);
+            if path
+                .file_name()
+                .is_some_and(|name| name == pattern.as_str())
+            {
+                ignored.names.push(pattern.clone());
+                continue;
+            }
+            anyhow::ensure!(
+                !pattern.is_empty() && path.is_relative(),
+                "ignore pattern {pattern:?} must be a basename or a workspace-relative path"
+            );
+            let path = starpls_common::absolute_path(&workspace.join(path))?;
+            anyhow::ensure!(
+                path.starts_with(&workspace),
+                "ignore pattern {pattern:?} resolves outside workspace {}",
+                workspace.display()
+            );
+            ignored.paths.push(path);
+        }
+        Ok(ignored)
+    }
+
+    /// Paths come from normalized CLI roots or the analysis file interner.
+    fn contains(&self, path: &Path) -> bool {
+        let Self { names, paths } = self;
+        path.components()
+            .any(|component| is_ignored_name(component.as_os_str(), names))
+            || paths.iter().any(|ignored| path.starts_with(ignored))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1039,12 +1357,14 @@ impl Checker {
         fetch_repo_receiver: crossbeam_channel::Receiver<Task>,
         options: &CheckCommand,
     ) -> anyhow::Result<Self> {
+        let ignored_paths = IgnoredPaths::new(&bazel_info.workspace, &options.ignore_patterns)?;
         let mut checker = Self {
             analysis,
             bazel_info,
             files: Default::default(),
             exclusions: Default::default(),
             input_errors: Vec::new(),
+            ignored_paths,
             loader,
             fetch_repo_receiver,
             progress: options.progress,
@@ -1055,32 +1375,46 @@ impl Checker {
             },
         };
 
-        checker
-            .files
-            .extend(checker.analysis.type_interface_files());
-        if paths.is_empty() && checker.files.is_empty() {
+        let interfaces = checker.analysis.type_interface_files();
+        if paths.is_empty() && interfaces.is_empty() {
             checker.input_errors.push(InputError {
                 path: checker.bazel_info.workspace.clone(),
                 message: "no input paths or configured interfaces were selected".to_owned(),
             });
         }
+        let snapshot = checker.analysis.snapshot();
+        for file in interfaces {
+            let path = snapshot.path(file);
+            if checker.ignored_paths.contains(path) {
+                checker
+                    .exclusions
+                    .insert(path.to_path_buf(), Exclusion::Ignored);
+            } else {
+                checker.files.insert(file);
+            }
+        }
+        drop(snapshot);
         for path in paths {
+            let path = starpls_common::absolute_path(Path::new(&path))?;
+            if checker.ignored_paths.contains(&path) {
+                checker.exclusions.insert(path, Exclusion::Ignored);
+                continue;
+            }
             let mut walk = WalkDir::new(&path).into_iter();
             while let Some(entry) = walk.next() {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
                         checker.input_errors.push(InputError {
-                            path: error
-                                .path()
-                                .unwrap_or_else(|| Path::new(&path))
-                                .to_path_buf(),
+                            path: error.path().unwrap_or(&path).to_path_buf(),
                             message: error.to_string(),
                         });
                         continue;
                     }
                 };
-                if !document::visit_source_entry(&entry, &options.ignore_patterns) {
+                if !document::visit_source_entry(&entry, &[])
+                    || checker.ignored_paths.contains(entry.path())
+                {
                     checker
                         .exclusions
                         .insert(entry.path().to_path_buf(), Exclusion::Ignored);
@@ -1184,7 +1518,17 @@ impl Checker {
             files: self.files.clone(),
             unresolved: Default::default(),
         };
-        graph.files.extend(self.analysis.type_interface_sources());
+        let snapshot = self.analysis.snapshot();
+        for file in self.analysis.type_interface_sources() {
+            let path = snapshot.path(file);
+            if self.ignored_paths.contains(path) {
+                self.exclusions
+                    .insert(path.to_path_buf(), Exclusion::Ignored);
+            } else {
+                graph.files.insert(file);
+            }
+        }
+        drop(snapshot);
         let mut frontier: Vec<_> = graph.files.iter().copied().collect();
         if self.progress {
             eprintln!("Discovering loads from {} source files", frontier.len());
@@ -1308,11 +1652,7 @@ impl Checker {
         Ok(graph)
     }
 
-    fn check_files(
-        &mut self,
-        validate_stubs: bool,
-        ignore_patterns: &[String],
-    ) -> anyhow::Result<CheckResult> {
+    fn check_files(&mut self, validate_stubs: bool) -> anyhow::Result<CheckResult> {
         loop {
             let mut graph = if self.load_scope == LoadScope::Transitive {
                 self.prepare_loads()?
@@ -1323,11 +1663,21 @@ impl Checker {
                 if self.progress {
                     eprintln!("Validating configured stub implementations");
                 }
-                self.analysis.validate_stubs(|path| {
-                    !path
-                        .components()
-                        .any(|component| is_ignored_name(component.as_os_str(), ignore_patterns))
-                })?
+                let excluded = std::cell::RefCell::new(Vec::new());
+                let diagnostics = self.analysis.validate_stubs(|path| {
+                    let ignored = self.ignored_paths.contains(path);
+                    if ignored {
+                        excluded.borrow_mut().push(path.to_path_buf());
+                    }
+                    !ignored
+                })?;
+                self.exclusions.extend(
+                    excluded
+                        .into_inner()
+                        .into_iter()
+                        .map(|path| (path, Exclusion::Ignored)),
+                );
+                diagnostics
             } else {
                 Vec::new()
             };
@@ -1363,13 +1713,12 @@ impl Checker {
     fn report_diagnostics(
         &mut self,
         validate_stubs: bool,
-        ignore_patterns: &[String],
         report_path: Option<&Path>,
     ) -> anyhow::Result<()> {
         let CheckResult {
             loads: graph,
             diagnostics,
-        } = self.check_files(validate_stubs, ignore_patterns)?;
+        } = self.check_files(validate_stubs)?;
         let snapshot = self.analysis.snapshot();
         let mut counts = DiagnosticCounts::default();
         let mut checked = indexmap::IndexSet::new();
