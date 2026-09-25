@@ -111,6 +111,9 @@ dictionary values of source exports.
 
 `class _Artifact(TypedDict, closed=True)` limits keys to the declared fields.
 The default open form permits additional fields when accepting existing values.
+`extra_items=ReadOnly[object]` also accepts additional fields in literal
+initializers. Their values have type `object`, and access through the contract
+permits reads. Declared fields retain their individual types and mutability.
 
 ## Protocols
 
@@ -153,17 +156,18 @@ Function validation requires static expression and callable types throughout
 the checked body.
 
 Module variables with one simple assignment can borrow the stub annotation.
-The contract must be fully static, with `closed=True` for any `TypedDict` it
-contains. The initializer must consist of fresh literal containers and statically
-typed literal values, and the source module must leave the variable unread and
+The contract must be fully static, with `closed=True` or an explicit
+`extra_items` type for any `TypedDict` it contains. The initializer must consist
+of fresh literal containers and statically typed literal values, and the source
+module must leave the variable unread and
 unmodified, including in nested functions. Ty checks the initializer against
 the borrowed annotation. Source annotations and type comments take precedence.
 
 Other variable contracts use independently inferred source types. A `TypedDict`
 contract is incomplete when those types cannot establish its dictionary fields,
-including through lists and other containers. Open `TypedDict` contracts use
-this independent inference because structural compatibility permits hidden
-fields that literal initialization rejects.
+including through lists and other containers. Implicitly open `TypedDict`
+contracts use this independent inference because structural compatibility
+permits hidden fields that literal initialization rejects.
 
 Provider validation checks the original source's allowed fields and constructor
 inputs. A constructor that stores fields directly must require every declared

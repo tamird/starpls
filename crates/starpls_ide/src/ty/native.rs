@@ -536,7 +536,14 @@ fn declarations(
     for name in classes.keys() {
         writeln!(output, "_starpls_annotation_{name} = _starpls_types.{name}")?;
     }
-    for name in ["Final", "Callable", "Protocol", "TypedDict", "NotRequired"] {
+    for name in [
+        "Final",
+        "Callable",
+        "Protocol",
+        "TypedDict",
+        "NotRequired",
+        "ReadOnly",
+    ] {
         writeln!(
             output,
             "_starpls_annotation_{name} = _starpls_typing.{name}"

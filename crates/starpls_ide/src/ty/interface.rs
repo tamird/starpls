@@ -1163,7 +1163,7 @@ mod tests {
             "data.bzli",
             include_str!("../../../../stubs/rules_rs/data.bzli"),
         );
-        let caller_text = "load('data.bzl', 'DEP_DATA', 'EXTRA')\nrow = DEP_DATA['sample']\nname: str = row['crate_name']\nalias: str = row['aliases']['//:dep']\nbinary: str = row.get('binaries', {}).keys()[0]\nplatform_deps: list[str] = row.get('dev_deps_by_platform', {}).values()[0]\nfeatures: list[str] = row['crate_features']\nlint: str | None = row.get('lint_config')\nextra: str = EXTRA\n";
+        let caller_text = "load('data.bzl', 'DEP_DATA', 'EXTRA')\nrow = DEP_DATA['sample']\nname: str = row['crate_name']\nalias: str = row['aliases']['//:dep']\nbinary: str = row.get('binaries', {}).keys()[0]\nplatform_deps: list[str] = row.get('dev_deps_by_platform', {}).values()[0]\nfeatures: list[str] = row['crate_features']\nlint: str | None = row.get('lint_config')\nextra: str = EXTRA\nplatforms: object = row['platforms']\n";
         let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
         loader.add_files_from_fixture(&fixture);
         analysis.set_type_interfaces([(source, interface)]).unwrap();
@@ -1171,12 +1171,27 @@ mod tests {
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
-        analysis.update_file(caller, format!("{caller_text}row['deps'].append(42)\n"));
+        for (statement, expected) in [
+            ("row['deps'].append(42)", "invalid-argument-type"),
+            (
+                "platform_name: str = row['platforms']",
+                "invalid-assignment",
+            ),
+            ("row['platforms'] = []", "invalid-assignment"),
+        ] {
+            analysis.update_file(caller, format!("{caller_text}{statement}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{statement}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), expected);
+        }
+        analysis.update_file(caller, format!("{caller_text}print(object, ReadOnly)\n"));
         let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
-        let [diagnostic] = diagnostics.as_slice() else {
-            panic!("{diagnostics:?}");
-        };
-        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.id().as_str() == "unresolved-reference"));
     }
 
     #[test]

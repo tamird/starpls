@@ -223,7 +223,7 @@ impl Database {
     ) -> std::collections::BTreeMap<String, bool> {
         use starpls_hir::Db;
 
-        if matches!(usage, BuiltinUsage::Annotation) {
+        if matches!(usage, BuiltinUsage::Annotation) || file.is_type_interface(self) {
             let definitions = self.get_builtin_defs(&file.dialect);
             let candidates = definitions
                 .builtins(self)
@@ -245,6 +245,8 @@ impl Database {
                     "Protocol",
                     "TypedDict",
                     "NotRequired",
+                    "ReadOnly",
+                    "object",
                 ]);
             return candidates
                 .filter(|name| {
@@ -267,10 +269,6 @@ impl Database {
             .filter(|name| !matches!(**name, "True" | "False" | "None"))
             .map(|name| ((*name).to_owned(), true))
             .collect();
-        if file.is_type_interface(self) {
-            names.insert("Protocol".to_owned(), false);
-            names.insert("TypedDict".to_owned(), false);
-        }
         if let Some(context) = file.api_context() {
             let definitions = self.get_builtin_defs(&file.dialect);
             names.extend(
@@ -296,7 +294,13 @@ impl Database {
         use starpls_hir::Db;
 
         let source_file = self.starlark_file(file)?;
-        if matches!(name, "Protocol" | "TypedDict") && !source_file.is_type_interface(self) {
+        let is_interface = source_file.is_type_interface(self);
+        let usage = if is_interface {
+            BuiltinUsage::Annotation
+        } else {
+            usage
+        };
+        if matches!(name, "Protocol" | "TypedDict") && !is_interface {
             return Some(ProvidedBindingValue::Unresolved);
         }
         if name == "string" {
@@ -328,6 +332,12 @@ impl Database {
         }
         if matches!(usage, BuiltinUsage::Annotation) {
             match name {
+                "object" => {
+                    return Some(ProvidedBindingValue::Value(
+                        KnownClass::Object
+                            .to_class_literal(self, &ProgramEnvironment::from_file(file)),
+                    ))
+                }
                 "unknown" => {
                     return Some(ProvidedBindingValue::Value(
                         ty_python_semantic::types::Type::unknown(),
@@ -376,9 +386,7 @@ impl Database {
         let native_file = self
             .files
             .try_virtual_file(&native::path(source_file.dialect))?;
-        let name = if matches!(usage, BuiltinUsage::Annotation)
-            || (source_file.is_type_interface(self) && matches!(name, "Protocol" | "TypedDict"))
-        {
+        let name = if matches!(usage, BuiltinUsage::Annotation) {
             Name::new(format!("_starpls_annotation_{name}"))
         } else {
             Name::new(native::export_name(context, name))

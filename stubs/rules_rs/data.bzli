@@ -1,4 +1,4 @@
-class _DependencyData(TypedDict):
+class _DependencyData(TypedDict, extra_items=ReadOnly[object]):
     aliases: dict[str, str]
     binaries: dict[str, str]
     build_deps: list[str]

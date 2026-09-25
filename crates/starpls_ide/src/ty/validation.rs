@@ -1724,6 +1724,54 @@ mod tests {
     }
 
     #[test]
+    fn readonly_extra_items_validate_fresh_dictionary_values() {
+        let stub = "class _Row(TypedDict, extra_items=ReadOnly[object]):\n    name: str\nROWS: dict[str, _Row]\n";
+        for extra_items in ["object", "ReadOnly[object]", "ReadOnly[Iterable[str]]"] {
+            let diagnostics = validate(
+                "ROWS = {'first': {'name': 'ok', 'platforms': ['linux']}}\n",
+                &stub.replace("ReadOnly[object]", extra_items),
+            );
+            assert!(diagnostics.is_empty(), "{extra_items}: {diagnostics:?}");
+        }
+        for (source, expected) in [
+            ("ROWS = {'first': {'name': 'ok'}}\n", None),
+            (
+                "ROWS = {'first': {'name': 'ok', 'platforms': ['linux']}}\n",
+                None,
+            ),
+            (
+                "ROWS = {'first': {'platforms': []}}\n",
+                Some("missing-typed-dict-key"),
+            ),
+            (
+                "ROWS = {'first': {'name': 1, 'platforms': []}}\n",
+                Some("invalid-argument-type"),
+            ),
+            (
+                "def opaque(): pass\nROWS = {'first': {'name': 'ok', 'platforms': opaque()}}\n",
+                Some("incomplete-stub-validation"),
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .any(|id| id == "incomplete-stub-validation"),
+                    expected == "incomplete-stub-validation",
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
     fn typed_dictionary_variable_proofs_reject_shared_or_mutable_values() {
         let stub = "class _Row(TypedDict, closed=True):\n    name: str\nROWS: list[_Row]\n";
         for source in [

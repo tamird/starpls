@@ -544,8 +544,14 @@ fn interface_statement(statement: &Stmt) -> bool {
                 && class.arguments.as_ref().is_none_or(|arguments| {
                     arguments.args.iter().all(Expr::is_name_expr)
                         && arguments.keywords.iter().all(|keyword| {
-                            keyword.arg.as_ref().is_some_and(|name| name.id == "closed")
-                                && keyword.value.is_boolean_literal_expr()
+                            keyword
+                                .arg
+                                .as_ref()
+                                .is_some_and(|name| match name.as_str() {
+                                    "closed" => keyword.value.is_boolean_literal_expr(),
+                                    "extra_items" => true,
+                                    _ => false,
+                                })
                         })
                 })
                 && class.body.iter().all(|statement| match statement {
@@ -736,6 +742,11 @@ mod tests {
             ),
             ("class Info:\n    value: Info | None", true),
             ("class Info(Base):\n    value: int", true),
+            (
+                "class Row(TypedDict, extra_items=ReadOnly[object]):\n    name: str",
+                true,
+            ),
+            ("class Row(TypedDict, closed=1): pass", false),
             (
                 "class Builder(Protocol):\n    def build(self) -> str: ...",
                 true,
