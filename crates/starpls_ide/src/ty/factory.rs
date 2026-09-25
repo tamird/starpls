@@ -765,7 +765,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         items,
         extra_items: _,
     } = own_attributes;
-    let is_complete = is_complete && items.iter().all(|item| item.is_required);
+    let is_complete = is_complete && items.iter().all(DictionaryItem::is_required);
     complete &= is_complete;
     if parent.is_some() && !is_complete {
         // Unseen overrides can replace a public label's default, but not its
@@ -797,12 +797,9 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         name,
         ty: value,
         source,
-        is_required,
-    } in items
+        kind: _,
+    } in IntoIterator::into_iter(items).filter(DictionaryItem::is_required)
     {
-        if !is_required {
-            continue;
-        }
         let source = FileRange::new(call.file().file(db), source);
         let name = name.as_str();
         if matches!(kind, RuleKind::Macro) && matches!(name, "name" | "visibility") {
@@ -1592,17 +1589,14 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
                         items,
                         extra_items: _,
                     } = mapping;
-                    open = !is_complete || items.iter().any(|item| !item.is_required);
+                    open = !is_complete || items.iter().any(|item| !item.is_required());
                     for DictionaryItem {
                         name,
                         ty,
                         source,
-                        is_required,
-                    } in items
+                        kind: _,
+                    } in IntoIterator::into_iter(items).filter(DictionaryItem::is_required)
                     {
-                        if !is_required {
-                            continue;
-                        }
                         if let Some(doc) = ty.string_literal_value(db) {
                             documentation.parameters.push((name.clone(), doc.into()));
                         }

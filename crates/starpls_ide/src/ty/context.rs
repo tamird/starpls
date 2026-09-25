@@ -183,16 +183,16 @@ pub(super) fn parameter_type<'db>(
             items,
             extra_items: _,
         } = mapping;
-        let is_complete = is_complete && items.iter().all(|item| item.is_required);
+        let is_complete = is_complete && items.iter().all(DictionaryItem::is_required);
         aspect_attributes = items
             .iter()
-            .filter(|item| item.is_required)
+            .filter(|item| item.is_required())
             .map(
                 |DictionaryItem {
                      name,
                      ty,
                      source,
-                     is_required: _,
+                     kind: _,
                  }| RuleAttributeData {
                     name: name.clone(),
                     descriptor: if is_complete {
@@ -298,18 +298,16 @@ pub(super) fn parameter_type<'db>(
                             items,
                             extra_items: _,
                         } = mapping;
-                        let is_complete = is_complete && items.iter().all(|item| item.is_required);
+                        let is_complete =
+                            is_complete && items.iter().all(DictionaryItem::is_required);
                         complete &= is_complete;
                         for DictionaryItem {
                             name,
                             ty: _,
                             source,
-                            is_required,
-                        } in items
+                            kind: _,
+                        } in IntoIterator::into_iter(items).filter(DictionaryItem::is_required)
                         {
-                            if !is_required {
-                                continue;
-                            }
                             insert_field(
                                 &mut fields,
                                 ProvidedField {
