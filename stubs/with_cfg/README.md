@@ -4,6 +4,7 @@
 [with_cfg.bzl 0.14.6](https://github.com/fmeum/with_cfg.bzl/tree/v0.14.6).
 `build()` returns a callable and an optional rule. Bazel requires global
 bindings for freshly created rules, including private bindings.
+The builder exposes readonly callable fields with named parameters.
 
 Add the source and stub modules to the consumer's `MODULE.bazel`:
 
@@ -28,7 +29,7 @@ The manifest checks the selected source version. Starpls uses the trusted
 contract to check callers; `starpls check --validate-stubs` checks the
 implementation separately. The private module interface declares
 `is_executable` and `get_implicit_targets`; implementation validation checks
-their bodies. The fluent builder's gradual signature and recursive return
+their bodies. The fluent builder's gradual body types and recursive return
 values can still leave its full validation incomplete.
 
 Setting values depend on Bazel's selected configuration. The declarations

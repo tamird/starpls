@@ -45,6 +45,7 @@ pub fn validate(
         statement_node: None,
         annotation_mode,
         in_annotation: false,
+        in_interface_class: false,
     };
     let py::ModModule {
         node_index: _,
@@ -156,6 +157,7 @@ struct Validator<'a> {
     statement_node: Option<NodeIndex>,
     annotation_mode: AnnotationMode,
     in_annotation: bool,
+    in_interface_class: bool,
 }
 
 impl Validator<'_> {
@@ -168,6 +170,7 @@ impl Validator<'_> {
             statement_node: _,
             annotation_mode: _,
             in_annotation: _,
+            in_interface_class: _,
         } = self;
         errors(SyntaxError {
             message: message.into(),
@@ -191,6 +194,7 @@ impl Validator<'_> {
             statement_node: _,
             annotation_mode: _,
             in_annotation: _,
+            in_interface_class: _,
         } = self;
         let tokens = *tokens;
         let py::ExprCall {
@@ -251,7 +255,15 @@ impl Validator<'_> {
                     if let Some(arguments) = &class.arguments {
                         self.visit_arguments(arguments);
                     }
+                    // Classes without bases declare providers, whose fields
+                    // are annotations and whose only method is __init__.
+                    let previous = self.in_interface_class;
+                    self.in_interface_class = class
+                        .arguments
+                        .as_ref()
+                        .is_some_and(|arguments| !arguments.is_empty());
                     self.visit_body(&class.body);
+                    self.in_interface_class = previous;
                 } else {
                     self.excluded.push(stmt.node_index().load());
                     self.unsupported(stmt.range());
@@ -269,8 +281,19 @@ impl Validator<'_> {
                     returns,
                     body,
                 } = def;
+                let supported_decorators = match decorator_list.as_slice() {
+                    [] => true,
+                    [decorator] => {
+                        self.in_interface_class
+                            && decorator
+                                .expression
+                                .as_name_expr()
+                                .is_some_and(|name| name.id == "property")
+                    }
+                    _ => false,
+                };
                 if *is_async
-                    || !decorator_list.is_empty()
+                    || !supported_decorators
                     || type_params.is_some()
                     || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                 {
@@ -284,7 +307,7 @@ impl Validator<'_> {
                     );
                 }
                 if *is_async
-                    || !decorator_list.is_empty()
+                    || !supported_decorators
                     || type_params.is_some()
                     || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                     || !parameters.posonlyargs.is_empty()
@@ -298,13 +321,20 @@ impl Validator<'_> {
                         .push(self.statement_node.expect("visiting a statement"));
                 }
                 self.visit_identifier(name);
+                if supported_decorators {
+                    for decorator in decorator_list {
+                        self.visit_expr(&decorator.expression);
+                    }
+                }
                 self.visit_parameters(parameters);
                 if self.annotation_mode != AnnotationMode::Disabled {
                     if let Some(annotation) = returns {
                         self.annotation(annotation);
                     }
                 }
+                let previous = std::mem::replace(&mut self.in_interface_class, false);
                 self.visit_body(body);
+                self.in_interface_class = previous;
             }
             Stmt::For(stmt) => {
                 let py::StmtFor {
@@ -712,6 +742,7 @@ mod tests {
             ("def f(value: int ** str): pass", false),
             ("def f(value: int):\n    result: int = 1", true),
             ("@decorator\ndef f(value: int): pass", false),
+            ("@property\ndef f(value: int): pass", false),
         ] {
             let parsed = ruff_python_parser::parse_unchecked_source(
                 source,
@@ -750,6 +781,35 @@ mod tests {
             (
                 "class Builder(Protocol):\n    def build(self) -> str: ...",
                 true,
+            ),
+            (
+                "class Builder(Protocol):\n    @property\n    def value(self) -> str: ...",
+                true,
+            ),
+            (
+                "class Builder(Base):\n    @property\n    def value(self) -> str: ...",
+                true,
+            ),
+            ("@property\ndef value() -> str: ...", false),
+            (
+                "class Info:\n    @property\n    def value(self) -> str: ...",
+                false,
+            ),
+            (
+                "class Info:\n    @property\n    def __init__(self) -> None: ...",
+                false,
+            ),
+            (
+                "class Builder(Protocol):\n    @property()\n    def value(self) -> str: ...",
+                false,
+            ),
+            (
+                "class Builder(Protocol):\n    @other\n    @property\n    def value(self) -> str: ...",
+                false,
+            ),
+            (
+                "class Builder(Protocol):\n    @value.setter\n    def value(self, value: str) -> None: ...",
+                false,
             ),
             (
                 "class Builder(Protocol):\n    def build(self) -> str: return 'built'",

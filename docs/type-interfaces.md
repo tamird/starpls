@@ -132,6 +132,24 @@ ordinary function annotations and declaration bodies. Ty checks compatibility
 structurally. Private helper protocols describe return values and parameters
 without declaring a corresponding source export.
 
+Readonly properties describe fields that callers can read but cannot assign.
+A named callback protocol preserves the keyword parameters of a callable field:
+
+```starlark
+class _Set(Protocol):
+    def __call__(self, value: int) -> _Builder: ...
+
+class _Builder(Protocol):
+    @property
+    def set(self) -> _Set: ...
+```
+
+This form describes immutable `struct` fields containing functions. Method
+declarations also require the member on the value's class. A property getter
+uses the same declaration body as a method. Only a single bare `@property`
+decorator is supported; provider declarations and runtime files do not support
+decorators.
+
 ## Implementation validation
 
 `starpls check --validate-stubs` checks the selected implementations against their

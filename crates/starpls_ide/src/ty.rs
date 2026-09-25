@@ -247,6 +247,7 @@ impl Database {
                     "NotRequired",
                     "ReadOnly",
                     "object",
+                    "property",
                 ]);
             return candidates
                 .filter(|name| {
@@ -332,6 +333,16 @@ impl Database {
         }
         if matches!(usage, BuiltinUsage::Annotation) {
             match name {
+                "property" => {
+                    return Some(if is_interface {
+                        ProvidedBindingValue::Value(
+                            KnownClass::Property
+                                .to_class_literal(self, &ProgramEnvironment::from_file(file)),
+                        )
+                    } else {
+                        ProvidedBindingValue::Unresolved
+                    });
+                }
                 "object" => {
                     return Some(ProvidedBindingValue::Value(
                         KnownClass::Object

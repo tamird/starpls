@@ -1081,6 +1081,144 @@ mod tests {
     }
 
     #[test]
+    fn readonly_protocol_callbacks_preserve_call_shapes_and_origins() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "def make(): pass\n");
+        let interface_text = r#"
+class _Set(Protocol):
+    def __call__(self, value: int, *, enabled: bool = ...) -> _Builder: ...
+class _Build(Protocol):
+    def __call__(self, *parts: str) -> str: ...
+class _Builder(Protocol):
+    @property
+    def set(self) -> _Set: ...
+    @property
+    def build(self) -> _Build: ...
+def make() -> _Builder: ...
+"#;
+        let interface = fixture.add_file(&mut analysis.db, "source.bzli", interface_text);
+        let caller_text = "load('source.bzl', 'make')\nresult: str = make().set(value=1, enabled=True).set(2).build('a', 'b')\n";
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        assert!(analysis
+            .db
+            .builtin_completion_names(
+                interface,
+                ty_python_semantic::provided::BuiltinUsage::Runtime
+            )
+            .contains_key("property"));
+        assert!(!analysis
+            .db
+            .builtin_completion_names(
+                caller,
+                ty_python_semantic::provided::BuiltinUsage::Annotation
+            )
+            .contains_key("property"));
+        for file in [interface, caller] {
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        let locations = analysis
+            .snapshot()
+            .goto_definition(
+                FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.find(".build").unwrap() as u32 + 1).into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let [location] = locations.as_slice() else {
+            panic!("{locations:?}");
+        };
+        let LocationLink::Local {
+            target_file_id,
+            target_selection_range,
+            origin_selection_range: _,
+            target_range: _,
+        } = location
+        else {
+            panic!("{locations:?}");
+        };
+        assert_eq!(*target_file_id, interface.source);
+        assert_eq!(&interface_text[*target_selection_range], "build");
+        for (text, expected) in [
+            (
+                caller_text.replace("value=1", "wrong=1"),
+                "unknown-argument",
+            ),
+            (caller_text.replace(".set(2)", ".set()"), "missing-argument"),
+            (
+                caller_text.replace("'a', 'b'", "1"),
+                "invalid-argument-type",
+            ),
+            (
+                caller_text.replace("result: str", "result: int"),
+                "invalid-assignment",
+            ),
+            (
+                "load('source.bzl', 'make')\nmake().set = make().set\n".into(),
+                "invalid-assignment",
+            ),
+        ] {
+            analysis.update_file(caller, text);
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == expected),
+                "{expected}: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.id().as_str() != "invalid-syntax"),
+                "{diagnostics:?}"
+            );
+        }
+        analysis.update_file(caller, caller_text.into());
+        analysis.update_file(
+            interface,
+            interface_text.replace("value: int", "value: str"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+        analysis.update_file(interface, interface_text.into());
+        assert!(analysis.snapshot().diagnostics(caller).unwrap().is_empty());
+        analysis.update_file(
+            interface,
+            format!("def property(value: object) -> int: ...\n{interface_text}"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "call-non-callable"),
+            "{diagnostics:?}"
+        );
+        analysis.update_file(
+            interface,
+            interface_text.replace("def set(self)", "def set(self, required: int)"),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(interface).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn typed_dictionary_contracts_retain_keys_across_edits() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
@@ -1203,6 +1341,9 @@ mod tests {
             "class Broken(Protocol, metaclass=Meta): pass",
             "class Broken(TypedDict, closed=1): pass",
             "class Broken:\n    value = 1",
+            "class Broken:\n    @property\n    def value(self) -> str: ...",
+            "class Broken:\n    @property\n    def __init__(self) -> None: ...",
+            "class Broken(Protocol):\n    @other\n    def value(self) -> str: ...",
         ] {
             analysis.update_file(
                 file,
@@ -1210,17 +1351,19 @@ mod tests {
             );
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert_eq!(diagnostics.len(), 2, "{invalid}: {diagnostics:?}");
-            for message in [
-                "Interfaces contain declarations, not executable statements",
-                "Only TypedDict declarations accept class keywords",
-            ] {
-                assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.headline_message() == message),
-                    "{invalid}: {diagnostics:?}"
-                );
-            }
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == "invalid-syntax"),
+                "{invalid}: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.headline_message()
+                        == "Only TypedDict declarations accept class keywords"),
+                "{invalid}: {diagnostics:?}"
+            );
         }
     }
 

@@ -1364,6 +1364,35 @@ mod tests {
     }
 
     #[test]
+    fn readonly_protocol_fields_check_named_callbacks() {
+        let stub = r#"
+class _Run(Protocol):
+    def __call__(self, value: int) -> int: ...
+class _Runner(Protocol):
+    @property
+    def run(self) -> _Run: ...
+def make() -> _Runner: ...
+"#;
+        for (callback, compatible) in [
+            ("def _known(value: int) -> int: return value", true),
+            ("def _known(value: int) -> str: return 'wrong'", false),
+            ("def _known() -> int: return 1", false),
+            ("def _known(other: int) -> int: return other", false),
+        ] {
+            let source = format!("{callback}\ndef make(): return struct(run=_known)\n");
+            let diagnostics = validate(&source, stub);
+            let expected = if compatible {
+                vec!["incomplete-stub-validation"]
+            } else {
+                vec!["invalid-return-type", "incomplete-stub-validation"]
+            };
+            // The native struct constructor still has a gradual signature.
+            // Property compatibility does not complete its body evidence.
+            assert_eq!(diagnostics, expected, "{callback}");
+        }
+    }
+
+    #[test]
     fn provider_contracts_check_storage_and_constructor_inputs() {
         let stub = "class Info:\n    value: Final[str]\n    def __init__(self, *, value: str) -> None: ...\n";
         for source in [
