@@ -184,10 +184,18 @@ files and reexported bodies to exclude. Callers use the trusted stub contracts
 independently of validation results.
 
 Equivalent function signatures may include `Any` when their other type
-components are fully known. Function validation requires static expression and
-callable types throughout the checked body. Parameter defaults require the same
-expression evidence or a fresh literal construction whose contents are proved
-independently of the parameter type.
+components are fully known. Function validation checks operations on module
+globals using conservative value bounds. For example, a global `list[Any]` can
+be read as objects and copied into a fresh `list[object]`. Mutations and calls
+must be valid under those bounds. Other body expressions require static types,
+including the signatures of callable values.
+
+Ordinary type errors retain their source diagnostics. Failed conservative
+checks, unresolved inference, and suppressed checking failures produce an
+incomplete result. Parameter defaults require static expression evidence or a
+fresh literal construction whose contents are proved independently of the
+parameter type. Default expressions and provider initializers also require
+checking without unresolved or suppressed failures.
 
 Module variables with one simple assignment can borrow a fully static stub
 annotation. The source module must leave the variable unread and unmodified,

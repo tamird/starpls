@@ -56,11 +56,20 @@ pub trait Db: starpls_common::Db {
 /// Syntax correspondence used by a synchronous stub validation pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StubValidation {
+    pub phase: StubValidationPhase,
     pub annotations:
         FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ValidationAnnotation>,
     pub provider_returns:
         FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
     pub files: FxHashSet<ruff_db::files::File>,
+}
+
+/// The inference view active during synchronous implementation validation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StubValidationPhase {
+    #[default]
+    Ordinary,
+    Conservative,
 }
 
 /// The kind of source check selected by the validation overlay.

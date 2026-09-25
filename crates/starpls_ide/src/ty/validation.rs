@@ -26,6 +26,7 @@ use starpls_common::File;
 use starpls_hir::Db as _;
 use starpls_hir::ProviderContract;
 use starpls_hir::StubValidation;
+use starpls_hir::StubValidationPhase;
 use starpls_hir::ValidationAnnotation;
 use ty_python_core::definition::BindingsOwner;
 use ty_python_core::definition::Definition;
@@ -42,6 +43,7 @@ use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::TypeDefinition;
+use ty_python_semantic::FunctionInferenceFacts;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
@@ -186,7 +188,7 @@ impl Analysis {
             validation
                 .files
                 .extend(reports.keys().map(|file| file.source));
-            environment.set_stub_validation(db).to(validation);
+            environment.set_stub_validation(db).to(validation.clone());
             // Infer exported values from source with the borrowed signatures installed.
             // Keeping redirection disabled here avoids proving a reexport against itself.
             for value in values {
@@ -278,6 +280,7 @@ impl Analysis {
                 }
             }
             environment.set_type_interfaces(db).to(interfaces.clone());
+            let mut body_checks = Vec::new();
             for contract in contracts {
                 let Contract {
                     source,
@@ -300,12 +303,39 @@ impl Analysis {
                 {
                     compare_initializer(db, source, stub, &name, file, class)
                 } else {
-                    compare_function_body(db, source, &name, actual, expected)
+                    let result = compare_function(db, source.file, &name, actual, expected);
+                    if result.is_ok() {
+                        let FunctionInferenceFacts {
+                            has_cycle_recovery,
+                            has_errors,
+                            has_diagnostics_or_suppressions,
+                        } = model
+                            .function_inference_facts(function_definition(db, source))
+                            .expect("function contracts originate in a function declaration");
+                        if !has_errors {
+                            if has_cycle_recovery || has_diagnostics_or_suppressions {
+                                ContractError::Incomplete(format!("Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"))
+                                    .report(&mut reports, source.file, range);
+                            } else {
+                                body_checks.push((source, name.clone(), range));
+                            }
+                        }
+                    }
+                    result
                 };
                 if let Err(error) = result {
                     error.report(&mut reports, source.file, range);
                 }
             }
+            validation.phase = StubValidationPhase::Conservative;
+            environment.set_stub_validation(db).to(validation.clone());
+            for (source, name, range) in body_checks {
+                if let Err(error) = compare_function_body(db, source, &name) {
+                    error.report(&mut reports, source.file, range);
+                }
+            }
+            validation.phase = StubValidationPhase::Ordinary;
+            environment.set_stub_validation(db).to(validation);
             let mut reports: Vec<_> = reports
                 .into_iter()
                 .map(|(file, diagnostics)| {
@@ -1168,24 +1198,68 @@ fn compare_initializer<'db>(
             )));
         }
     }
-    if !has_static_evidence(db, source.file, function) {
+    let FunctionInferenceFacts {
+        has_cycle_recovery,
+        has_errors,
+        has_diagnostics_or_suppressions,
+    } = model
+        .function_inference_facts(definition)
+        .expect("provider initializers originate in a function declaration");
+    if !has_errors && (has_cycle_recovery || has_diagnostics_or_suppressions) {
+        return Err(ContractError::Incomplete(format!(
+            "Cannot prove `{name}`: initializer checking has unresolved or suppressed obligations"
+        )));
+    }
+    if !has_errors && !has_static_evidence(db, source.file, function, false) {
         return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer contains dynamic or unavailable expression types")));
     }
     Ok(())
 }
 
+pub(super) fn conservative_global_reads(
+    db: &Database,
+    scope: ty_python_core::scope::ScopeId<'_>,
+) -> bool {
+    if db.environment().stub_validation(db).phase != StubValidationPhase::Conservative {
+        return false;
+    }
+    let ty_python_core::scope::NodeWithScopeKind::Function(function) = scope.node(db) else {
+        return false;
+    };
+    let Some(source) = db.starlark_file(scope.program_file(db)) else {
+        return false;
+    };
+    let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
+    conservative_function(db, source, function.node(&parsed).node_index().load())
+}
+
+fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool {
+    let validation = db.environment().stub_validation(db);
+    validation.phase == StubValidationPhase::Conservative
+        && matches!(
+            validation.annotations.get(&(source.source, owner)),
+            Some(ValidationAnnotation::Declaration { file: _, owner: _ })
+        )
+}
+
 /// Contextual checking of structural returns can hide gradual child types.
-fn has_static_evidence(db: &Database, source: File, function: &StmtFunctionDef) -> bool {
+fn has_static_evidence(
+    db: &Database,
+    source: File,
+    function: &StmtFunctionDef,
+    conservative_body: bool,
+) -> bool {
     use ruff_python_ast::visitor::Visitor;
     use ruff_python_ast::visitor::{self};
 
     struct Evidence<'a, 'db> {
         model: &'a SemanticModel<'db>,
         complete: bool,
+        conservative: bool,
     }
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
-            if !expression_has_static_evidence(self.model, expression) {
+            if !expression_has_evidence(self.model, expression, self.conservative) {
                 self.complete = false;
             }
             visitor::walk_expr(self, expression);
@@ -1216,6 +1290,7 @@ fn has_static_evidence(db: &Database, source: File, function: &StmtFunctionDef) 
     let mut evidence = Evidence {
         model: &model,
         complete: true,
+        conservative: false,
     };
     for parameter in parameters.iter_non_variadic_params() {
         let ruff_python_ast::ParameterWithDefault {
@@ -1232,11 +1307,21 @@ fn has_static_evidence(db: &Database, source: File, function: &StmtFunctionDef) 
             }
         }
     }
+    evidence.conservative =
+        conservative_body && conservative_function(db, source, function.node_index().load());
     evidence.visit_body(body);
     evidence.complete
 }
 
 fn expression_has_static_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
+    expression_has_evidence(model, expression, false)
+}
+
+fn expression_has_evidence(
+    model: &SemanticModel<'_>,
+    expression: &Expr,
+    conservative: bool,
+) -> bool {
     let environment = model.program_environment();
     expression.inferred_type(model).is_some_and(|ty| {
         let ty = ty
@@ -1248,6 +1333,13 @@ fn expression_has_static_evidence(model: &SemanticModel<'_>, expression: &Expr) 
             )
             .unwrap_or(ty);
         ty.is_fully_static(model.db(), &environment)
+            || (conservative
+                && ty.is_fully_static_except_any(model.db(), &environment)
+                && ty.is_equivalent_to(
+                    model.db(),
+                    &environment,
+                    ty.top_materialization(model.db(), &environment),
+                ))
     })
 }
 
@@ -1260,20 +1352,27 @@ impl ContractError {
     }
 }
 
-fn compare_function_body<'db>(
-    db: &'db Database,
-    source: Function,
-    name: &str,
-    actual: Type<'db>,
-    expected: Type<'db>,
-) -> Result<(), ContractError> {
-    compare_function(db, source.file, name, actual, expected)?;
+fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<(), ContractError> {
     let definition = function_definition(db, source);
     let DefinitionKind::Function(function) = definition.kind(db) else {
         unreachable!("function contracts originate in a function declaration");
     };
     let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
-    if !has_static_evidence(db, source.file, function.node(&parsed)) {
+    let function = function.node(&parsed);
+    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+    let FunctionInferenceFacts {
+        has_cycle_recovery,
+        has_errors: _,
+        has_diagnostics_or_suppressions,
+    } = model
+        .function_inference_facts(definition)
+        .expect("function contracts originate in a function declaration");
+    if has_cycle_recovery || has_diagnostics_or_suppressions {
+        return Err(ContractError::Incomplete(format!(
+            "Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"
+        )));
+    }
+    if !has_static_evidence(db, source.file, function, true) {
         return Err(ContractError::Incomplete(format!(
             "Cannot prove `{name}`: its implementation contains dynamic or unavailable expression types"
         )));
@@ -1470,7 +1569,7 @@ mod tests {
                 "def make(value: Any): return struct(run=value)",
                 "value: Any",
                 "int",
-                vec!["unsound-return-statement", "incomplete-stub-validation"],
+                vec!["unsound-return-statement"],
             ),
             (
                 "def make(kwargs): return struct(run=_known, **kwargs)",
@@ -1516,11 +1615,7 @@ mod tests {
         let stub = "class _Rows(Protocol):\n    def __getitem__(self, index: int) -> int: ...\ndef extract(value: _Rows) -> Callable[[int], int]: ...\n";
         assert_eq!(
             validate("def extract(value): return value.__getitem__", stub),
-            [
-                "unresolved-attribute",
-                "unsound-return-statement",
-                "incomplete-stub-validation"
-            ]
+            ["unresolved-attribute", "unsound-return-statement"]
         );
     }
 
@@ -1532,11 +1627,7 @@ mod tests {
             let diagnostics = validate(source, &stub);
             assert_eq!(
                 diagnostics,
-                [
-                    "unresolved-attribute",
-                    "unsound-return-statement",
-                    "incomplete-stub-validation"
-                ],
+                ["unresolved-attribute", "unsound-return-statement"],
                 "{annotation}"
             );
         }
@@ -1552,11 +1643,7 @@ mod tests {
                 "def known(value: int) -> int: return value\ndef extract(): return known.__call__",
                 stub
             ),
-            [
-                "unresolved-attribute",
-                "unsound-return-statement",
-                "incomplete-stub-validation"
-            ]
+            ["unresolved-attribute", "unsound-return-statement"]
         );
         let source = "def known(value: int) -> int: return value\ndef make(): return struct(__call__=known)\n";
         let stub = "class _Callback(Protocol):\n    def __call__(self, value: int) -> int: ...\nclass _Required(Protocol):\n    @property\n    def __call__(self) -> _Callback: ...\ndef make() -> _Required: ...\n";
@@ -1729,7 +1816,6 @@ def make() -> _Runner: ...
         for source in [
             "def _init(xs: list[Any]):\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
             "def _unknown() -> Any: ...\ndef _init(xs):\n    return {'value': [_unknown()]}\nInfo, _ = provider(fields=['value'], init=_init)\n",
-            "def _unknown() -> Any: ...\ndef _init(xs):\n    return {**_unknown(), 'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
             "def _mutate(xs) -> None:\n    xs.append('bad')\ndef _init(xs):\n    _mutate(xs)\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
             "def _init(xs) -> dict[str, list[int]]:\n    return {}\nInfo, _ = provider(fields=['value'], init=_init)\n",
             "def _init(xs): # type: (list[int]) -> dict[str, list[int]]\n    return {}\nInfo, _ = provider(fields=['value'], init=_init)\n",
@@ -1837,6 +1923,16 @@ def make() -> _Runner: ...
                 Some("incomplete-stub-validation"),
             ),
             (
+                "def compute(value='bad'): # ty: ignore[invalid-parameter-default]\n    return value\n",
+                "def compute(value: int = ...) -> int: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def needs_int(value: int) -> int: return value\ndef compute(value=needs_int('bad')): # ty: ignore[invalid-argument-type]\n    return value\n",
+                "def compute(value: int = ...) -> int: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
                 "def compute(value=[]): return value\n",
                 "def compute(value: list[int] = ...) -> list[int]: ...\n",
                 None,
@@ -1860,6 +1956,10 @@ def make() -> _Runner: ...
             }
         }
         let stub = "class Info:\n    value: Final[list[int]]\n    def __init__(self, xs: list[int] = ...) -> None: ...\n";
+        assert_eq!(validate(
+            "def needs_int(value: int) -> list[int]: return [value]\ndef _init(xs=needs_int('bad')): # ty: ignore[invalid-argument-type]\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
+            stub,
+        ), ["incomplete-stub-validation"]);
         for (default, expected) in [
             ("[]", None),
             ("[opaque()]", Some("incomplete-stub-validation")),
@@ -1997,7 +2097,7 @@ def make() -> _Runner: ...
             ),
             (
                 "def opaque(): pass\ndef make(): return opaque()\n",
-                Some("incomplete-stub-validation"),
+                Some("unsound-return-statement"),
             ),
             (
                 "def opaque(): pass\ndef make(): return {'name': opaque()}\n",
@@ -2422,8 +2522,8 @@ def make() -> _Runner: ...
             ("def helper(): pass\ndef make():\n    return helper()\n", "class _Builder(Protocol):\n    def build(self) -> str: ...\ndef make() -> _Builder: ...\n", Some("unsound-return-statement")),
             ("def helper(): pass\ndef make(): return [helper()]\n", "def make() -> list[int]: ...\n", Some("incomplete-stub-validation")),
             ("def helper(): pass\ndef make(): return {'name': helper()}\n", "def make() -> dict[str, int]: ...\n", Some("incomplete-stub-validation")),
-            ("def identity(value): return value\ndef make(): return identity\n", "def make() -> Callable[[int], int]: ...\n", Some("incomplete-stub-validation")),
-            ("def identity(value): return value\nCALLBACKS = [identity]\ndef make(): return CALLBACKS\n", "def make() -> list[Callable[[int], int]]: ...\n", Some("incomplete-stub-validation")),
+            ("def identity(value): return value\ndef make(): return identity\n", "def make() -> Callable[[int], int]: ...\n", Some("unsound-return-statement")),
+            ("def identity(value): return value\nCALLBACKS = [identity]\ndef make(): return CALLBACKS\n", "def make() -> list[Callable[[int], int]]: ...\n", Some("invalid-return-type")),
             ("def helper() -> int: return 1\ndef make(): return [helper()]\n", "def make() -> list[int]: ...\n", None),
             ("def make(): return {'name': 1}\n", "def make() -> dict[str, int]: ...\n", None),
             ("def identity(value: int) -> int: return value\ndef make(): return identity\n", "def make() -> Callable[[int], int]: ...\n", None),
@@ -2492,6 +2592,36 @@ def make() -> _Runner: ...
     }
 
     #[test]
+    fn opaque_global_collections_check_consuming_operations() {
+        let globals = "def opaque() -> Any: return None\nVALUES = [opaque()]\n";
+        let collector = r#"
+def collect(extra):
+    if not extra:
+        return VALUES
+    out = list(VALUES)
+    for item in extra:
+        if item not in out:
+            out.append(item)
+    return out
+"#;
+        assert!(validate(
+            &format!("{globals}{collector}"),
+            "def collect(extra: Iterable[object] | None) -> Sequence[object]: ...\n",
+        )
+        .is_empty());
+        for body in ["VALUES.append(1)", "VALUES[0]()"] {
+            assert_eq!(
+                validate(
+                    &format!("{globals}def compute():\n    {body}\n"),
+                    "def compute() -> None: ...\n",
+                ),
+                ["incomplete-stub-validation"],
+                "{body}",
+            );
+        }
+    }
+
+    #[test]
     fn gradual_signatures_require_matching_contracts_and_static_bodies() {
         for annotation in ["Any", "list[Any]", "Callable[..., Any]"] {
             let stub = format!("def compute(value: {annotation}) -> int: ...\n");
@@ -2546,10 +2676,6 @@ def make() -> _Runner: ...
                 "def wants_int(value): return value\ndef compute(value): return wants_int(value)\n",
                 "def wants_int(value: int) -> int: ...\ndef compute(value: Any) -> int: ...\n",
             ),
-            (
-                "def helper(): return 1\ndef compute(value): return helper()\n",
-                "def compute(value: Any) -> int: ...\n",
-            ),
         ] {
             let diagnostics = validate(source, stub);
             assert!(
@@ -2559,6 +2685,13 @@ def make() -> _Runner: ...
                 "{source}: {diagnostics:?}"
             );
         }
+        assert_eq!(
+            validate(
+                "def helper(): return 1\ndef compute(value): return helper()\n",
+                "def compute(value: Any) -> int: ...\n",
+            ),
+            ["unsound-return-statement"]
+        );
         assert_eq!(
             validate(
                 "def compute(value): return 'wrong'\n",
