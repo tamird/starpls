@@ -1168,14 +1168,14 @@ fn compare_initializer<'db>(
             )));
         }
     }
-    if !has_static_evidence(&model, &function.body) {
+    if !has_static_evidence(db, source.file, function) {
         return Err(ContractError::Incomplete(format!("Cannot prove `{name}`: its initializer contains dynamic or unavailable expression types")));
     }
     Ok(())
 }
 
 /// Contextual checking of structural returns can hide gradual child types.
-fn has_static_evidence(model: &SemanticModel<'_>, body: &[ruff_python_ast::Stmt]) -> bool {
+fn has_static_evidence(db: &Database, source: File, function: &StmtFunctionDef) -> bool {
     use ruff_python_ast::visitor::Visitor;
     use ruff_python_ast::visitor::{self};
 
@@ -1201,10 +1201,37 @@ fn has_static_evidence(model: &SemanticModel<'_>, body: &[ruff_python_ast::Stmt]
             visitor::walk_stmt(self, statement);
         }
     }
+    let model = SemanticModel::new(db, db.starlark_program_file(source));
+    let StmtFunctionDef {
+        node_index: _,
+        range: _,
+        is_async: _,
+        decorator_list: _,
+        name: _,
+        type_params: _,
+        parameters,
+        returns: _,
+        body,
+    } = function;
     let mut evidence = Evidence {
-        model,
+        model: &model,
         complete: true,
     };
+    for parameter in parameters.iter_non_variadic_params() {
+        let ruff_python_ast::ParameterWithDefault {
+            parameter: _,
+            default,
+            range: _,
+            node_index: _,
+        } = parameter;
+        if let Some(default) = default {
+            // Fresh literals establish their contents independently of gradual
+            // parameter context; other defaults need evidence from every child.
+            if !has_fresh_literal_evidence(db, source, &model, default) {
+                evidence.visit_expr(default);
+            }
+        }
+    }
     evidence.visit_body(body);
     evidence.complete
 }
@@ -1241,15 +1268,14 @@ fn compare_function_body<'db>(
     expected: Type<'db>,
 ) -> Result<(), ContractError> {
     compare_function(db, source.file, name, actual, expected)?;
-    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
     let definition = function_definition(db, source);
     let DefinitionKind::Function(function) = definition.kind(db) else {
         unreachable!("function contracts originate in a function declaration");
     };
     let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
-    if !has_static_evidence(&model, &function.node(&parsed).body) {
+    if !has_static_evidence(db, source.file, function.node(&parsed)) {
         return Err(ContractError::Incomplete(format!(
-            "Cannot prove `{name}`: its body contains dynamic or unavailable expression types"
+            "Cannot prove `{name}`: its implementation contains dynamic or unavailable expression types"
         )));
     }
     Ok(())
@@ -1790,6 +1816,62 @@ def make() -> _Runner: ...
             "def compute(*args: int, **kwargs: string) -> int: ...\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn parameter_defaults_require_independent_evidence() {
+        for (source, stub, expected) in [
+            (
+                "def opaque(): return 'bad'\ndef compute(value=opaque()): return value\n",
+                "def compute(value: int = ...) -> int: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def opaque() -> Any: return 'bad'\ndef compute(value=[opaque()]): return value[0]\n",
+                "def compute(value: list[int] = ...) -> int: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def opaque(): return 'bad'\ndef needs_int(value: int) -> int: return value\ndef compute(*, value=needs_int(opaque())): return value\n",
+                "def compute(*, value: int = ...) -> int: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def compute(value=[]): return value\n",
+                "def compute(value: list[int] = ...) -> list[int]: ...\n",
+                None,
+            ),
+            (
+                "def compute(value=[]): return 1\n",
+                "def compute(value: list[Any] = ...) -> int: ...\n",
+                None,
+            ),
+            (
+                "def compute(value={'items': [1]}): return 1\n",
+                "def compute(value: dict[str, list[Any]] = ...) -> int: ...\n",
+                None,
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            if let Some(expected) = expected {
+                assert_eq!(diagnostics, [expected], "{source}");
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+        let stub = "class Info:\n    value: Final[list[int]]\n    def __init__(self, xs: list[int] = ...) -> None: ...\n";
+        for (default, expected) in [
+            ("[]", None),
+            ("[opaque()]", Some("incomplete-stub-validation")),
+        ] {
+            let source = format!("def opaque() -> Any: return 'bad'\ndef _init(xs={default}): return {{'value': xs}}\nInfo, _ = provider(fields=['value'], init=_init)\n");
+            let diagnostics = validate(&source, stub);
+            if let Some(expected) = expected {
+                assert_eq!(diagnostics, [expected], "{source}");
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
     }
 
     #[test]
