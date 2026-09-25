@@ -7,3 +7,4 @@ versions = ["0.14.6"]
 
 [files]
 "with_cfg.bzl" = "with_cfg.bzli"
+"with_cfg/private/with_cfg.bzl" = "private_helpers.bzli"

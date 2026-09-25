@@ -235,6 +235,8 @@ mod tests {
             std::fs::create_dir_all(directory).unwrap();
         }
         std::fs::write(source.join("with_cfg.bzl"), "def with_cfg(kind): pass\n").unwrap();
+        std::fs::create_dir_all(source.join("with_cfg/private")).unwrap();
+        std::fs::write(source.join("with_cfg/private/with_cfg.bzl"), "").unwrap();
         std::fs::write(
             stubs.join("stubs.toml"),
             include_str!("../../../../stubs/with_cfg/stubs.toml"),
@@ -243,6 +245,11 @@ mod tests {
         std::fs::write(
             stubs.join("with_cfg.bzli"),
             include_str!("../../../../stubs/with_cfg/with_cfg.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("private_helpers.bzli"),
+            include_str!("../../../../stubs/with_cfg/private_helpers.bzli"),
         )
         .unwrap();
         std::fs::write(
@@ -279,16 +286,26 @@ mod tests {
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
-                let [super::Registration {
-                    source: actual_source,
-                    interface,
-                    origin: _,
-                }] = prepared.registrations.as_slice()
-                else {
+                let [first, second] = prepared.registrations.as_slice() else {
                     panic!("{prepared:?}");
                 };
-                assert_eq!(*actual_source, source.join("with_cfg.bzl"));
-                assert_eq!(*interface, stubs.join("with_cfg.bzli"));
+                let actual =
+                    std::collections::BTreeMap::from([first, second].map(|registration| {
+                        let super::Registration {
+                            source,
+                            interface,
+                            origin: _,
+                        } = registration;
+                        (source.clone(), interface.clone())
+                    }));
+                let expected = std::collections::BTreeMap::from([
+                    (source.join("with_cfg.bzl"), stubs.join("with_cfg.bzli")),
+                    (
+                        source.join("with_cfg/private/with_cfg.bzl"),
+                        stubs.join("private_helpers.bzli"),
+                    ),
+                ]);
+                assert_eq!(actual, expected);
             } else {
                 let message = format!("{:#}", prepared.unwrap_err());
                 assert!(
