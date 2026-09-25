@@ -1364,6 +1364,24 @@ mod tests {
     }
 
     #[test]
+    fn native_rules_without_contracts_remain_unproved() {
+        assert_eq!(
+            validate(
+                "def namespace(): return native\n",
+                "class _Required(Protocol):\n    @property\n    def sh_binary(self) -> object: ...\ndef namespace() -> _Required: ...\n",
+            ),
+            ["invalid-return-type"]
+        );
+        assert_eq!(
+            validate(
+                "def read(): return str(native.sh_binary)\n",
+                "def read() -> str: ...\n",
+            ),
+            ["incomplete-stub-validation"]
+        );
+    }
+
+    #[test]
     fn struct_signature_validation_requires_present_fields() {
         for field in ["run", "__repr__", "__class__", "__getattr__"] {
             for source in [

@@ -139,11 +139,44 @@ fn declarations(
     builtins: &Builtins,
     rules: &BuildLanguage,
 ) -> anyhow::Result<String> {
+    // ApiExporter::collectRuleInfo omits return_type; collectMethodInfo supplies it.
+    // This encoding identifies rule documentation only within the native inventory.
+    let documented_rules: BTreeSet<_> = builtins
+        .r#type
+        .iter()
+        .filter(|class| class.name == "native")
+        .flat_map(|class| &class.field)
+        .filter(|field| {
+            field
+                .callable
+                .as_ref()
+                .is_some_and(|callable| callable.return_type.is_empty())
+        })
+        .map(|field| field.name.as_str())
+        .collect();
+    // BaseRuleClasses::EmptyRule uses this attribute even when its default is null.
+    // Its common attributes describe a removed-rule placeholder, not its replacement.
+    let placeholder_rules: BTreeSet<_> = rules
+        .rule
+        .iter()
+        .filter(|rule| {
+            rule.attribute
+                .iter()
+                .any(|attribute| attribute.name == "$bzl_load_label")
+        })
+        .map(|rule| rule.name.as_str())
+        .collect();
     let rule_values: Vec<_> = rules.rule.iter().map(rule_value).collect();
     let rule_names: BTreeSet<_> = rule_values
         .iter()
         .filter(|_| dialect == Dialect::Bazel)
+        .filter(|rule| !placeholder_rules.contains(rule.name.as_str()))
         .map(|rule| rule.name.as_str())
+        .collect();
+    let unresolved_rules: BTreeSet<_> = documented_rules
+        .difference(&rule_names)
+        .chain(&placeholder_rules)
+        .copied()
         .collect();
     let contexts: Vec<_> = [
         APIContext::Bzl,
@@ -360,6 +393,17 @@ fn declarations(
                 )?;
                 continue;
             }
+            if class.name == "native" && unresolved_rules.contains(field.name.as_str()) {
+                // Autoloads can provide these names independently of the live rule
+                // registry, including replacements implemented as ordinary functions.
+                writeln!(body, "        if _starpls_native_rule_available:")?;
+                writeln!(
+                    body,
+                    "            {}: _starpls_typing.Any = ...",
+                    field.name
+                )?;
+                continue;
+            }
             if class.name == "ctx" && field.name == "build_setting_value" {
                 writeln!(body, "        @_starpls_builtins.property")?;
                 writeln!(
@@ -450,6 +494,7 @@ fn declarations(
         .iter()
         .zip(&rule_values)
         .filter(|_| dialect == Dialect::Bazel)
+        .filter(|(rule, _)| !placeholder_rules.contains(rule.name.as_str()))
     {
         let Some(callable) = &value.callable else {
             continue;
@@ -482,6 +527,15 @@ fn declarations(
     for (context, globals) in contexts {
         for value in globals.values() {
             let export = export_name(context, &value.name);
+            if matches!(
+                context,
+                APIContext::Bzl | APIContext::Build | APIContext::Prelude
+            ) && unresolved_rules.contains(value.name.as_str())
+            {
+                writeln!(exports, "if _starpls_native_rule_available:")?;
+                writeln!(exports, "    {export}: _starpls_typing.Any = ...")?;
+                continue;
+            }
             let Some(callable) = &value.callable else {
                 writeln!(
                     exports,
@@ -529,7 +583,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -966,6 +1020,7 @@ mod tests {
     use starpls_bazel::build::attribute::Discriminator;
     use starpls_bazel::build::AttributeDefinition;
     use starpls_bazel::build::RuleDefinition;
+    use starpls_common::FileInfo;
     use starpls_hir::Db;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
@@ -1019,6 +1074,151 @@ mod tests {
         );
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn native_rules_use_available_contracts() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let live = RuleDefinition {
+            name: "sh_binary".to_owned(),
+            attribute: vec![
+                AttributeDefinition {
+                    name: "name".to_owned(),
+                    r#type: Discriminator::String as i32,
+                    ..Default::default()
+                },
+                AttributeDefinition {
+                    name: "srcs".to_owned(),
+                    r#type: Discriminator::LabelList as i32,
+                    ..Default::default()
+                },
+                AttributeDefinition {
+                    name: "use_bash_launcher".to_owned(),
+                    r#type: Discriminator::Boolean as i32,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let placeholder = RuleDefinition {
+            name: "sh_binary".to_owned(),
+            attribute: vec![AttributeDefinition {
+                name: "$bzl_load_label".to_owned(),
+                r#type: Discriminator::String as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let unrelated = RuleDefinition {
+            name: "filegroup".to_owned(),
+            ..Default::default()
+        };
+        for (rules, precise) in [
+            (vec![], false),
+            (vec![unrelated], false),
+            (vec![placeholder], false),
+            (vec![live], true),
+        ] {
+            let (mut analysis, _) = Analysis::new_for_test();
+            analysis
+                .set_builtin_defs(builtins.clone(), BuildLanguage { rule: rules })
+                .unwrap();
+            let native_source = r#"def macro_impl(**kwargs):
+    pass
+selected = native.sh_binary
+selected(name="shell", srcs=["//:input"], use_bash_launcher=True)
+macro(implementation=macro_impl, inherit_attrs=selected)
+native.package_name()
+"#;
+            let build_source = r#"selected = sh_binary
+selected(name="global", srcs=["//:input"], use_bash_launcher=True)
+"#;
+            for (path, source, callee, context) in [
+                (
+                    "/main.bzl",
+                    native_source,
+                    "native.sh_binary",
+                    APIContext::Bzl,
+                ),
+                ("/BUILD.bazel", build_source, "sh_binary", APIContext::Build),
+            ] {
+                let info = Some(FileInfo::Bazel {
+                    api_context: context,
+                    is_external: false,
+                });
+                let file = analysis
+                    .open_document(Path::new(path), Dialect::Bazel, info, source.to_owned(), 1)
+                    .unwrap();
+                assert_eq!(file.api_context(), Some(context));
+                let snapshot = analysis.snapshot();
+                let db = &snapshot.db;
+                let python_file = db.starlark_program_file(file);
+                let parsed =
+                    ruff_db::parsed::parsed_module(db, python_file.python_file(db)).load(db);
+                let model = SemanticModel::new(db, python_file);
+                let env = model.program_environment();
+                let types: Vec<_> = parsed
+                    .suite()
+                    .iter()
+                    .filter_map(|statement| {
+                        let Stmt::Assign(assignment) = statement else {
+                            return None;
+                        };
+                        let ruff_python_ast::StmtAssign {
+                            range: _,
+                            node_index: _,
+                            targets: _,
+                            value,
+                        } = assignment;
+                        value.inferred_type(&model)
+                    })
+                    .collect();
+                let [selected] = types.as_slice() else {
+                    panic!("expected the selected rule value: {types:?}")
+                };
+                assert_eq!(
+                    selected.display(db, &env).to_string(),
+                    if precise { "sh_binary" } else { "Any" },
+                    "{path}"
+                );
+                let diagnostics = snapshot.diagnostics(file).unwrap();
+                assert!(
+                    diagnostics.is_empty(),
+                    "{path}, precise={precise}: {diagnostics:?}"
+                );
+                drop(snapshot);
+                let mut invalid_calls = Vec::new();
+                if path == "/main.bzl" {
+                    invalid_calls.push((
+                        "native.package_name(1)\n".to_owned(),
+                        "too-many-positional-arguments",
+                    ));
+                }
+                if precise {
+                    invalid_calls.push((format!("{callee}(srcs=[1])\n"), "invalid-argument-type"));
+                }
+                for (invalid, expected) in invalid_calls {
+                    analysis
+                        .open_document(
+                            Path::new(path),
+                            Dialect::Bazel,
+                            info,
+                            format!("{source}{invalid}"),
+                            2,
+                        )
+                        .unwrap();
+                    let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                    let [diagnostic] = diagnostics.as_slice() else {
+                        panic!("{invalid}: {diagnostics:?}");
+                    };
+                    assert_eq!(diagnostic.id().as_str(), expected);
+                    assert!(usize::from(diagnostic.range().unwrap().start()) >= source.len());
+                }
+            }
+        }
     }
 
     #[test]
