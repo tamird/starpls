@@ -238,6 +238,7 @@ mod tests {
         std::fs::create_dir_all(source.join("with_cfg/private")).unwrap();
         std::fs::write(source.join("with_cfg/private/with_cfg.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/providers.bzl"), "").unwrap();
+        std::fs::write(source.join("with_cfg/private/setting.bzl"), "").unwrap();
         std::fs::write(
             source.join("with_cfg/private/builder.bzl"),
             "def make_builder(rule_info): return rule_info\n",
@@ -286,6 +287,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            stubs.join("setting.bzli"),
+            include_str!("../../../../stubs/with_cfg/setting.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
             workspace.join("starpls.toml"),
             "[[stub-packages]]\nmanifest = '@with_cfg_stubs//:stubs.toml'\n",
         )
@@ -325,12 +331,13 @@ mod tests {
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
-                let [first, second, third, fourth, fifth] = prepared.registrations.as_slice()
+                let [first, second, third, fourth, fifth, sixth] =
+                    prepared.registrations.as_slice()
                 else {
                     panic!("{prepared:?}");
                 };
                 let actual = std::collections::BTreeMap::from(
-                    [first, second, third, fourth, fifth].map(|registration| {
+                    [first, second, third, fourth, fifth, sixth].map(|registration| {
                         let super::Registration {
                             source,
                             interface,
@@ -348,6 +355,10 @@ mod tests {
                     (
                         source.join("with_cfg/private/providers.bzl"),
                         stubs.join("providers.bzli"),
+                    ),
+                    (
+                        source.join("with_cfg/private/setting.bzl"),
+                        stubs.join("setting.bzli"),
                     ),
                     (
                         source.join("with_cfg/private/utils.bzl"),
