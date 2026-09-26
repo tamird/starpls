@@ -294,12 +294,14 @@ impl Validator<'_> {
                 };
                 if *is_async
                     || !supported_decorators
-                    || type_params.is_some()
+                    || (type_params.is_some() && self.annotation_mode != AnnotationMode::Interface)
                     || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                 {
                     self.error(
                         *range,
-                        if self.annotation_mode != AnnotationMode::Disabled {
+                        if self.annotation_mode == AnnotationMode::Interface {
+                            "Async functions and these decorators are not supported in type interfaces"
+                        } else if self.annotation_mode != AnnotationMode::Disabled {
                             "Async functions, decorators, and type parameters are not supported in Starlark"
                         } else {
                             "Function annotations and decorators are not supported in Starlark"
@@ -308,7 +310,7 @@ impl Validator<'_> {
                 }
                 if *is_async
                     || !supported_decorators
-                    || type_params.is_some()
+                    || (type_params.is_some() && self.annotation_mode != AnnotationMode::Interface)
                     || (self.annotation_mode == AnnotationMode::Disabled && returns.is_some())
                     || !parameters.posonlyargs.is_empty()
                     || (self.annotation_mode == AnnotationMode::Disabled
@@ -321,6 +323,11 @@ impl Validator<'_> {
                         .push(self.statement_node.expect("visiting a statement"));
                 }
                 self.visit_identifier(name);
+                if self.annotation_mode == AnnotationMode::Interface {
+                    if let Some(type_params) = type_params {
+                        self.visit_type_params(type_params);
+                    }
+                }
                 if supported_decorators {
                     for decorator in decorator_list {
                         self.visit_expr(&decorator.expression);
@@ -734,6 +741,7 @@ mod tests {
                 true,
             ),
             ("def f(value: int = ...): pass", false),
+            ("def f[T](value: T) -> T: pass", false),
             ("value: int", false),
             ("obj.value: int = 1", false),
             ("items[0]: int = 1", false),
@@ -766,6 +774,7 @@ mod tests {
             ("value: int", true),
             ("value: int = ...", true),
             ("def f(value, other: int = ...) -> string: ...", true),
+            ("def f[T](value: T) -> T: ...", true),
             ("def f():\n    \"Documentation\"\n    pass", true),
             (
                 "class Info:\n    value: str\n    def __init__(self, *, value: str) -> None: ...",

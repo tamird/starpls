@@ -883,11 +883,27 @@ fn annotations(
     let source_node = source_kind.node(&source_parsed);
     let stub_node = stub_kind.node(&stub_parsed);
     if source_node.type_params.is_some()
-        || stub_node.type_params.is_some()
         || source_kind.has_decorators()
         || stub_kind.has_decorators()
     {
         return Err("generic or decorated functions require a dedicated implementation contract");
+    }
+    if stub_node.type_params.is_some()
+        && (provider.is_some()
+            || source_node.returns.is_some()
+            || source_node
+                .parameters
+                .iter()
+                .any(|parameter| parameter.as_parameter().annotation.is_some())
+            || stub_node.returns.is_none()
+            || stub_node
+                .parameters
+                .iter()
+                .any(|parameter| parameter.as_parameter().annotation.is_none()))
+    {
+        return Err(
+            "generic contracts require a complete signature and an unannotated implementation",
+        );
     }
     let pairs = parameter_pairs_with_receiver(source_node, stub_node, provider.is_some())?;
     if let Some(provider) = provider {
@@ -1480,6 +1496,13 @@ mod tests {
     use crate::Analysis;
 
     fn validate(source: &str, stub: &str) -> Vec<String> {
+        validation_diagnostics(source, stub)
+            .into_iter()
+            .map(|diagnostic| diagnostic.id().as_str().to_owned())
+            .collect()
+    }
+
+    fn validation_diagnostics(source: &str, stub: &str) -> Vec<super::Diagnostic> {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
         let source = fixture.add_file(&mut analysis.db, "source.bzl", source);
@@ -1496,14 +1519,94 @@ mod tests {
             .unwrap();
         analysis.set_type_interfaces([(source, stub)]).unwrap();
         let reports = analysis.validate_stubs(|_| true).unwrap();
-        let diagnostics: Vec<_> = reports
+        reports
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
-            .collect();
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| diagnostic.id().as_str().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn external_generic_contracts_check_identity_and_body() {
+        assert!(validate(
+            "def identity(value): return value\n",
+            "def identity[T](value: T) -> T: ...\n"
+        )
+        .is_empty());
+        assert!(validate(
+            "def identity(value=None): return value\n",
+            "def identity[T](value: T | None = ...) -> T | None: ...\n"
+        )
+        .is_empty());
+        for (body, expected) in [
+            ("return 1", vec!["invalid-return-type"]),
+            ("return []", vec!["invalid-return-type"]),
+            (
+                "return value.missing()",
+                vec!["unresolved-attribute", "unsound-return-statement"],
+            ),
+        ] {
+            assert_eq!(
+                validate(
+                    &format!("def identity(value): {body}\n"),
+                    "def identity[T](value: T) -> T: ...\n"
+                ),
+                expected,
+                "{body}"
+            );
+        }
+        for (source, stub) in [
+            (
+                "def identity(value) -> int: return 1\n",
+                "def identity[T](value: T) -> T: ...\n",
+            ),
+            (
+                "def identity(value): return value\n",
+                "def identity[T](value: T): ...\n",
+            ),
+        ] {
+            assert_eq!(validate(source, stub), ["incomplete-stub-validation"]);
+        }
+    }
+
+    #[test]
+    fn external_generic_contracts_validate_reset_helper() {
+        let source = r#"
+def _reset_on_attrs(attrs, *, self, attrs_to_reset, mutable_has_been_built):
+    if mutable_has_been_built[0]:
+        fail("reset_on_attrs() can only be called before build()")
+    if not attrs:
+        fail("reset_on_attrs() must be called with at least one attribute name")
+    if attrs_to_reset:
+        fail("reset_on_attrs() can only be called once")
+    attrs_to_reset.extend(attrs)
+    return self
+
+_reset_on_attrs(("srcs",), self=1, attrs_to_reset=[], mutable_has_been_built=[False])
+"#;
+        let stub = r#"def _reset_on_attrs[T](
+    attrs: tuple[str, ...],
+    *,
+    self: T,
+    attrs_to_reset: list[str],
+    mutable_has_been_built: list[bool],
+) -> T: ...
+"#;
+        let diagnostics = validation_diagnostics(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            validate(&source.replace("return self", "return 42"), stub),
+            ["invalid-return-type"]
+        );
+        assert_eq!(
+            validate(
+                &source.replace(
+                    "attrs_to_reset.extend(attrs)",
+                    "attrs_to_reset.extend([42])"
+                ),
+                stub
+            ),
+            ["invalid-argument-type"]
+        );
     }
 
     #[test]

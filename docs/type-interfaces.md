@@ -196,8 +196,24 @@ local to the stub.
 Missing exports and incompatible types are errors. Compatibility that depends on
 dynamic types and unsupported function correspondence produce an
 incomplete-validation error. Matching
-variadic parameters are supported. Generic, overloaded, and conflicting function
-contracts produce an incomplete result. `--ignore_pattern` selects implementation
+variadic parameters are supported. A fully annotated generic function declaration
+can describe an unannotated implementation:
+
+```python
+# source.bzli
+def identity[T](value: T) -> T: ...
+```
+
+```python
+# source.bzl
+def identity(value):
+    return value
+```
+
+The type parameters retain their declaration scope, and each call specializes
+them independently. Generic contracts with missing stub annotations or source
+annotations produce an incomplete result, as do overloaded and conflicting
+function contracts. `--ignore_pattern` selects implementation
 files and reexported bodies to exclude. Callers use the trusted stub contracts
 independently of validation results.
 
