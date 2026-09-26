@@ -38,6 +38,8 @@ use ty_python_core::semantic_index;
 use ty_python_core::use_def_map;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedBindingValue;
+use ty_python_semantic::types::ide_support::unreachable_ranges;
+use ty_python_semantic::types::ide_support::UnreachableRange;
 use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Signature;
@@ -1413,11 +1415,25 @@ fn has_static_evidence(
     struct Evidence<'a, 'db> {
         db: &'db Database,
         model: &'a SemanticModel<'db>,
+        unreachable: &'a [UnreachableRange],
         complete: bool,
         conservative: bool,
     }
+    impl Evidence<'_, '_> {
+        fn is_unreachable(&self, range: TextRange) -> bool {
+            let index = self
+                .unreachable
+                .partition_point(|unreachable| unreachable.range.end() <= range.start());
+            self.unreachable
+                .get(index)
+                .is_some_and(|unreachable| unreachable.range.contains_range(range))
+        }
+    }
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
+            if self.is_unreachable(expression.range()) {
+                return;
+            }
             if !expression_has_evidence(self.model, expression, self.conservative)
                 && !expression.inferred_type(self.model).is_some_and(|ty| {
                     plain_provider_fields(self.db, ty, &self.model.program_environment()).is_some()
@@ -1428,6 +1444,9 @@ fn has_static_evidence(
             visitor::walk_expr(self, expression);
         }
         fn visit_stmt(&mut self, statement: &'a ruff_python_ast::Stmt) {
+            if self.is_unreachable(statement.range()) {
+                return;
+            }
             if matches!(
                 statement,
                 ruff_python_ast::Stmt::FunctionDef(_) | ruff_python_ast::Stmt::ClassDef(_)
@@ -1453,6 +1472,7 @@ fn has_static_evidence(
     let mut evidence = Evidence {
         db,
         model: &model,
+        unreachable: unreachable_ranges(db, model.program_file()),
         complete: true,
         conservative: false,
     };
@@ -1664,6 +1684,25 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn validation_checks_reachable_code() {
+        for (name, source, stub, expected) in [
+            ("dead_unknown", "def make():\n    if False:\n        missing\n    return 1\n", "def make() -> int: ...\n", &[] as &[&str]),
+            ("dead_suppressed", "def make():\n    if False:\n        missing # ty: ignore[unresolved-reference]\n    return 1\n", "def make() -> int: ...\n", &[]),
+            ("dead_return", "def make():\n    if False:\n        return 'bad'\n    return 1\n", "def make() -> int: ...\n", &[]),
+            ("live_return", "def make():\n    return 'bad'\n", "def make() -> int: ...\n", &["invalid-return-type"]),
+            ("conditional", "def make(): return 1 if True else missing\n", "def make() -> int: ...\n", &[]),
+            ("short_circuit", "def make(): return False and missing\n", "def make() -> bool: ...\n", &[]),
+            ("after_return", "def make():\n    return 1\n    missing\n", "def make() -> int: ...\n", &[]),
+            ("uncertain", "def make(flag):\n    if flag:\n        missing\n    return 1\n", "def make(flag: bool) -> int: ...\n", &["unresolved-reference"]),
+            ("live_default", "def make(value=missing): return 1\n", "def make(value: object = ...) -> int: ...\n", &["unresolved-reference"]),
+            ("live_suppressed", "def make():\n    missing # ty: ignore[unresolved-reference]\n    return 1\n", "def make() -> int: ...\n", &["incomplete-stub-validation"]),
+            ("suppressed_default", "def make(value=missing): # ty: ignore[unresolved-reference]\n    return 1\n", "def make(value: object = ...) -> int: ...\n", &["incomplete-stub-validation"]),
+        ] {
+            assert_eq!(validate(source, stub), expected, "{name}");
+        }
     }
 
     #[test]
