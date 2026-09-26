@@ -1905,6 +1905,32 @@ def make() -> _Runner: ...
     }
 
     #[test]
+    fn returned_callbacks_use_borrowed_context() {
+        let stub = "def make() -> Callable[[str], str]: ...\n";
+        assert_eq!(
+            validate(
+                "def make():\n    callback = lambda value: value.lower()\n    return callback\n",
+                stub,
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make():\n    callback = lambda value: value + 1\n    return callback\n",
+                stub,
+            ),
+            ["unsupported-operator", "unsound-return-statement"],
+        );
+        assert_eq!(
+            validate(
+                "def make():\n    callback = lambda value='bad': 1\n    callback()\n    return callback\n",
+                "def make() -> Callable[[int], int]: ...\n",
+            ),
+            ["unsound-return-statement"],
+        );
+    }
+
+    #[test]
     fn parameter_defaults_require_independent_evidence() {
         for (source, stub, expected) in [
             (
