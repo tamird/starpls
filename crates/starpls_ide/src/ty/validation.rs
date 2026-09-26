@@ -1213,48 +1213,77 @@ pub(super) fn call_diagnostics(
         return Vec::new();
     }
     let environment = ty_python_semantic::ProgramEnvironment::from_file(call.file());
-    let Some(fields) = call
-        .expression_type(&call.call().func)
-        .and_then(|ty| plain_provider_fields(db, ty, &environment))
-    else {
-        return Vec::new();
-    };
-    let mut diagnostics = Vec::new();
-    for field in fields {
-        let (range, reason) = match call.argument(&field.name) {
+    let check_argument = |subject: &str, name: &str, expected, missing, indeterminate| {
+        let (range, reason) = match call.argument(name) {
             CheckedArgument::Value { ty, expression } => {
-                if ty.satisfies_declared_output(db, &environment, field.ty) {
-                    continue;
+                if ty.satisfies_declared_output(db, &environment, expected) {
+                    return None;
                 }
                 (
                     expression.map_or(call.call().range(), Ranged::range),
                     format!(
                         "argument type `{}` does not preserve declared type `{}`",
                         ty.display(db, &environment),
-                        field.ty.display(db, &environment),
+                        expected.display(db, &environment),
                     ),
                 )
             }
-            CheckedArgument::Omitted => (
-                call.call().range(),
-                "no argument establishes the required field".to_owned(),
-            ),
-            CheckedArgument::Indeterminate => (
-                call.call().range(),
-                "argument matching does not identify one definite field value".to_owned(),
-            ),
+            CheckedArgument::Omitted => (call.call().range(), String::from(missing)),
+            CheckedArgument::Indeterminate => (call.call().range(), String::from(indeterminate)),
         };
         let mut diagnostic = Diagnostic::new(
             DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
             Severity::Error,
-            format!("Cannot prove constructor field `{}`: {reason}", field.name),
+            format!("Cannot prove {subject} `{name}`: {reason}"),
         );
         diagnostic.annotate(Annotation::primary(
             Span::from(call.file().file(db)).with_range(range),
         ));
-        diagnostics.push(diagnostic);
+        Some(diagnostic)
+    };
+    let selected_signature = || {
+        let ty = call.expression_type(&call.call().func)?;
+        let function = ty.as_function_literal()?;
+        let signature = function.selected_contract_signature(db)?;
+        let TypeDefinition::Function(definition) = ty.definition(db, &environment)? else {
+            return None;
+        };
+        if call.declaration() != Some(definition) {
+            return None;
+        }
+        let index = semantic_index(db, call.file());
+        let scope = index.try_expression_scope_id(&ruff_python_ast::ExprRef::from(call.call()))?;
+        selected_execution_scope(db, scope.to_scope_id(db, call.file())).then_some(signature)
+    };
+    if let Some(signature) = selected_signature() {
+        return signature
+            .parameters()
+            .iter()
+            .filter_map(|parameter| {
+                check_argument(
+                    "argument",
+                    parameter.name().expect("selected parameters have names"),
+                    parameter.annotated_type(),
+                    "no argument establishes the required input",
+                    "argument matching does not identify one definite input value",
+                )
+            })
+            .collect();
     }
-    diagnostics
+    call.expression_type(&call.call().func)
+        .and_then(|ty| plain_provider_fields(db, ty, &environment))
+        .into_iter()
+        .flatten()
+        .filter_map(|field| {
+            check_argument(
+                "constructor field",
+                &field.name,
+                field.ty,
+                "no argument establishes the required field",
+                "argument matching does not identify one definite field value",
+            )
+        })
+        .collect()
 }
 
 fn compare_initializer<'db>(
@@ -1372,6 +1401,26 @@ pub(super) fn function_inference_mode(
     if validation.annotations.is_empty() {
         return FunctionInferenceMode::Default;
     }
+    if (validation.phase == StubValidationPhase::Ordinary
+        && !matches!(
+            scope.node(db),
+            ty_python_core::scope::NodeWithScopeKind::Function(_)
+        ))
+        || !selected_execution_scope(db, scope)
+    {
+        return FunctionInferenceMode::Default;
+    }
+    match validation.phase {
+        StubValidationPhase::Ordinary => FunctionInferenceMode::OutputProof,
+        StubValidationPhase::Conservative => FunctionInferenceMode::Conservative,
+    }
+}
+
+fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
+    let validation = db.environment().stub_validation(db);
+    if validation.annotations.is_empty() {
+        return false;
+    }
     // Execution scopes inherit the nearest named owner. Semantic ancestry also
     // places defaults and comprehension iterables in the scope that evaluates them.
     let scope = if matches!(
@@ -1380,9 +1429,6 @@ pub(super) fn function_inference_mode(
             | ty_python_core::scope::NodeWithScopeKind::ListComprehension(_)
             | ty_python_core::scope::NodeWithScopeKind::DictComprehension(_)
     ) {
-        if validation.phase != StubValidationPhase::Conservative {
-            return FunctionInferenceMode::Default;
-        }
         let index = semantic_index(db, scope.program_file(db));
         let Some((owner, _)) =
             index
@@ -1397,30 +1443,24 @@ pub(super) fn function_inference_mode(
                     )
                 })
         else {
-            return FunctionInferenceMode::Default;
+            return false;
         };
         owner.to_scope_id(db, scope.program_file(db))
     } else {
         scope
     };
     let ty_python_core::scope::NodeWithScopeKind::Function(function) = scope.node(db) else {
-        return FunctionInferenceMode::Default;
+        return false;
     };
     let Some(source) = db.starlark_file(scope.program_file(db)) else {
-        return FunctionInferenceMode::Default;
+        return false;
     };
     let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
     let owner = function.node(&parsed).node_index().load();
-    if !matches!(
+    matches!(
         validation.annotations.get(&(source.source, owner)),
         Some(ValidationAnnotation::Declaration { file: _, owner: _ })
-    ) {
-        return FunctionInferenceMode::Default;
-    }
-    match validation.phase {
-        StubValidationPhase::Ordinary => FunctionInferenceMode::OutputProof,
-        StubValidationPhase::Conservative => FunctionInferenceMode::Conservative,
-    }
+    )
 }
 
 fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool {
@@ -2057,9 +2097,10 @@ _LABEL_TYPE = type(Label("//:bogus"))
                 expected
             );
         }
-        let higher_order_source = "def use(factory): return factory(text='x')\nuse(struct)\n";
-        let higher_order_stub = "class _Factory(Protocol):\n    def __call__(self, **kwargs: str) -> struct[str]: ...\ndef use(factory: _Factory) -> struct[str]: ...\n";
-        assert!(validate(higher_order_source, higher_order_stub).is_empty());
+        let higher_order_source = "def use(factory): return factory(text='x')\nuse(struct)\ndef make(): return use(struct)\n";
+        let higher_order_stub = "class _Factory(Protocol):\n    def __call__(self, **kwargs: str) -> struct[str]: ...\ndef use(factory: _Factory) -> struct[str]: ...\ndef make() -> struct[str]: ...\n";
+        let diagnostics = validation_diagnostics(higher_order_source, higher_order_stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         assert!(validate(
             "def make(): return struct()",
             "class _Empty(Protocol): ...\ndef make() -> _Empty: ...\n"
@@ -3724,6 +3765,193 @@ def make() -> _Row: ...
     }
 
     #[test]
+    fn selected_function_calls_check_declared_inputs() {
+        let stub = r#"
+def _id(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...
+def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...
+"#;
+        for (prefix, helper, body, expected) in [
+            ("", "callback", "_id(callback)", &[] as &[&str]),
+            ("_alias = _id\n", "callback", "_alias(callback)", &[]),
+            ("", "callback", "_id(lambda values: len(values))", &[]),
+            (
+                "",
+                "callback",
+                "_id(lambda values: values.append(1) or 1)",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "def _narrow(values: list[str]) -> int: return len(values)\n",
+                "callback",
+                "_id(_narrow)",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "def _narrow(values: list[str]) -> int: return len(values)\n",
+                "callback",
+                "_id(_narrow) # ty: ignore[incomplete-stub-validation]",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "",
+                "callback",
+                "_id(*[callback])",
+                &["incomplete-stub-validation"],
+            ),
+            ("", "1", "_id(callback)", &["invalid-return-type"]),
+        ] {
+            let source = format!(
+                "def _id(callback): return {helper}
+{prefix}def make(callback): return {body}
+"
+            );
+            assert_eq!(validate(&source, stub), expected, "{source}");
+        }
+        assert_eq!(
+            validate(
+                r#"
+def _id(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]:
+    return callback
+def make(callback): return _id(callback)
+"#,
+                "def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        assert_eq!(
+            validate(
+                r#"
+def _id(values):
+    values.append(1)
+    return values
+def make(values): return _id(values)
+"#,
+                "def _id(values: list[Any]) -> list[Any]: ...\ndef make(values: list[Any]) -> list[Any]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        assert_eq!(
+            validate(
+                r#"
+def _narrow(values: list[str]) -> int: return len(values)
+def _id(value): return value
+def make(): return _id(struct(run=_narrow))
+"#,
+                r#"
+class _Runner(Protocol):
+    @property
+    def run(self) -> Callable[[list[Any]], int]: ...
+def _id(value: _Runner) -> _Runner: ...
+def make() -> _Runner: ...
+"#,
+            ),
+            ["incomplete-stub-validation"],
+        );
+    }
+
+    #[test]
+    fn selected_function_calls_follow_caller_scope() {
+        for expression in [
+            "_id(_narrow)",
+            "lambda: _id(_narrow)",
+            "[_id(_narrow) for _ in [1]]",
+            "{1: _id(_narrow) for _ in [1]}",
+        ] {
+            let source = format!(
+                "def _id(callback): return callback
+def _narrow(values: list[str]) -> int: return len(values)
+def _caller(): return {expression}
+_caller()
+"
+            );
+            for selected in [false, true] {
+                let mut stub = "def _id(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...\n".to_owned();
+                if selected {
+                    stub.push_str("def _caller() -> object: ...\n");
+                }
+                let expected: &[&str] = if selected {
+                    &["incomplete-stub-validation"]
+                } else {
+                    &[]
+                };
+                assert_eq!(
+                    validate(&source, &stub),
+                    expected,
+                    "{expression}, selected={selected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_function_imports_require_source_identity() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let helper = fixture.add_file(
+            &mut analysis.db,
+            "helper.bzl",
+            "def forward(callback): return callback\n",
+        );
+        let helper_stub = fixture.add_file(&mut analysis.db, "helper.bzli", "def forward(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...\n");
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "load('helper.bzl', _forward='forward')\nforward = _forward\ndef make(callback): return forward(callback)\n",
+        );
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let declaration =
+            "def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...\n";
+        for redirected in [false, true, false] {
+            let mut interfaces = vec![(source, stub)];
+            let declarations = if redirected {
+                interfaces.push((helper, helper_stub));
+                declaration.to_owned()
+            } else {
+                format!("{declaration}def forward(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...\n")
+            };
+            analysis.update_file(stub, declarations);
+            analysis.set_type_interfaces(interfaces).unwrap();
+            let previous = analysis
+                .db
+                .environment()
+                .stub_validation(&analysis.db)
+                .clone();
+            let diagnostics: Vec<_> = analysis
+                .validate_stubs(|_| true)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .collect();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect::<Vec<_>>(),
+                if redirected {
+                    vec!["incomplete-stub-validation"]
+                } else {
+                    vec![]
+                },
+                "redirected={redirected}: {diagnostics:?}"
+            );
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous
+            );
+        }
+    }
+
+    #[test]
     fn contextual_lambda_inputs_check_consuming_operations() {
         assert_eq!(
             validate(
@@ -3872,6 +4100,13 @@ def mixed(runner: _Runner, flag: bool) -> _Runner: ...
 
     #[test]
     fn gradual_signatures_require_matching_contracts_and_static_bodies() {
+        assert_eq!(
+            validate(
+                "def helper(value): return 1\ndef compute(value): return helper(value)\n",
+                "def helper(value: Any) -> int: ...\ndef compute(value: Any) -> int: ...\n",
+            ),
+            Vec::<String>::new(),
+        );
         for annotation in ["Any", "list[Any]", "Callable[..., Any]"] {
             let stub = format!("def compute(value: {annotation}) -> int: ...\n");
             assert!(
@@ -3912,10 +4147,6 @@ def mixed(runner: _Runner, flag: bool) -> _Runner: ...
             (
                 "def compute(value):\n    value.missing()\n    return 1\n",
                 "def compute(value: Any) -> int: ...\n",
-            ),
-            (
-                "def helper(value): return 1\ndef compute(value): return helper(value)\n",
-                "def helper(value: Any) -> int: ...\ndef compute(value: Any) -> int: ...\n",
             ),
             (
                 "def wants_int(value): return value\ndef compute(value): return wants_int(value)\n",

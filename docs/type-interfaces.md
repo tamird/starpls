@@ -234,6 +234,13 @@ Validation checks paired function bodies using the inferred or declared types
 of their callees. Unpaired helper bodies participate in ordinary file checking;
 the paired function's proof uses their callable contracts.
 
+Declarations for selected functions govern calls between selected bodies.
+Arguments must satisfy each declared input type, and every selected body is
+checked. A failure in any selected body makes validation unsuccessful. This
+support applies to original functions with nongeneric signatures and fixed,
+required parameters. Defaults, variadic signatures, and imports redirected to
+stub declarations use the existing conservative checks.
+
 Function validation checks operations on parameters and module globals using
 conservative value bounds. For example, a `list[Any]` can be read as objects and
 copied into a fresh `list[object]`. Mutations and calls must be valid under those
