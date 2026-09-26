@@ -1223,9 +1223,7 @@ pub(super) fn call_diagnostics(
     for field in fields {
         let (range, reason) = match call.argument(&field.name) {
             CheckedArgument::Value { ty, expression } => {
-                if field.ty.is_explicit_any(db)
-                    || ty.is_pure_redundant_with(db, &environment, field.ty)
-                {
+                if ty.satisfies_declared_output(db, &environment, field.ty) {
                     continue;
                 }
                 (
@@ -2134,6 +2132,148 @@ _LABEL_TYPE = type(Label("//:bogus"))
         let source = "def known(value: int) -> int: return value\ndef make(): return struct(__call__=known)\n";
         let stub = "class _Callback(Protocol):\n    def __call__(self, value: int) -> int: ...\nclass _Required(Protocol):\n    @property\n    def __call__(self) -> _Callback: ...\ndef make() -> _Required: ...\n";
         assert!(validate(source, stub).is_empty());
+    }
+
+    #[test]
+    fn declared_callback_outputs_check_retained_constraints() {
+        for (name, source, stub, expected) in [
+            (
+                "finite callback",
+                "def make(): return lambda: 1\n",
+                "def make() -> Callable[..., int]: ...\n",
+                &[][..],
+            ),
+            (
+                "tuple callback",
+                "def make(): return (lambda: 1,)\n",
+                "def make() -> tuple[Callable[..., int]]: ...\n",
+                &[],
+            ),
+            (
+                "readonly callback",
+                "def make(): return struct(run=lambda: 1)\n",
+                r#"class _Runner(Protocol):
+    @property
+    def run(self) -> Callable[..., int]: ...
+def make() -> _Runner: ...
+"#,
+                &[],
+            ),
+            (
+                "unconstrained result",
+                "def _known(value: str) -> str: return value\ndef make(): return _known\n",
+                "def make() -> Callable[..., Any]: ...\n",
+                &[],
+            ),
+            (
+                "opaque helper",
+                "def _opaque(value): return value.missing()\ndef make(): return _opaque\n",
+                "def make() -> Callable[..., Any]: ...\n",
+                &[],
+            ),
+            (
+                "unknown explicit input",
+                "def _opaque(value) -> int: return 1\ndef make(): return _opaque\n",
+                "def make() -> Callable[[Any], int]: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "omitted unknown input",
+                "def _opaque(value) -> int: return 1\ndef make(): return _opaque\n",
+                "def make() -> Callable[..., int]: ...\n",
+                &[],
+            ),
+            (
+                "local unknown body",
+                "def make(): return lambda value: value.missing()\n",
+                "def make() -> Callable[..., Any]: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "known helper error",
+                "def _bad(value: Any) -> int: return 'bad'\ndef make(): return _bad\n",
+                "def make() -> Callable[..., Any]: ...\n",
+                &["invalid-return-type"],
+            ),
+            (
+                "wrong result",
+                "def make(): return lambda: 'bad'\n",
+                "def make() -> Callable[..., int]: ...\n",
+                &["invalid-return-type"],
+            ),
+            (
+                "unknown callable presence",
+                "def make(value): return value\n",
+                "def make(value: Any) -> Callable[..., Any]: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "mixed readonly domains",
+                r#"def _narrow(values: list[str]) -> int: return len(values[0])
+def make(): return struct(opaque=lambda: 1, checked=_narrow)
+"#,
+                r#"class _Runner(Protocol):
+    @property
+    def opaque(self) -> Callable[..., int]: ...
+    @property
+    def checked(self) -> Callable[[list[Any]], int]: ...
+def make() -> _Runner: ...
+"#,
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "mutable callback storage",
+                "def make(): return [lambda: 1]\n",
+                "def make() -> list[Callable[..., int]]: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            assert_eq!(validate(source, stub), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn provider_outputs_compare_declared_read_constraints() {
+        for (name, helper, value, field, expected) in [
+            (
+                "finite callback",
+                "def _known(value: str) -> str: return value\n",
+                "_known",
+                "Callable[..., str]",
+                &[][..],
+            ),
+            (
+                "unconstrained nested result",
+                "def _opaque(value): return value.missing()\n",
+                "(_opaque,)",
+                "tuple[Callable[..., Any]]",
+                &[],
+            ),
+            (
+                "unknown explicit input",
+                "def _opaque(value) -> int: return 1\n",
+                "_opaque",
+                "Callable[[Any], int]",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "concrete nested result",
+                "def _opaque(value): return value.missing()\n",
+                "(_opaque,)",
+                "tuple[Callable[..., int]]",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            let source = format!("Info = provider(fields=['run'])\n{helper}_VALUE = Info(run={value})\ndef make(): return _VALUE\n");
+            let stub = format!(
+                r#"class Info:
+    run: Final[{field}]
+    def __init__(self, *, run: {field}) -> None: ...
+def make() -> Info: ...
+"#
+            );
+            assert_eq!(validate(&source, &stub), expected, "{name}");
+        }
     }
 
     #[test]

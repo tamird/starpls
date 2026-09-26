@@ -90,9 +90,9 @@ source instances, callers, annotations, and `Target` lookups. Multiple distinct
 classes claiming the same declaration are an error. A stub may expose a subset
 of the fields allowed by the source provider.
 
-Validation of plain provider calls checks each field value against its declared
-type. A stored callback must accept the parameter domain promised by that
-declaration. An explicit `Any` field accepts every value type.
+Validation of plain provider calls compares each stored value with its declared
+readonly type using the output constraints described below. Callback input
+domains and mutable nested storage must satisfy their declared requirements.
 
 For a provider with an initializer, `__init__` describes the initializer's public
 arguments. An exported raw constructor has its own declaration:
@@ -223,8 +223,16 @@ independently of validation results.
 
 Equivalent function signatures may include `Any` when their other type
 components are fully known. Ordinary inferred return types must establish the
-declared output contract, including the parameter domains of returned callbacks.
-An explicit `Any` return annotation admits every result type.
+declared output contract. In positive output and readonly positions, `Any`
+omits a value requirement, and bare `Callable[..., R]` omits an input shape
+and checks `R`. Explicit callback input domains, mutable writes, and invariant
+storage require known compared types and strict type correspondence under
+their value bounds. Missing callable parameter types cannot establish an
+explicit input domain.
+
+Validation checks paired function bodies using the inferred or declared types
+of their callees. Unpaired helper bodies participate in ordinary file checking;
+the paired function's proof uses their callable contracts.
 
 Function validation checks operations on parameters and module globals using
 conservative value bounds. For example, a `list[Any]` can be read as objects and
