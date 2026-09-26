@@ -1905,6 +1905,85 @@ def make() -> _Runner: ...
     }
 
     #[test]
+    fn struct_keyword_fields_contextualize_callbacks() {
+        let stub = r#"class _Reset(Protocol):
+    def __call__(self, *attrs: str) -> _Builder: ...
+class _Builder(Protocol):
+    @property
+    def reset(self) -> _Reset: ...
+    @property
+    def normalize(self) -> Callable[[str], str]: ...
+def make() -> _Builder: ...
+def reset(self: _Builder, state: list[str], attrs: tuple[str, ...]) -> _Builder: ...
+"#;
+        for constructor in ["struct", "constructor"] {
+            let alias = if constructor == "constructor" {
+                "    constructor = struct\n"
+            } else {
+                ""
+            };
+            let source = format!(
+                r#"def make():
+{alias}    state = []
+    self = {constructor}(reset=lambda *attrs: reset(self, state, attrs), normalize=lambda text: text.lower())
+    return self
+def reset(self, state, attrs):
+    state.extend(attrs)
+    return self
+"#
+            );
+            assert_eq!(validate(&source, stub), Vec::<String>::new(), "{source}");
+        }
+
+        let callback_stub = r#"class _Row(Protocol):
+    @property
+    def run(self) -> Callable[[str], str]: ...
+def make() -> _Row: ...
+"#;
+        for (body, expected) in [
+            ("1", vec!["invalid-return-type"]),
+            (
+                "value + 1",
+                vec!["unsupported-operator", "unsound-return-statement"],
+            ),
+        ] {
+            let source = format!(
+                "def make():\n    result = struct(run=lambda value: {body})\n    return result\n"
+            );
+            assert_eq!(validate(&source, callback_stub), expected, "{source}");
+        }
+        assert_eq!(
+            validate(
+                "def struct(**fields): return fields\ndef make(): return struct(run=lambda value: value.lower())\n",
+                callback_stub,
+            ),
+            ["unsound-return-statement"],
+        );
+
+        let optional_stub = r#"class _Run(Protocol):
+    def __call__(self, value: int = ...) -> int: ...
+class _Row(Protocol):
+    @property
+    def run(self) -> _Run: ...
+def make() -> _Row: ...
+"#;
+        assert_eq!(
+            validate(
+                "def make(): return struct(run=lambda value='bad': value)\n",
+                optional_stub
+            ),
+            ["invalid-return-type"],
+        );
+        assert_eq!(
+            validate(
+                "def make(): return struct(run=lambda value='bad': 1)\n",
+                optional_stub
+            ),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[test]
     fn returned_callbacks_use_borrowed_context() {
         let stub = "def make() -> Callable[[str], str]: ...\n";
         assert_eq!(

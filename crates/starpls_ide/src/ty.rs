@@ -508,6 +508,13 @@ impl ty_python_semantic::Db for Database {
             || support::is_operation_declaration(self, definition)
     }
 
+    fn provided_keyword_field_factory(&self, definition: Definition<'_>) -> bool {
+        matches!(
+            factory::declaration(self, definition),
+            Some(factory::BuiltinFunction::Struct)
+        )
+    }
+
     fn provided_getattr_may_be_missing(&self, definition: Definition<'_>) -> bool {
         matches!(
             factory::declaration(self, definition),
