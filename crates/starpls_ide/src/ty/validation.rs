@@ -1372,6 +1372,37 @@ pub(super) fn function_inference_mode(
     if validation.annotations.is_empty() {
         return FunctionInferenceMode::Default;
     }
+    // Execution scopes inherit the nearest named owner. Semantic ancestry also
+    // places defaults and comprehension iterables in the scope that evaluates them.
+    let scope = if matches!(
+        scope.node(db),
+        ty_python_core::scope::NodeWithScopeKind::Lambda(_)
+            | ty_python_core::scope::NodeWithScopeKind::ListComprehension(_)
+            | ty_python_core::scope::NodeWithScopeKind::DictComprehension(_)
+    ) {
+        if validation.phase != StubValidationPhase::Conservative {
+            return FunctionInferenceMode::Default;
+        }
+        let index = semantic_index(db, scope.program_file(db));
+        let Some((owner, _)) =
+            index
+                .ancestor_scopes(scope.file_scope_id(db))
+                .skip(1)
+                .find(|(_, ancestor)| {
+                    matches!(
+                        ancestor.node(),
+                        ty_python_core::scope::NodeWithScopeKind::Function(_)
+                            | ty_python_core::scope::NodeWithScopeKind::Class(_)
+                            | ty_python_core::scope::NodeWithScopeKind::Module
+                    )
+                })
+        else {
+            return FunctionInferenceMode::Default;
+        };
+        owner.to_scope_id(db, scope.program_file(db))
+    } else {
+        scope
+    };
     let ty_python_core::scope::NodeWithScopeKind::Function(function) = scope.node(db) else {
         return FunctionInferenceMode::Default;
     };
@@ -3690,6 +3721,57 @@ def make() -> _Row: ...
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
         }
+    }
+
+    #[test]
+    fn nested_execution_scopes_check_opaque_operations() {
+        let helper = r#"
+def _opaque() -> Callable[..., None]:
+    return lambda: None
+"#;
+        for (body, result, expected) in [
+            (
+                "lambda: _opaque()",
+                "Callable[[], Callable[..., None]]",
+                &[] as &[&str],
+            ),
+            (
+                "lambda: lambda: _opaque()",
+                "Callable[[], Callable[[], Callable[..., None]]]",
+                &[],
+            ),
+            (
+                "lambda: [_opaque() for _ in [1]][0]",
+                "Callable[[], Callable[..., None]]",
+                &[],
+            ),
+            (
+                "lambda: {key: _opaque() for key in ['build']}['build']",
+                "Callable[[], Callable[..., None]]",
+                &[],
+            ),
+            (
+                "lambda: _opaque()()",
+                "Callable[[], None]",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            assert_eq!(
+                validate(
+                    &format!("{helper}def make(): return {body}\n"),
+                    &format!("def make() -> {result}: ...\n"),
+                ),
+                expected,
+                "{body}",
+            );
+        }
+        assert_eq!(
+            validate(
+                "def make(values): return lambda: values.append(1)\n",
+                "def make(values: list[Any]) -> Callable[[], None]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
     }
 
     #[test]
