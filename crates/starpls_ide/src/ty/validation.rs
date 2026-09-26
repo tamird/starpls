@@ -42,6 +42,7 @@ use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::ParameterKind;
 use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
+use ty_python_semantic::types::TypeCheckResult;
 use ty_python_semantic::types::TypeDefinition;
 use ty_python_semantic::FunctionInferenceFacts;
 use ty_python_semantic::FunctionInferenceMode;
@@ -347,11 +348,27 @@ impl Analysis {
                     let mut checked: Vec<_> = starpls_hir::diagnostics_for_file(db, file)
                         .take(128)
                         .collect();
-                    checked.extend(super::diagnostics::check_with_diagnostics(
-                        db,
-                        file,
-                        diagnostics,
-                    ));
+                    let TypeCheckResult {
+                        diagnostics: source_diagnostics,
+                        has_suppressed_inference_diagnostics,
+                    } = super::diagnostics::check_with_status(db, file);
+                    checked.extend(source_diagnostics);
+                    if has_suppressed_inference_diagnostics
+                        && !diagnostics.iter().any(|diagnostic| {
+                            diagnostic.id() == DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name())
+                        })
+                    {
+                        let mut diagnostic = Diagnostic::new(
+                            DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
+                            Severity::Error,
+                            "Cannot validate implementation: type-checking diagnostics were suppressed",
+                        );
+                        diagnostic.annotate(Annotation::primary(Span::from(file.source)));
+                        checked.push(diagnostic);
+                    }
+                    // These outcomes include suppressed checking obligations. Source lint
+                    // suppressions cannot establish that a contract was validated.
+                    checked.extend(diagnostics);
                     (file, checked)
                 })
                 .collect();
@@ -2036,6 +2053,15 @@ def make() -> _Runner: ...
                 "{source}\n{stub}: {diagnostics:?}"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_contract_reports_survive_source_suppression() {
+        let diagnostics = validate(
+            "def make(value): # ty: ignore[incomplete-stub-validation]\n    return value.missing\n",
+            "def make(value: Any) -> Any: ...\n",
+        );
+        assert_eq!(diagnostics, ["incomplete-stub-validation"]);
     }
 
     #[test]

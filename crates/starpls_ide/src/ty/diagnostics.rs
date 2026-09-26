@@ -38,6 +38,7 @@ use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::unreachable_ranges;
 use ty_python_semantic::types::ide_support::unused_definitions;
 use ty_python_semantic::types::Type;
+use ty_python_semantic::types::TypeCheckResult;
 use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::SemanticModel;
 
@@ -149,14 +150,11 @@ pub(super) fn validation_rules() -> RuleSelection {
 }
 
 pub(crate) fn check(db: &Database, file: File) -> Vec<Diagnostic> {
-    check_with_diagnostics(db, file, Vec::new())
+    check_with_status(db, file).diagnostics
 }
 
-pub(super) fn check_with_diagnostics(
-    db: &Database,
-    file: File,
-    mut diagnostics: Vec<Diagnostic>,
-) -> Vec<Diagnostic> {
+pub(super) fn check_with_status(db: &Database, file: File) -> TypeCheckResult {
+    let mut diagnostics = Vec::new();
     let program_file = db.starlark_program_file(file);
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
     let options = db.environment().options(db);

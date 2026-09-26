@@ -230,8 +230,9 @@ Other body expressions require static types, including the signatures of
 callable values.
 
 Ordinary type errors retain their source diagnostics. Failed conservative
-checks, unresolved inference, and suppressed checking failures produce an
-incomplete result. Parameter defaults require static expression evidence or a
+checks and unresolved inference produce an incomplete result. Used type-checking
+suppressions anywhere in a checked file also produce an incomplete result.
+Parameter defaults require static expression evidence or a
 fresh literal construction whose contents are proved independently of the
 parameter type. Default expressions and provider initializers also require
 checking without unresolved or suppressed failures.
