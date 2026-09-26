@@ -1120,7 +1120,9 @@ fn compare_provider<'db>(
                 field.name
             )));
         };
-        compare(
+        // Plain and raw constructors store each argument unchanged in its field,
+        // so this compares declarations rather than independently inferred values.
+        compare_declarations(
             db,
             file,
             &format!("{name}.{}", field.name),
@@ -1433,14 +1435,24 @@ fn compare_function<'db>(
         )
         .unwrap_or(ty)
     };
-    let actual = signature(actual);
-    let expected = signature(expected);
+    compare_declarations(db, file, name, signature(actual), signature(expected))
+}
+
+fn compare_declarations<'db>(
+    db: &'db Database,
+    file: File,
+    name: &str,
+    actual: Type<'db>,
+    expected: Type<'db>,
+) -> Result<(), ContractError> {
+    let environment =
+        ty_python_semantic::ProgramEnvironment::from_file(db.starlark_program_file(file));
     let error = match compare(db, file, name, actual, expected) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
-    // Equivalent gradual signatures describe the same contract. Unknown and provisional
-    // components cannot establish that correspondence; body evidence is checked separately.
+    // Equivalent gradual annotations describe the same declared contract. Unknown and
+    // provisional components cannot establish correspondence; bodies are checked separately.
     if matches!(&error, ContractError::Incomplete(_))
         && actual.is_fully_static_except_any(db, &environment)
         && expected.is_fully_static_except_any(db, &environment)
@@ -2024,6 +2036,46 @@ def make() -> _Runner: ...
                 "{source}\n{stub}: {diagnostics:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_contracts_preserve_equivalent_gradual_storage() {
+        let source = "Info = provider(fields=['value'])\n";
+        let stub = r#"class Info:
+    value: Final[Callable[..., Any]]
+    def __init__(self, *, value: Callable[..., Any]) -> None: ...
+"#;
+        let diagnostics = validation_diagnostics(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mismatched = r#"class Info:
+    value: Final[Callable[[list[Any]], int]]
+    def __init__(self, *, value: Callable[[list[str]], int]) -> None: ...
+"#;
+        assert_eq!(validate(source, mismatched), ["incomplete-stub-validation"]);
+        let unknown = r#"class Info:
+    value: Final[Any]
+    def __init__(self, *, value) -> None: ...
+"#;
+        assert_eq!(validate(source, unknown), ["incomplete-stub-validation"]);
+
+        let source = r#"def _init(value):
+    return {"value": value}
+Info, raw = provider(fields=["value"], init=_init)
+"#;
+        let stub = r#"class Info:
+    value: Final[Callable[..., Any]]
+    def __init__(self, value: Callable[..., Any]) -> None: ...
+def raw(*, value: Callable[..., Any]) -> Info: ...
+"#;
+        let diagnostics = validation_diagnostics(source, stub);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:#?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "incomplete-stub-validation");
+        assert!(
+            diagnostic.headline_message().contains("`Info`"),
+            "{diagnostic:?}"
+        );
     }
 
     #[test]
