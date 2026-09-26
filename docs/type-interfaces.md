@@ -222,9 +222,10 @@ components are fully known. Ordinary inferred return types must establish the
 declared output contract, including the parameter domains of returned callbacks.
 An explicit `Any` return annotation admits every result type.
 
-Function validation checks operations on module globals using conservative
-value bounds. For example, a global `list[Any]` can be read as objects and copied
-into a fresh `list[object]`. Mutations and calls must be valid under those bounds.
+Function validation checks operations on parameters and module globals using
+conservative value bounds. For example, a `list[Any]` can be read as objects and
+copied into a fresh `list[object]`. Mutations and calls must be valid under those
+bounds.
 Other body expressions require static types, including the signatures of
 callable values.
 

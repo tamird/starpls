@@ -1718,7 +1718,7 @@ _LABEL_TYPE = type(Label("//:bogus"))
                 "def make(value: Any): return struct(run=value)",
                 "value: Any",
                 "object",
-                vec!["incomplete-stub-validation"],
+                vec![],
             ),
             (
                 "def make(value: Any): return struct(run=value)",
@@ -3079,6 +3079,54 @@ def collect(extra):
     }
 
     #[test]
+    fn opaque_parameter_inputs_check_consuming_operations() {
+        assert!(validate(
+            "def forward(callback): return callback\n",
+            "def forward(callback: Callable[..., int]) -> Callable[..., int]: ...\n",
+        )
+        .is_empty());
+        let diagnostics = validation_diagnostics(
+            "def collect(values):\n    result = list(values)\n    result.append(1)\n    return result\n",
+            "def collect(values: list[Any]) -> Sequence[object]: ...\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        for body in [
+            "values.append(1)",
+            "values[0] = 1",
+            "alias: list[Any] = values\n    alias.append(1)",
+        ] {
+            assert_eq!(
+                validate(
+                    &format!("def mutate(values):\n    {body}\n    return 1\n"),
+                    "def mutate(values: list[Any]) -> int: ...\n",
+                ),
+                ["incomplete-stub-validation"],
+                "{body}",
+            );
+        }
+        assert_eq!(
+            validate(
+                "def invoke(callback):\n    callback()\n    return 1\n",
+                "def invoke(callback: Callable[..., int]) -> int: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        let source = r#"
+def only_strings(values: list[str]) -> int:
+    return len(values[0])
+def mixed(runner, flag):
+    return runner if flag else struct(run=only_strings)
+"#;
+        let stub = r#"
+class _Runner(Protocol):
+    @property
+    def run(self) -> Callable[[list[Any]], int]: ...
+def mixed(runner: _Runner, flag: bool) -> _Runner: ...
+"#;
+        assert_eq!(validate(source, stub), ["incomplete-stub-validation"]);
+    }
+
+    #[test]
     fn gradual_signatures_require_matching_contracts_and_static_bodies() {
         for annotation in ["Any", "list[Any]", "Callable[..., Any]"] {
             let stub = format!("def compute(value: {annotation}) -> int: ...\n");
@@ -3108,10 +3156,6 @@ def collect(extra):
             (
                 "def compute(value): return 1\n",
                 "def compute(value: Any): ...\n",
-            ),
-            (
-                "def compute(value): return len(value)\n",
-                "def compute(value: list[Any]) -> int: ...\n",
             ),
             (
                 "def compute(value):\n    value.append('x')\n    return 1\n",
@@ -3159,6 +3203,11 @@ def collect(extra):
         assert!(validate(
             "def compute(value): return len(value)\n",
             "def compute(value: list[object]) -> int: ...\n"
+        )
+        .is_empty());
+        assert!(validate(
+            "def compute(value): return len(value)\n",
+            "def compute(value: list[Any]) -> int: ...\n"
         )
         .is_empty());
     }
