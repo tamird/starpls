@@ -1,0 +1,22 @@
+class RuleInfo:
+    executable: Final[bool]
+    implicit_targets: Final[Iterable[str]]
+    kind: Final[Callable[..., Any]]
+    native: Final[bool]
+    providers: Final[Sequence[object]]
+    supports_extension: Final[bool]
+    supports_inheritance: Final[bool]
+    test: Final[bool]
+
+    def __init__(
+        self,
+        *,
+        executable: bool,
+        implicit_targets: Iterable[str],
+        kind: Callable[..., Any],
+        native: bool,
+        providers: Sequence[object],
+        supports_extension: bool,
+        supports_inheritance: bool,
+        test: bool,
+    ) -> None: ...

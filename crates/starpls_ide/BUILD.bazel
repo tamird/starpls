@@ -33,6 +33,7 @@ rust_test(
         "//stubs/bazel_skylib:rules/copy_file.bzli",
         "//stubs/bazel_skylib:rules/write_file.bzli",
         "//stubs/rules_rs:data.bzli",
+        "//stubs/with_cfg:providers.bzli",
         "//stubs/with_cfg:types.bzli",
         "//stubs/with_cfg:with_cfg.bzli",
     ],

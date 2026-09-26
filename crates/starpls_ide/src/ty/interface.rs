@@ -1468,6 +1468,125 @@ def make() -> _Builder: ...
     }
 
     #[test]
+    fn with_cfg_rule_info_preserves_provider_identity() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let fields = concat!(
+            "['executable', 'implicit_targets', 'kind', 'native', 'providers', ",
+            "'supports_extension', 'supports_inheritance', 'test']"
+        );
+        let arguments = concat!(
+            "executable=True, implicit_targets=['%{name}'], kind=lambda: None, ",
+            "native=False, providers=[], supports_extension=True, ",
+            "supports_inheritance=False, test=False"
+        );
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "providers.bzl",
+            &format!(
+                r#"RuleInfo = provider(fields={fields})
+SettingInfo = provider(fields=['operation', 'value'])
+def consume(value: RuleInfo) -> RuleInfo:
+    return value
+original = RuleInfo({arguments})
+"#
+            ),
+        );
+        let interface = fixture.add_file(
+            &mut analysis.db,
+            "providers.bzli",
+            include_str!("../../../../stubs/with_cfg/providers.bzli"),
+        );
+        let caller_text = format!(
+            r#"load('providers.bzl', 'RuleInfo', 'SettingInfo', 'consume', 'original')
+item = consume(RuleInfo({arguments}))
+flag = item.executable
+previous = consume(original)
+setting = SettingInfo(operation='set', value=1)
+value = setting.value
+"#
+        );
+        let caller = fixture.add_file(&mut analysis.db, "main.bzl", &caller_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        let snapshot = analysis.snapshot();
+        for file in [source, interface, caller] {
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+        let hover = snapshot
+            .hover(FilePosition {
+                file_id: caller,
+                pos: (caller_text.find("item.executable").unwrap() as u32 + 5).into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains("executable: bool"),
+            "{}",
+            hover.contents.value
+        );
+        let locations = snapshot
+            .goto_definition(
+                FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.rfind("SettingInfo").unwrap() as u32).into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let [crate::LocationLink::Local {
+            target_file_id,
+            origin_selection_range: _,
+            target_range: _,
+            target_selection_range: _,
+        }] = locations.as_slice()
+        else {
+            panic!("{locations:?}");
+        };
+        assert_eq!(*target_file_id, source.source);
+        drop(snapshot);
+        for (bad_call, expected) in [
+            (
+                format!(
+                    "RuleInfo({})",
+                    arguments.replace("executable=True", "executable='bad'")
+                ),
+                "invalid-argument-type",
+            ),
+            (
+                format!("RuleInfo({})", arguments.replace(", test=False", "")),
+                "missing-argument",
+            ),
+            (
+                format!("Other = provider(fields={fields})\nconsume(Other({arguments}))"),
+                "invalid-argument-type",
+            ),
+        ] {
+            analysis.update_file(caller, format!("{caller_text}{bad_call}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{bad_call}: {diagnostics:?}");
+            };
+            assert_eq!(
+                diagnostic.id().as_str(),
+                expected,
+                "{bad_call}: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_aliases_raw_constructors_and_editor_origins_follow_edits() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);

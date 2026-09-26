@@ -21,6 +21,7 @@ rust_test(
     compile_data = [
         "//stubs/with_cfg:builder.bzli",
         "//stubs/with_cfg:private_helpers.bzli",
+        "//stubs/with_cfg:providers.bzli",
         "//stubs/with_cfg:stubs.toml",
         "//stubs/with_cfg:types.bzli",
         "//stubs/with_cfg:utils.bzli",

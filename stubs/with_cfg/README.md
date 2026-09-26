@@ -37,6 +37,8 @@ Private builder contracts cover `_reset_on_attrs` and `_resettable`. Their
 generic contracts preserve the receiver's type.
 The utility contract declares `is_label(object) -> bool`. Undeclared exports,
 including `make_builder`, continue to use their source definitions.
+`RuleInfo` declares its eight readonly fields and required constructor
+arguments. `providers` exposes a readonly sequence of objects.
 The fluent builder's gradual body types and recursive return values can still
 leave its full validation incomplete.
 
