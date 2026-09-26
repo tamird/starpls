@@ -189,6 +189,11 @@ pub fn system_path(path: &std::path::Path) -> anyhow::Result<&ruff_db::system::S
 
 /// Normalize a host path with the same rules as Ruff's file interner.
 pub fn absolute_path(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        let path = system_path(path)?;
+        // The lexical normalizer ignores its base for absolute paths.
+        return Ok(ruff_db::system::SystemPath::absolute(path, path).into_std_path_buf());
+    }
     let cwd = std::env::current_dir()?;
     let cwd = system_path(&cwd)?;
     let path = system_path(path)?;
