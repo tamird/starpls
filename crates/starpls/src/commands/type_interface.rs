@@ -248,6 +248,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            stubs.join("types.bzli"),
+            include_str!("../../../../stubs/with_cfg/types.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
             stubs.join("private_helpers.bzli"),
             include_str!("../../../../stubs/with_cfg/private_helpers.bzli"),
         )
@@ -275,14 +280,14 @@ mod tests {
                 },
             );
             let (sender, _) = crossbeam_channel::unbounded();
-            let loader = crate::document::DefaultFileLoader::new(
+            let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
                 std::sync::Arc::new(client),
                 workspace.clone(),
                 None,
                 external.clone(),
                 sender,
                 true,
-            );
+            ));
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
@@ -306,6 +311,29 @@ mod tests {
                     ),
                 ]);
                 assert_eq!(actual, expected);
+                let mut analysis = starpls_ide::Analysis::new(loader, Default::default()).unwrap();
+                analysis
+                    .set_builtin_defs(crate::server::load_bazel_builtins(), Default::default())
+                    .unwrap();
+                prepared.install(&mut analysis, &workspace).unwrap();
+                let interface = analysis
+                    .file(
+                        &stubs.join("with_cfg.bzli"),
+                        starpls_common::Dialect::Bazel,
+                        None,
+                    )
+                    .unwrap();
+                let snapshot = analysis.snapshot();
+                let resolution = snapshot.resolve_load(interface, ":types.bzli").unwrap();
+                let starpls_ide::LoadResolution::Resolved(types) = resolution else {
+                    panic!("{resolution:?}");
+                };
+                assert_eq!(snapshot.path(types), stubs.join("types.bzli"));
+                assert!(!snapshot.is_type_interface_root(types));
+                for file in [interface, types] {
+                    let diagnostics = snapshot.diagnostics(file).unwrap();
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                }
             } else {
                 let message = format!("{:#}", prepared.unwrap_err());
                 assert!(

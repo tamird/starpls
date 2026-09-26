@@ -4,5 +4,6 @@ exports_files([
     "README.md",
     "private_helpers.bzli",
     "stubs.toml",
+    "types.bzli",
     "with_cfg.bzli",
 ])

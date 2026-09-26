@@ -1,36 +1,4 @@
-class _Set(Protocol):
-    def __call__(
-        self,
-        setting: str | Label,
-        value: str | Label | int | bool | list[Any] | None | select[str | Label | int | bool | list[Any] | None],
-    ) -> _Builder: ...
-
-class _Extend(Protocol):
-    def __call__(
-        self,
-        setting: str | Label,
-        value: list[Any] | select[list[Any] | None],
-    ) -> _Builder: ...
-
-class _Resettable(Protocol):
-    def __call__(self, label: Label) -> _Builder: ...
-
-class _ResetOnAttrs(Protocol):
-    def __call__(self, *attrs: str) -> _Builder: ...
-
-class _Builder(Protocol):
-    @property
-    def set(self) -> _Set: ...
-    @property
-    def extend(self) -> _Extend: ...
-    @property
-    def resettable(self) -> _Resettable: ...
-    @property
-    def reset_on_attrs(self) -> _ResetOnAttrs: ...
-    @property
-    def clone(self) -> Callable[[], _Builder]: ...
-    @property
-    def build(self) -> Callable[[], tuple[Callable[..., None], rule | None]]: ...
+load(":types.bzli", _Builder = "Builder")
 
 def with_cfg(
     kind: Callable[..., Any],

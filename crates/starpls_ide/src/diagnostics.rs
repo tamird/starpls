@@ -1663,6 +1663,11 @@ def _unused_function() -> rule:
             "with_cfg.bzli",
             include_str!("../../../stubs/with_cfg/with_cfg.bzli"),
         );
+        let types = fixture.add_file(
+            &mut analysis.db,
+            ":types.bzli",
+            include_str!("../../../stubs/with_cfg/types.bzli"),
+        );
         let source = "load('with_cfg.bzl', wrap='with_cfg')\ndef macro(**kwargs): pass\nwrapped, _internal = wrap(macro).set('compilation_mode', 'dbg').set('platforms', select({'//conditions:default': [Label('//:platform')]})).extend('copt', select({'//conditions:default': ['-O0']})).resettable(Label('//:saved')).reset_on_attrs('deps').clone().build()\ndef use():\n    wrapped(name='target')\n";
         let caller = fixture.add_file(&mut analysis.db, "main.bzl", source);
         loader.add_files_from_fixture(&fixture);
@@ -1678,7 +1683,7 @@ def _unused_function() -> rule:
         analysis
             .set_type_interfaces([(implementation, interface)])
             .unwrap();
-        for file in [interface, caller] {
+        for file in [types, interface, caller] {
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }

@@ -6,14 +6,14 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "starpls_ide",
     srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "@crates//:salsa": "salsa",
+    },
     compile_data = [
         "src/ty/collections.pyi",
         "src/ty/primitives.pyi",
         "src/ty/starlark.pyi",
     ],
-    aliases = {
-        "@crates//:salsa": "salsa",
-    },
     deps = all_crate_deps() + [
         "//crates/starpls_bazel",
         "//crates/starpls_common",
@@ -33,6 +33,7 @@ rust_test(
         "//stubs/bazel_skylib:rules/copy_file.bzli",
         "//stubs/bazel_skylib:rules/write_file.bzli",
         "//stubs/rules_rs:data.bzli",
+        "//stubs/with_cfg:types.bzli",
         "//stubs/with_cfg:with_cfg.bzli",
     ],
     crate = ":starpls_ide",
