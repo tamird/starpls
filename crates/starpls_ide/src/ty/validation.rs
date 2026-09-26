@@ -1744,6 +1744,36 @@ def make(values):
     }
 
     #[test]
+    fn reassigned_inputs_preserve_inferred_bounds() {
+        for (annotation, body, expected) in [
+            (
+                "dict[str, list[Any]]",
+                "values = dict(values)\n    return len(values)",
+                vec![],
+            ),
+            (
+                "list[Any]",
+                "values = []\n    values.append(1)\n    return len(values)",
+                vec![],
+            ),
+            (
+                "dict[str, list[Any]]",
+                "values = dict(values)\n    values['key'].append(1)\n    return len(values)",
+                vec!["incomplete-stub-validation"],
+            ),
+        ] {
+            assert_eq!(
+                validate(
+                    &format!("def collect(values):\n    {body}\n"),
+                    &format!("def collect(values: {annotation}) -> int: ...\n")
+                ),
+                expected,
+                "{body}",
+            );
+        }
+    }
+
+    #[test]
     fn module_storage_suppression_keeps_validation_incomplete() {
         let stub = r#"
 class Info:
