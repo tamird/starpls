@@ -1349,6 +1349,9 @@ def consume(values):
 consume([1])
 existing = [1]
 consume(existing)
+fixed = [1]  # type: list[int]
+consume(fixed)
+observed = existing
 "#;
         let file = analysis
             .open_document(
@@ -1363,14 +1366,45 @@ consume(existing)
         let db = &snapshot.db;
         let program_file = db.starlark_program_file(file);
         let diagnostics = ty_python_semantic::check_file_unwrap(db, program_file);
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].id().to_string(), "invalid-argument-type");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected the fixed-type argument error: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().to_string(), "invalid-argument-type");
         assert!(
-            diagnostics[0]
+            diagnostic
                 .concise_message()
                 .to_string()
                 .contains("list[int]"),
             "{diagnostics:?}"
+        );
+        let Some(range) = diagnostic.primary_span().and_then(|span| span.range()) else {
+            panic!("expected the fixed-type argument range: {diagnostic:?}");
+        };
+        assert_eq!(&source[range], "fixed");
+        assert_eq!(
+            usize::from(range.start()),
+            source.find("consume(fixed)").unwrap() + "consume(".len()
+        );
+        let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);
+        let Some(statement) = parsed.suite().last() else {
+            panic!("expected the observation statement");
+        };
+        let Stmt::Assign(assignment) = statement else {
+            panic!("expected the observation assignment");
+        };
+        let ruff_python_ast::StmtAssign {
+            node_index: _,
+            range: _,
+            targets: _,
+            value,
+        } = assignment;
+        let model = SemanticModel::new(db, program_file);
+        let observed = value.inferred_type(&model).unwrap();
+        assert_eq!(
+            observed
+                .display(db, &model.program_environment())
+                .to_string(),
+            "list[int | None]"
         );
     }
 
