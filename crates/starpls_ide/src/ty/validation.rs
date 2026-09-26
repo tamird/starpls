@@ -3724,6 +3724,24 @@ def make() -> _Row: ...
     }
 
     #[test]
+    fn contextual_lambda_inputs_check_consuming_operations() {
+        assert_eq!(
+            validate(
+                "def make(): return lambda values: len(values)\n",
+                "def make() -> Callable[[list[Any]], int]: ...\n",
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(): return lambda values: values.append(1)\n",
+                "def make() -> Callable[[list[Any]], None]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+    }
+
+    #[test]
     fn nested_execution_scopes_check_opaque_operations() {
         let helper = r#"
 def _opaque() -> Callable[..., None]:
