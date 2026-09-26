@@ -981,8 +981,11 @@ impl FileLoader for DefaultFileLoader {
                     Err(err) => return Err(anyhow!("error parsing label: {}", err.err)),
                 };
 
-                // Only .bzl files can be loaded.
-                if !label.target().ends_with(".bzl") {
+                let allow_type_interfaces = from.is_type_interface(db);
+                if !is_loadable_bazel_file(label.target(), allow_type_interfaces) {
+                    if allow_type_interfaces {
+                        bail!("type interfaces can only load .bzl or .bzli files");
+                    }
                     bail!("cannot load a non-bzl file");
                 }
 
@@ -1047,6 +1050,7 @@ impl FileLoader for DefaultFileLoader {
                 Ok(Some(candidates))
             }
             Dialect::Bazel => {
+                let allow_type_interfaces = from.is_type_interface(db);
                 let (label, err) = match Label::parse(path) {
                     Ok(label) => (label, None),
                     Err(PartialParse { partial, err }) => (partial, Some(err)),
@@ -1116,16 +1120,19 @@ impl FileLoader for DefaultFileLoader {
                     Some(ParseError::EmptyPackage) => {
                         // An empty package usually indicates that the user is about to
                         // starting typing the package name.
-                        read_dir_packages_and_targets(root, false).map(Some)
+                        read_dir_packages_and_targets(root, false, allow_type_interfaces).map(Some)
                     }
 
                     Some(ParseError::EmptyTarget) => {
                         // Same logic as above, but for the target.
-                        read_dir_targets(if label.is_relative() {
-                            package
-                        } else {
-                            root.join(label.package())
-                        })
+                        read_dir_targets(
+                            if label.is_relative() {
+                                package
+                            } else {
+                                root.join(label.package())
+                            },
+                            allow_type_interfaces,
+                        )
                         .map(Some)
                     }
 
@@ -1133,13 +1140,14 @@ impl FileLoader for DefaultFileLoader {
                         // TODO(withered-magic): Handle targets like in `//foo:bar/baz.bzl`.
                         if label.is_relative() {
                             // If the label is relative, check for target candidates in the current package.
-                            read_dir_targets(package).map(Some)
+                            read_dir_targets(package, allow_type_interfaces).map(Some)
                         } else if !label.target().is_empty() && !label.has_target_shorthand() {
                             // Check for target candidates in the label's package.
                             let package_dir = root.join(label.package());
                             let (target_dir, _) =
                                 try_opt!(strip_slashes_or_pop_dir(label.target()));
-                            read_dir_targets(package_dir.join(target_dir)).map(Some)
+                            read_dir_targets(package_dir.join(target_dir), allow_type_interfaces)
+                                .map(Some)
                         } else {
                             // Otherwise, find package candidates.
                             let (package_dir, has_trailing_slash) =
@@ -1147,6 +1155,7 @@ impl FileLoader for DefaultFileLoader {
                             read_dir_packages_and_targets(
                                 root.join(package_dir),
                                 has_trailing_slash,
+                                allow_type_interfaces,
                             )
                             .map(Some)
                         }
@@ -1198,9 +1207,14 @@ fn package_for_path(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
     )
 }
 
+fn is_loadable_bazel_file(name: &str, allow_type_interfaces: bool) -> bool {
+    name.ends_with(".bzl") || (allow_type_interfaces && name.ends_with(".bzli"))
+}
+
 fn read_dir_packages_and_targets(
     path: impl AsRef<Path>,
     has_trailing_slash: bool,
+    allow_type_interfaces: bool,
 ) -> anyhow::Result<Vec<LoadItemCandidate>> {
     Ok(fs::read_dir(path)?
         .flatten()
@@ -1218,7 +1232,7 @@ fn read_dir_packages_and_targets(
                         file_name.to_string(),
                         false,
                     )
-                } else if file_name.ends_with(".bzl") {
+                } else if is_loadable_bazel_file(file_name, allow_type_interfaces) {
                     (
                         LoadItemCandidateKind::File,
                         format!(":{}", file_name),
@@ -1237,7 +1251,10 @@ fn read_dir_packages_and_targets(
         .collect())
 }
 
-fn read_dir_targets(path: impl AsRef<Path>) -> anyhow::Result<Vec<LoadItemCandidate>> {
+fn read_dir_targets(
+    path: impl AsRef<Path>,
+    allow_type_interfaces: bool,
+) -> anyhow::Result<Vec<LoadItemCandidate>> {
     Ok(fs::read_dir(path)?
         .flatten()
         .filter_map(|entry| {
@@ -1251,7 +1268,7 @@ fn read_dir_targets(path: impl AsRef<Path>) -> anyhow::Result<Vec<LoadItemCandid
                 Some(LoadItemCandidate {
                     kind: if file_type.is_dir() {
                         LoadItemCandidateKind::Directory
-                    } else if file_name.ends_with(".bzl") {
+                    } else if is_loadable_bazel_file(file_name, allow_type_interfaces) {
                         LoadItemCandidateKind::File
                     } else {
                         return None;
@@ -1712,6 +1729,135 @@ pub(crate) mod source_tests {
             );
         }
         assert!(client.mapping_requests.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn type_interfaces_load_shared_declarations_and_complete_paths() {
+        use starpls_ide::LoadResolution;
+
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("shared-type-interfaces");
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let source_path = workspace.join("defs.bzl");
+        let stub_path = workspace.join("defs.bzli");
+        let shared_path = workspace.join("shared.bzli");
+        let shared = |field_type| {
+            format!(
+                "class Row(Protocol):\n    @property\n    def value(self) -> {field_type}: ...\n"
+            )
+        };
+        std::fs::write(&source_path, "def read(value): return value.value\n").unwrap();
+        std::fs::write(
+            &stub_path,
+            "load(\":shared.bzli\", _Row=\"Row\")\ndef read(value: _Row) -> int: ...\n",
+        )
+        .unwrap();
+        std::fs::write(&shared_path, shared("int")).unwrap();
+        std::fs::write(workspace.join("ignored.txt"), "").unwrap();
+        let (sender, _) = crossbeam_channel::unbounded();
+        let loader = Arc::new(DefaultFileLoader::new(
+            Arc::new(TestBazelClient::default()),
+            workspace.clone(),
+            None,
+            external,
+            sender,
+            false,
+        ));
+        let mut analysis = Analysis::new(loader, Default::default()).unwrap();
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!("builtin/builtin.pb")).unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let source = analysis.file(&source_path, Dialect::Bazel, None).unwrap();
+        let stub = analysis.file(&stub_path, Dialect::Bazel, None).unwrap();
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        {
+            let snapshot = analysis.snapshot();
+            let resolution = snapshot.resolve_load(stub, ":shared.bzli").unwrap();
+            let LoadResolution::Resolved(shared) = resolution else {
+                panic!("{resolution:?}");
+            };
+            assert_eq!(snapshot.path(shared), shared_path);
+            assert!(!snapshot.is_type_interface_root(shared));
+            let resolution = snapshot.resolve_load(source, ":shared.bzli").unwrap();
+            let LoadResolution::Failed(error) = resolution else {
+                panic!("{resolution:?}");
+            };
+            assert_eq!(error, "cannot load a non-bzl file");
+            let resolution = snapshot.resolve_load(stub, ":defs.bzl").unwrap();
+            assert!(
+                matches!(resolution, LoadResolution::Resolved(_)),
+                "{resolution:?}"
+            );
+        }
+
+        for (revision, field_type, expected) in [
+            (0, "int", vec![]),
+            (1, "str", vec!["invalid-return-type"]),
+            (2, "int", vec![]),
+        ] {
+            if revision != 0 {
+                analysis
+                    .open_document(
+                        &shared_path,
+                        Dialect::Bazel,
+                        None,
+                        shared(field_type),
+                        revision,
+                    )
+                    .unwrap();
+            }
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let diagnostics: Vec<_> = reports
+                .into_iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str().to_owned())
+                .collect();
+            assert_eq!(diagnostics, expected, "{field_type}");
+        }
+
+        for (extension, expected) in [
+            ("bzl", vec!["defs.bzl"]),
+            ("bzli", vec!["defs.bzl", "defs.bzli", "shared.bzli"]),
+        ] {
+            for (label, prefix) in [(":", ""), ("//", ":")] {
+                let text = format!("load(\"{label}\", \"value\")\n");
+                let file = analysis
+                    .open_document(
+                        &workspace.join(format!("completion.{extension}")),
+                        Dialect::Bazel,
+                        None,
+                        text.clone(),
+                        1,
+                    )
+                    .unwrap();
+                let candidates = analysis
+                    .snapshot()
+                    .completions(
+                        FilePosition {
+                            file_id: file,
+                            pos: (text.find(label).unwrap() as u32 + label.len() as u32).into(),
+                        },
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mut labels: Vec<_> =
+                    candidates.iter().map(|item| item.label.as_str()).collect();
+                labels.sort_unstable();
+                let expected: Vec<_> = expected
+                    .iter()
+                    .map(|name| format!("{prefix}{name}"))
+                    .collect();
+                assert_eq!(labels, expected, "{extension}: {label}");
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

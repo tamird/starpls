@@ -24,6 +24,24 @@ when present and source inference otherwise. Annotations are resolved in the
 stub's scope. Stubs are trusted contracts; implementation validation is a
 separate check.
 
+### Shared declarations
+
+Stub loads accept `.bzl` and `.bzli` labels. For example, `shared.bzli` can
+declare a public protocol:
+
+```starlark
+class Builder(Protocol):
+    def build(self) -> str: ...
+```
+
+Other stubs can import it under a private local name:
+
+```starlark
+load(":shared.bzli", _Builder = "Builder")
+
+def builder() -> _Builder: ...
+```
+
 ## BUILD annotations
 
 An explicit mapping such as `BUILD.bazel=BUILD.bzli` applies variable annotations
