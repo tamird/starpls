@@ -777,6 +777,54 @@ def register(name: str, visibility: list[str] | None):
     }
 
     #[test]
+    fn native_type_results_preserve_container_tags() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let file = fixture.main_file();
+        for (annotation, expression, expected) in [
+            ("object", "[]", "Literal[\"list\"]"),
+            ("object", "[1, 'x']", "Literal[\"list\"]"),
+            ("list[int]", "value", "Literal[\"list\"]"),
+            ("object", "{}", "Literal[\"dict\"]"),
+            ("object", "{1: 'x', 'y': 2}", "Literal[\"dict\"]"),
+            ("dict[str, int]", "value", "Literal[\"dict\"]"),
+            ("object", "()", "Literal[\"tuple\"]"),
+            ("object", "(1, 'x')", "Literal[\"tuple\"]"),
+            ("set[str]", "value", "Literal[\"set\"]"),
+            ("set[int | str]", "value", "Literal[\"set\"]"),
+            ("object", "value", "str"),
+        ] {
+            let source = format!(
+                "def probe(value: {annotation}):\n    result = type({expression})\n    return result\n"
+            );
+            analysis.update_file(file, source.clone());
+            let snapshot = analysis.snapshot();
+            let hover = snapshot
+                .hover(crate::FilePosition {
+                    file_id: file,
+                    pos: (source.rfind("result").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains(&format!(": {expected}\n")),
+                "{source}\n{}",
+                hover.contents.value
+            );
+            let diagnostics = snapshot.diagnostics(file).unwrap();
+            assert!(diagnostics.is_empty(), "{source}\n{diagnostics:?}");
+        }
+    }
+
+    #[test]
     fn native_type_tests_preserve_collection_arguments() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         analysis

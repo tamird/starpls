@@ -1610,6 +1610,28 @@ _reset_on_attrs(("srcs",), self=1, attrs_to_reset=[], mutable_has_been_built=[Fa
     }
 
     #[test]
+    fn type_predicate_has_static_implementation_evidence() {
+        let source = r#"def is_label(value):
+    return type(value) == _LABEL_TYPE
+
+_LABEL_TYPE = type(Label("//:bogus"))
+"#;
+        let stub = "def is_label(value: object) -> bool: ...\n";
+        let diagnostics = validation_diagnostics(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            validate(
+                &source.replace(
+                    "type(value) == _LABEL_TYPE",
+                    "(type(value) == _LABEL_TYPE, 42)[1]"
+                ),
+                stub
+            ),
+            ["invalid-return-type"]
+        );
+    }
+
+    #[test]
     fn native_rules_without_contracts_remain_unproved() {
         assert_eq!(
             validate(
