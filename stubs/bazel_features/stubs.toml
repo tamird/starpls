@@ -1,0 +1,10 @@
+format-version = 1
+
+[source]
+repository = "@bazel_features"
+module = "bazel_features"
+versions = ["1.50.0"]
+
+[files]
+"private/parse.bzl" = "private/parse.bzli"
+"private/util.bzl" = "private/util.bzli"
