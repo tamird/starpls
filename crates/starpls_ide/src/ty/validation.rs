@@ -1706,6 +1706,44 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_copies_preserve_nested_input_bounds() {
+        let source = r#"
+def make(values):
+    copied = dict(values)
+    return len(copied)
+"#;
+        for value in ["int", "list[Any]"] {
+            let stub = format!("def make(values: dict[str, {value}]) -> int: ...\n");
+            let diagnostics = validate(source, &stub);
+            assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        }
+        assert_eq!(
+            validate(
+                r#"
+def make(values):
+    copied = dict(values)
+    copied["key"].append(1)
+    return len(copied)
+"#,
+                "def make(values: dict[str, list[Any]]) -> int: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        assert!(validate(
+            "def make(): return dict()\n",
+            "def make() -> dict[str, int]: ...\n",
+        )
+        .is_empty());
+        assert_eq!(
+            validate(
+                "def make(): return len(dict(1))\n",
+                "def make() -> int: ...\n",
+            ),
+            ["no-matching-overload"],
+        );
+    }
+
+    #[test]
     fn module_storage_suppression_keeps_validation_incomplete() {
         let stub = r#"
 class Info:
