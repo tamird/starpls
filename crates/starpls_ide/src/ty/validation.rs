@@ -1097,6 +1097,28 @@ fn compare_provider<'db>(
         }
         super::factory::ProviderInitializer::Unknown => return Err(incomplete()),
     }
+    compare_provider_constructor(
+        db,
+        file,
+        name,
+        expected,
+        raw_signature,
+        &fields,
+        data.fields.as_deref(),
+    )
+}
+
+fn compare_provider_constructor<'db>(
+    db: &'db Database,
+    file: File,
+    name: &str,
+    expected: Type<'db>,
+    raw_signature: Option<Signature<'db>>,
+    fields: &[ty_python_semantic::provided::ProvidedField<'db>],
+    allowed: Option<&[Name]>,
+) -> Result<(), ContractError> {
+    let environment =
+        ty_python_semantic::ProgramEnvironment::from_file(db.starlark_program_file(file));
     let signature = raw_signature
         .or_else(|| callable_signature(db, &environment, expected))
         .ok_or_else(|| {
@@ -1106,7 +1128,7 @@ fn compare_provider<'db>(
         })?;
     for parameter in signature.parameters().iter() {
         if matches!(parameter.kind(), ParameterKind::KeywordVariadic { name: _ })
-            && data.fields.is_none()
+            && allowed.is_none()
         {
             continue;
         }
@@ -1119,11 +1141,7 @@ fn compare_provider<'db>(
                 "Provider `{name}` accepts only keyword field arguments"
             )));
         };
-        if data
-            .fields
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(parameter_name))
-        {
+        if allowed.is_some_and(|allowed| !allowed.contains(parameter_name)) {
             return Err(ContractError::Incompatible(format!(
                 "Provider `{name}` does not accept constructor argument `{parameter_name}`"
             )));
@@ -1148,6 +1166,94 @@ fn compare_provider<'db>(
         )?;
     }
     Ok(())
+}
+
+fn plain_provider_fields<'db>(
+    db: &'db Database,
+    ty: Type<'db>,
+    environment: &ty_python_semantic::ProgramEnvironment<'db>,
+) -> Option<Vec<ty_python_semantic::provided::ProvidedField<'db>>> {
+    let Type::ClassLiteral(_) = ty else {
+        return None;
+    };
+    let definition = super::interface::provider_definition(db, ty, environment)?;
+    let allowed = super::interface::plain_provider_schema(db, definition)?;
+    let fields = super::interface::provider_fields(db, ty, environment)?;
+    if fields.iter().any(|field| !allowed.contains(&field.name)) {
+        return None;
+    }
+    let file = db.starlark_file(definition.program_file(db))?;
+    compare_provider_constructor(
+        db,
+        file,
+        &definition.name(db)?,
+        ty,
+        None,
+        &fields,
+        Some(&allowed),
+    )
+    .ok()?;
+    Some(fields)
+}
+
+pub(super) fn call_diagnostics(
+    db: &Database,
+    call: &ty_python_semantic::types::CheckedCall<'_, '_>,
+) -> Vec<Diagnostic> {
+    use ty_python_semantic::types::CheckedArgument;
+
+    let validation = db.environment().stub_validation(db);
+    if validation.phase != StubValidationPhase::Ordinary
+        || !validation.files.contains(&call.file().file(db))
+        || call.has_binding_errors()
+    {
+        return Vec::new();
+    }
+    let environment = ty_python_semantic::ProgramEnvironment::from_file(call.file());
+    let Some(fields) = call
+        .expression_type(&call.call().func)
+        .and_then(|ty| plain_provider_fields(db, ty, &environment))
+    else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    for field in fields {
+        let (range, reason) = match call.argument(&field.name) {
+            CheckedArgument::Value { ty, expression } => {
+                if field.ty.is_explicit_any(db)
+                    || ty.is_pure_redundant_with(db, &environment, field.ty)
+                {
+                    continue;
+                }
+                (
+                    expression.map_or(call.call().range(), Ranged::range),
+                    format!(
+                        "argument type `{}` does not preserve declared type `{}`",
+                        ty.display(db, &environment),
+                        field.ty.display(db, &environment),
+                    ),
+                )
+            }
+            CheckedArgument::Omitted => (
+                call.call().range(),
+                "no argument establishes the required field".to_owned(),
+            ),
+            CheckedArgument::Indeterminate => (
+                call.call().range(),
+                "argument matching does not identify one definite field value".to_owned(),
+            ),
+        };
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
+            Severity::Error,
+            format!("Cannot prove constructor field `{}`: {reason}", field.name),
+        );
+        diagnostic.annotate(Annotation::primary(
+            Span::from(call.file().file(db)).with_range(range),
+        ));
+        diagnostics.push(diagnostic);
+    }
+    diagnostics
 }
 
 fn compare_initializer<'db>(
@@ -1305,13 +1411,18 @@ fn has_static_evidence(
     use ruff_python_ast::visitor::{self};
 
     struct Evidence<'a, 'db> {
+        db: &'db Database,
         model: &'a SemanticModel<'db>,
         complete: bool,
         conservative: bool,
     }
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
-            if !expression_has_evidence(self.model, expression, self.conservative) {
+            if !expression_has_evidence(self.model, expression, self.conservative)
+                && !expression.inferred_type(self.model).is_some_and(|ty| {
+                    plain_provider_fields(self.db, ty, &self.model.program_environment()).is_some()
+                })
+            {
                 self.complete = false;
             }
             visitor::walk_expr(self, expression);
@@ -1340,6 +1451,7 @@ fn has_static_evidence(
         body,
     } = function;
     let mut evidence = Evidence {
+        db,
         model: &model,
         complete: true,
         conservative: false,
@@ -1552,6 +1664,41 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn module_storage_suppression_keeps_validation_incomplete() {
+        let stub = r#"
+class Info:
+    run: Final[Callable[[list[Any]], int]]
+    def __init__(self, *, run: Callable[[list[Any]], int]) -> None: ...
+def make() -> Info: ...
+"#;
+        for suppression in ["", " # ty: ignore[incomplete-stub-validation]"] {
+            let source = format!(
+                r#"
+Info = provider(fields=["run"])
+def _only_strings(values: list[str]) -> int:
+    return len(values[0])
+_BAD = Info(run=_only_strings){suppression}
+def make():
+    return _BAD
+"#
+            );
+            assert_eq!(validate(&source, stub), ["incomplete-stub-validation"]);
+        }
+        assert_eq!(
+            validate(
+                "def _unused():\n    return 1\ndef make(): return 1\n",
+                "def make() -> int: ...\n",
+            ),
+            ["unused-definition"],
+        );
+        assert!(validate(
+            "def _unused(): # ty: ignore[unused-definition]\n    return 1\ndef make(): return 1\n",
+            "def make() -> int: ...\n",
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2062,6 +2209,148 @@ def make() -> _Runner: ...
             "def make(value: Any) -> Any: ...\n",
         );
         assert_eq!(diagnostics, ["incomplete-stub-validation"]);
+    }
+
+    #[test]
+    fn plain_provider_calls_check_stored_values() {
+        let provider = "Info = provider(fields=['run'])\n";
+        let declaration = r#"class Info:
+    run: Final[Callable[[list[Any]], int]]
+    def __init__(self, *, run: Callable[[list[Any]], int]) -> None: ...
+"#;
+        let narrow = r#"def _only_strings(values: list[str]) -> int:
+    return len(values[0])
+"#;
+        let safe = r#"def _all_objects(values: Sequence[object]) -> int:
+    return len(values)
+"#;
+        for (name, helper, source, contract, expected) in [
+            (
+                "forward",
+                "",
+                "def make(run):\n    return Info(run=run)\n",
+                "def make(run: Callable[[list[Any]], int]) -> Info: ...\n",
+                false,
+            ),
+            (
+                "sequence",
+                safe,
+                "def make():\n    return Info(run=_all_objects)\n",
+                "def make() -> Info: ...\n",
+                false,
+            ),
+            (
+                "constructor alias",
+                "",
+                "def make(run):\n    constructor = Info\n    return constructor(run=run)\n",
+                "def make(run: Callable[[list[Any]], int]) -> Info: ...\n",
+                false,
+            ),
+            (
+                "direct",
+                narrow,
+                "def make():\n    return Info(run=_only_strings)\n",
+                "def make() -> Info: ...\n",
+                true,
+            ),
+            (
+                "local result",
+                narrow,
+                "def make():\n    result = Info(run=_only_strings)\n    return result\n",
+                "def make() -> Info: ...\n",
+                true,
+            ),
+            (
+                "annotated callback alias",
+                narrow,
+                "def make():\n    callback: Callable[[list[Any]], int] = _only_strings\n    return Info(run=callback)\n",
+                "def make() -> Info: ...\n",
+                true,
+            ),
+            (
+                "nested lambda",
+                narrow,
+                "def make():\n    return lambda: Info(run=_only_strings)\n",
+                "def make() -> Callable[[], Info]: ...\n",
+                true,
+            ),
+            (
+                "default",
+                narrow,
+                "def make(value=Info(run=_only_strings)):\n    return value\n",
+                "def make(value: Info = ...) -> Info: ...\n",
+                true,
+            ),
+            (
+                "suppressed body",
+                narrow,
+                "def make():\n    return Info(run=_only_strings) # ty: ignore[incomplete-stub-validation]\n",
+                "def make() -> Info: ...\n",
+                true,
+            ),
+            (
+                "suppressed default",
+                narrow,
+                "def make(value=Info(run=_only_strings)): # ty: ignore[incomplete-stub-validation]\n    return value\n",
+                "def make(value: Info = ...) -> Info: ...\n",
+                true,
+            ),
+        ] {
+            let source = format!("{provider}{helper}{source}");
+            let stub = format!("{declaration}{contract}");
+            let diagnostics = validation_diagnostics(&source, &stub);
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                if expected {
+                    vec!["incomplete-stub-validation"]
+                } else {
+                    Vec::new()
+                },
+                "{name}: {diagnostics:#?}"
+            );
+        }
+        let source = "Info = provider(fields={'run': 'Callback'})\ndef make(run):\n    return Info(run=run)\n";
+        let stub = format!("{declaration}def make(run: Callable[[list[Any]], int]) -> Info: ...\n");
+        let diagnostics = validation_diagnostics(source, &stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        for provider in [
+            "native_provider = provider\nprovider = native_provider\nInfo = provider(fields=['run'])\n",
+            "native_provider = provider\nInfo = native_provider(fields=['run'])\n",
+        ] {
+            let source = format!("{provider}def make(run):\n    return Info(run=run)\n");
+            let stub = format!("{declaration}def make(run: Callable[[list[Any]], int]) -> Info: ...\n");
+            assert_eq!(validate(&source, &stub), ["incomplete-stub-validation"], "{source}");
+        }
+
+        let stub = r#"class Info:
+    run: Final[Any]
+    def __init__(self, *, run: Any) -> None: ...
+def make() -> Info: ...
+"#;
+        let source = "Info = provider(fields=['run'])\ndef make():\n    return Info(run=42)\n";
+        let diagnostics = validation_diagnostics(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let stub = r#"class Info:
+    run: Final[_Missing]
+    def __init__(self, *, run: _Missing) -> None: ...
+def make() -> Info: ...
+"#;
+        let diagnostics = validate(
+            "Info = provider(fields=['run'])\ndef make():\n    return Info(run=42)\n",
+            stub,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

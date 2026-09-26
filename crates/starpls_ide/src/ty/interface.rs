@@ -25,6 +25,7 @@ use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
 use ty_python_core::place_table;
+use ty_python_core::semantic_index;
 use ty_python_core::use_def_map;
 use ty_python_core::ProgramFile;
 use ty_python_semantic::provided::ProvidedField;
@@ -617,6 +618,103 @@ fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definiti
         }
     }
     pairs
+}
+
+/// Finite storage declared by an unshadowed native provider without an initializer.
+#[salsa::tracked(returns(clone))]
+pub(super) fn plain_provider_schema<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Option<Box<[Name]>> {
+    let DefinitionKind::Class(class) = definition.kind(db) else {
+        return None;
+    };
+    let declaration = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
+    if class.node(&declaration).type_params.is_some() {
+        return None;
+    }
+    let mut origins = provider_pairs(db)
+        .iter()
+        .filter(|(_, definitions)| definitions.as_slice() == [definition])
+        .map(|(origin, _)| *origin);
+    let (file, node) = origins.next()?;
+    if origins.next().is_some() {
+        return None;
+    }
+    let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+    let ruff_python_ast::AnyRootNodeRef::Expr(Expr::Call(call)) =
+        parsed.get_by_index(NodeIndex::from(node))
+    else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    let scope = global_scope(db, file);
+    if semantic_index(db, file).try_expression_scope_id(&ruff_python_ast::ExprRef::from(call))?
+        != scope.file_scope_id(db)
+        || place_table(db, scope)
+            .symbol_by_name(&callee.id)
+            .is_some_and(|symbol| symbol.is_bound() || symbol.is_declared())
+    {
+        return None;
+    }
+    let model = SemanticModel::new(db, file);
+    let callee = model.builtin_type(
+        &callee.id,
+        ty_python_semantic::provided::BuiltinUsage::Runtime,
+    )?;
+    let Some(TypeDefinition::Function(callee)) =
+        callee.definition(db, &model.program_environment())
+    else {
+        return None;
+    };
+    if !matches!(
+        super::factory::declaration(db, callee),
+        Some(super::factory::BuiltinFunction::Provider)
+    ) || !call.arguments.args.is_empty()
+    {
+        return None;
+    }
+    let mut fields = None;
+    for keyword in &call.arguments.keywords {
+        match keyword.arg.as_ref()?.as_str() {
+            "fields" => {
+                if fields.is_some() {
+                    return None;
+                }
+                let elements: Vec<_> = match &keyword.value {
+                    Expr::List(list) => list.elts.iter().collect(),
+                    Expr::Tuple(tuple) => tuple.elts.iter().collect(),
+                    Expr::Dict(dict) => dict
+                        .items
+                        .iter()
+                        .map(|item| item.key.as_ref())
+                        .collect::<Option<_>>()?,
+                    _ => return None,
+                };
+                fields = Some(
+                    elements
+                        .into_iter()
+                        .map(|element| {
+                            let Expr::StringLiteral(literal) = element else {
+                                return None;
+                            };
+                            Some(Name::new(literal.value.to_str()))
+                        })
+                        .collect::<Option<Box<[_]>>>()?,
+                );
+            }
+            "init" => {
+                if !matches!(keyword.value, Expr::NoneLiteral(_)) {
+                    return None;
+                }
+            }
+            "doc" => {}
+            _ => return None,
+        }
+    }
+    fields
 }
 
 fn provider_origin<'db>(

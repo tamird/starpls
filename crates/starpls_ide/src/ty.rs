@@ -502,8 +502,11 @@ impl ty_python_semantic::Db for Database {
     fn provided_call_result<'db>(
         &'db self,
         call: &ty_python_semantic::types::CheckedCall<'_, 'db>,
-    ) -> Option<ty_python_semantic::types::Type<'db>> {
-        factory::result(self, call)
+    ) -> ty_python_semantic::provided::ProvidedCallResult<'db> {
+        ty_python_semantic::provided::ProvidedCallResult {
+            return_type: factory::result(self, call),
+            diagnostics: validation::call_diagnostics(self, call),
+        }
     }
 
     fn provided_function_type_check_only(&self, definition: Definition<'_>) -> bool {

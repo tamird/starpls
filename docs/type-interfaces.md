@@ -90,6 +90,10 @@ source instances, callers, annotations, and `Target` lookups. Multiple distinct
 classes claiming the same declaration are an error. A stub may expose a subset
 of the fields allowed by the source provider.
 
+Validation of plain provider calls checks each field value against its declared
+type. A stored callback must accept the parameter domain promised by that
+declaration. An explicit `Any` field accepts every value type.
+
 For a provider with an initializer, `__init__` describes the initializer's public
 arguments. An exported raw constructor has its own declaration:
 
