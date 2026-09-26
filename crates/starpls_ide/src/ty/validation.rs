@@ -10,6 +10,7 @@ use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprContext;
 use ruff_python_ast::ExprName;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
@@ -1434,7 +1435,14 @@ fn has_static_evidence(
             if self.is_unreachable(expression.range()) {
                 return;
             }
-            if !expression_has_evidence(self.model, expression, self.conservative)
+            // Inference types the leaves of a binding pattern, not its container.
+            let binding_pattern = match expression {
+                Expr::Tuple(tuple) => tuple.ctx == ExprContext::Store,
+                Expr::List(list) => list.ctx == ExprContext::Store,
+                _ => false,
+            };
+            if !binding_pattern
+                && !expression_has_evidence(self.model, expression, self.conservative)
                 && !expression.inferred_type(self.model).is_some_and(|ty| {
                     plain_provider_fields(self.db, ty, &self.model.program_environment()).is_some()
                 })
@@ -1707,28 +1715,55 @@ mod tests {
 
     #[test]
     fn dictionary_copies_preserve_nested_input_bounds() {
-        let source = r#"
-def make(values):
-    copied = dict(values)
-    return len(copied)
-"#;
-        for value in ["int", "list[Any]"] {
-            let stub = format!("def make(values: dict[str, {value}]) -> int: ...\n");
-            let diagnostics = validate(source, &stub);
-            assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
-        }
-        assert_eq!(
-            validate(
+        for copy in [
+            "dict(values)",
+            "{key: value for key, value in values.items()}",
+        ] {
+            let source = format!(
                 r#"
 def make(values):
-    copied = dict(values)
+    copied = {copy}
+    return len(copied)
+"#
+            );
+            for value in ["int", "list[Any]"] {
+                let stub = format!("def make(values: dict[str, {value}]) -> int: ...\n");
+                let diagnostics = validate(&source, &stub);
+                assert!(diagnostics.is_empty(), "{copy}, {value}: {diagnostics:?}");
+            }
+            assert_eq!(
+                validate(
+                    &format!(
+                        r#"
+def make(values):
+    copied = {copy}
     copied["key"].append(1)
     return len(copied)
-"#,
-                "def make(values: dict[str, list[Any]]) -> int: ...\n",
-            ),
-            ["incomplete-stub-validation"],
-        );
+"#
+                    ),
+                    "def make(values: dict[str, list[Any]]) -> int: ...\n",
+                ),
+                ["incomplete-stub-validation"],
+                "{copy}",
+            );
+            assert_eq!(
+                validate(
+                    &format!(
+                        r#"
+def _mutate(values: dict[str, list[Any]]) -> None:
+    values["key"].append(1)
+def make(values):
+    copied = {copy}
+    _mutate(copied)
+    return len(copied)
+"#
+                    ),
+                    "def make(values: dict[str, list[Any]]) -> int: ...\n",
+                ),
+                ["incomplete-stub-validation"],
+                "{copy}",
+            );
+        }
         assert!(validate(
             "def make(): return dict()\n",
             "def make() -> dict[str, int]: ...\n",
@@ -1740,6 +1775,31 @@ def make(values):
                 "def make() -> int: ...\n",
             ),
             ["no-matching-overload"],
+        );
+    }
+
+    #[test]
+    fn binding_patterns_preserve_runtime_evidence() {
+        assert!(validate(
+            r#"
+def make():
+    [first, (second, third)] = (1, (2, 3))
+    return first + second + third
+"#,
+            "def make() -> int: ...\n",
+        )
+        .is_empty());
+        assert_eq!(
+            validate(
+                r#"
+def make():
+    values = [0]
+    [values[(lambda item: item)(0)], result] = (1, 2)
+    return result
+"#,
+                "def make() -> int: ...\n",
+            ),
+            ["incomplete-stub-validation"],
         );
     }
 
