@@ -377,7 +377,7 @@ fn declarations(
             names.insert("__call__");
             writeln!(
                 body,
-                "        def __call__(self, **kwargs: _starpls_typing.Any) -> None: ..."
+                "        def __call__(self, *, name: _starpls_builtins.str, **kwargs: _starpls_typing.Any) -> None: ..."
             )?;
         }
         for field in &class.field {
@@ -2293,6 +2293,29 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
                             .is_some_and(|range| range.start().to_usize() >= source.len())),
                 "{call}: {diagnostics:?}"
             );
+        }
+        for annotation in ["rule", "macro"] {
+            for (call, expected) in [
+                ("value(name='accepted')", None),
+                ("value(name='accepted', custom=1)", None),
+                ("value()", Some("missing-argument")),
+                ("value(name=1)", Some("invalid-argument-type")),
+            ] {
+                analysis.update_file(
+                    file,
+                    format!("def invoke(value: {annotation}):\n    {call}\n"),
+                );
+                let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+                let ids: Vec<_> = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{annotation}: {call}: {diagnostics:?}"
+                );
+            }
         }
     }
 
