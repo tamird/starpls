@@ -2545,6 +2545,65 @@ example, register = make_rule(False)
     }
 
     #[test]
+    fn dictionary_union_attributes_preserve_required_inputs() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"def implementation(ctx): return []
+base = {"exports": attr.label(mandatory=True), "count": attr.string()}
+extra = {"count": attr.int()}
+target_test = rule(implementation, attrs=base | extra, test=True)
+target_test($0name="valid", exports="//:input", count=1)
+"#,
+        );
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let (file_id, pos) = fixture.cursor_pos.unwrap();
+        let snapshot = analysis.snapshot();
+        let help = snapshot
+            .signature_help(FilePosition { file_id, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}");
+        };
+        assert!(
+            signature
+                .label
+                .contains("exports: Label | str | select[Label | str | None]"),
+            "{help:?}"
+        );
+        assert!(
+            signature
+                .label
+                .contains("count: int | select[int | None] | None = ..."),
+            "{help:?}"
+        );
+        assert!(!signature.label.contains("**kwargs"), "{help:?}");
+        let diagnostics = snapshot.diagnostics(file_id).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(snapshot);
+        analysis.update_file(
+            file_id,
+            r#"def implementation(ctx): return []
+base = {"exports": attr.label(mandatory=True)}
+extra = {"count": attr.int()}
+target_test = rule(implementation, attrs=base | extra, test=True)
+target_test(name="missing")
+"#
+            .to_owned(),
+        );
+        let diagnostics = analysis.snapshot().diagnostics(file_id).unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].id().as_str(), "missing-argument");
+    }
+
+    #[test]
     fn mutated_rule_attributes_keep_types_and_requiredness() {
         let (mut analysis, _) = Analysis::new_for_test();
         let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
