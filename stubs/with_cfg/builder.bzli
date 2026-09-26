@@ -1,15 +1,17 @@
-def _resettable[T](
+load(":types.bzli", _Builder = "Builder")
+
+def _resettable(
     label: Label,
     *,
-    self: T,
+    self: _Builder,
     mutable_original_settings_label: list[Label],
     mutable_has_been_built: list[bool],
-) -> T: ...
+) -> _Builder: ...
 
-def _reset_on_attrs[T](
+def _reset_on_attrs(
     attrs: tuple[str, ...],
     *,
-    self: T,
+    self: _Builder,
     attrs_to_reset: list[str],
     mutable_has_been_built: list[bool],
-) -> T: ...
+) -> _Builder: ...

@@ -33,8 +33,8 @@ implementation separately. The private module interface declares
 `_all_providers`; implementation validation checks their bodies. The collector
 accepts iterable values and exposes its result as a readonly sequence of
 objects. Provider-specific operations require a more specific element contract.
-Private builder contracts cover `_reset_on_attrs` and `_resettable`. Their
-generic contracts preserve the receiver's type.
+Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
+use the shared `Builder` type for their receiver and result.
 The utility contract declares `is_label(object) -> bool`. Undeclared exports,
 including `make_builder`, continue to use their source definitions.
 `RuleInfo` declares its eight readonly fields and required constructor
