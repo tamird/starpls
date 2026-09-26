@@ -3937,16 +3937,55 @@ _caller()
                     .iter()
                     .map(|diagnostic| diagnostic.id().as_str())
                     .collect::<Vec<_>>(),
-                if redirected {
-                    vec!["incomplete-stub-validation"]
-                } else {
-                    vec![]
-                },
+                Vec::<&str>::new(),
                 "redirected={redirected}: {diagnostics:?}"
             );
             assert_eq!(
                 analysis.db.environment().stub_validation(&analysis.db),
                 &previous
+            );
+        }
+
+        analysis
+            .set_type_interfaces([(source, stub), (helper, helper_stub)])
+            .unwrap();
+        analysis.update_file(stub, declaration.to_owned());
+        for narrow in [false, true, false] {
+            let argument = if narrow { "_narrow" } else { "callback" };
+            let helper = if narrow {
+                "def _narrow(values: list[str]) -> int: return len(values)\n"
+            } else {
+                ""
+            };
+            analysis.update_file(
+                source,
+                format!(
+                    "load('helper.bzl', _forward='forward')
+forward = _forward
+{helper}def make(callback): return forward({argument})
+"
+                ),
+            );
+            let previous = analysis
+                .db
+                .environment()
+                .stub_validation(&analysis.db)
+                .clone();
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let diagnostics: Vec<_> = reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str())
+                .collect();
+            let expected: &[&str] = if narrow {
+                &["incomplete-stub-validation"]
+            } else {
+                &[]
+            };
+            assert_eq!(diagnostics, expected, "narrow={narrow}: {reports:?}");
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous,
             );
         }
     }

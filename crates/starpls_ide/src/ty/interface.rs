@@ -21,6 +21,7 @@ use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_hir::Db as _;
+use starpls_hir::ValidationAnnotation;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
@@ -548,6 +549,16 @@ impl Database {
         name: &str,
     ) -> ProgramFile<'db> {
         if let Some(interface) = self.type_interface(from, source) {
+            if !from.is_type_interface(self)
+                && self
+                    .environment()
+                    .stub_validation(self)
+                    .files
+                    .contains(&from.source)
+                && selected_function_import(self, source, interface, Name::new(name))
+            {
+                return self.starlark_program_file(source);
+            }
             let file = self.starlark_program_file(interface);
             if !export_definitions(self, file, name).is_empty() {
                 return file;
@@ -894,6 +905,40 @@ pub(super) fn is_function_contract<'db>(
             .is_some_and(|name| !export_definitions(db, implementation, &name).is_empty())
 }
 
+/// Preserve an exact selected implementation across a runtime import.
+/// Tracking the decision isolates cross-file definition changes from caller inference.
+#[salsa::tracked(returns(copy))]
+fn selected_function_import(db: &dyn Db, source: File, interface: File, name: Name) -> bool {
+    let function_node = |file| {
+        let scope = global_scope(db, db.starlark_program_file(file));
+        let symbol = place_table(db, scope).symbol_id(&name)?;
+        let mut bindings = use_def_map(db, scope).end_of_scope_symbol_bindings(symbol);
+        let binding = bindings.next()?;
+        if bindings.next().is_some() {
+            return None;
+        }
+        let definition = binding.binding.definition()?;
+        let DefinitionKind::Function(function) = definition.kind(db) else {
+            return None;
+        };
+        Some(function.node_key().index())
+    };
+    let Some(source_owner) = function_node(source) else {
+        return false;
+    };
+    let Some(interface_owner) = function_node(interface) else {
+        return false;
+    };
+    db.environment()
+        .stub_validation(db)
+        .annotations
+        .get(&(source.source, source_owner))
+        == Some(&ValidationAnnotation::Declaration {
+            file: interface,
+            owner: interface_owner,
+        })
+}
+
 pub(crate) fn export_definitions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
@@ -912,14 +957,151 @@ pub(crate) fn export_definitions<'db>(
 
 #[cfg(test)]
 mod tests {
+    use salsa::Setter;
     use starpls_bazel::APIContext;
     use starpls_common::Dialect;
     use starpls_common::FileInfo;
+    use starpls_hir::Db as _;
     use starpls_hir::Fixture;
+    use starpls_hir::StubValidation;
+    use starpls_hir::StubValidationPhase;
+    use starpls_hir::ValidationAnnotation;
+    use ty_python_core::definition::DefinitionKind;
 
     use crate::Analysis;
     use crate::FilePosition;
     use crate::LocationLink;
+
+    #[test]
+    fn selected_function_imports_require_definite_pairs() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let function = "def forward(value): return value\n";
+        let declaration = "def forward(value: object) -> object: ...\n";
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", function);
+        let other = fixture.add_file(&mut analysis.db, "other.bzl", function);
+        let interface = fixture.add_file(&mut analysis.db, "shared.bzli", declaration);
+        let caller = fixture.add_file(&mut analysis.db, "caller.bzl", "");
+        let annotation = fixture.add_file(&mut analysis.db, "caller.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_type_interfaces([(source, interface), (other, interface)])
+            .unwrap();
+        // The broad export candidates let these rows pair a function even when an
+        // unavailable or competing binding prevents preserving its import identity.
+        let node = |db: &crate::Database, file| {
+            super::export_definitions(db, db.starlark_program_file(file), "forward")
+                .into_iter()
+                .find_map(|definition| {
+                    let DefinitionKind::Function(function) = definition.kind(db) else {
+                        return None;
+                    };
+                    Some(function.node_key().index())
+                })
+        };
+        let source_owner = node(&analysis.db, source).unwrap();
+        let interface_owner = node(&analysis.db, interface).unwrap();
+        let environment = analysis.db.environment();
+        let previous = environment.stub_validation(&analysis.db).clone();
+        for phase in [
+            StubValidationPhase::Ordinary,
+            StubValidationPhase::Conservative,
+        ] {
+            let mut validation = StubValidation {
+                phase,
+                annotations: Default::default(),
+                provider_returns: Default::default(),
+                files: Default::default(),
+            };
+            validation.files.extend([caller.source, annotation.source]);
+            validation.annotations.insert(
+                (source.source, source_owner),
+                ValidationAnnotation::Declaration {
+                    file: interface,
+                    owner: interface_owner,
+                },
+            );
+            environment
+                .set_stub_validation(&mut analysis.db)
+                .to(validation);
+            for (from, loaded, expected) in [
+                (caller, source, source),
+                (caller, other, interface),
+                (annotation, source, interface),
+                (other, source, interface),
+            ] {
+                assert_eq!(
+                    analysis.db.load_export_file(from, loaded, "forward"),
+                    analysis.db.starlark_program_file(expected),
+                );
+            }
+        }
+        for (changed, text, definite) in [
+            (
+                source,
+                format!("{function}if False:\n    forward = None\n"),
+                true,
+            ),
+            (source, format!("if flag:\n    {function}"), false),
+            (
+                source,
+                format!("{function}if flag:\n    def forward(value): return value\n"),
+                false,
+            ),
+            (source, format!("{function}forward = forward\n"), false),
+            (source, "load('other.bzl', 'forward')\n".to_owned(), false),
+            (source, function.to_owned(), true),
+            (
+                interface,
+                "forward: Callable[[object], object]\n".to_owned(),
+                false,
+            ),
+            (
+                interface,
+                "load('other.bzl', 'forward')\n".to_owned(),
+                false,
+            ),
+            (interface, declaration.to_owned(), true),
+        ] {
+            analysis.update_file(changed, text.clone());
+            let mut validation = environment.stub_validation(&analysis.db).clone();
+            validation.annotations.clear();
+            validation.annotations.insert(
+                (
+                    source.source,
+                    node(&analysis.db, source).unwrap_or(source_owner),
+                ),
+                ValidationAnnotation::Declaration {
+                    file: interface,
+                    owner: node(&analysis.db, interface).unwrap_or(interface_owner),
+                },
+            );
+            environment
+                .set_stub_validation(&mut analysis.db)
+                .to(validation);
+            assert_eq!(
+                super::selected_function_import(&analysis.db, source, interface, "forward".into(),),
+                definite,
+                "{text}",
+            );
+            if changed == source {
+                assert_eq!(
+                    analysis.db.load_export_file(caller, source, "forward"),
+                    analysis
+                        .db
+                        .starlark_program_file(if definite { source } else { interface }),
+                    "{text}",
+                );
+            }
+        }
+        environment
+            .set_stub_validation(&mut analysis.db)
+            .to(previous);
+        assert_eq!(
+            analysis.db.load_export_file(caller, source, "forward"),
+            analysis.db.starlark_program_file(interface),
+        );
+    }
 
     #[test]
     fn build_annotations_check_private_tables_and_follow_edits() {
