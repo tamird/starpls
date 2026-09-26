@@ -1,0 +1,15 @@
+def _resettable[T](
+    label: Label,
+    *,
+    self: T,
+    mutable_original_settings_label: list[Label],
+    mutable_has_been_built: list[bool],
+) -> T: ...
+
+def _reset_on_attrs[T](
+    attrs: tuple[str, ...],
+    *,
+    self: T,
+    attrs_to_reset: list[str],
+    mutable_has_been_built: list[bool],
+) -> T: ...

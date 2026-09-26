@@ -238,6 +238,18 @@ mod tests {
         std::fs::create_dir_all(source.join("with_cfg/private")).unwrap();
         std::fs::write(source.join("with_cfg/private/with_cfg.bzl"), "").unwrap();
         std::fs::write(
+            source.join("with_cfg/private/builder.bzl"),
+            "def make_builder(rule_info): return rule_info\n",
+        )
+        .unwrap();
+        let caller_text = "load('@with_cfg.bzl//with_cfg/private:builder.bzl', 'make_builder')\nresult = make_builder('source')\n";
+        std::fs::write(workspace.join("caller.bzl"), caller_text).unwrap();
+        std::fs::write(
+            source.join("with_cfg/private/utils.bzl"),
+            "def is_label(value): return type(value) == type(Label('//:bogus'))\n",
+        )
+        .unwrap();
+        std::fs::write(
             stubs.join("stubs.toml"),
             include_str!("../../../../stubs/with_cfg/stubs.toml"),
         )
@@ -250,6 +262,16 @@ mod tests {
         std::fs::write(
             stubs.join("types.bzli"),
             include_str!("../../../../stubs/with_cfg/types.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("builder.bzli"),
+            include_str!("../../../../stubs/with_cfg/builder.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("utils.bzli"),
+            include_str!("../../../../stubs/with_cfg/utils.bzli"),
         )
         .unwrap();
         std::fs::write(
@@ -266,7 +288,13 @@ mod tests {
             let mut client = crate::document::source_tests::TestBazelClient::default();
             client.repository_mappings.insert(
                 "".into(),
-                std::sync::Arc::new([("with_cfg_stubs".into(), "with_cfg_stubs+".into())].into()),
+                std::sync::Arc::new(
+                    [
+                        ("with_cfg_stubs".into(), "with_cfg_stubs+".into()),
+                        ("with_cfg.bzl".into(), "with_cfg.bzl+".into()),
+                    ]
+                    .into(),
+                ),
             );
             client.repository_mappings.insert(
                 "with_cfg_stubs+".into(),
@@ -291,20 +319,29 @@ mod tests {
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
-                let [first, second] = prepared.registrations.as_slice() else {
+                let [first, second, third, fourth] = prepared.registrations.as_slice() else {
                     panic!("{prepared:?}");
                 };
-                let actual =
-                    std::collections::BTreeMap::from([first, second].map(|registration| {
+                let actual = std::collections::BTreeMap::from([first, second, third, fourth].map(
+                    |registration| {
                         let super::Registration {
                             source,
                             interface,
                             origin: _,
                         } = registration;
                         (source.clone(), interface.clone())
-                    }));
+                    },
+                ));
                 let expected = std::collections::BTreeMap::from([
                     (source.join("with_cfg.bzl"), stubs.join("with_cfg.bzli")),
+                    (
+                        source.join("with_cfg/private/builder.bzl"),
+                        stubs.join("builder.bzli"),
+                    ),
+                    (
+                        source.join("with_cfg/private/utils.bzl"),
+                        stubs.join("utils.bzli"),
+                    ),
                     (
                         source.join("with_cfg/private/with_cfg.bzl"),
                         stubs.join("private_helpers.bzli"),
@@ -323,6 +360,20 @@ mod tests {
                         None,
                     )
                     .unwrap();
+                let caller = analysis
+                    .file(
+                        &workspace.join("caller.bzl"),
+                        starpls_common::Dialect::Bazel,
+                        None,
+                    )
+                    .unwrap();
+                let builder = analysis
+                    .file(
+                        &source.join("with_cfg/private/builder.bzl"),
+                        starpls_common::Dialect::Bazel,
+                        None,
+                    )
+                    .unwrap();
                 let snapshot = analysis.snapshot();
                 let resolution = snapshot.resolve_load(interface, ":types.bzli").unwrap();
                 let starpls_ide::LoadResolution::Resolved(types) = resolution else {
@@ -330,10 +381,30 @@ mod tests {
                 };
                 assert_eq!(snapshot.path(types), stubs.join("types.bzli"));
                 assert!(!snapshot.is_type_interface_root(types));
-                for file in [interface, types] {
+                for file in [interface, types, caller] {
                     let diagnostics = snapshot.diagnostics(file).unwrap();
                     assert!(diagnostics.is_empty(), "{diagnostics:?}");
                 }
+                let locations = snapshot
+                    .goto_definition(
+                        starpls_ide::FilePosition {
+                            file_id: caller,
+                            pos: (caller_text.rfind("make_builder").unwrap() as u32).into(),
+                        },
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let [starpls_ide::LocationLink::Local {
+                    target_file_id,
+                    origin_selection_range: _,
+                    target_range: _,
+                    target_selection_range: _,
+                }] = locations.as_slice()
+                else {
+                    panic!("{locations:?}");
+                };
+                assert_eq!(*target_file_id, builder.source);
             } else {
                 let message = format!("{:#}", prepared.unwrap_err());
                 assert!(
