@@ -2137,6 +2137,28 @@ _LABEL_TYPE = type(Label("//:bogus"))
     }
 
     #[test]
+    fn callback_keyword_variadic_context_checks_body() {
+        let stub = r#"class _Collect(Protocol):
+    def __call__(self, *, name: str, **values: int) -> int: ...
+def make() -> _Collect: ...
+"#;
+        assert_eq!(
+            validate(
+                "def make(): return lambda *, name, **values: values['first'] + 1\n",
+                stub,
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(): return lambda *, name, **values: values['first'].upper()\n",
+                stub,
+            ),
+            ["unresolved-attribute", "unsound-return-statement"],
+        );
+    }
+
+    #[test]
     fn gradual_return_proofs_preserve_unrestricted_outputs() {
         assert_eq!(
             validate("def make(): return 1\n", "def make() -> Any: ...\n"),
