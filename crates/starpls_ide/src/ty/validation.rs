@@ -44,6 +44,7 @@ use ty_python_semantic::types::Signature;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::TypeDefinition;
 use ty_python_semantic::FunctionInferenceFacts;
+use ty_python_semantic::FunctionInferenceMode;
 use ty_python_semantic::HasType;
 use ty_python_semantic::SemanticModel;
 
@@ -306,6 +307,7 @@ impl Analysis {
                     let result = compare_function(db, source.file, &name, actual, expected);
                     if result.is_ok() {
                         let FunctionInferenceFacts {
+                            return_type_correspondence,
                             has_cycle_recovery,
                             has_errors,
                             has_diagnostics_or_suppressions,
@@ -313,7 +315,10 @@ impl Analysis {
                             .function_inference_facts(function_definition(db, source))
                             .expect("function contracts originate in a function declaration");
                         if !has_errors {
-                            if has_cycle_recovery || has_diagnostics_or_suppressions {
+                            if has_cycle_recovery
+                                || has_diagnostics_or_suppressions
+                                || return_type_correspondence != Some(true)
+                            {
                                 ContractError::Incomplete(format!("Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"))
                                     .report(&mut reports, source.file, range);
                             } else {
@@ -1199,6 +1204,7 @@ fn compare_initializer<'db>(
         }
     }
     let FunctionInferenceFacts {
+        return_type_correspondence: _,
         has_cycle_recovery,
         has_errors,
         has_diagnostics_or_suppressions,
@@ -1216,21 +1222,32 @@ fn compare_initializer<'db>(
     Ok(())
 }
 
-pub(super) fn conservative_global_reads(
+pub(super) fn function_inference_mode(
     db: &Database,
     scope: ty_python_core::scope::ScopeId<'_>,
-) -> bool {
-    if db.environment().stub_validation(db).phase != StubValidationPhase::Conservative {
-        return false;
+) -> FunctionInferenceMode {
+    let validation = db.environment().stub_validation(db);
+    if validation.annotations.is_empty() {
+        return FunctionInferenceMode::Default;
     }
     let ty_python_core::scope::NodeWithScopeKind::Function(function) = scope.node(db) else {
-        return false;
+        return FunctionInferenceMode::Default;
     };
     let Some(source) = db.starlark_file(scope.program_file(db)) else {
-        return false;
+        return FunctionInferenceMode::Default;
     };
     let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
-    conservative_function(db, source, function.node(&parsed).node_index().load())
+    let owner = function.node(&parsed).node_index().load();
+    if !matches!(
+        validation.annotations.get(&(source.source, owner)),
+        Some(ValidationAnnotation::Declaration { file: _, owner: _ })
+    ) {
+        return FunctionInferenceMode::Default;
+    }
+    match validation.phase {
+        StubValidationPhase::Ordinary => FunctionInferenceMode::OutputProof,
+        StubValidationPhase::Conservative => FunctionInferenceMode::Conservative,
+    }
 }
 
 fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool {
@@ -1361,6 +1378,7 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
     let function = function.node(&parsed);
     let model = SemanticModel::new(db, db.starlark_program_file(source.file));
     let FunctionInferenceFacts {
+        return_type_correspondence: _,
         has_cycle_recovery,
         has_errors: _,
         has_diagnostics_or_suppressions,
@@ -1648,6 +1666,163 @@ mod tests {
         let source = "def known(value: int) -> int: return value\ndef make(): return struct(__call__=known)\n";
         let stub = "class _Callback(Protocol):\n    def __call__(self, value: int) -> int: ...\nclass _Required(Protocol):\n    @property\n    def __call__(self) -> _Callback: ...\ndef make() -> _Required: ...\n";
         assert!(validate(source, stub).is_empty());
+    }
+
+    #[test]
+    fn gradual_return_proofs_preserve_unrestricted_outputs() {
+        assert_eq!(
+            validate("def make(): return 1\n", "def make() -> Any: ...\n"),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(value): return value.missing()\n",
+                "def make(value: Any) -> Any: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        assert_eq!(
+            validate(
+                "def make(): return struct(value=1)\n",
+                "class _Row(Protocol):\n    @property\n    def value(self) -> int: ...\ndef make() -> _Row: ...\n",
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(): return lambda value: len(value)\n",
+                "def make() -> Callable[[str], int]: ...\n",
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                r#"def _length(values: Sequence[object]) -> int:
+    return len(values)
+def make():
+    return struct(run=_length)
+"#,
+                r#"class _Run(Protocol):
+    def __call__(self, values: list[Any]) -> int: ...
+class _Runner(Protocol):
+    @property
+    def run(self) -> _Run: ...
+def make() -> _Runner: ...
+"#,
+            ),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[test]
+    fn gradual_output_correspondence_preserves_declared_results() {
+        let source = r#"
+def length(values: Sequence[object]) -> int:
+    return len(values)
+def only_strings(values: list[str]) -> int:
+    return len(values[0])
+def declared():
+    return struct(run=length)
+def forward():
+    return declared()
+def mixed(flag):
+    return declared() if flag else struct(run=only_strings)
+"#;
+        let stub = r#"
+class _Runner(Protocol):
+    @property
+    def run(self) -> Callable[[list[Any]], int]: ...
+def declared() -> _Runner: ...
+def forward() -> _Runner: ...
+def mixed(flag: bool) -> _Runner: ...
+"#;
+        let diagnostics = validation_diagnostics(source, stub);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("only the mixed return should remain unproved: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "incomplete-stub-validation");
+        let range = diagnostic
+            .primary_span()
+            .and_then(|span| span.range())
+            .unwrap();
+        assert_eq!(&source[range], "mixed");
+
+        let source = r#"
+def accept_any(*args: object, **kwargs: object) -> None:
+    pass
+def declared() -> Callable[..., None]:
+    return accept_any
+def invoke():
+    declared()()
+    return 1
+"#;
+        assert_eq!(
+            validate(source, "def invoke() -> int: ...\n"),
+            ["incomplete-stub-validation"]
+        );
+    }
+
+    #[test]
+    fn gradual_callback_returns_check_the_promised_input_domain() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            r#"def only_strings(values: list[str]) -> int:
+    return len(values[0])
+def make():
+    return struct(run=only_strings)
+"#,
+        );
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            r#"class _Run(Protocol):
+    def __call__(self, values: list[Any]) -> int: ...
+class _Runner(Protocol):
+    @property
+    def run(self) -> _Run: ...
+def make() -> _Runner: ...
+def only_strings(values: list[str]) -> int: ...
+"#,
+        );
+        let caller_source =
+            "load('source.bzl', 'make', 'only_strings')\nmake().run([1])\nonly_strings([1])\n";
+        let caller = fixture.add_file(&mut analysis.db, "caller.bzl", caller_source);
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+
+        let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected only the direct helper call to fail: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        let Some(range) = diagnostic.primary_span().and_then(|span| span.range()) else {
+            panic!("expected the direct helper argument range: {diagnostic:?}");
+        };
+        assert_eq!(&caller_source[range], "[1]");
+        assert_eq!(
+            usize::from(range.start()),
+            caller_source.rfind("[1]").unwrap()
+        );
+
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        let ids: Vec<_> = reports
+            .iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        assert_eq!(ids, ["incomplete-stub-validation"], "{reports:?}");
     }
 
     #[test]

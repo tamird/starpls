@@ -478,8 +478,11 @@ impl ty_python_core::Db for Database {
 
 #[salsa::db]
 impl ty_python_semantic::Db for Database {
-    fn conservative_global_reads(&self, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
-        validation::conservative_global_reads(self, scope)
+    fn function_inference_mode(
+        &self,
+        scope: ty_python_core::scope::ScopeId<'_>,
+    ) -> ty_python_semantic::FunctionInferenceMode {
+        validation::function_inference_mode(self, scope)
     }
 
     fn provided_return_type<'db>(
