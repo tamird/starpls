@@ -857,7 +857,7 @@ mod tests {
                 .contains("Literal[1]"));
             assert!(hover(&mut server, &client, &local, 1, 101)
                 .to_string()
-                .contains("rule("));
+                .contains("(function) def rule"));
             change(&mut server, &local, "value = 'updated'\nrule\n");
             assert!(hover(&mut server, &client, &local, 0, 102)
                 .to_string()

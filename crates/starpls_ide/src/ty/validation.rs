@@ -1812,6 +1812,43 @@ mod tests {
     }
 
     #[test]
+    fn validation_checks_rule_attribute_inputs() {
+        for (attrs, expected) in [
+            (None, None),
+            (Some("{}"), None),
+            (Some("attributes()"), None),
+            (Some("descriptors"), None),
+            (Some(r#"{"value": attr.string()}"#), None),
+            (Some(r#"{"value": attr.label(default=None)}"#), None),
+            (Some("None"), Some("invalid-argument-type")),
+            (Some("{1: attr.string()}"), Some("invalid-argument-type")),
+            (Some(r#"{"value": None}"#), Some("invalid-argument-type")),
+            (Some(r#"{"value": 42}"#), Some("invalid-argument-type")),
+            (Some("[]"), Some("invalid-argument-type")),
+        ] {
+            let attrs = attrs.map_or_else(String::new, |attrs| format!(", attrs={attrs}"));
+            let source = format!(
+                r#"def attributes():
+    # type: () -> dict[str, Attribute]
+    return {{"value": attr.string(mandatory=True)}}
+
+descriptors = {{"text": attr.string(), "number": attr.int()}}
+target = rule(implementation=lambda ctx: []{attrs})
+def marker(): return 1
+"#,
+            );
+            let diagnostics = validate(&source, "def marker() -> int: ...\n");
+            match expected {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                ),
+                None => assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn validation_checks_generic_collection_initializers() {
         for value in [
             "type([])",

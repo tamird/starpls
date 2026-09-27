@@ -583,7 +583,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -724,6 +724,8 @@ fn write_function(
         }
         let parameter_type = match (kind, value.name.as_str(), name) {
             (CallableKind::Function, "struct", "kwargs") => Some("_StructField"),
+            // Rule construction reads each dictionary while preserving its key and value types.
+            (CallableKind::Function, "rule", "attrs") => Some("_starpls_builtins.dict[_RuleAttributeName, _RuleAttribute]"),
             (CallableKind::Function, "select", "x") => Some("_starpls_typing.Mapping[_SelectCondition, _SelectValue]"),
             (CallableKind::Function, "depset", "direct") => {
                 Some("_starpls_typing.Sequence[_DepsetElement] | None")
@@ -1020,6 +1022,7 @@ mod tests {
     use starpls_bazel::build::attribute::Discriminator;
     use starpls_bazel::build::AttributeDefinition;
     use starpls_bazel::build::RuleDefinition;
+    use starpls_common::Db as _;
     use starpls_common::FileInfo;
     use starpls_hir::Db;
     use ty_python_semantic::HasType;
@@ -1028,6 +1031,47 @@ mod tests {
     use super::*;
     use crate::Analysis;
     use crate::FilePosition;
+
+    #[test]
+    fn rule_attributes_accept_literal_keys() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins.clone(), Default::default())
+            .unwrap();
+        let DeclarationSource { path, mut contents } =
+            generate(Dialect::Bazel, &builtins, &BuildLanguage::default()).unwrap();
+        contents.push_str(
+            r#"
+def check_literal_keys(attrs: dict[_starpls_typing.Literal["dep"], _starpls_types.Attribute]):
+    _starpls_Bzl_rule(implementation=lambda ctx: [], attrs=attrs)
+"#,
+        );
+        analysis
+            .db
+            .source_system_mut()
+            .set_virtual_source(&path, contents);
+        let file = analysis.db.files.try_virtual_file(&path).unwrap();
+        file.sync(&mut analysis.db);
+        let db = &analysis.db;
+        let file = ty_python_semantic::Db::program_file(db, file.file());
+        let parsed = ruff_db::parsed::parsed_module(db, file.python_file(db)).load(db);
+        let function = parsed
+            .suite()
+            .iter()
+            .filter_map(Stmt::as_function_def_stmt)
+            .find(|function| function.name.as_str() == "check_literal_keys")
+            .unwrap();
+        let definition =
+            ty_python_core::semantic_index(db, file).expect_single_definition(function);
+        let facts = SemanticModel::new(db, file)
+            .function_inference_facts(definition)
+            .unwrap();
+        assert!(!facts.has_errors, "{facts:?}");
+    }
 
     #[test]
     fn bundled_metadata_uses_recursive_native_declarations() {
