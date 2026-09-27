@@ -455,12 +455,8 @@ impl ty_python_core::Db for Database {
             .type_comment_annotation(file, owner)
             .map(ty_python_core::ProvidedAnnotation::Range)
             .or_else(|| {
-                let annotation = self
-                    .environment()
-                    .stub_validation(self)
-                    .annotations
-                    .get(&(file.source, owner))?;
-                Some(match *annotation {
+                let annotation = validation::annotation(self, file.source, owner)?;
+                Some(match annotation {
                     starpls_hir::ValidationAnnotation::Declaration { file, owner } => {
                         ty_python_core::ProvidedAnnotation::External {
                             file: self.starlark_program_file(file),
@@ -619,12 +615,7 @@ impl ty_python_semantic::Db for Database {
     }
 
     fn rule_selection(&self, file: File) -> &RuleSelection {
-        if self
-            .environment()
-            .stub_validation(self)
-            .files
-            .contains(&file)
-        {
+        if validation::is_validation_file(self, file) {
             &self.semantic.validation_rules
         } else if self.environment().options(self).use_code_flow_analysis {
             &self.semantic.rules_with_flow_diagnostics

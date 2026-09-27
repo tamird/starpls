@@ -551,11 +551,7 @@ impl Database {
     ) -> ProgramFile<'db> {
         if let Some(interface) = self.type_interface(from, source) {
             if !from.is_type_interface(self)
-                && self
-                    .environment()
-                    .stub_validation(self)
-                    .files
-                    .contains(&from.source)
+                && super::validation::is_validation_file(self, from.source)
                 && selected_function_import(self, source, interface, Name::new(name))
             {
                 return self.starlark_program_file(source);

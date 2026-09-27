@@ -85,6 +85,38 @@ struct Contract {
     provider: Option<ProviderContract>,
 }
 
+// Track selections separately so unchanged answers survive a phase change.
+#[salsa::tracked(returns(copy))]
+pub(super) fn annotation(
+    db: &dyn starpls_hir::Db,
+    file: ruff_db::files::File,
+    owner: NodeIndex,
+) -> Option<ValidationAnnotation> {
+    db.environment()
+        .stub_validation(db)
+        .annotations
+        .get(&(file, owner))
+        .copied()
+}
+
+#[salsa::tracked(returns(ref))]
+fn provider_contract(
+    db: &dyn starpls_hir::Db,
+    file: ruff_db::files::File,
+    owner: NodeIndex,
+) -> Option<ProviderContract> {
+    db.environment()
+        .stub_validation(db)
+        .provider_returns
+        .get(&(file, owner))
+        .cloned()
+}
+
+#[salsa::tracked(returns(copy))]
+pub(super) fn is_validation_file(db: &dyn starpls_hir::Db, file: ruff_db::files::File) -> bool {
+    db.environment().stub_validation(db).files.contains(&file)
+}
+
 impl Analysis {
     /// Validate selected registered implementations without changing caller contracts.
     /// Syntax correspondence is scoped to this operation and rebuilt after every edit.
@@ -844,11 +876,7 @@ pub(super) fn provider_return_type<'db>(
         stub,
         class: owner,
         allowed_fields: allowed,
-    } = db
-        .environment()
-        .stub_validation(db)
-        .provider_returns
-        .get(&(definition.file(db), node.node_index().load()))?;
+    } = provider_contract(db, definition.file(db), node.node_index().load()).as_ref()?;
     let program = db.starlark_program_file(*stub);
     let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
     let ruff_python_ast::AnyRootNodeRef::Stmt(ruff_python_ast::Stmt::ClassDef(class)) =
@@ -1219,9 +1247,8 @@ pub(super) fn call_diagnostics(
 ) -> Vec<Diagnostic> {
     use ty_python_semantic::types::CheckedArgument;
 
-    let validation = db.environment().stub_validation(db);
-    if validation.phase != StubValidationPhase::Ordinary
-        || !validation.files.contains(&call.file().file(db))
+    if !is_validation_file(db, call.file().file(db))
+        || db.environment().stub_validation(db).phase != StubValidationPhase::Ordinary
         || call.has_binding_errors()
     {
         return Vec::new();
@@ -1267,7 +1294,9 @@ pub(super) fn call_diagnostics(
         }
         let index = semantic_index(db, call.file());
         let scope = index.try_expression_scope_id(&ruff_python_ast::ExprRef::from(call.call()))?;
-        selected_execution_scope(db, scope.to_scope_id(db, call.file())).then_some(signature)
+        (function_inference_mode(db, scope.to_scope_id(db, call.file()))
+            == FunctionInferenceMode::OutputProof)
+            .then_some(signature)
     };
     if let Some(signature) = selected_signature() {
         return signature
@@ -1398,9 +1427,10 @@ fn compare_initializer<'db>(
     Ok(())
 }
 
-pub(super) fn function_inference_mode(
-    db: &Database,
-    scope: ty_python_core::scope::ScopeId<'_>,
+#[salsa::tracked(returns(copy))]
+pub(super) fn function_inference_mode<'db>(
+    db: &'db dyn super::interface::Db,
+    scope: ty_python_core::scope::ScopeId<'db>,
 ) -> FunctionInferenceMode {
     let validation = db.environment().stub_validation(db);
     if validation.files.is_empty() {
@@ -1415,7 +1445,10 @@ pub(super) fn function_inference_mode(
     }
 }
 
-fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
+fn selected_execution_scope(
+    db: &dyn super::interface::Db,
+    scope: ty_python_core::scope::ScopeId<'_>,
+) -> bool {
     let validation = db.environment().stub_validation(db);
     if validation.files.is_empty() {
         return false;
@@ -1881,6 +1914,117 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn validation_phase_changes_reuse_semantic_index() {
+        use std::sync::atomic::Ordering;
+
+        use ruff_python_ast::HasNodeIndex;
+        use salsa::Setter;
+        use ty_python_core::Db as _;
+        use ty_python_semantic::FunctionInferenceMode;
+
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "def selected(value): return value\ndef unselected(value): return value\n",
+        );
+        let stub = fixture.add_file(
+            &mut analysis.db,
+            "source.bzli",
+            "def selected(value: int) -> int: ...\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let function = |db: &crate::Database, file, name| {
+            let definitions = super::export_definitions(db, db.starlark_program_file(file), name);
+            let [definition] = definitions.as_slice() else {
+                panic!("expected one function");
+            };
+            super::function(db, *definition).unwrap()
+        };
+        let selected = function(&analysis.db, source, "selected");
+        let declaration = function(&analysis.db, stub, "selected");
+        let environment = analysis.db.environment();
+        let previous = environment.stub_validation(&analysis.db).clone();
+        let mut validation = starpls_hir::StubValidation::default();
+        validation.files.insert(source.source);
+        super::annotations(&analysis.db, selected, declaration, None, &mut validation).unwrap();
+        // Source syntax is fixed throughout these phase changes, so its node and scope IDs
+        // can be reused without traversing the syntax tree after each change.
+        let (owners, scopes) = {
+            let db = &analysis.db;
+            let program = db.starlark_program_file(source);
+            let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+            let index = ty_python_core::semantic_index(db, program);
+            let mut owners = Vec::new();
+            let mut scopes = Vec::new();
+            for statement in &parsed.syntax().body {
+                let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
+                    panic!("expected function");
+                };
+                owners.extend(
+                    function
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.as_parameter().node_index().load()),
+                );
+                scopes.push(
+                    index.node_scope(ty_python_core::scope::NodeWithScopeRef::Function(function)),
+                );
+            }
+            (owners, scopes)
+        };
+        let modes = |db: &crate::Database| {
+            let program = db.starlark_program_file(source);
+            scopes
+                .iter()
+                .map(|scope| super::function_inference_mode(db, scope.to_scope_id(db, program)))
+                .collect::<Vec<_>>()
+        };
+        environment
+            .set_stub_validation(&mut analysis.db)
+            .to(validation.clone());
+        assert_eq!(
+            modes(&analysis.db),
+            [
+                FunctionInferenceMode::OutputProof,
+                FunctionInferenceMode::Default
+            ]
+        );
+        for (phase, expected) in [
+            (
+                starpls_hir::StubValidationPhase::Conservative,
+                FunctionInferenceMode::Conservative,
+            ),
+            (
+                starpls_hir::StubValidationPhase::Ordinary,
+                FunctionInferenceMode::OutputProof,
+            ),
+        ] {
+            validation.phase = phase;
+            environment
+                .set_stub_validation(&mut analysis.db)
+                .to(validation.clone());
+            let db = &analysis.db;
+            let program = db.starlark_program_file(source);
+            // Revalidate annotation selections before checking that the index can be reused.
+            for owner in &owners {
+                let _ = db.provided_annotation(program, *owner);
+            }
+            db.executions.store(0, Ordering::Relaxed);
+            ty_python_core::semantic_index(db, program);
+            assert_eq!(db.executions.load(Ordering::Relaxed), 0);
+            assert_eq!(modes(db), [expected, FunctionInferenceMode::Default]);
+        }
+        environment
+            .set_stub_validation(&mut analysis.db)
+            .to(previous.clone());
+        assert_eq!(environment.stub_validation(&analysis.db), &previous);
+        assert_eq!(modes(&analysis.db), [FunctionInferenceMode::Default; 2]);
     }
 
     #[test]
@@ -3337,6 +3481,52 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
                     .iter()
                     .any(|id| id == "invalid-stub-implementation"),
                 "{stub}: {diagnostics:?}"
+            );
+        }
+
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl",
+            "def _init(): return {'value': 'ok'}\nInfo, _ = provider(fields=['value'], init=_init)\n");
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let previous = analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .clone();
+        for (field, expected) in [
+            ("str", &[] as &[&str]),
+            ("int", &["invalid-argument-type", "invalid-return-type"]),
+            ("str", &[]),
+        ] {
+            analysis.update_file(
+                stub,
+                format!(
+                    "class Info:\n    value: Final[{field}]\n    def __init__(self) -> None: ...\n"
+                ),
+            );
+            let diagnostics: Vec<_> = analysis
+                .validate_stubs(|_| true)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str().to_owned())
+                .collect();
+            assert_eq!(diagnostics, expected, "{field}");
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous
             );
         }
     }
