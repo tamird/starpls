@@ -4629,6 +4629,13 @@ def _opaque() -> Callable[..., None]:
 
     #[test]
     fn opaque_global_collections_check_consuming_operations() {
+        for source in [
+            "TABLE = {'string': None}\nRESULT = 'string' in TABLE\n",
+            "VALUES = [None]\nRESULT = None not in VALUES\n",
+        ] {
+            let diagnostics = validation_diagnostics(source, "RESULT: bool\n");
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        }
         let globals = "def opaque() -> Any: return None\nVALUES = [opaque()]\n";
         let collector = r#"
 def collect(extra):
