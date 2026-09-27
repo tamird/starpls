@@ -545,8 +545,8 @@ impl ty_python_semantic::Db for Database {
         }
         let environment = ProgramEnvironment::from_file(file);
         let unknown = Type::unknown();
-        // Runtime tags differ from annotation names, and provider names need
-        // not identify a unique type. Only canonical core tags are exhaustive.
+        // Runtime tags differ from annotation names. Use canonical core tags
+        // and Bazel's nominal Label declaration, independent of source names.
         let ty = match tag {
             "bool" => KnownClass::Bool.to_instance(self, &environment),
             "int" => KnownClass::Int.to_instance(self, &environment),
@@ -560,6 +560,14 @@ impl ty_python_semantic::Db for Database {
             }
             "set" => KnownClass::Set.to_specialized_instance(self, &environment, &[unknown]),
             "tuple" => Type::homogeneous_tuple(self, &environment, unknown),
+            "Label" => {
+                let binding = self.language_builtin(file, "Label", BuiltinUsage::Annotation)?;
+                let class = binding.resolve_type(self)?;
+                if !matches!(class, Type::ClassLiteral(_)) {
+                    return None;
+                }
+                class.to_instance_approximation(self, &environment)?
+            }
             _ => return None,
         };
         Some(ty)
@@ -780,7 +788,7 @@ def register(name: str, visibility: list[str] | None):
     }
 
     #[test]
-    fn native_type_results_preserve_container_tags() {
+    fn native_type_results_preserve_runtime_tags() {
         let (mut analysis, fixture) = Analysis::from_single_file_fixture("");
         analysis
             .set_builtin_defs(
@@ -803,6 +811,8 @@ def register(name: str, visibility: list[str] | None):
             ("object", "(1, 'x')", "Literal[\"tuple\"]"),
             ("set[str]", "value", "Literal[\"set\"]"),
             ("set[int | str]", "value", "Literal[\"set\"]"),
+            ("Label", "value", "Literal[\"Label\"]"),
+            ("object", "Label('//pkg:target')", "Literal[\"Label\"]"),
             ("object", "value", "str"),
         ] {
             let source = format!(
@@ -863,6 +873,7 @@ def register(name: str, visibility: list[str] | None):
                 "Target",
             ),
             ("set[str] | Target", "set", "set[str]", "Target"),
+            ("Label | str", "Label", "Label", "str"),
             ("str | int", "str", "str | int", "str | int"),
             ("str | int", "unknown", "str | int", "str | int"),
         ] {
@@ -904,21 +915,65 @@ def register(name: str, visibility: list[str] | None):
             )
             .unwrap();
         let file = fixture.main_file();
-        for (declarations, call, expected) in [
-            ("classify = type", "classify", "list[Target]"),
+        for (declarations, call, annotation, tag, expected) in [
+            (
+                "classify = type",
+                "classify",
+                "list[Target] | Target",
+                "list",
+                "list[Target]",
+            ),
             (
                 "def classify(value): return \"list\"",
                 "classify",
                 "list[Target] | Target",
+                "list",
+                "list[Target] | Target",
             ),
-            ("classify = type", "classify", "list[Target]"),
+            (
+                "classify = type",
+                "classify",
+                "list[Target] | Target",
+                "list",
+                "list[Target]",
+            ),
             (
                 "def type(value): return \"list\"",
                 "type",
                 "list[Target] | Target",
+                "list",
+                "list[Target] | Target",
+            ),
+            (
+                "classify = type",
+                "classify",
+                "Label | str",
+                "Label",
+                "Label",
+            ),
+            (
+                "def classify(value): return \"Label\"",
+                "classify",
+                "Label | str",
+                "Label",
+                "Label | str",
+            ),
+            (
+                "classify = type",
+                "classify",
+                "Label | str",
+                "Label",
+                "Label",
+            ),
+            (
+                "def type(value): return \"Label\"",
+                "type",
+                "Label | str",
+                "Label",
+                "Label | str",
             ),
         ] {
-            let source = format!("{declarations}\ndef probe(value: list[Target] | Target):\n    if {call}(value) == \"list\":\n        return value # matched\n    return value\n");
+            let source = format!("{declarations}\ndef probe(value: {annotation}):\n    if {call}(value) == \"{tag}\":\n        return value # matched\n    return value\n");
             analysis.update_file(file, source.clone());
             let hover = analysis
                 .snapshot()
@@ -945,6 +1000,12 @@ def incorrect(value: list[Target] | Target) -> list[str]:
     if type(value) == "list":
         return value
     return []
+
+Label = provider(fields=["local_only"])
+def package(value: object) -> str:
+    if type(value) == "Label":
+        return value.package
+    return ""
 "#;
         analysis.update_file(file, source.to_owned());
         let diagnostics = analysis.snapshot().diagnostics(file).unwrap();

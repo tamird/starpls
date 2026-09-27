@@ -607,7 +607,44 @@ fn declarations(
     output.push_str(&exports);
     output.push('\n');
     output.push_str(include_str!("starlark.pyi"));
+    write_type_overloads(&mut output, &declared_classes)?;
     Ok(output)
+}
+
+fn write_type_overloads(
+    output: &mut String,
+    declared_classes: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    for (annotation, tag) in [
+        ("_builtins.bool", "bool"),
+        ("_builtins.int", "int"),
+        ("_builtins.str", "string"),
+        ("_builtins.list[_T]", "list"),
+        ("_builtins.dict[_T, _U]", "dict"),
+        ("_builtins.tuple[_T, ...]", "tuple"),
+        ("_builtins.set[_T]", "set"),
+        ("_builtins.range", "range"),
+        ("None", "NoneType"),
+    ]
+    .into_iter()
+    .chain(
+        declared_classes
+            .contains("Label")
+            .then_some(("_starpls_types.Label", "Label")),
+    ) {
+        writeln!(output, "@_typing.overload")?;
+        writeln!(
+            output,
+            "def type(x: {annotation}, /) -> _typing.Literal[\"{tag}\"]: ..."
+        )?;
+    }
+    // Ty's float annotation includes integers, so it uses the general result.
+    writeln!(output, "@_typing.overload")?;
+    writeln!(
+        output,
+        "def type(x: _builtins.object, /) -> _builtins.str: ..."
+    )?;
+    Ok(())
 }
 
 // Selector concatenation is deferred until attribute conversion. Only strings,
@@ -2759,6 +2796,9 @@ consume(1, values, Label("//pkg:target"))
                 None,
                 r#"
 kind = type(1)
+def opaque(value: object) -> object:
+    return value
+opaque_kind = type(opaque(1))
 entries = enumerate(list=[1], start=1)
 backwards = reversed({1: 2})
 ordered = sorted([1], None, reverse=True)
@@ -2797,6 +2837,7 @@ def stop():
             types,
             [
                 "Literal[\"int\"]",
+                "str",
                 "list[tuple[int, int]]",
                 "list[int]",
                 "list[int]",
