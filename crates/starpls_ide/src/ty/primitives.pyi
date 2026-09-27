@@ -5,8 +5,13 @@
 
 from typing import Collection, TYPE_CHECKING
 
-# Every Starlark value is an object; this top type guarantees no attributes.
-class object: ...
+# Every Starlark value is an object; equality accepts any two values.
+# These operation signatures are internal to the checker.
+class object:
+    @type_check_only
+    def __eq__(self, other: object, /) -> bool: ...
+    @type_check_only
+    def __ne__(self, other: object, /) -> bool: ...
 
 @final
 @disjoint_base

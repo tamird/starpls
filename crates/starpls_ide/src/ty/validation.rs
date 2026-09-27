@@ -2314,6 +2314,12 @@ _reset_on_attrs(("srcs",), self=1, attrs_to_reset=[], mutable_has_been_built=[Fa
         let version = "tuple[list[int], bool, list[tuple[int, int | str]]]";
         let mut failures = Vec::new();
         for (left, right, operator) in [
+            ("object", "object", "=="),
+            ("object", "object", "!="),
+            ("object", "None", "=="),
+            ("object", "None", "!="),
+            ("None", "object", "=="),
+            ("None", "object", "!="),
             ("str", "object", "=="),
             ("str", "object", "!="),
             ("bool", "object", "=="),
@@ -2331,6 +2337,23 @@ _reset_on_attrs(("srcs",), self=1, attrs_to_reset=[], mutable_has_been_built=[Fa
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+        assert_eq!(
+            validate(
+                "def compare(value): return value == None\n",
+                "def compare(value: object) -> Literal[False]: ...\n"
+            ),
+            ["invalid-return-type"]
+        );
+        for name in ["__eq__", "__ne__"] {
+            assert_eq!(
+                validate(
+                    &format!("def extract(value): return value.{name}\n"),
+                    "def extract(value: object) -> Callable[[object], bool]: ...\n"
+                ),
+                ["unresolved-attribute", "unsound-return-statement"],
+                "{name}"
+            );
+        }
         let source = r#"def is_label(value):
     return type(value) == _LABEL_TYPE
 
