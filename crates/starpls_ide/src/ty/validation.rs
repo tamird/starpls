@@ -1425,8 +1425,19 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
     if source.is_type_interface(db) || !validation.files.contains(&source.source) {
         return false;
     }
+    let owns_function = |function: &StmtFunctionDef| {
+        let owner = function.node_index().load();
+        matches!(
+            validation.annotations.get(&(source.source, owner)),
+            Some(ValidationAnnotation::Declaration { file: _, owner: _ })
+        ) || (validation.phase == StubValidationPhase::Ordinary
+            && validation
+                .provider_returns
+                .contains_key(&(source.source, owner)))
+    };
     // Selected named implementations include their nested expression scopes.
-    // Module initialization includes eager comprehensions; lambda bodies are deferred.
+    // Module initialization includes eager comprehensions. Owned inline defaults
+    // also require operation proof; unrelated module lambda bodies remain deferred.
     // Defaults and first iterables retain their semantic execution scope.
     let mut deferred_body = matches!(
         scope.node(db),
@@ -1439,15 +1450,48 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
             | ty_python_core::scope::NodeWithScopeKind::DictComprehension(_)
     ) {
         let index = semantic_index(db, scope.program_file(db));
+        let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
+        let owns_default = |lambda: &ruff_python_ast::ExprLambda| {
+            if validation.phase != StubValidationPhase::Ordinary {
+                return false;
+            }
+            let Some(ty_python_core::statement::Statement::Definition(definition)) =
+                index.enclosing_lambda_statement(lambda.into())
+            else {
+                return false;
+            };
+            let DefinitionKind::Function(function) = definition.kind(db) else {
+                return false;
+            };
+            let function = function.node(&parsed);
+            owns_function(function)
+                && function
+                    .parameters
+                    .iter_non_variadic_params()
+                    .any(|parameter| {
+                        parameter
+                            .default
+                            .as_deref()
+                            .is_some_and(|default| default.range().contains_range(lambda.range()))
+                    })
+        };
+        let mut owned_default = match scope.node(db) {
+            ty_python_core::scope::NodeWithScopeKind::Lambda(lambda) => {
+                owns_default(lambda.node(&parsed))
+            }
+            _ => false,
+        };
         let Some((owner, _)) =
             index
                 .ancestor_scopes(scope.file_scope_id(db))
                 .skip(1)
                 .find(|(_, ancestor)| {
-                    deferred_body |= matches!(
-                        ancestor.node(),
-                        ty_python_core::scope::NodeWithScopeKind::Lambda(_)
-                    );
+                    if let ty_python_core::scope::NodeWithScopeKind::Lambda(lambda) =
+                        ancestor.node()
+                    {
+                        deferred_body = true;
+                        owned_default |= owns_default(lambda.node(&parsed));
+                    }
                     matches!(
                         ancestor.node(),
                         ty_python_core::scope::NodeWithScopeKind::Function(_)
@@ -1458,6 +1502,9 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
         else {
             return false;
         };
+        if owned_default {
+            return true;
+        }
         owner.to_scope_id(db, scope.program_file(db))
     } else {
         scope
@@ -1472,11 +1519,7 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
         return false;
     };
     let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
-    let owner = function.node(&parsed).node_index().load();
-    matches!(
-        validation.annotations.get(&(source.source, owner)),
-        Some(ValidationAnnotation::Declaration { file: _, owner: _ })
-    )
+    owns_function(function.node(&parsed))
 }
 
 fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool {
@@ -4625,6 +4668,42 @@ def _opaque() -> Callable[..., None]:
             ),
             ["incomplete-stub-validation"],
         );
+    }
+
+    #[test]
+    fn owned_defaults_and_provider_bodies_check_inputs() {
+        use starpls_common::Db as _;
+
+        for (case, callback_type, body, stub, expected) in [
+            ("provider_body_narrow", "str", "def _init(): return {'value': callback_value in test_container}\nInfo, _ = provider(fields = ['value'], init = _init)\n", "class Info:\n    value: Final[bool]\n    def __init__(self) -> None: ...\n", &["incomplete-stub-validation"] as &[&str]),
+            ("provider_body_known", "object", "def _init(): return {'value': callback_value in test_container}\nInfo, _ = provider(fields = ['value'], init = _init)\n", "class Info:\n    value: Final[bool]\n    def __init__(self) -> None: ...\n", &[]),
+            ("default_narrow", "str", "def make(callback=lambda: callback_value in test_container): return callback\n", "def make(callback: Callable[[], bool] = ...) -> Callable[[], bool]: ...\n", &["incomplete-stub-validation"]),
+            ("default_comprehension", "str", "def make(callback=lambda: [callback_value in test_container for _ in [0]]): return callback\n", "def make(callback: Callable[[], list[bool]] = ...) -> Callable[[], list[bool]]: ...\n", &["incomplete-stub-validation"]),
+            ("default_known", "object", "def make(callback=lambda: callback_value in test_container): return callback\n", "def make(callback: Callable[[], bool] = ...) -> Callable[[], bool]: ...\n", &[]),
+            ("provider_default_narrow", "str", "def _init(callback=lambda: callback_value in test_container): return {'value': callback()}\nInfo, _ = provider(fields = ['value'], init = _init)\n", "class Info:\n    value: Final[bool]\n    def __init__(self, callback: Callable[[], bool] = ...) -> None: ...\n", &["incomplete-stub-validation"]),
+            ("provider_default_known", "object", "def _init(callback=lambda: callback_value in test_container): return {'value': callback()}\nInfo, _ = provider(fields = ['value'], init = _init)\n", "class Info:\n    value: Final[bool]\n    def __init__(self, callback: Callable[[], bool] = ...) -> None: ...\n", &[]),
+            ("unrelated_default", "str", "deferred = lambda: callback_value in test_container\nVALUE = True\n", "VALUE: bool\n", &[]),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            let source_text = format!("def callback_value(value: {callback_type}) -> None: pass\n{body}");
+            let source = fixture.add_file(&mut analysis.db, "source.bzl", &source_text);
+            let stub = fixture.add_file(&mut analysis.db, "source.bzli", stub);
+            loader.add_files_from_fixture(&fixture);
+            let builtins = starpls_bazel::decode_builtins(include_bytes!("../../../starpls/src/builtin/builtin.pb")).unwrap();
+            analysis.set_builtin_defs(builtins.clone(), Default::default()).unwrap();
+            let super::super::native::DeclarationSource { path, mut contents } =
+                super::super::native::generate(starpls_common::Dialect::Bazel, &builtins, &Default::default()).unwrap();
+            contents.push_str("\nclass _ContainmentProbe:\n    def __contains__(self, callback: _starpls_typing.Callable[[_starpls_typing.Any], None], /) -> _starpls_builtins.bool: ...\n_starpls_Bzl_test_container: _ContainmentProbe\n");
+            analysis.db.source_system_mut().set_virtual_source(&path, contents);
+            let native_file = analysis.db.files.try_virtual_file(&path).unwrap();
+            native_file.sync(&mut analysis.db);
+            analysis.set_type_interfaces([(source, stub)]).unwrap();
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let ids: Vec<_> = reports.into_iter().flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str().to_owned()).collect();
+            assert_eq!(ids, expected, "{case}");
+        }
     }
 
     #[test]
