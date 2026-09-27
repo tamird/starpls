@@ -1622,8 +1622,18 @@ fn expression_has_evidence(
     expression.inferred_type(model).is_some_and(|ty| {
         // The ordinary pass checks calls and storage in selected bodies.
         // Defaults retain callable evidence because deferred bodies lack those checks.
-        if conservative && has_nominal_evidence(model.db(), &environment, ty) {
-            return true;
+        if conservative {
+            if has_nominal_evidence(model.db(), &environment, ty) {
+                return true;
+            }
+            if matches!(ty, Type::Callable(_))
+                && ty.is_fully_static_except_any(model.db(), &environment)
+                && ty
+                    .top_materialization(model.db(), &environment)
+                    .satisfies_declared_output(model.db(), &environment, ty)
+            {
+                return true;
+            }
         }
         let ty = ty
             .map_callable_signatures(
@@ -2402,6 +2412,33 @@ _LABEL_TYPE = type(Label("//:bogus"))
                 "def make(): return lambda: 1\n",
                 "def make() -> Callable[..., int]: ...\n",
                 &[][..],
+            ),
+            (
+                "stored omitted callback",
+                "def make(row): return row['run']\n",
+                r#"class _Row(TypedDict):
+    run: Callable[..., None]
+def make(row: _Row) -> Callable[..., None]: ...
+"#,
+                &[],
+            ),
+            (
+                "invoke stored omitted callback",
+                "def make(row): return row['run']()\n",
+                r#"class _Row(TypedDict):
+    run: Callable[..., None]
+def make(row: _Row) -> None: ...
+"#,
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "invoke aliased omitted callback",
+                "def make(row):\n    callback = row['run']\n    return callback()\n",
+                r#"class _Row(TypedDict):
+    run: Callable[..., None]
+def make(row: _Row) -> None: ...
+"#,
+                &["incomplete-stub-validation"],
             ),
             (
                 "tuple callback",
