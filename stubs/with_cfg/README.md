@@ -53,8 +53,9 @@ shallow dictionary results, paired with integer cursor positions. It covers
 `_consume_list_or_single_value`, and `_consume_compound_value`. Select mapping
 and recombination remain unproved.
 The transition interface declares `_get_settings_key(str | Label) -> str`,
-using the validated Label and string predicates. Settings encoding and
-transition construction retain separate implementation obligations.
+using the validated Label and string predicates. It also declares
+`_encode_settings(dict[str, object]) -> str`: successful settings encoding
+returns a JSON string. Transition construction remains unproved.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. `providers` exposes a readonly sequence of objects.
 The fluent builder's gradual body types and recursive return values can still
