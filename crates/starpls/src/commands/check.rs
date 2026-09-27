@@ -355,6 +355,88 @@ mod tests {
     }
 
     #[test]
+    fn mapping_commands_refresh_previously_read_sources() {
+        for failed in [false, true] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-mapping-refresh-{failed}"), true);
+            for repository in ["rules+", "generated+"] {
+                std::fs::create_dir_all(external.join(repository)).unwrap();
+            }
+            std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+            let generated = external.join("generated+/defs.bzl");
+            std::fs::write(&generated, "value = 42\n").unwrap();
+            let failure = if failed {
+                std::fs::create_dir_all(external.join("fail+")).unwrap();
+                std::fs::write(
+                    external.join("fail+/defs.bzl"),
+                    "load('@dep//:defs.bzl', 'value')\nother = value\n",
+                )
+                .unwrap();
+                "load('@@fail+//:defs.bzl', 'other')\nprint(other)\n"
+            } else {
+                ""
+            };
+            let caller = checker.bazel_info.workspace.join("caller.bzl");
+            std::fs::write(
+                &caller,
+                format!("load('@@generated+//:defs.bzl', 'value')\n{failure}len(value)\n"),
+            )
+            .unwrap();
+            checker.load_file(&caller, true, &[], true).unwrap();
+            let snapshot = checker.analysis.snapshot();
+            let caller = checker
+                .files
+                .iter()
+                .copied()
+                .find(|file| snapshot.path(*file) == caller)
+                .unwrap();
+            let diagnostics = snapshot.diagnostics(caller).unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+                "{failed}: {diagnostics:?}"
+            );
+            drop(snapshot);
+            *client.mapping_write.lock().unwrap() =
+                Some((generated, "value = 'regenerated source'\n".to_owned()));
+
+            let result = checker.check_files(false).unwrap();
+            let (_, diagnostics) = result
+                .diagnostics
+                .iter()
+                .find(|(file, _)| *file == caller)
+                .unwrap();
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == "invalid-argument-type"),
+                "{failed}: {diagnostics:?}"
+            );
+            let unresolved: Vec<_> = result.loads.unresolved.values().flatten().collect();
+            if failed {
+                assert!(!unresolved.is_empty(), "expected mapping failures");
+                for edge in unresolved {
+                    assert_eq!(
+                        edge.resolution,
+                        starpls_ide::LoadResolution::Failed(
+                            "repository mapping batch failed: cannot evaluate requested repository batch"
+                                .to_owned()
+                        )
+                    );
+                }
+            } else {
+                assert!(
+                    unresolved.is_empty(),
+                    "unexpected load failures: {unresolved:?}"
+                );
+            }
+            let fetches = client.fetch_requests.lock().unwrap();
+            assert!(fetches.is_empty(), "unexpected fetches: {fetches:?}");
+        }
+    }
+
+    #[test]
     fn fetches_materialize_transitive_loads_once() {
         let (mut checker, client, external) = fetch_checker("checker-fetch-transitive", true);
         client.fetch_files.lock().unwrap().extend([
@@ -1571,8 +1653,8 @@ impl Checker {
         }
     }
 
-    /// Finish native work after all snapshots have drained. A new revision
-    /// makes pending queries retry, including inputs created by repository fetches.
+    /// Finish native work after all snapshots have drained, then refresh files
+    /// before retrying pending queries. Mapping queries can regenerate files too.
     fn resolve_pending_loads(&mut self) -> bool {
         let mut repositories = self.loader.pending_repository_mappings();
         let fetches: Vec<_> = self
@@ -1590,9 +1672,6 @@ impl Checker {
             .collect();
         if repositories.is_empty() && fetches.is_empty() {
             return false;
-        }
-        if !repositories.is_empty() {
-            self.analysis.invalidate_loads();
         }
         while !repositories.is_empty() {
             if self.progress {
@@ -1615,8 +1694,8 @@ impl Checker {
                     eprintln!("Failed to fetch repository @@{repo}: {error:#}");
                 }
             }
-            self.analysis.invalidate_loads();
         }
+        self.analysis.invalidate_loads();
         true
     }
 

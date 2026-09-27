@@ -298,14 +298,14 @@ impl DefaultFileLoader {
         }
     }
 
-    /// Call after invalidating load queries and draining their readers.
+    /// Call with analysis snapshots drained; invalidate loads before analysis resumes.
     pub(crate) fn resolve_repository_mappings(&self, repositories: &[String]) {
         let names: Vec<_> = repositories.iter().map(String::as_str).collect();
         let result = self.bazel_client.dump_repo_mappings(&names);
         let _ = self.finish_repository_mappings(repositories, result);
     }
 
-    /// Call after invalidating load queries and draining their readers.
+    /// Publish with analysis snapshots drained; invalidate loads before analysis resumes.
     pub(crate) fn finish_repository_mappings(
         &self,
         repositories: &[String],
@@ -1353,6 +1353,7 @@ pub(crate) mod source_tests {
             std::collections::HashMap<String, starpls_bazel::client::SelectedModule>,
         pub(crate) retarget: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
         pub(crate) mapping_requests: std::sync::Mutex<Vec<Vec<String>>>,
+        pub(crate) mapping_write: std::sync::Mutex<Option<(std::path::PathBuf, String)>>,
         pub(crate) fetch_requests: std::sync::Mutex<Vec<String>>,
         pub(crate) fetch_batches: std::sync::Mutex<Vec<Vec<String>>>,
         pub(crate) fetch_files:
@@ -1446,6 +1447,9 @@ pub(crate) mod source_tests {
                     .map(|repository| (*repository).to_owned())
                     .collect(),
             );
+            if let Some((path, contents)) = self.mapping_write.lock().unwrap().take() {
+                std::fs::write(path, contents)?;
+            }
             if repositories.contains(&"fail+") {
                 anyhow::bail!("cannot evaluate requested repository batch");
             }

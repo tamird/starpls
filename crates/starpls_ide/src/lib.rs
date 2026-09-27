@@ -390,7 +390,7 @@ impl Analysis {
         starpls_common::update_file(db, file, contents);
     }
 
-    /// Refresh filesystem metadata after fetching external repositories, then
+    /// Refresh filesystem metadata after repository commands, then
     /// invalidate host resolution results that did not yet identify a file.
     pub fn invalidate_loads(&mut self) {
         let Self { db } = self;

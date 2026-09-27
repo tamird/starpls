@@ -1320,6 +1320,7 @@ mod tests {
                     during_fetch.then(|| (external.join("rules+"), new.clone())),
                 ),
                 mapping_requests: Default::default(),
+                mapping_write: Default::default(),
                 repository_mappings: Default::default(),
                 selected_modules: Default::default(),
             });
