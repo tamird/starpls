@@ -2274,6 +2274,18 @@ macro(implementation=implementation, inherit_attrs=native.sources)
 macro(implementation=implementation, inherit_attrs=sources)
 child = macro(implementation=implementation, inherit_attrs=alias)
 child(srcs=["//:input"], name="ok", generator_custom="custom")
+custom_rule = rule(implementation=lambda ctx: [], attrs={"count": attr.int(mandatory=True)})
+def excluded_kinds():
+    if type(native.sources) != "rule":
+        native.sources(srcs=42)
+    if type(child) != "macro":
+        child(name="unreachable", srcs=42)
+    if type(custom_rule) != "rule":
+        custom_rule(name="unreachable", count="wrong")
+    if type(implementation) == "rule":
+        implementation(42)
+    if type(native.glob) == "macro":
+        native.glob(42)
 "#;
         let file = analysis
             .open_document(
@@ -2365,6 +2377,18 @@ child(srcs=["//:input"], name="ok", generator_custom="custom")
             ),
             ("native.sources()", "missing-argument"),
             ("sources(srcs=42)", "invalid-argument-type"),
+            (
+                "def guarded():\n    if type(native.sources) == 'rule':\n        native.sources(srcs=42)",
+                "invalid-argument-type",
+            ),
+            (
+                "def guarded():\n    if type(child) == 'macro':\n        child(name='wrong', srcs=42)",
+                "invalid-argument-type",
+            ),
+            (
+                "def guarded():\n    if type(custom_rule) == 'rule':\n        custom_rule(name='wrong', count='wrong')",
+                "invalid-argument-type",
+            ),
             (
                 "native.sources([\"//:input\"])",
                 "too-many-positional-arguments",

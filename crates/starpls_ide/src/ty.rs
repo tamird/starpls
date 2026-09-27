@@ -545,7 +545,7 @@ impl ty_python_semantic::Db for Database {
         let environment = ProgramEnvironment::from_file(file);
         let unknown = Type::unknown();
         // Runtime tags differ from annotation names. Use canonical core tags
-        // and Bazel's nominal Label declaration, independent of source names.
+        // and Bazel's nominal declarations, independent of source names.
         let ty = match tag {
             "bool" => KnownClass::Bool.to_instance(self, &environment),
             "int" => KnownClass::Int.to_instance(self, &environment),
@@ -559,8 +559,8 @@ impl ty_python_semantic::Db for Database {
             }
             "set" => KnownClass::Set.to_specialized_instance(self, &environment, &[unknown]),
             "tuple" => Type::homogeneous_tuple(self, &environment, unknown),
-            "Label" => {
-                let binding = self.language_builtin(file, "Label", BuiltinUsage::Annotation)?;
+            "Label" | "rule" | "macro" => {
+                let binding = self.language_builtin(file, tag, BuiltinUsage::Annotation)?;
                 let class = binding.resolve_type(self)?;
                 if !matches!(class, Type::ClassLiteral(_)) {
                     return None;
@@ -868,6 +868,19 @@ def register(name: str, visibility: list[str] | None):
             ),
             ("set[str] | Target", "set", "set[str]", "Target"),
             ("Label | str", "Label", "Label", "str"),
+            (
+                "Callable[..., None]",
+                "rule",
+                "((...) -> None) & rule",
+                "((...) -> None) & ~rule",
+            ),
+            (
+                "Callable[..., None]",
+                "macro",
+                "((...) -> None) & macro",
+                "((...) -> None) & ~macro",
+            ),
+            ("Any", "macro", "Any & macro", "Any & ~macro"),
             ("str | int", "str", "str | int", "str | int"),
             ("str | int", "unknown", "str | int", "str | int"),
         ] {
@@ -994,6 +1007,26 @@ def incorrect(value: list[Target] | Target) -> list[str]:
     if type(value) == "list":
         return value
     return []
+
+def as_rule(value: object) -> rule:
+    if type(value) == "rule":
+        return value
+    fail("expected a rule")
+
+def as_macro(value: object) -> macro:
+    if type(value) == "macro":
+        return value
+    fail("expected a macro")
+
+def exclude_rule(value: rule | macro | str) -> macro | str:
+    if type(value) != "rule":
+        return value
+    return ""
+
+def exclude_macro(value: rule | macro) -> rule:
+    if type(value) == "macro":
+        fail("expected a rule")
+    return value
 
 Label = provider(fields=["local_only"])
 def package(value: object) -> str:
