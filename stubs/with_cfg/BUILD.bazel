@@ -9,6 +9,7 @@ exports_files([
     "select.bzli",
     "setting.bzli",
     "stubs.toml",
+    "transition.bzli",
     "types.bzli",
     "utils.bzli",
     "with_cfg.bzli",

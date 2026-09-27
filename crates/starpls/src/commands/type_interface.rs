@@ -241,6 +241,7 @@ mod tests {
         std::fs::write(source.join("with_cfg/private/setting.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/frontend.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/select.bzl"), "").unwrap();
+        std::fs::write(source.join("with_cfg/private/transition.bzl"), "").unwrap();
         std::fs::write(
             source.join("with_cfg/private/builder.bzl"),
             "def make_builder(rule_info): return rule_info\n",
@@ -281,6 +282,11 @@ mod tests {
         std::fs::write(
             stubs.join("select.bzli"),
             include_str!("../../../../stubs/with_cfg/select.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("transition.bzli"),
+            include_str!("../../../../stubs/with_cfg/transition.bzli"),
         )
         .unwrap();
         std::fs::write(
@@ -343,22 +349,23 @@ mod tests {
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
-                let [first, second, third, fourth, fifth, sixth, seventh, eighth] =
+                let [first, second, third, fourth, fifth, sixth, seventh, eighth, ninth] =
                     prepared.registrations.as_slice()
                 else {
                     panic!("{prepared:?}");
                 };
                 let actual = std::collections::BTreeMap::from(
-                    [first, second, third, fourth, fifth, sixth, seventh, eighth].map(
-                        |registration| {
-                            let super::Registration {
-                                source,
-                                interface,
-                                origin: _,
-                            } = registration;
-                            (source.clone(), interface.clone())
-                        },
-                    ),
+                    [
+                        first, second, third, fourth, fifth, sixth, seventh, eighth, ninth,
+                    ]
+                    .map(|registration| {
+                        let super::Registration {
+                            source,
+                            interface,
+                            origin: _,
+                        } = registration;
+                        (source.clone(), interface.clone())
+                    }),
                 );
                 let expected = std::collections::BTreeMap::from([
                     (source.join("with_cfg.bzl"), stubs.join("with_cfg.bzli")),
@@ -373,6 +380,10 @@ mod tests {
                     (
                         source.join("with_cfg/private/select.bzl"),
                         stubs.join("select.bzli"),
+                    ),
+                    (
+                        source.join("with_cfg/private/transition.bzl"),
+                        stubs.join("transition.bzli"),
                     ),
                     (
                         source.join("with_cfg/private/providers.bzl"),
