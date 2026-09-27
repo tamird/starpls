@@ -20,6 +20,7 @@ rust_test(
     name = "starpls_test",
     compile_data = [
         "//stubs/with_cfg:builder.bzli",
+        "//stubs/with_cfg:extend.bzli",
         "//stubs/with_cfg:frontend.bzli",
         "//stubs/with_cfg:private_helpers.bzli",
         "//stubs/with_cfg:providers.bzli",

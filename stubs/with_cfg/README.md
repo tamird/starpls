@@ -36,6 +36,10 @@ objects. Provider-specific operations require a more specific element contract.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
 `_clone_value_deeply(object) -> object` copies lists and returns other values.
+The extension interface declares `_initializer_base` with string-keyed
+keyword arguments and setting values keyed by strings or labels. It returns
+a fresh string-keyed dictionary of objects, with validated setting names
+overriding matching keyword arguments.
 The utility contracts declare `is_label`, `is_string`, and `is_list` as type
 guards. A true result narrows the input to `Label`, `str`, or the readonly
 `Sequence[object]` view, respectively. In the true branch, the list guard

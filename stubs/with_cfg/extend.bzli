@@ -1,0 +1,5 @@
+def _initializer_base(
+    *,
+    kwargs: dict[str, object],
+    values: dict[str | Label, object],
+) -> dict[str, object]: ...

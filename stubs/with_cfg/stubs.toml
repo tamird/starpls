@@ -8,6 +8,7 @@ versions = ["0.14.6"]
 [files]
 "with_cfg.bzl" = "with_cfg.bzli"
 "with_cfg/private/builder.bzl" = "builder.bzli"
+"with_cfg/private/extend.bzl" = "extend.bzli"
 "with_cfg/private/frontend.bzl" = "frontend.bzli"
 "with_cfg/private/providers.bzl" = "providers.bzli"
 "with_cfg/private/select.bzl" = "select.bzli"

@@ -239,6 +239,7 @@ mod tests {
         std::fs::write(source.join("with_cfg/private/with_cfg.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/providers.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/setting.bzl"), "").unwrap();
+        std::fs::write(source.join("with_cfg/private/extend.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/frontend.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/select.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/transition.bzl"), "").unwrap();
@@ -272,6 +273,11 @@ mod tests {
         std::fs::write(
             stubs.join("builder.bzli"),
             include_str!("../../../../stubs/with_cfg/builder.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("extend.bzli"),
+            include_str!("../../../../stubs/with_cfg/extend.bzli"),
         )
         .unwrap();
         std::fs::write(
@@ -349,15 +355,9 @@ mod tests {
             let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
             if version == "0.14.6" {
                 let prepared = prepared.unwrap();
-                let [first, second, third, fourth, fifth, sixth, seventh, eighth, ninth] =
-                    prepared.registrations.as_slice()
-                else {
-                    panic!("{prepared:?}");
-                };
-                let actual = std::collections::BTreeMap::from(
-                    [
-                        first, second, third, fourth, fifth, sixth, seventh, eighth, ninth,
-                    ]
+                let actual = prepared
+                    .registrations
+                    .iter()
                     .map(|registration| {
                         let super::Registration {
                             source,
@@ -365,13 +365,18 @@ mod tests {
                             origin: _,
                         } = registration;
                         (source.clone(), interface.clone())
-                    }),
-                );
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(actual.len(), prepared.registrations.len());
                 let expected = std::collections::BTreeMap::from([
                     (source.join("with_cfg.bzl"), stubs.join("with_cfg.bzli")),
                     (
                         source.join("with_cfg/private/builder.bzl"),
                         stubs.join("builder.bzli"),
+                    ),
+                    (
+                        source.join("with_cfg/private/extend.bzl"),
+                        stubs.join("extend.bzli"),
                     ),
                     (
                         source.join("with_cfg/private/frontend.bzl"),
