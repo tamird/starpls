@@ -50,8 +50,12 @@ returning a list; implementation validation reports that mismatch.
 The select parser interface describes successful string, scalar, list, and
 shallow dictionary results, paired with integer cursor positions. It covers
 `_consume_string`, `consume_single_value`, `consume_list`,
-`_consume_list_or_single_value`, and `_consume_compound_value`. Select mapping
-and recombination remain unproved.
+`_consume_list_or_single_value`, and `_consume_compound_value`.
+`decompose_select_elements` preserves each Boolean tag with its payload:
+a true tag carries a dictionary of parsed compound values. `_apply_func`
+accepts those items and an object-to-object callback, retaining the tag and
+returning a fresh dictionary for true-tagged items. These contracts describe
+successful results; select mapping and recombination remain unproved.
 The transition interface declares `_get_settings_key(str | Label) -> str`,
 using the validated Label and string predicates. It also declares
 `_encode_settings(dict[str, object]) -> str`: successful settings encoding

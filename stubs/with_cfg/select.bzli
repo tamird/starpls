@@ -7,3 +7,36 @@ def consume_list(r: str, pos: int) -> tuple[list[str | bool | int | None | Label
 def _consume_list_or_single_value(r: str, pos: int) -> tuple[str | bool | int | None | Label | list[str | bool | int | None | Label], int]: ...
 
 def _consume_compound_value(r: str, pos: int) -> tuple[str | bool | int | None | Label | list[str | bool | int | None | Label] | dict[str | bool | int | None | Label, str | bool | int | None | Label | list[str | bool | int | None | Label]], int]: ...
+
+def decompose_select_elements(value: object) -> list[
+    tuple[
+        Literal[True],
+        dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label
+            | list[str | bool | int | None | Label]
+            | dict[
+                str | bool | int | None | Label,
+                str | bool | int | None | Label | list[str | bool | int | None | Label],
+            ],
+        ],
+    ]
+    | tuple[Literal[False], object]
+]: ...
+
+def _apply_func(
+    func: Callable[[object], object],
+    item: tuple[
+        Literal[True],
+        dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label
+            | list[str | bool | int | None | Label]
+            | dict[
+                str | bool | int | None | Label,
+                str | bool | int | None | Label | list[str | bool | int | None | Label],
+            ],
+        ],
+    ]
+    | tuple[Literal[False], object],
+) -> tuple[Literal[True], dict[str | bool | int | None | Label, object]] | tuple[Literal[False], object]: ...
