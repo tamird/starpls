@@ -35,9 +35,12 @@ accepts iterable values and exposes its result as a readonly sequence of
 objects. Provider-specific operations require a more specific element contract.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
-The utility contracts declare `is_label` and `is_string` as type guards:
-a true result narrows the input to `Label` or `str`, respectively. The other
-five utility predicates accept `object` and return `bool`. The setting
+`_clone_value_deeply(object) -> object` copies lists and returns other values.
+The utility contracts declare `is_label`, `is_string`, and `is_list` as type
+guards. A true result narrows the input to `Label`, `str`, or the readonly
+`Sequence[object]` view, respectively. In the true branch, the list guard
+replaces any more specific list type with this readonly view. The other four
+utility predicates accept `object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.
 The frontend interface declares `get_frontend` with a callable returning
