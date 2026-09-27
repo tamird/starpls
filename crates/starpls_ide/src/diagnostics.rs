@@ -738,6 +738,13 @@ defaulted_right = defaulted + ["b"] # type: select[list[str] | None]
 defaulted_left = ["b"] + defaulted # type: select[list[str] | None]
 defaulted_text = "b" + select({"//:condition": "a", "//conditions:default": None}) # type: select[str | None]
 defaulted_mapping = {"a": 1} | select({"//:condition": {"b": "c"}, "//conditions:default": None}) # type: select[dict[str, int | str] | None]
+integer_right = select({"//:condition": 1}) + 2
+integer_left = 2 + select({"//:condition": 1})
+integer_pair = select({"//:condition": 1}) + select({"//:condition": 2})
+integer_defaulted = select({"//:condition": 1, "//conditions:default": None}) + 2
+none_right = select({"//:condition": None}) + None
+none_left = None + select({"//:condition": None})
+none_pair = select({"//:condition": None}) + select({"//:condition": None})
 text = select({"//:condition": "a"}) + "b" # type: select[str]
 text_before = "b" + select({"//:condition": "a"}) # type: select[str]
 mapping = select({"//:condition": {"a": 1}}) | {"b": "c"} # type: select[dict[str, int | str]]
@@ -746,6 +753,13 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
         let (mut analysis, fixture) = native_analysis(source);
         let file = fixture.main_file();
         for (name, expected) in [
+            ("integer_right", "select[int]"),
+            ("integer_left", "select[int]"),
+            ("integer_pair", "select[int]"),
+            ("integer_defaulted", "select[int | None]"),
+            ("none_right", "select[None]"),
+            ("none_left", "select[None]"),
+            ("none_pair", "select[None]"),
             ("known_mixed", "select[list[str | int]]"),
             ("declared_mixed", "select[list[str | int]]"),
             ("nullable_mixed", "select[list[str | int] | None]"),
@@ -844,7 +858,15 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
                 "bad = defaulted_mapping # type: select[dict[str, int | str]]",
                 "invalid-assignment",
             ),
-            ("select({'//:condition': 1}) + 2", "unsupported-operator"),
+            ("select({'//:condition': 1}) + 'a'", "unsupported-operator"),
+            ("select({'//:condition': 1}) + True", "unsupported-operator"),
+            ("defaulted + None", "unsupported-operator"),
+            ("None + defaulted", "unsupported-operator"),
+            (
+                "select({'//:condition': None}) | None",
+                "unsupported-operator",
+            ),
+            ("None + None", "unsupported-operator"),
         ] {
             analysis.update_file(file, format!("{source}\n{statement}\n"));
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();

@@ -650,13 +650,14 @@ fn write_type_overloads(
     Ok(())
 }
 
-// Selector concatenation is deferred until attribute conversion. Only strings,
-// lists, and dictionaries support that conversion in Bazel.
+// Selector concatenation is deferred until attribute conversion. Integer,
+// string, sequence, and mapping overloads model the attribute value domains.
 // Nullable overloads preserve default markers but cannot model the first-branch
 // runtime kind that Bazel uses to accept or reject a concatenation.
 fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
     for (methods, signatures) in [
         (["__add__", "__radd__"], &[
+            ("_starpls_builtins.int", "_starpls_builtins.int", "_starpls_builtins.int"),
             ("_starpls_builtins.str", "_starpls_builtins.str", "_starpls_builtins.str"),
             ("_starpls_typing.Sequence[_SelectLeft]", "_starpls_typing.Sequence[_SelectRight]", "_starpls_builtins.list[_SelectLeft | _SelectRight]"),
         ][..]),
@@ -665,6 +666,11 @@ fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
         ][..]),
     ] {
         for method in methods {
+            if matches!(method, "__add__" | "__radd__") {
+                writeln!(output, "        @_starpls_typing.overload")?;
+                writeln!(output, "        @_starpls_typing.type_check_only")?;
+                writeln!(output, "        def {method}(self: _starpls_types.select[None], other: None | _starpls_types.select[None], /) -> _starpls_types.select[None]: ...")?;
+            }
             for nullable in ["", " | None"] {
                 for (receiver, operand, result) in signatures {
                     writeln!(output, "        @_starpls_typing.overload")?;
