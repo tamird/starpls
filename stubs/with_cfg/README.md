@@ -54,8 +54,9 @@ shallow dictionary results, paired with integer cursor positions. It covers
 `decompose_select_elements` preserves each Boolean tag with its payload:
 a true tag carries a dictionary of parsed compound values. `_apply_func`
 accepts those items and an object-to-object callback, retaining the tag and
-returning a fresh dictionary for true-tagged items. These contracts describe
-successful results; select mapping and recombination remain unproved.
+returning a fresh dictionary for true-tagged items. `_is_dict_element` accepts
+those mapped items and returns `bool`. These contracts describe successful
+results; select mapping and recombination remain unproved.
 The transition interface declares `_get_settings_key(str | Label) -> str`,
 using the validated Label and string predicates. It also declares
 `_encode_settings(dict[str, object]) -> str`: successful settings encoding

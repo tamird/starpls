@@ -40,3 +40,7 @@ def _apply_func(
     ]
     | tuple[Literal[False], object],
 ) -> tuple[Literal[True], dict[str | bool | int | None | Label, object]] | tuple[Literal[False], object]: ...
+
+def _is_dict_element(
+    item: tuple[Literal[True], dict[str | bool | int | None | Label, object]] | tuple[Literal[False], object],
+) -> bool: ...
