@@ -3258,6 +3258,34 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
             "def compute(*args: int, **kwargs: string) -> int: ...\n"
         )
         .is_empty());
+        let source = r#"def target(*, name, value=0):
+    pass
+def forward(**kwargs):
+    target(**kwargs)
+"#;
+        let stub = r#"class _Keywords(TypedDict, closed=True):
+    name: str
+    value: NotRequired[int]
+def target(*, name: str, value: int = ...) -> None: ...
+def forward(**kwargs: Unpack[_Keywords]) -> None: ...
+"#;
+        let diagnostics = validate(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            validate(
+                source,
+                &stub.replace("name: str\n", "name: NotRequired[str]\n")
+            ),
+            ["incomplete-stub-validation"],
+        );
+        let diagnostics = validate(
+            source,
+            &stub.replace("NotRequired[int]", "NotRequired[str]"),
+        );
+        assert!(
+            diagnostics.iter().any(|id| id == "invalid-argument-type"),
+            "{diagnostics:?}",
+        );
     }
 
     #[test]
