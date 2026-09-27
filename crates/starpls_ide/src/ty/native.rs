@@ -597,6 +597,7 @@ fn declarations(
         "TypedDict",
         "TypeGuard",
         "Unpack",
+        "Literal",
         "NotRequired",
         "ReadOnly",
     ] {

@@ -246,6 +246,7 @@ impl Database {
                     "TypedDict",
                     "TypeGuard",
                     "Unpack",
+                    "Literal",
                     "NotRequired",
                     "ReadOnly",
                     "object",

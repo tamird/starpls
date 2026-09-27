@@ -3286,6 +3286,36 @@ def forward(**kwargs: Unpack[_Keywords]) -> None: ...
             diagnostics.iter().any(|id| id == "invalid-argument-type"),
             "{diagnostics:?}",
         );
+        let source = r#"def apply(func, item):
+    flag, payload = item
+    if flag:
+        return (True, {key: func(value) for key, value in payload.items()})
+    else:
+        return (False, func(payload))
+"#;
+        let stub = "def apply(func: Callable[[object], object], item: tuple[Literal[True], dict[str, object]] | tuple[Literal[False], object]) -> tuple[bool, object]: ...\n";
+        for (stub, expected) in [
+            (stub.to_owned(), None),
+            (
+                stub.replace("Literal[True], dict", "Literal[False], dict")
+                    .replace("Literal[False], object", "Literal[True], object"),
+                Some("unresolved-attribute"),
+            ),
+            (
+                stub.replace("Callable[[object], object]", "Callable[[str], object]"),
+                Some("invalid-argument-type"),
+            ),
+        ] {
+            let diagnostics = validate(source, &stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{stub}: {diagnostics:?}",
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}");
+            }
+        }
     }
 
     #[test]
