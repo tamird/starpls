@@ -50,6 +50,7 @@ use ty_python_semantic::types::TypeDefinition;
 use ty_python_semantic::FunctionInferenceFacts;
 use ty_python_semantic::FunctionInferenceMode;
 use ty_python_semantic::HasType;
+use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::SemanticModel;
 
 use super::diagnostics::INCOMPLETE_STUB_VALIDATION;
@@ -1367,19 +1368,7 @@ fn compare_initializer<'db>(
         // Contextual return checking can hide gradual evidence in structural
         // contracts. Restrict proof to nominal values and their containers;
         // ordinary Ty diagnostics still check every initializer below.
-        if !field.ty.is_fully_static(db, &environment)
-            || ty_python_semantic::types::any_over_type(db, &environment, field.ty, false, |ty| {
-                !matches!(
-                    ty,
-                    Type::NominalInstance(_)
-                        | Type::ClassLiteral(_)
-                        | Type::GenericAlias(_)
-                        | Type::Union(_)
-                        | Type::LiteralValue(_)
-                        | Type::Never
-                )
-            })
-        {
+        if !has_nominal_evidence(db, &environment, field.ty) {
             return Err(ContractError::Incomplete(format!(
                 "Cannot prove `{name}`: field `{}` requires a structural or unresolved contract",
                 field.name
@@ -1601,6 +1590,25 @@ fn has_static_evidence(
     evidence.complete
 }
 
+fn has_nominal_evidence<'db>(
+    db: &'db dyn ty_python_semantic::Db,
+    environment: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    ty.is_fully_static(db, environment)
+        && !ty_python_semantic::types::any_over_type(db, environment, ty, false, |ty| {
+            !matches!(
+                ty,
+                Type::NominalInstance(_)
+                    | Type::ClassLiteral(_)
+                    | Type::GenericAlias(_)
+                    | Type::Union(_)
+                    | Type::LiteralValue(_)
+                    | Type::Never
+            )
+        })
+}
+
 fn expression_has_static_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
     expression_has_evidence(model, expression, false)
 }
@@ -1612,6 +1620,11 @@ fn expression_has_evidence(
 ) -> bool {
     let environment = model.program_environment();
     expression.inferred_type(model).is_some_and(|ty| {
+        // The ordinary pass checks calls and storage in selected bodies.
+        // Defaults retain callable evidence because deferred bodies lack those checks.
+        if conservative && has_nominal_evidence(model.db(), &environment, ty) {
+            return true;
+        }
         let ty = ty
             .map_callable_signatures(
                 model.db(),
@@ -1844,6 +1857,83 @@ def marker(): return 1
                     "{source}: {diagnostics:?}"
                 ),
                 None => assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validation_distinguishes_rule_values_from_uses() {
+        let preamble = r#"def attrs():
+    # type: () -> dict[str, Attribute]
+    return {"required": attr.string(mandatory=True)}
+
+rule_value = rule(implementation=lambda ctx: [], attrs=attrs())
+other_rule = rule(implementation=lambda ctx: [], attrs=attrs(), test=True)
+def known(*, name: str) -> None: pass
+"#;
+        for (body, stub, expected) in [
+            (
+                "def make(): return rule_value",
+                "def make() -> Callable[..., None]: ...",
+                None,
+            ),
+            (
+                "def make(flag): return rule_value if flag else other_rule",
+                "def make(flag: bool) -> Callable[..., None]: ...",
+                None,
+            ),
+            (
+                "def make():\n    alias = rule_value\n    return alias",
+                "def make() -> Callable[..., None]: ...",
+                None,
+            ),
+            (
+                "def make(): rule_value(name='target')",
+                "def make() -> None: ...",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def make():\n    alias = rule_value\n    alias(name='target')",
+                "def make() -> None: ...",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def make(): return rule_value",
+                "class _Named(Protocol):\n    def __call__(self, *, name: str) -> None: ...\ndef make() -> _Named: ...",
+                Some("unsound-return-statement"),
+            ),
+            (
+                "def make(): return [rule_value]",
+                "class _Named(Protocol):\n    def __call__(self, *, name: str) -> None: ...\ndef make() -> list[_Named]: ...",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def make(callback=lambda: rule_value(name='target')): return callback",
+                "def make(callback: Callable[[], None] = ...) -> Callable[[], None]: ...",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def make(callback=lambda: None): return callback",
+                "def make(callback: Callable[[], None] = ...) -> Callable[[], None]: ...",
+                None,
+            ),
+            (
+                "def make(callback=lambda: [rule_value]): return callback",
+                "class _Named(Protocol):\n    def __call__(self, *, name: str) -> None: ...\ndef make(callback: Callable[[], list[_Named]] = ...) -> Callable[[], list[_Named]]: ...",
+                Some("incomplete-stub-validation"),
+            ),
+            (
+                "def make(callback=lambda: [known]): return callback",
+                "class _Named(Protocol):\n    def __call__(self, *, name: str) -> None: ...\ndef make(callback: Callable[[], list[_Named]] = ...) -> Callable[[], list[_Named]]: ...",
+                None,
+            ),
+        ] {
+            let source = format!("{preamble}\n{body}\n");
+            let diagnostics = validate(&source, stub);
+            if let Some(expected) = expected {
+                assert_eq!(diagnostics, [expected], "{body}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
             }
         }
     }
@@ -2823,6 +2913,9 @@ def make() -> _Runner: ...
         ] {
             let source = format!("{provider}def make(run):\n    return Info(run=run)\n");
             let stub = format!("{declaration}def make(run: Callable[[list[Any]], int]) -> Info: ...\n");
+            assert!(validate(&source, &stub).is_empty(), "{source}");
+            let source = format!("{provider}{narrow}def make():\n    return Info(run=_only_strings)\n");
+            let stub = format!("{declaration}def make() -> Info: ...\n");
             assert_eq!(validate(&source, &stub), ["incomplete-stub-validation"], "{source}");
         }
 
