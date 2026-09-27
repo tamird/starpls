@@ -117,12 +117,14 @@ impl Analysis {
                 .to(StubValidation::default());
             let mut contracts = Vec::new();
             let mut values = Vec::new();
+            let mut validation = StubValidation::default();
             for source in &sources {
                 let Some(&(_, stub)) = interfaces.get(&source.source) else {
                     continue;
                 };
                 reports.entry(*source).or_default();
                 reports.entry(stub).or_default();
+                let previous_count = contracts.len() + values.len();
                 discover(
                     db,
                     *source,
@@ -132,6 +134,9 @@ impl Analysis {
                     &mut values,
                     &mut reports,
                 );
+                if contracts.len() + values.len() > previous_count {
+                    validation.files.insert(source.source);
+                }
             }
             let mut owners = FxHashMap::default();
             for contract in &contracts {
@@ -146,7 +151,6 @@ impl Analysis {
                     }
                 }
             }
-            let mut validation = StubValidation::default();
             for (&source, owner) in &mut owners {
                 if let Ok(stub) = *owner {
                     let provider = contracts
@@ -192,7 +196,7 @@ impl Analysis {
             }
             validation
                 .files
-                .extend(reports.keys().map(|file| file.source));
+                .extend(contracts.iter().map(|contract| contract.source.file.source));
             environment.set_stub_validation(db).to(validation.clone());
             // Infer exported values from source with the borrowed signatures installed.
             // Keeping redirection disabled here avoids proving a reexport against itself.
@@ -315,12 +319,14 @@ impl Analysis {
                             has_cycle_recovery,
                             has_errors,
                             has_diagnostics_or_suppressions,
+                            has_unproved_requirements,
                         } = model
                             .function_inference_facts(function_definition(db, source))
                             .expect("function contracts originate in a function declaration");
                         if !has_errors {
                             if has_cycle_recovery
                                 || has_diagnostics_or_suppressions
+                                || has_unproved_requirements
                                 || return_type_correspondence != Some(true)
                             {
                                 ContractError::Incomplete(format!("Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"))
@@ -354,17 +360,23 @@ impl Analysis {
                     let TypeCheckResult {
                         diagnostics: source_diagnostics,
                         has_suppressed_inference_diagnostics,
+                        has_unproved_requirements,
                     } = super::diagnostics::check_with_status(db, file);
                     checked.extend(source_diagnostics);
-                    if has_suppressed_inference_diagnostics
-                        && !diagnostics.iter().any(|diagnostic| {
+                    let has_errors = diagnostics
+                        .iter()
+                        .chain(&checked)
+                        .any(|diagnostic| diagnostic.severity() == Severity::Error);
+                    if (has_suppressed_inference_diagnostics
+                        || (has_unproved_requirements && !has_errors))
+                        && !diagnostics.iter().chain(&checked).any(|diagnostic| {
                             diagnostic.id() == DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name())
                         })
                     {
                         let mut diagnostic = Diagnostic::new(
                             DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
                             Severity::Error,
-                            "Cannot validate implementation: type-checking diagnostics were suppressed",
+                            "Cannot validate implementation: type checking has unresolved or suppressed obligations",
                         );
                         diagnostic.annotate(Annotation::primary(Span::from(file.source)));
                         checked.push(diagnostic);
@@ -1379,10 +1391,13 @@ fn compare_initializer<'db>(
         has_cycle_recovery,
         has_errors,
         has_diagnostics_or_suppressions,
+        has_unproved_requirements,
     } = model
         .function_inference_facts(definition)
         .expect("provider initializers originate in a function declaration");
-    if !has_errors && (has_cycle_recovery || has_diagnostics_or_suppressions) {
+    if !has_errors
+        && (has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements)
+    {
         return Err(ContractError::Incomplete(format!(
             "Cannot prove `{name}`: initializer checking has unresolved or suppressed obligations"
         )));
@@ -1398,16 +1413,10 @@ pub(super) fn function_inference_mode(
     scope: ty_python_core::scope::ScopeId<'_>,
 ) -> FunctionInferenceMode {
     let validation = db.environment().stub_validation(db);
-    if validation.annotations.is_empty() {
+    if validation.files.is_empty() {
         return FunctionInferenceMode::Default;
     }
-    if (validation.phase == StubValidationPhase::Ordinary
-        && !matches!(
-            scope.node(db),
-            ty_python_core::scope::NodeWithScopeKind::Function(_)
-        ))
-        || !selected_execution_scope(db, scope)
-    {
+    if !selected_execution_scope(db, scope) {
         return FunctionInferenceMode::Default;
     }
     match validation.phase {
@@ -1418,11 +1427,22 @@ pub(super) fn function_inference_mode(
 
 fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId<'_>) -> bool {
     let validation = db.environment().stub_validation(db);
-    if validation.annotations.is_empty() {
+    if validation.files.is_empty() {
         return false;
     }
-    // Execution scopes inherit the nearest named owner. Semantic ancestry also
-    // places defaults and comprehension iterables in the scope that evaluates them.
+    let Some(source) = db.starlark_file(scope.program_file(db)) else {
+        return false;
+    };
+    if source.is_type_interface(db) || !validation.files.contains(&source.source) {
+        return false;
+    }
+    // Selected named implementations include their nested expression scopes.
+    // Module initialization includes eager comprehensions; lambda bodies are deferred.
+    // Defaults and first iterables retain their semantic execution scope.
+    let mut deferred_body = matches!(
+        scope.node(db),
+        ty_python_core::scope::NodeWithScopeKind::Lambda(_)
+    );
     let scope = if matches!(
         scope.node(db),
         ty_python_core::scope::NodeWithScopeKind::Lambda(_)
@@ -1435,6 +1455,10 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
                 .ancestor_scopes(scope.file_scope_id(db))
                 .skip(1)
                 .find(|(_, ancestor)| {
+                    deferred_body |= matches!(
+                        ancestor.node(),
+                        ty_python_core::scope::NodeWithScopeKind::Lambda(_)
+                    );
                     matches!(
                         ancestor.node(),
                         ty_python_core::scope::NodeWithScopeKind::Function(_)
@@ -1449,10 +1473,13 @@ fn selected_execution_scope(db: &Database, scope: ty_python_core::scope::ScopeId
     } else {
         scope
     };
+    if matches!(
+        scope.node(db),
+        ty_python_core::scope::NodeWithScopeKind::Module
+    ) {
+        return validation.phase == StubValidationPhase::Ordinary && !deferred_body;
+    }
     let ty_python_core::scope::NodeWithScopeKind::Function(function) = scope.node(db) else {
-        return false;
-    };
-    let Some(source) = db.starlark_file(scope.program_file(db)) else {
         return false;
     };
     let parsed = ruff_db::parsed::parsed_module(db, scope.python_file(db)).load(db);
@@ -1626,10 +1653,11 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
         has_cycle_recovery,
         has_errors: _,
         has_diagnostics_or_suppressions,
+        has_unproved_requirements,
     } = model
         .function_inference_facts(definition)
         .expect("function contracts originate in a function declaration");
-    if has_cycle_recovery || has_diagnostics_or_suppressions {
+    if has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements {
         return Err(ContractError::Incomplete(format!(
             "Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"
         )));
@@ -1761,6 +1789,39 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn validation_checks_native_constructor_inputs() {
+        for (source, stub) in [
+            (
+                "def convert(value): return int(value)\n",
+                "def convert(value: str) -> int: ...\n",
+            ),
+            (
+                "def convert(value): return str(value)\n",
+                "def convert(value: object) -> str: ...\n",
+            ),
+            (
+                "def convert(value): return [i for i in range(value)]\n",
+                "def convert(value: int) -> list[int]: ...\n",
+            ),
+        ] {
+            assert!(validate(source, stub).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn validation_checks_generic_collection_initializers() {
+        for value in [
+            "type([])",
+            "type({})",
+            "type(select({'//conditions:default': []}))",
+        ] {
+            let source = format!("VALUE = {value}\n");
+            let diagnostics = validate(&source, "VALUE: str\n");
+            assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        }
     }
 
     #[test]
@@ -2924,7 +2985,7 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
             ),
             (
                 "def compute(value='bad'):\n    return value\n",
-                Some("invalid-parameter-default"),
+                Some("invalid-return-type"),
             ),
             (
                 "def compute(renamed):\n    return renamed\n",
@@ -3078,12 +3139,90 @@ def make() -> _Row: ...
     }
 
     #[test]
+    fn augmented_storage_checks_local_and_module_values() {
+        for (input, expected) in [
+            (
+                "Callable[..., None]",
+                &["incomplete-stub-validation"] as &[&str],
+            ),
+            ("Callable[[str], None]", &[]),
+        ] {
+            let source = "def make(values):\n    callbacks: list[Callable[[str], None]] = []\n    callbacks += values\n    return callbacks[0]\n";
+            let stub = format!("def make(values: list[{input}]) -> Callable[[str], None]: ...\n");
+            assert_eq!(validate(source, &stub), expected, "local {input}");
+
+            let source = format!("def incoming() -> {input}: return lambda value: None\nvalues = [incoming()]\ncallbacks: list[Callable[[str], None]] = []\ncallbacks += values\ndef make(): return callbacks[0]\n");
+            assert_eq!(
+                validate(&source, "def make() -> Callable[[str], None]: ...\n"),
+                expected,
+                "module {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_defaults_enter_the_implementation_body() {
+        for (default, annotation, valid) in [
+            ("narrow", "Callable[[Any], None]", false),
+            ("narrow", "Callable[[str], None]", true),
+            ("narrow", "Callable[..., None]", true),
+            (
+                "lambda value: narrow(value)",
+                "Callable[[Any], None]",
+                false,
+            ),
+            ("lambda value: narrow(value)", "Callable[[str], None]", true),
+        ] {
+            let source = format!(
+                "def narrow(value: str) -> None: pass\ndef make(callback={default}): return callback\n"
+            );
+            let stub = format!("def make(callback: {annotation} = ...) -> {annotation}: ...\n");
+            let diagnostics = validate(&source, &stub);
+            let expected: &[&str] = if valid {
+                &[]
+            } else {
+                &["incomplete-stub-validation"]
+            };
+            assert_eq!(diagnostics, expected, "{source}");
+        }
+        assert!(validate(
+            "def narrow(value: str) -> None: pass\ndef make(callback=narrow): return 1\n",
+            "def make(callback: Callable[[Any], None] = ...) -> int: ...\n",
+        )
+        .is_empty());
+        for (body, valid) in [
+            (
+                "    if value == None:\n        value = 1\n    return value\n",
+                true,
+            ),
+            ("    return value\n", false),
+        ] {
+            let source = format!("def make(value=None):\n{body}");
+            let diagnostics = validate(&source, "def make(value: int = ...) -> int: ...\n");
+            let expected: &[&str] = if valid { &[] } else { &["invalid-return-type"] };
+            assert_eq!(diagnostics, expected, "{source}");
+        }
+        for source in [
+            "def make(value: int = None) -> int: return value\n",
+            "def make(value=None): # type: (int) -> int\n    return value\n",
+        ] {
+            let diagnostics = validate(source, "def make(value: int = ...) -> int: ...\n");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "invalid-parameter-default"),
+                "{source}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parameter_defaults_require_independent_evidence() {
         for (source, stub, expected) in [
             (
                 "def opaque(): return 'bad'\ndef compute(value=opaque()): return value\n",
                 "def compute(value: int = ...) -> int: ...\n",
-                Some("incomplete-stub-validation"),
+                Some("unsound-return-statement"),
             ),
             (
                 "def opaque() -> Any: return 'bad'\ndef compute(value=[opaque()]): return value[0]\n",
@@ -3098,7 +3237,7 @@ def make() -> _Row: ...
             (
                 "def compute(value='bad'): # ty: ignore[invalid-parameter-default]\n    return value\n",
                 "def compute(value: int = ...) -> int: ...\n",
-                Some("incomplete-stub-validation"),
+                Some("invalid-return-type"),
             ),
             (
                 "def needs_int(value: int) -> int: return value\ndef compute(value=needs_int('bad')): # ty: ignore[invalid-argument-type]\n    return value\n",
@@ -3733,6 +3872,11 @@ def make() -> _Row: ...
         );
         loader.add_files_from_fixture(&fixture);
         analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let previous = analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .clone();
         for (body_text, valid) in [
             ("def compute(value):\n    return 'bad'\n", false),
             ("def compute(value):\n    return value\n", true),
@@ -3752,12 +3896,10 @@ def make() -> _Row: ...
                     "{diagnostics:?}"
                 );
             }
-            assert!(analysis
-                .db
-                .environment()
-                .stub_validation(&analysis.db)
-                .annotations
-                .is_empty());
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous
+            );
             let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
@@ -3847,6 +3989,94 @@ def make() -> _Runner: ...
             ),
             ["incomplete-stub-validation"],
         );
+    }
+
+    #[test]
+    fn module_storage_requirements_include_value_only_contracts() {
+        for (result, expected) in [
+            (
+                "Callable[..., None]",
+                &["incomplete-stub-validation"] as &[&str],
+            ),
+            ("Callable[[int], None]", &[]),
+        ] {
+            let source = format!(
+                "def opaque() -> {result}: return lambda value: None\ncallbacks: list[Callable[[int], None]] = []\ncallbacks.append(opaque())\n"
+            );
+            assert_eq!(
+                validate(&source, "callbacks: list[Callable[[int], None]]\n"),
+                expected,
+                "{result}",
+            );
+        }
+    }
+
+    #[test]
+    fn storage_requirements_follow_selected_execution_scopes() {
+        let helper = "def opaque() -> Callable[..., None]: return lambda value: None\n";
+        for body in [
+            "callbacks.append(opaque())",
+            "(lambda: callbacks.append(opaque()))()",
+            "[callbacks.append(opaque()) for _ in [1]]",
+            "{1: callbacks.append(opaque()) for _ in [1]}",
+        ] {
+            for selected in [false, true] {
+                let source = format!("{helper}def use():\n    callbacks: list[Callable[[int], None]] = []\n    {body}\n    return 1\n");
+                let stub = if selected {
+                    "def use() -> int: ...\n"
+                } else {
+                    ""
+                };
+                let expected: &[&str] = if selected {
+                    &["incomplete-stub-validation"]
+                } else {
+                    &[]
+                };
+                assert_eq!(
+                    validate(&source, stub),
+                    expected,
+                    "{body}, selected={selected}"
+                );
+            }
+        }
+        assert_eq!(
+            validate(
+                &format!("{helper}callbacks: list[Callable[[int], None]] = []\ndef make(value=callbacks.append(opaque())): return 1\n"),
+                "def make(value: None = ...) -> int: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+    }
+
+    #[test]
+    fn module_initialization_does_not_select_unrelated_lazy_bodies() {
+        for body in [
+            "def unused(): consume(opaque())",
+            "unused = lambda: consume(opaque())",
+            "unused = lambda: [consume(opaque()) for _ in [1]]",
+        ] {
+            let source = format!(
+                "def consume(value: Callable[[int], None]) -> None: pass\ndef opaque() -> Callable[..., None]: return lambda value: None\n{body}\nVALUE = 1\n"
+            );
+            assert_eq!(
+                validate(&source, "VALUE: int\n"),
+                Vec::<&str>::new(),
+                "{body}"
+            );
+        }
+        for expression in [
+            "lambda value=consume(opaque()): None",
+            "[consume(opaque()) for _ in [1]]",
+        ] {
+            let source = format!(
+                "def consume(value: Callable[[int], None]) -> None: pass\ndef opaque() -> Callable[..., None]: return lambda value: None\nunused = {expression}\nVALUE = 1\n"
+            );
+            assert_eq!(
+                validate(&source, "VALUE: int\n"),
+                ["incomplete-stub-validation"],
+                "{expression}"
+            );
+        }
     }
 
     #[test]

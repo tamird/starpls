@@ -1063,19 +1063,19 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         });
     }
     if !complete {
-        // Partial mappings and unknown parents can contain additional names.
+        // Partial mappings and unknown parents can contain additional required names.
         parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
     }
-    let callable = Type::function_like_callable(
-        db,
-        Signature::new(
-            Parameters::standard(
-                std::iter::once(Parameter::positional_only(Some(Name::new("self"))))
-                    .chain(parameters),
-            ),
-            Type::none(db, &environment),
-        ),
+    let parameters = Parameters::standard(
+        std::iter::once(Parameter::positional_only(Some(Name::new("self")))).chain(parameters),
     );
+    let parameters = if complete {
+        parameters
+    } else {
+        parameters.with_incomplete_shape()
+    };
+    let callable =
+        Type::function_like_callable(db, Signature::new(parameters, Type::none(db, &environment)));
     let name = match kind {
         RuleKind::Build => "rule",
         RuleKind::Repository => "repository_rule",
@@ -1914,6 +1914,7 @@ pub(super) fn native_class<'db>(
 
 #[cfg(test)]
 mod tests {
+    use ty_python_semantic::types::DynamicType;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
 
@@ -2542,6 +2543,103 @@ example, register = make_rule(False)
         assert!(!signature.label.contains("dep:"), "{help:?}");
         let diagnostics = snapshot.diagnostics(file_id).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn incomplete_rule_shapes_preserve_known_parameters() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"def implementation(ctx): return []
+def macro_impl(name, visibility, **kwargs): pass
+def attributes(): return {"exports": attr.label(mandatory=True)}
+target = rule(implementation, attrs=dict(attributes(), count=attr.int()))
+inherited = macro(implementation=macro_impl, inherit_attrs=target)
+inherited($0name="valid", count=1)
+target()
+target(name=1)
+target("positional")
+"#,
+        );
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let (file, pos) = fixture.cursor_pos.unwrap();
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let program = db.starlark_program_file(file);
+        let environment = ProgramEnvironment::from_file(program);
+        let named = Type::single_callable(
+            db,
+            Signature::new(
+                Parameters::standard([Parameter::keyword_only(Name::new("name"))
+                    .with_annotated_type(KnownClass::Str.to_instance(db, &environment))]),
+                Type::none(db, &environment),
+            ),
+        );
+        let omitted = Type::single_callable(
+            db,
+            Signature::new(
+                Parameters::from_annotation(
+                    db,
+                    [
+                        Parameter::variadic(Name::new("args"))
+                            .with_annotated_type(Type::Dynamic(DynamicType::Any)),
+                        Parameter::keyword_variadic(Name::new("kwargs"))
+                            .with_annotated_type(Type::Dynamic(DynamicType::Any)),
+                    ],
+                ),
+                Type::none(db, &environment),
+            ),
+        );
+        for name in ["target", "inherited"] {
+            let ty = ProvidedBindingValue::Export {
+                file: program,
+                name: Name::new(name),
+            }
+            .resolve_type(db)
+            .unwrap();
+            let data = ty.provided_data(db, &environment).unwrap();
+            assert!(!data.downcast_ref::<RuleData>().unwrap().complete);
+            assert!(ty.is_assignable_to(db, &environment, named), "{name}");
+            assert!(
+                !ty.satisfies_declared_output(db, &environment, named),
+                "{name}"
+            );
+            assert!(
+                ty.satisfies_declared_output(db, &environment, omitted),
+                "{name}"
+            );
+        }
+        let help = snapshot
+            .signature_help(FilePosition { file_id: file, pos })
+            .unwrap()
+            .unwrap();
+        let [signature] = help.signatures.as_slice() else {
+            panic!("{help:?}")
+        };
+        assert!(signature.label.contains("name: str"), "{help:?}");
+        assert!(signature.label.contains("count:"), "{help:?}");
+        assert!(signature.label.contains("**kwargs"), "{help:?}");
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        let ids: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.id().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "missing-argument",
+                "invalid-argument-type",
+                "too-many-positional-arguments",
+                "missing-argument"
+            ],
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

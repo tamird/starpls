@@ -233,8 +233,13 @@ explicit input domain.
 Validation checks paired function bodies using the inferred or declared types
 of their callees. Unpaired helper bodies participate in ordinary file checking;
 the paired function's proof uses their callable contracts.
+Module initializers participate in validation, including files that export only
+values. Defaults and comprehensions follow their evaluation scope. Lambda bodies
+participate within selected function bodies; unrelated deferred bodies retain
+ordinary checking.
 
-Declarations for selected functions govern calls between selected bodies.
+Declarations for selected functions govern calls from module initialization
+and selected bodies.
 Arguments must satisfy each declared input type, and every selected body is
 checked. A failure in any selected body makes validation unsuccessful. This
 support applies to original functions with nongeneric signatures and fixed,
