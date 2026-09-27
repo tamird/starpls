@@ -23,6 +23,7 @@ rust_test(
         "//stubs/with_cfg:frontend.bzli",
         "//stubs/with_cfg:private_helpers.bzli",
         "//stubs/with_cfg:providers.bzli",
+        "//stubs/with_cfg:select.bzli",
         "//stubs/with_cfg:setting.bzli",
         "//stubs/with_cfg:stubs.toml",
         "//stubs/with_cfg:types.bzli",

@@ -10,6 +10,7 @@ versions = ["0.14.6"]
 "with_cfg/private/builder.bzl" = "builder.bzli"
 "with_cfg/private/frontend.bzl" = "frontend.bzli"
 "with_cfg/private/providers.bzl" = "providers.bzli"
+"with_cfg/private/select.bzl" = "select.bzli"
 "with_cfg/private/setting.bzl" = "setting.bzli"
 "with_cfg/private/utils.bzl" = "utils.bzli"
 "with_cfg/private/with_cfg.bzl" = "private_helpers.bzli"

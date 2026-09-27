@@ -6,6 +6,7 @@ exports_files([
     "frontend.bzli",
     "private_helpers.bzli",
     "providers.bzli",
+    "select.bzli",
     "setting.bzli",
     "stubs.toml",
     "types.bzli",

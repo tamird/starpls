@@ -47,6 +47,11 @@ set covers the common attributes forwarded by the wrapper and excludes
 accept. Callers must satisfy the chosen frontend's parameters.
 The source's `_frontend_impl` annotation declares `None` despite
 returning a list; implementation validation reports that mismatch.
+The select parser interface describes successful string, scalar, list, and
+shallow dictionary results, paired with integer cursor positions. It covers
+`_consume_string`, `consume_single_value`, `consume_list`,
+`_consume_list_or_single_value`, and `_consume_compound_value`. Select mapping
+and recombination remain unproved.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. `providers` exposes a readonly sequence of objects.
 The fluent builder's gradual body types and recursive return values can still
