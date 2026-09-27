@@ -595,6 +595,7 @@ fn declarations(
         "Callable",
         "Protocol",
         "TypedDict",
+        "TypeGuard",
         "NotRequired",
         "ReadOnly",
     ] {

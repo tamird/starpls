@@ -2239,6 +2239,66 @@ _LABEL_TYPE = type(Label("//:bogus"))
             ),
             ["invalid-return-type"]
         );
+
+        let guard = "def is_label(value: object) -> TypeGuard[Label]: ...\n";
+        let diagnostics = validation_diagnostics(source, guard);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            validate(
+                source,
+                "def is_label(value: object) -> TypeGuard[str]: ...\n"
+            ),
+            ["incomplete-stub-validation"]
+        );
+        for expression in ["True", "type(value) == 'string'"] {
+            assert_eq!(
+                validate(
+                    &format!("def is_label(value): return {expression}\n"),
+                    guard
+                ),
+                ["incomplete-stub-validation"],
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            validate(
+                "def is_label(value, classifier): return classifier(value) == 'Label'\n",
+                "def is_label(value: object, classifier: Callable[[object], str]) -> TypeGuard[Label]: ...\n"
+            ),
+            ["incomplete-stub-validation"]
+        );
+        assert_eq!(
+            validate(
+                &source.replace(
+                    "_LABEL_TYPE = type(Label(\"//:bogus\"))",
+                    "_LABEL_TYPE = type(\"\")"
+                ),
+                guard
+            ),
+            ["incomplete-stub-validation"]
+        );
+        let predicates = format!(
+            r#"{source}
+def is_string(value):
+    return type(value) == _STRING_TYPE
+
+_STRING_TYPE = type("")
+
+def read(value):
+    if is_label(value):
+        return value.name
+    if is_string(value):
+        return value
+    fail("expected Label or string")
+"#
+        );
+        let contracts = format!(
+            r#"{guard}def is_string(value: object) -> TypeGuard[str]: ...
+def read(value: Label | str) -> str: ...
+"#
+        );
+        let diagnostics = validation_diagnostics(&predicates, &contracts);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]

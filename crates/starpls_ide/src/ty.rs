@@ -244,6 +244,7 @@ impl Database {
                     "Callable",
                     "Protocol",
                     "TypedDict",
+                    "TypeGuard",
                     "NotRequired",
                     "ReadOnly",
                     "object",
