@@ -348,7 +348,7 @@ impl Analysis {
                 } else {
                     let result = compare_function(db, source.file, &name, actual, expected);
                     if result.is_ok() {
-                        let FunctionInferenceFacts {
+                        let facts @ FunctionInferenceFacts {
                             return_type_correspondence,
                             has_cycle_recovery,
                             has_errors,
@@ -363,8 +363,15 @@ impl Analysis {
                                 || has_unproved_requirements
                                 || return_type_correspondence != Some(true)
                             {
-                                ContractError::Incomplete(format!("Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"))
-                                    .report(&mut reports, source.file, range);
+                                ContractError::Incomplete(format!(
+                                    "Cannot prove `{name}`: {}",
+                                    inference_failure_reasons(facts, true)
+                                ))
+                                .report(
+                                    &mut reports,
+                                    source.file,
+                                    range,
+                                );
                             } else {
                                 body_checks.push((source, name.clone(), range));
                             }
@@ -1405,7 +1412,7 @@ fn compare_initializer<'db>(
             )));
         }
     }
-    let FunctionInferenceFacts {
+    let facts @ FunctionInferenceFacts {
         return_type_correspondence: _,
         has_cycle_recovery,
         has_errors,
@@ -1418,7 +1425,8 @@ fn compare_initializer<'db>(
         && (has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements)
     {
         return Err(ContractError::Incomplete(format!(
-            "Cannot prove `{name}`: initializer checking has unresolved or suppressed obligations"
+            "Cannot prove initializer for `{name}`: {}",
+            inference_failure_reasons(facts, false),
         )));
     }
     if !has_errors && !has_static_evidence(db, source.file, function, false) {
@@ -1765,6 +1773,36 @@ impl ContractError {
     }
 }
 
+fn inference_failure_reasons(facts: FunctionInferenceFacts, require_return: bool) -> String {
+    let FunctionInferenceFacts {
+        return_type_correspondence,
+        has_cycle_recovery,
+        has_errors: _,
+        has_diagnostics_or_suppressions,
+        has_unproved_requirements,
+    } = facts;
+    let mut reasons = Vec::new();
+    if has_cycle_recovery {
+        reasons.push("type inference used recursive recovery");
+    }
+    if has_diagnostics_or_suppressions {
+        reasons.push("diagnostics were reported or suppressed");
+    }
+    if has_unproved_requirements {
+        reasons.push("some operation inputs could not be proved");
+    }
+    if require_return {
+        match return_type_correspondence {
+            Some(true) => {}
+            Some(false) => {
+                reasons.push("returned values were not proved to satisfy the declared result")
+            }
+            None => reasons.push("declared-result correspondence was unavailable"),
+        }
+    }
+    reasons.join("; ")
+}
+
 fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<(), ContractError> {
     let definition = function_definition(db, source);
     let DefinitionKind::Function(function) = definition.kind(db) else {
@@ -1773,7 +1811,7 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
     let parsed = ruff_db::parsed::parsed_module(db, definition.python_file(db)).load(db);
     let function = function.node(&parsed);
     let model = SemanticModel::new(db, db.starlark_program_file(source.file));
-    let FunctionInferenceFacts {
+    let facts @ FunctionInferenceFacts {
         return_type_correspondence: _,
         has_cycle_recovery,
         has_errors: _,
@@ -1784,7 +1822,8 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
         .expect("function contracts originate in a function declaration");
     if has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements {
         return Err(ContractError::Incomplete(format!(
-            "Cannot prove `{name}`: implementation checking has unresolved or suppressed obligations"
+            "Cannot prove `{name}`: {}",
+            inference_failure_reasons(facts, false),
         )));
     }
     if !has_static_evidence(db, source.file, function, true) {
@@ -2264,7 +2303,16 @@ def known(*, name: str) -> None: pass
             ("live_suppressed", "def make():\n    missing # ty: ignore[unresolved-reference]\n    return 1\n", "def make() -> int: ...\n", &["incomplete-stub-validation"]),
             ("suppressed_default", "def make(value=missing): # ty: ignore[unresolved-reference]\n    return 1\n", "def make(value: object = ...) -> int: ...\n", &["incomplete-stub-validation"]),
         ] {
-            assert_eq!(validate(source, stub), expected, "{name}");
+            let diagnostics = validation_diagnostics(source, stub);
+            let ids: Vec<_> = diagnostics.iter().map(|diagnostic| diagnostic.id().as_str()).collect();
+            assert_eq!(ids, expected, "{name}: {diagnostics:?}");
+            let reason = match name {
+                "live_suppressed" | "suppressed_default" => Some("diagnostics were reported or suppressed"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                assert!(diagnostics[0].headline_message().contains(reason), "{name}: {diagnostics:?}");
+            }
         }
     }
 
@@ -2574,20 +2622,35 @@ _LABEL_TYPE = type(Label("//:bogus"))
         let guard = "def is_label(value: object) -> TypeGuard[Label]: ...\n";
         let diagnostics = validation_diagnostics(source, guard);
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let diagnostics = validation_diagnostics(
+            source,
+            "def is_label(value: object) -> TypeGuard[str]: ...\n",
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}");
+        };
+        assert_eq!(diagnostic.id().as_str(), "incomplete-stub-validation");
         assert_eq!(
-            validate(
-                source,
-                "def is_label(value: object) -> TypeGuard[str]: ...\n"
-            ),
-            ["incomplete-stub-validation"]
+            diagnostic.headline_message(),
+            "Cannot prove `is_label`: returned values were not proved to satisfy the declared result"
         );
         for expression in ["True", "type(value) == 'string'"] {
+            let diagnostics = validation_diagnostics(
+                &format!("def is_label(value): return {expression}\n"),
+                guard,
+            );
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{diagnostics:?}");
+            };
+            assert_eq!(diagnostic.id().as_str(), "incomplete-stub-validation");
+            let reason = if expression == "True" {
+                "declared-result correspondence was unavailable"
+            } else {
+                "returned values were not proved to satisfy the declared result"
+            };
             assert_eq!(
-                validate(
-                    &format!("def is_label(value): return {expression}\n"),
-                    guard
-                ),
-                ["incomplete-stub-validation"],
+                diagnostic.headline_message(),
+                format!("Cannot prove `is_label`: {reason}"),
                 "{expression}"
             );
         }
@@ -4999,9 +5062,12 @@ def _opaque() -> Callable[..., None]:
             native_file.sync(&mut analysis.db);
             analysis.set_type_interfaces([(source, stub)]).unwrap();
             let reports = analysis.validate_stubs(|_| true).unwrap();
-            let ids: Vec<_> = reports.into_iter().flat_map(|(_, diagnostics)| diagnostics)
-                .map(|diagnostic| diagnostic.id().as_str().to_owned()).collect();
+            let diagnostics: Vec<_> = reports.into_iter().flat_map(|(_, diagnostics)| diagnostics).collect();
+            let ids: Vec<_> = diagnostics.iter().map(|diagnostic| diagnostic.id().as_str()).collect();
             assert_eq!(ids, expected, "{case}");
+            if case == "provider_body_narrow" {
+                assert_eq!(diagnostics[0].headline_message(), "Cannot prove initializer for `Info`: some operation inputs could not be proved");
+            }
         }
     }
 
