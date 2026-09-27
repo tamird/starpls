@@ -9,6 +9,7 @@ use ruff_db::diagnostic::DiagnosticId;
 use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprContext;
 use ruff_python_ast::ExprName;
@@ -1576,6 +1577,17 @@ fn has_static_evidence(
                 })
             {
                 self.complete = false;
+            }
+            if self.conservative {
+                if let Expr::Compare(compare) = expression {
+                    if let Some((left, CmpOp::In | CmpOp::NotIn, receiver)) = compare.as_single() {
+                        // Ordinary input proof owns the receiver's containment contract.
+                        // Its children still need evidence for calls and stored values.
+                        self.visit_expr(left);
+                        visitor::walk_expr(self, receiver);
+                        return;
+                    }
+                }
             }
             visitor::walk_expr(self, expression);
         }
@@ -4727,6 +4739,164 @@ def _opaque() -> Callable[..., None]:
     }
 
     #[test]
+    fn membership_checks_selected_inputs() {
+        use starpls_common::Db as _;
+
+        let native_property = validate(
+            "def read(value): return value.build_setting_value\n",
+            "def read(value: ctx[int]) -> int: ...\n",
+        );
+        assert!(native_property.is_empty(), "{native_property:?}");
+        for (case, callback_type, setup, expression, expected) in [
+            (
+                "direct_narrow",
+                "str",
+                "",
+                "callback_value in test_container",
+                &["incomplete-stub-validation"] as &[&str],
+            ),
+            (
+                "direct_known",
+                "object",
+                "",
+                "callback_value in test_container",
+                &[],
+            ),
+            (
+                "subscript_narrow",
+                "str",
+                "",
+                "'x' in test_indexer[callback_value]",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "subscript_known",
+                "object",
+                "",
+                "'x' in test_indexer[callback_value]",
+                &[],
+            ),
+            (
+                "stored_subscript_narrow",
+                "str",
+                "TABLE = test_indexer[callback_value]\n",
+                "'x' in TABLE",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "unary_narrow",
+                "str",
+                "",
+                "'x' in +test_unary",
+                &["incomplete-stub-validation"],
+            ),
+            ("unary_known", "str", "", "'x' in +test_unary", &[]),
+            (
+                "stored_unary_narrow",
+                "str",
+                "TABLE = +test_unary\n",
+                "'x' in TABLE",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "descriptor_narrow",
+                "str",
+                "",
+                "'x' in test_box.field",
+                &["incomplete-stub-validation"],
+            ),
+            ("descriptor_known", "str", "", "'x' in test_box.field", &[]),
+            (
+                "stored_descriptor_narrow",
+                "str",
+                "TABLE = test_box.field\n",
+                "'x' in TABLE",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "rich_narrow",
+                "str",
+                "",
+                "'x' in (test_comparer < callback_value)",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "rich_known",
+                "object",
+                "",
+                "'x' in (test_comparer < callback_value)",
+                &[],
+            ),
+            (
+                "stored_rich_narrow",
+                "str",
+                "TABLE = test_comparer < callback_value\n",
+                "'x' in TABLE",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            let source_text = format!("def callback_value(value: {callback_type}) -> None: pass\n{setup}def make(): return {expression}\n");
+            let source = fixture.add_file(&mut analysis.db, "source.bzl", &source_text);
+            let stub =
+                fixture.add_file(&mut analysis.db, "source.bzli", "def make() -> bool: ...\n");
+            loader.add_files_from_fixture(&fixture);
+            let builtins = starpls_bazel::decode_builtins(include_bytes!(
+                "../../../starpls/src/builtin/builtin.pb"
+            ))
+            .unwrap();
+            analysis
+                .set_builtin_defs(builtins.clone(), Default::default())
+                .unwrap();
+            let super::super::native::DeclarationSource { path, mut contents } =
+                super::super::native::generate(
+                    starpls_common::Dialect::Bazel,
+                    &builtins,
+                    &Default::default(),
+                )
+                .unwrap();
+            contents.push_str("\nclass _ContainmentProbe:\n    def __contains__(self, callback: _starpls_typing.Callable[[_starpls_typing.Any], None], /) -> _starpls_builtins.bool: ...\n_starpls_Bzl_test_container: _ContainmentProbe\nclass _IndexerProbe:\n    def __getitem__(self, callback: _starpls_typing.Callable[[_starpls_typing.Any], None], /) -> _starpls_builtins.dict[_starpls_builtins.str, _starpls_typing.Any]: ...\n_starpls_Bzl_test_indexer: _IndexerProbe\n");
+            let domain = if case.ends_with("known") {
+                "_starpls_builtins.str"
+            } else {
+                "_starpls_typing.Any"
+            };
+            contents.push_str(&format!(r#"
+_ProbeT = _starpls_typing.TypeVar("_ProbeT")
+class _UnaryProbe(_starpls_typing.Generic[_ProbeT]):
+    def __pos__(self: _UnaryProbe[_starpls_typing.Callable[[{domain}], None]]) -> _starpls_builtins.dict[_starpls_builtins.str, _starpls_typing.Any]: ...
+_starpls_Bzl_test_unary: _UnaryProbe[_starpls_typing.Callable[[_starpls_builtins.str], None]]
+class _DescriptorProbe:
+    def __get__(self, instance: _BoxProbe[_starpls_typing.Callable[[{domain}], None]], owner: _starpls_builtins.object = None) -> _starpls_builtins.dict[_starpls_builtins.str, _starpls_typing.Any]: ...
+_starpls_Bzl_test_descriptor: _DescriptorProbe
+class _BoxProbe(_starpls_typing.Generic[_ProbeT]):
+    field = _DescriptorProbe()
+_starpls_Bzl_test_box: _BoxProbe[_starpls_typing.Callable[[_starpls_builtins.str], None]]
+"#));
+            contents.push_str(r#"
+class _ComparisonProbe:
+    def __lt__(self, callback: _starpls_typing.Callable[[_starpls_typing.Any], None], /) -> _starpls_builtins.dict[_starpls_builtins.str, _starpls_typing.Any]: ...
+_starpls_Bzl_test_comparer: _ComparisonProbe
+"#);
+            analysis
+                .db
+                .source_system_mut()
+                .set_virtual_source(&path, contents);
+            let native_file = analysis.db.files.try_virtual_file(&path).unwrap();
+            native_file.sync(&mut analysis.db);
+            analysis.set_type_interfaces([(source, stub)]).unwrap();
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            let ids: Vec<_> = reports
+                .into_iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .map(|diagnostic| diagnostic.id().as_str().to_owned())
+                .collect();
+            assert_eq!(ids, expected, "{case}: {source_text}");
+        }
+    }
+
+    #[test]
     fn opaque_global_collections_check_consuming_operations() {
         for source in [
             "TABLE = {'string': None}\nRESULT = 'string' in TABLE\n",
@@ -4735,6 +4905,54 @@ def _opaque() -> Callable[..., None]:
             let diagnostics = validation_diagnostics(source, "RESULT: bool\n");
             assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
         }
+        let dictionary = "TABLE = {'string': None}\n";
+        for (body, stub, expected) in [
+            (
+                "def contains(key): return key in TABLE\n",
+                "def contains(key: str) -> bool: ...\n",
+                &[] as &[&str],
+            ),
+            (
+                "def contains(key): return key not in TABLE\n",
+                "def contains(key: str) -> bool: ...\n",
+                &[],
+            ),
+            (
+                "def read(key): return TABLE[key]\n",
+                "def read(key: str) -> None: ...\n",
+                &["unsound-return-statement"],
+            ),
+            (
+                "def chained(key): return key in TABLE == {}\n",
+                "def chained(key: str) -> bool: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "def make(callback=lambda: 'string' in TABLE): return callback\n",
+                "def make(callback: Callable[[], bool] = ...) -> Callable[[], bool]: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "def dynamic(receiver, key): return key in receiver\n",
+                "def dynamic(receiver: Any, key: str) -> bool: ...\n",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            let source = format!("{dictionary}{body}");
+            let diagnostics = validation_diagnostics(&source, stub);
+            let ids: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id().as_str().to_owned())
+                .collect();
+            assert_eq!(ids, expected, "{source}: {diagnostics:#?}");
+        }
+        assert_eq!(
+            validate(
+                "def opaque() -> Any: return None\nTABLE = {'run': opaque()}\ndef invoke(): TABLE['run']()\n",
+                "def invoke() -> None: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
         let globals = "def opaque() -> Any: return None\nVALUES = [opaque()]\n";
         let collector = r#"
 def collect(extra):
