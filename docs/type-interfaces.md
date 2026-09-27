@@ -193,6 +193,11 @@ annotations, parameter names, parameter kinds, and defaults determine the
 implementation signature. Exported functions are followed through explicit
 reexports to check their bodies.
 
+Parameter contracts from stubs describe supplied arguments. Source defaults
+also contribute to the implementation's entry types. Local reassignments of
+unannotated parameters infer their own types. Source parameter annotations
+constrain subsequent assignments.
+
 Private function declarations and module variable annotations also supply
 contracts when the implementation defines the same name. Private helper classes,
 type aliases, loaded names, and unmatched private names remain local to the stub.
