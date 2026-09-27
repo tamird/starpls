@@ -276,6 +276,28 @@ impl DefaultFileLoader {
         pending
     }
 
+    /// Prepare mappings on a fresh loader before publishing it to analysis.
+    pub(crate) fn prepare_repository_mappings(&self, repositories: &[String]) {
+        if !self.bzlmod_enabled {
+            return;
+        }
+        {
+            let mut mappings = self.repository_mappings.write();
+            for repository in repositories {
+                mappings
+                    .entry(repository.clone())
+                    .or_insert(RepositoryMapping::Pending);
+            }
+        }
+        loop {
+            let pending = self.pending_repository_mappings();
+            if pending.is_empty() {
+                break;
+            }
+            self.resolve_repository_mappings(&pending);
+        }
+    }
+
     /// Call after invalidating load queries and draining their readers.
     pub(crate) fn resolve_repository_mappings(&self, repositories: &[String]) {
         let names: Vec<_> = repositories.iter().map(String::as_str).collect();
@@ -617,25 +639,6 @@ impl DefaultFileLoader {
             name: String::new(),
             root: self.workspace.clone(),
         }
-    }
-
-    pub(crate) fn fetch_repository(&self, repository: &Repository) -> anyhow::Result<()> {
-        self.watch_repository(&repository.root);
-        if repository.name.is_empty() {
-            return Ok(());
-        }
-        let result = if self.bzlmod_enabled {
-            self.bazel_client.fetch_repo(&repository.name)
-        } else {
-            self.bazel_client
-                .null_query_external_repo_targets(&repository.name)
-        };
-        let outcome = match &result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(format!("{error:#}")),
-        };
-        self.finish_fetch([repository.name.clone()], outcome);
-        result
     }
 
     pub(crate) fn fetch_repositories(
@@ -1550,22 +1553,19 @@ pub(crate) mod source_tests {
         let loader =
             DefaultFileLoader::new(client.clone(), Default::default(), None, None, sender, true)
                 .with_deferred_mappings();
-        for index in 0..1000 {
-            loader
-                .repository_mapping(&format!("npm+{}+{index:04}", "x".repeat(100)))
-                .unwrap();
-        }
-        loop {
-            let batch = loader.pending_repository_mappings();
-            if batch.is_empty() {
-                break;
-            }
-            assert!(batch.iter().map(|name| name.len() + 1).sum::<usize>() <= 16 * 1024);
-            loader.resolve_repository_mappings(&batch);
-        }
+        let repositories = (0..1000)
+            .map(|index| format!("npm+{}+{index:04}", "x".repeat(100)))
+            .collect::<Vec<_>>();
+        loader.prepare_repository_mappings(&repositories);
+        loader.prepare_repository_mappings(&repositories);
         let requests = client.mapping_requests.lock().unwrap();
         assert_eq!(requests.iter().map(Vec::len).sum::<usize>(), 1000);
         assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|batch| batch
+            .iter()
+            .map(|name| name.len() + 1)
+            .sum::<usize>()
+            <= 16 * 1024));
     }
 
     #[test]
