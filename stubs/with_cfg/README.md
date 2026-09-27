@@ -56,6 +56,11 @@ interface declares `make_valid_identifier(str) -> str` and
 `string_list`, `label`, `label_list`, `int`, `int_list`, and `bool`.
 It selects the name from the value or the first element of a nonempty
 list; `None` and empty lists have no selected name.
+`get_attr_type(object)` returns one of the same seven names, using
+`string_list` when no value selects a name. Its body currently validates
+with a local 0.14.6 source patch that traverses the parsed select values
+directly and returns the first selected name. The unpatched release's
+captured result cell leaves the return proof incomplete.
 The frontend interface declares `get_frontend` with a callable returning
 `None` and `_frontend_default` with a closed set of optional alias attributes. That
 set covers the common attributes forwarded by the wrapper and excludes
