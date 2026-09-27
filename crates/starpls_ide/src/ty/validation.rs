@@ -1835,6 +1835,41 @@ mod tests {
     }
 
     #[test]
+    fn validation_checks_json_encoder_inputs() {
+        for (source, stub, expected) in [
+            (
+                "def encode(value): return json.encode(value)\n",
+                "def encode(value: object) -> str: ...\n",
+                None,
+            ),
+            (
+                "def encoder(): return json.encode\n",
+                "def encoder() -> Callable[[object], str]: ...\n",
+                None,
+            ),
+            (
+                "def encode(): return json.encode()\n",
+                "def encode() -> str: ...\n",
+                Some("missing-argument"),
+            ),
+            (
+                "def encode(value): return json.encode(value)\n",
+                "def encode(value: object) -> int: ...\n",
+                Some("invalid-return-type"),
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            match expected {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                ),
+                None => assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn validation_checks_rule_attribute_inputs() {
         for (attrs, expected) in [
             (None, None),

@@ -764,6 +764,8 @@ fn write_function(
         }
         let parameter_type = match (kind, value.name.as_str(), name) {
             (CallableKind::Function, "struct", "kwargs") => Some("_StructField"),
+            // Encoding accepts any object; unsupported values raise rather than return.
+            (CallableKind::Method("json"), "encode", "x") => Some("_starpls_builtins.object"),
             // Rule construction reads each dictionary while preserving its key and value types.
             (CallableKind::Function, "rule", "attrs") => Some("_starpls_builtins.dict[_RuleAttributeName, _RuleAttribute]"),
             (CallableKind::Function, "select", "x") => Some("_starpls_typing.Mapping[_SelectCondition, _SelectValue]"),
