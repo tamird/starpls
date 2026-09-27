@@ -489,6 +489,16 @@ impl Analysis {
         Ok(())
     }
 
+    /// Physical implementations and their registered type interfaces.
+    pub fn type_interface_pairs(&self) -> Vec<(File, File)> {
+        let Self { db } = self;
+        db.environment()
+            .type_interfaces(db)
+            .values()
+            .copied()
+            .collect()
+    }
+
     /// Physical inputs whose declarations may be referenced by trusted interfaces.
     pub fn type_interface_sources(&self) -> Vec<File> {
         let Self { db } = self;

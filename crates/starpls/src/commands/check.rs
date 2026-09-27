@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
@@ -436,6 +437,114 @@ mod tests {
         }
     }
 
+    fn check_removed_load(case: &str, old_source: Option<&str>) {
+        let (mut checker, client, external) =
+            fetch_checker(&format!("checker-mapping-removed-load-{case}"), true);
+        std::fs::create_dir_all(external.join("rules+")).unwrap();
+        std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+        let generated = checker.bazel_info.workspace.join("generated.bzl");
+        let old = checker.bazel_info.workspace.join("old.bzl");
+        if let Some(old_source) = old_source {
+            std::fs::write(&old, old_source).unwrap();
+        }
+        std::fs::write(&generated, "load(':old.bzl', 'value')\nprint(value)\n").unwrap();
+        checker.load_file(&generated, true, &[], true).unwrap();
+        let snapshot = checker.analysis.snapshot();
+        for file in &checker.files {
+            snapshot.diagnostics(*file).unwrap();
+        }
+        let requested = checker.loader.recorded_loads();
+        assert!(
+            requested.iter().any(|(_, module)| module == ":old.bzl"),
+            "old load was not requested: {requested:?}"
+        );
+        if case == "detached" {
+            assert!(
+                requested.iter().any(|(file, module)| {
+                    snapshot.path(*file) == old && module == ":detached.bzl"
+                }),
+                "detached child was not requested: {requested:?}"
+            );
+        }
+        drop(snapshot);
+        *client.mapping_write.lock().unwrap() =
+            Some((generated, "value = 'regenerated source'\n".to_owned()));
+
+        let result = checker
+            .check_files(false)
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        assert!(
+            result.loads.unresolved.is_empty(),
+            "obsolete load remains unresolved: {:?}",
+            result.loads.unresolved
+        );
+        let snapshot = checker.analysis.snapshot();
+        let dependencies: Vec<_> = result
+            .loads
+            .files
+            .iter()
+            .map(|file| snapshot.path(*file))
+            .collect();
+        assert!(
+            !dependencies.contains(&old.as_path()),
+            "obsolete dependency remains loaded: {dependencies:?}"
+        );
+        let fetches = client.fetch_requests.lock().unwrap();
+        assert!(fetches.is_empty(), "unexpected fetches: {fetches:?}");
+    }
+
+    #[test]
+    fn mapping_commands_remove_missing_loads() {
+        check_removed_load("missing", None);
+    }
+
+    #[test]
+    fn mapping_commands_remove_resolved_loads() {
+        check_removed_load("resolved", Some("value = 42\n"));
+    }
+
+    #[test]
+    fn mapping_commands_remove_detached_loads() {
+        check_removed_load(
+            "detached",
+            Some("load(':detached.bzl', 'child')\nvalue = child\n"),
+        );
+    }
+
+    #[test]
+    fn mapping_commands_audit_new_unused_loads() {
+        for audit in [false, true] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-mapping-added-load-{audit}"), true);
+            if audit {
+                checker.load_scope = super::LoadScope::Transitive;
+            }
+            std::fs::create_dir_all(external.join("rules+")).unwrap();
+            std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+            let generated = checker.bazel_info.workspace.join("generated.bzl");
+            std::fs::write(&generated, "value = 42\n").unwrap();
+            let caller = checker.bazel_info.workspace.join("caller.bzl");
+            std::fs::write(&caller, "load(':generated.bzl', 'value')\nprint(value)\n").unwrap();
+            checker.load_file(&caller, true, &[], true).unwrap();
+            *client.mapping_write.lock().unwrap() = Some((
+                generated,
+                "load(':new.bzl', 'unused')\nvalue = 42\n".to_owned(),
+            ));
+
+            let result = checker.check_files(false).unwrap();
+            let unresolved: Vec<_> = result
+                .loads
+                .unresolved
+                .values()
+                .flatten()
+                .map(|edge| edge.module.as_ref())
+                .collect();
+            assert_eq!(unresolved, if audit { vec![":new.bzl"] } else { vec![] });
+            let fetches = client.fetch_requests.lock().unwrap();
+            assert!(fetches.is_empty(), "unexpected fetches: {fetches:?}");
+        }
+    }
+
     #[test]
     fn fetches_materialize_transitive_loads_once() {
         let (mut checker, client, external) = fetch_checker("checker-fetch-transitive", true);
@@ -618,7 +727,8 @@ mod tests {
         .unwrap();
         std::fs::write(physical.join("helper.bzl"), "value = 42\n").unwrap();
         *client.retarget.lock().unwrap() = Some((external.join("rules+"), physical.clone()));
-        let graph = checker.prepare_loads().unwrap();
+        checker.load_scope = super::LoadScope::Transitive;
+        let graph = checker.check_files(false).unwrap().loads;
         let snapshot = checker.analysis.snapshot();
         let report = checker
             .coverage_report(&snapshot, &graph, &checker.files, Default::default())
@@ -795,7 +905,14 @@ mod tests {
                     "load(':missing.bzl', 'unused')\nvalue = 'wrong'\n",
                 ),
                 ("types/unused.bzli", "value: int\n"),
-                ("types/hidden.bzli", "value: int\nunrelated = missing\n"),
+                (
+                    "types/hidden.bzli",
+                    "load('//:types/helper.bzli', 'Value')\nvalue: Value\nunrelated = missing\n",
+                ),
+                (
+                    "types/helper.bzli",
+                    "class Value(Protocol):\n    def marker(self) -> int: ...\n",
+                ),
                 ("other/hidden.bzl", "value = 'wrong'\n"),
                 ("types/other.bzli", "value: int\n"),
             ],
@@ -803,17 +920,44 @@ mod tests {
         );
         let root = checker.bazel_info.workspace.clone();
         assert_eq!(checker.files.len(), 1);
+        checker.load_scope = super::LoadScope::Requested;
         let checked = checker.check_files(false).unwrap();
         let [(file, diagnostics)] = checked.diagnostics.as_slice() else {
             panic!("expected only selected caller diagnostics");
         };
-        assert_eq!(checker.analysis.snapshot().path(*file), root.join("BUILD"));
+        let snapshot = checker.analysis.snapshot();
+        assert_eq!(snapshot.path(*file), root.join("BUILD"));
+        let requested = checker.loader.recorded_loads();
+        assert!(
+            requested.iter().any(|(file, module)| {
+                snapshot.path(*file) == root.join("types/hidden.bzli")
+                    && module == "//:types/helper.bzli"
+            }),
+            "interface helper was not requested: {requested:?}"
+        );
+        assert!(
+            checked.loads.unresolved.is_empty(),
+            "{:?}",
+            checked.loads.unresolved
+        );
         assert!(
             diagnostics
                 .iter()
                 .any(|d| d.id().as_str() == "invalid-argument-type"),
             "{diagnostics:?}"
         );
+        let dependencies: Vec<_> = checked
+            .loads
+            .files
+            .iter()
+            .map(|file| snapshot.path(*file))
+            .collect();
+        assert!(
+            dependencies.contains(&root.join("types/helper.bzli").as_path()),
+            "excluded interface helper was not loaded: {dependencies:?}"
+        );
+        drop(snapshot);
+        checker.load_scope = super::LoadScope::Transitive;
         let checked = checker.check_files(true).unwrap();
         assert!(
             checked.loads.unresolved.is_empty(),
@@ -1053,7 +1197,8 @@ mod tests {
             Some(starpls_bazel::APIContext::Build)
         );
         assert_eq!(checker.input_errors.len(), 1);
-        let graph = checker.prepare_loads().unwrap();
+        checker.load_scope = super::LoadScope::Transitive;
+        let graph = checker.check_files(false).unwrap().loads;
         let snapshot = checker.analysis.snapshot();
         let report = checker
             .coverage_report(&snapshot, &graph, &checker.files, Default::default())
@@ -1595,62 +1740,98 @@ impl Checker {
         Ok(())
     }
 
-    fn prepare_loads(&mut self) -> anyhow::Result<LoadGraph> {
+    fn load_graph(&mut self, checked: impl IntoIterator<Item = File>) -> anyhow::Result<LoadGraph> {
         let mut graph = LoadGraph {
             files: self.files.clone(),
             unresolved: Default::default(),
         };
+        graph.files.extend(checked);
+        let interfaces = self.analysis.type_interface_pairs();
         let snapshot = self.analysis.snapshot();
-        for file in self.analysis.type_interface_sources() {
-            let path = snapshot.path(file);
-            if self.ignored_paths.contains(path) {
-                self.exclusions
-                    .insert(path.to_path_buf(), Exclusion::Ignored);
-            } else {
-                graph.files.insert(file);
+        if self.load_scope == LoadScope::Transitive {
+            for (source, _) in &interfaces {
+                let path = snapshot.path(*source);
+                if self.ignored_paths.contains(path) {
+                    self.exclusions
+                        .insert(path.to_path_buf(), Exclusion::Ignored);
+                } else {
+                    graph.files.insert(*source);
+                }
             }
         }
-        drop(snapshot);
+        // Requests survive cached queries. Current roots and load statements
+        // determine which of those requests still belong to this check.
+        let mut requests: HashMap<File, HashSet<String>> = Default::default();
+        for (file, module) in self.loader.recorded_loads() {
+            requests.entry(file).or_default().insert(module);
+        }
         let mut frontier: Vec<_> = graph.files.iter().copied().collect();
-        if self.progress {
+        let progress = self.progress && self.load_scope == LoadScope::Transitive;
+        if progress {
             eprintln!("Discovering loads from {} source files", frontier.len());
         }
         let mut visited = 0;
-        loop {
-            let snapshot = self.analysis.snapshot();
-            while let Some(file) = frontier.pop() {
-                visited += 1;
-                if self.progress && (visited == 1 || visited % 100 == 0) {
-                    eprintln!(
-                        "Discovering loads: {visited} files visited, {} discovered; {}",
-                        graph.files.len(),
-                        snapshot.path(file).display()
-                    );
-                }
-                let mut unresolved = Vec::new();
-                for edge in snapshot.load_dependencies(file)? {
-                    match &edge.resolution {
-                        LoadResolution::Resolved(loaded) => {
-                            if graph.files.insert(*loaded) {
-                                frontier.push(*loaded);
-                            }
-                        }
-                        LoadResolution::Pending => unresolved.push(edge),
-                        LoadResolution::Failed(_) => unresolved.push(edge),
-                    }
-                }
-                if unresolved.is_empty() {
-                    graph.unresolved.shift_remove(&file);
+        while let Some(file) = frontier.pop() {
+            visited += 1;
+            if progress && (visited == 1 || visited % 100 == 0) {
+                eprintln!(
+                    "Discovering loads: {visited} files visited, {} discovered; {}",
+                    graph.files.len(),
+                    snapshot.path(file).display()
+                );
+            }
+            // Trusted interfaces and implementations can consult each other's
+            // declarations without a load statement, including excluded files.
+            for (source, interface) in &interfaces {
+                let counterpart = if file == *source {
+                    *interface
+                } else if file == *interface {
+                    *source
                 } else {
-                    graph.unresolved.insert(file, unresolved);
+                    continue;
+                };
+                if requests.contains_key(&counterpart) && graph.files.insert(counterpart) {
+                    frontier.push(counterpart);
                 }
             }
-            drop(snapshot);
-            if !self.resolve_pending_loads() {
-                return Ok(graph);
+            let dependencies = match self.load_scope {
+                LoadScope::Transitive => snapshot.load_dependencies(file)?,
+                LoadScope::Requested => {
+                    let Some(modules) = requests.get(&file) else {
+                        continue;
+                    };
+                    let mut dependencies = Vec::new();
+                    for (module, range) in snapshot.load_statement_locations(file)? {
+                        if !modules.contains(module.as_ref()) {
+                            continue;
+                        }
+                        let resolution = snapshot.resolve_load(file, &module)?;
+                        dependencies.push(LoadDependency {
+                            module,
+                            range,
+                            resolution,
+                        });
+                    }
+                    dependencies
+                }
+            };
+            let mut unresolved = Vec::new();
+            for edge in dependencies {
+                match &edge.resolution {
+                    LoadResolution::Resolved(loaded) => {
+                        if graph.files.insert(*loaded) {
+                            frontier.push(*loaded);
+                        }
+                    }
+                    LoadResolution::Pending => unresolved.push(edge),
+                    LoadResolution::Failed(_) => unresolved.push(edge),
+                }
             }
-            frontier.extend(graph.unresolved.keys().copied());
+            if !unresolved.is_empty() {
+                graph.unresolved.insert(file, unresolved);
+            }
         }
+        Ok(graph)
     }
 
     /// Finish native work after all snapshots have drained, then refresh files
@@ -1699,45 +1880,8 @@ impl Checker {
         true
     }
 
-    fn requested_loads(&self) -> anyhow::Result<LoadGraph> {
-        let snapshot = self.analysis.snapshot();
-        let mut graph = LoadGraph {
-            files: self.files.clone(),
-            unresolved: Default::default(),
-        };
-        for (file, module) in self.loader.recorded_loads() {
-            graph.files.insert(file);
-            let resolution = snapshot.resolve_load(file, &module)?;
-            if let LoadResolution::Resolved(loaded) = resolution {
-                graph.files.insert(loaded);
-                continue;
-            }
-            let ranges = snapshot.load_statement_ranges(file, &module)?;
-            anyhow::ensure!(
-                !ranges.is_empty(),
-                "requested load {module:?} is no longer present in {}",
-                snapshot.path(file).display()
-            );
-            graph
-                .unresolved
-                .entry(file)
-                .or_default()
-                .extend(ranges.into_iter().map(|range| LoadDependency {
-                    module: module.clone().into_boxed_str(),
-                    range,
-                    resolution: resolution.clone(),
-                }));
-        }
-        Ok(graph)
-    }
-
     fn check_files(&mut self, validate_stubs: bool) -> anyhow::Result<CheckResult> {
         loop {
-            let mut graph = if self.load_scope == LoadScope::Transitive {
-                self.prepare_loads()?
-            } else {
-                LoadGraph::default()
-            };
             let mut diagnostics = if validate_stubs {
                 if self.progress {
                     eprintln!("Validating configured stub implementations");
@@ -1777,9 +1921,7 @@ impl Checker {
                 diagnostics.push((file, snapshot.diagnostics(file)?));
             }
             drop(snapshot);
-            let requested = self.requested_loads()?;
-            graph.files.extend(requested.files);
-            graph.unresolved = requested.unresolved;
+            let graph = self.load_graph(diagnostics.iter().map(|(file, _)| *file))?;
             if !self.resolve_pending_loads() {
                 return Ok(CheckResult {
                     loads: graph,

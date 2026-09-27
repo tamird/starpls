@@ -563,18 +563,12 @@ impl AnalysisSnapshot {
         self.query(|db| ty::load::resolve_dependency(db, file, module))
     }
 
-    /// Return source locations without resolving sibling loads.
-    pub fn load_statement_ranges(
+    /// Return source locations without resolving loads.
+    pub fn load_statement_locations(
         &self,
         file: File,
-        module: &str,
-    ) -> Cancellable<Vec<ruff_text_size::TextRange>> {
-        self.query(|db| {
-            ty::load::statement_locations(db, file)
-                .iter()
-                .filter_map(|(name, range)| (name.as_ref() == module).then_some(*range))
-                .collect()
-        })
+    ) -> Cancellable<Vec<(Box<str>, ruff_text_size::TextRange)>> {
+        self.query(|db| ty::load::statement_locations(db, file).to_vec())
     }
 
     /// Renders diagnostics obtained from this snapshot using its captured source.
