@@ -35,9 +35,11 @@ accepts iterable values and exposes its result as a readonly sequence of
 objects. Provider-specific operations require a more specific element contract.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
-The utility contracts declare `is_bool`, `is_dict`, `is_int`, `is_label`,
-`is_list`, `is_select`, and `is_string` as functions from `object` to `bool`.
-The setting interface declares `make_valid_identifier(str) -> str`.
+The utility contracts declare `is_label` and `is_string` as type guards:
+a true result narrows the input to `Label` or `str`, respectively. The other
+five utility predicates accept `object` and return `bool`. The setting
+interface declares `make_valid_identifier(str) -> str` and
+`validate_and_get_attr_name(str | Label) -> str`.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. `providers` exposes a readonly sequence of objects.
 The fluent builder's gradual body types and recursive return values can still
