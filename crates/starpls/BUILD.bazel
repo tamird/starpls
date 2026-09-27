@@ -31,6 +31,7 @@ rust_test(
         "//stubs/with_cfg:types.bzli",
         "//stubs/with_cfg:utils.bzli",
         "//stubs/with_cfg:with_cfg.bzli",
+        "//stubs/with_cfg:wrapper.bzli",
     ],
     crate = ":starpls",
 )

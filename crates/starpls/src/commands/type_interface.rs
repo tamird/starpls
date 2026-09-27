@@ -243,6 +243,7 @@ mod tests {
         std::fs::write(source.join("with_cfg/private/frontend.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/select.bzl"), "").unwrap();
         std::fs::write(source.join("with_cfg/private/transition.bzl"), "").unwrap();
+        std::fs::write(source.join("with_cfg/private/wrapper.bzl"), "").unwrap();
         std::fs::write(
             source.join("with_cfg/private/builder.bzl"),
             "def make_builder(rule_info): return rule_info\n",
@@ -263,6 +264,11 @@ mod tests {
         std::fs::write(
             stubs.join("with_cfg.bzli"),
             include_str!("../../../../stubs/with_cfg/with_cfg.bzli"),
+        )
+        .unwrap();
+        std::fs::write(
+            stubs.join("wrapper.bzli"),
+            include_str!("../../../../stubs/with_cfg/wrapper.bzli"),
         )
         .unwrap();
         std::fs::write(
@@ -405,6 +411,10 @@ mod tests {
                     (
                         source.join("with_cfg/private/with_cfg.bzl"),
                         stubs.join("private_helpers.bzli"),
+                    ),
+                    (
+                        source.join("with_cfg/private/wrapper.bzl"),
+                        stubs.join("wrapper.bzli"),
                     ),
                 ]);
                 assert_eq!(actual, expected);

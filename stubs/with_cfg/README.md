@@ -40,6 +40,11 @@ The extension interface declares `_initializer_base` with string-keyed
 keyword arguments and setting values keyed by strings or labels. It returns
 a fresh string-keyed dictionary of objects, with validated setting names
 overriding matching keyword arguments.
+The wrapper interface declares `_replace_single_dep` with an `object`
+input, a Label-to-string memo dictionary, and an integer counter. Its
+callback takes the keyword arguments `name: str` and `exports: Label` and
+returns `None`. The helper validates the input as a string or Label and
+returns the replacement as a string or Label.
 The utility contracts declare `is_label`, `is_string`, and `is_list` as type
 guards. A true result narrows the input to `Label`, `str`, or the readonly
 `Sequence[object]` view, respectively. In the true branch, the list guard
