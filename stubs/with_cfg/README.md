@@ -40,6 +40,13 @@ a true result narrows the input to `Label` or `str`, respectively. The other
 five utility predicates accept `object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.
+The frontend interface declares `get_frontend` with a callable returning
+`None` and `_frontend_default` with a closed set of optional alias attributes. That
+set covers the common attributes forwarded by the wrapper and excludes
+`exec_properties` and `exec_group_compatible_with`, which `alias` does not
+accept. Callers must satisfy the chosen frontend's parameters.
+The source's `_frontend_impl` annotation declares `None` despite
+returning a list; implementation validation reports that mismatch.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. `providers` exposes a readonly sequence of objects.
 The fluent builder's gradual body types and recursive return values can still

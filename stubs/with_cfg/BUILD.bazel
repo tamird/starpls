@@ -3,6 +3,7 @@ exports_files([
     "MODULE.bazel",
     "README.md",
     "builder.bzli",
+    "frontend.bzli",
     "private_helpers.bzli",
     "providers.bzli",
     "setting.bzli",
