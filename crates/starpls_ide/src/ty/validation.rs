@@ -2299,6 +2299,26 @@ _reset_on_attrs(("srcs",), self=1, attrs_to_reset=[], mutable_has_been_built=[Fa
 
     #[test]
     fn type_predicate_has_static_implementation_evidence() {
+        let version = "tuple[list[int], bool, list[tuple[int, int | str]]]";
+        let mut failures = Vec::new();
+        for (left, right, operator) in [
+            ("str", "object", "=="),
+            ("str", "object", "!="),
+            ("bool", "object", "=="),
+            ("bool", "object", "!="),
+            ("list[int]", "object", "=="),
+            ("list[int]", "object", "!="),
+            (version, version, "<"),
+            (version, version, "=="),
+        ] {
+            let source = format!("def compare(value, other): return value {operator} other\n");
+            let donor = format!("def compare(value: {left}, other: {right}) -> bool: ...\n");
+            let diagnostics = validate(&source, &donor);
+            if !diagnostics.is_empty() {
+                failures.push(format!("{left} {operator} {right}: {diagnostics:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
         let source = r#"def is_label(value):
     return type(value) == _LABEL_TYPE
 
