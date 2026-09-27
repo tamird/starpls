@@ -25,6 +25,7 @@ use starpls_hir::ValidationAnnotation;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
+use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::place_table;
 use ty_python_core::semantic_index;
 use ty_python_core::use_def_map;
@@ -893,16 +894,28 @@ pub(super) fn provider_definition<'db>(
     is_provider_class(class.node(&parsed)).then_some(definition)
 }
 
-/// A function contract describes an existing binding; validation checks its type.
-pub(super) fn is_function_contract<'db>(
+/// Function and value contracts describe existing implementation bindings.
+pub(super) fn is_implementation_contract<'db>(
     db: &'db dyn Db,
     declaration: Definition<'db>,
     implementation: ProgramFile<'db>,
 ) -> bool {
-    matches!(declaration.kind(db), DefinitionKind::Function(_))
-        && declaration
-            .name(db)
-            .is_some_and(|name| !export_definitions(db, implementation, &name).is_empty())
+    let ScopedPlaceId::Symbol(symbol) = declaration.place(db) else {
+        return false;
+    };
+    let table = place_table(db, declaration.scope(db));
+    if export_definitions(db, implementation, table.symbol(symbol).name()).is_empty() {
+        return false;
+    }
+    match declaration.kind(db) {
+        DefinitionKind::Function(_) => true,
+        DefinitionKind::AnnotatedAssignment(_) => {
+            let program = declaration.program_file(db);
+            declaration.scope(db) == global_scope(db, program)
+                && !SemanticModel::new(db, program).is_type_alias_definition(declaration)
+        }
+        _ => false,
+    }
 }
 
 /// Preserve an exact selected implementation across a runtime import.
@@ -971,6 +984,59 @@ mod tests {
     use crate::Analysis;
     use crate::FilePosition;
     use crate::LocationLink;
+
+    #[test]
+    fn private_value_contracts_distinguish_values_from_type_helpers() {
+        use starpls_common::Db as _;
+
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "_Alias = 1\n_Type = 1\n_Callback = 1\n_Loaded = 1\n_Helper = 1\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(Default::default(), Default::default())
+            .unwrap();
+        let super::super::native::DeclarationSource { path, mut contents } =
+            super::super::native::generate(
+                Dialect::Bazel,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
+        contents.push_str(
+            "\nfrom typing import TypeAlias as Marker, Callable, Any as _Loaded\n_Alias: Marker = int\n_Type: type[int]\n_Callback: Callable[[object], object]\nclass _Helper: ...\n",
+        );
+        analysis
+            .db
+            .source_system_mut()
+            .set_virtual_source(&path, contents);
+        let file = analysis.db.files.try_virtual_file(&path).unwrap();
+        file.sync(&mut analysis.db);
+        let db = &analysis.db;
+        let declarations = ty_python_semantic::Db::program_file(db, file.file());
+        let implementation = db.starlark_program_file(source);
+        for (name, expected) in [
+            ("_Alias", false),
+            ("_Type", true),
+            ("_Callback", true),
+            ("_Loaded", false),
+            ("_Helper", false),
+        ] {
+            let definitions = super::export_definitions(db, declarations, name);
+            let [definition] = definitions.as_slice() else {
+                panic!("Expected one declaration for {name}: {definitions:?}");
+            };
+            assert_eq!(
+                super::is_implementation_contract(db, *definition, implementation),
+                expected,
+                "{name}",
+            );
+        }
+    }
 
     #[test]
     fn selected_function_imports_require_definite_pairs() {

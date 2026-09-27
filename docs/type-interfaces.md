@@ -193,9 +193,10 @@ annotations, parameter names, parameter kinds, and defaults determine the
 implementation signature. Exported functions are followed through explicit
 reexports to check their bodies.
 
-Private function declarations also supply contracts when the implementation
-defines the same name. Private helper types and unmatched private names are
-local to the stub.
+Private function declarations and module variable annotations also supply
+contracts when the implementation defines the same name. Private helper classes,
+type aliases, loaded names, and unmatched private names remain local to the stub.
+Value contracts use the same initializer and type checks as public variables.
 
 Missing exports and incompatible types are errors. Compatibility that depends on
 dynamic types and unsupported function correspondence produce an

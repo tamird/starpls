@@ -229,7 +229,7 @@ pub(super) fn check_with_status(db: &Database, file: File) -> TypeCheckResult {
                 || build_annotations.contains(&kind.target_range(&parsed))
                 || (is_module
                     && contract_sources.iter().any(|source| {
-                        super::interface::is_function_contract(db, definition, *source)
+                        super::interface::is_implementation_contract(db, definition, *source)
                     }))
             {
                 continue;
