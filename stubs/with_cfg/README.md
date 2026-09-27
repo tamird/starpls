@@ -43,6 +43,10 @@ replaces any more specific list type with this readonly view. The other four
 utility predicates accept `object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.
+`_get_type_as_attr_type(object)` returns `None` or one of `string`,
+`string_list`, `label`, `label_list`, `int`, `int_list`, and `bool`.
+It selects the name from the value or the first element of a nonempty
+list; `None` and empty lists have no selected name.
 The frontend interface declares `get_frontend` with a callable returning
 `None` and `_frontend_default` with a closed set of optional alias attributes. That
 set covers the common attributes forwarded by the wrapper and excludes
