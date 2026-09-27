@@ -1550,6 +1550,32 @@ fn has_static_evidence(
         conservative: bool,
     }
     impl Evidence<'_, '_> {
+        fn visit_expr_children(&mut self, expression: &Expr) {
+            if self.conservative {
+                match expression {
+                    Expr::Call(call) => {
+                        // Ordinary input proof owns the selected callable and receiver.
+                        // Recurse here so chained calls retain the same callee role.
+                        self.visit_expr_children(&call.func);
+                        self.visit_arguments(&call.arguments);
+                        return;
+                    }
+                    Expr::Compare(compare) => {
+                        if let Some((left, CmpOp::In | CmpOp::NotIn, receiver)) =
+                            compare.as_single()
+                        {
+                            // Ordinary input proof owns the receiver's containment contract.
+                            self.visit_expr(left);
+                            self.visit_expr_children(receiver);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            visitor::walk_expr(self, expression);
+        }
+
         fn is_unreachable(&self, range: TextRange) -> bool {
             let index = self
                 .unreachable
@@ -1578,18 +1604,7 @@ fn has_static_evidence(
             {
                 self.complete = false;
             }
-            if self.conservative {
-                if let Expr::Compare(compare) = expression {
-                    if let Some((left, CmpOp::In | CmpOp::NotIn, receiver)) = compare.as_single() {
-                        // Ordinary input proof owns the receiver's containment contract.
-                        // Its children still need evidence for calls and stored values.
-                        self.visit_expr(left);
-                        visitor::walk_expr(self, receiver);
-                        return;
-                    }
-                }
-            }
-            visitor::walk_expr(self, expression);
+            self.visit_expr_children(expression);
         }
         fn visit_stmt(&mut self, statement: &'a ruff_python_ast::Stmt) {
             if self.is_unreachable(statement.range()) {
@@ -1676,7 +1691,6 @@ fn expression_has_evidence(
     let environment = model.program_environment();
     expression.inferred_type(model).is_some_and(|ty| {
         // The ordinary pass checks calls and storage in selected bodies.
-        // Defaults retain callable evidence because deferred bodies lack those checks.
         if conservative {
             if has_nominal_evidence(model.db(), &environment, ty) {
                 return true;
@@ -1886,6 +1900,46 @@ mod tests {
             ),
         ] {
             assert!(validate(source, stub).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn validation_checks_selected_callee_evidence() {
+        for (source, stub, expected) in [
+            (
+                "def make(): return attr.string()\n",
+                "def make() -> Attribute: ...\n",
+                None,
+            ),
+            (
+                "def make(): return attr.string(mandatory='yes')\n",
+                "def make() -> Attribute: ...\n",
+                Some("invalid-argument-type"),
+            ),
+            (
+                "def make(): return attr.string()\n",
+                "def make() -> int: ...\n",
+                Some("invalid-return-type"),
+            ),
+            (
+                "def factory(unused: Any = None) -> Callable[[int], int]: return lambda value: 1\ndef make(): return factory()(1)\n",
+                "def make() -> int: ...\n",
+                None,
+            ),
+            (
+                "def factory() -> Callable[..., None]: return lambda: None\ndef make(): return factory()()\n",
+                "def make() -> None: ...\n",
+                Some("incomplete-stub-validation"),
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            match expected {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}",
+                ),
+                None => assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}"),
+            }
         }
     }
 
