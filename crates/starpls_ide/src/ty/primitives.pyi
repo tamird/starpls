@@ -4,6 +4,7 @@
 # Special methods encode operations for Ty and are omitted from completion.
 
 from typing import Collection, TYPE_CHECKING
+from typing_extensions import Never
 
 # Every Starlark value is an object; equality accepts any two values.
 # These operation signatures are internal to the checker.
@@ -176,6 +177,10 @@ class list(Sequence[_T]):
         __hash__: ClassVar[None]
     @type_check_only
     def __init__(self, iterable: Iterable[_T] = (), /) -> None: ...
+    @overload
+    @type_check_only
+    def __len__(self: list[Never]) -> Literal[0]: ...
+    @overload
     @type_check_only
     def __len__(self) -> int: ...
     @type_check_only

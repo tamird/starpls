@@ -522,6 +522,66 @@ element = values.pop()
     }
 
     #[test]
+    fn empty_lists_have_false_truthiness() {
+        let source = r#"
+def inspect(empty, strings, gradual):
+    # type: (list[Never], list[str], list[Any]) -> None
+    if empty:
+        empty.append("dead")
+    if strings:
+        pass
+    if gradual:
+        pass
+    empty.append("live")
+
+def unknown(value):
+    values = [value]
+    if values:
+        pass
+
+def mutated():
+    values = []
+    values.append("present")
+    if values:
+        pass
+"#;
+        let (mut analysis, _) = Analysis::new_for_test();
+        let file = analysis
+            .open_document(
+                Path::new("/list_truthiness.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let file = db.starlark_program_file(file);
+        let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+        let mut actual: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let start =
+                    usize::from(diagnostic.primary_span().unwrap().range().unwrap().start());
+                let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                (
+                    diagnostic.id().to_string(),
+                    source[line_start..].lines().next().unwrap().trim(),
+                )
+            })
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [
+                ("invalid-argument-type".to_owned(), "empty.append(\"live\")"),
+                ("redundant-condition".to_owned(), "if empty:"),
+            ],
+        );
+    }
+
+    #[test]
     fn boolean_conditions_follow_diagnostic_policy() {
         let source = r#"
 def available():
