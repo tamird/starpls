@@ -374,8 +374,10 @@ pub(super) fn parameter_type<'db>(
         None => factory::native_class(db, declarations, name)?,
     };
     let mut implications = Vec::new();
-    // Bazel validates single-file and executable prerequisites before invoking the rule.
-    // A present target therefore has a File in each enabled view of that attribute.
+    // Valid single-file and executable prerequisites provide a File in each
+    // enabled view when the target is present. These types describe accepted
+    // inputs; Bazel can record prerequisite errors during context construction
+    // and still invoke the implementation.
     if context_kind != ContextKind::Repository {
         for RuleAttributeData {
             name,
