@@ -339,11 +339,14 @@ fn scalar_members(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
+    use ruff_db::diagnostic::Severity;
     use ruff_db::vendored::FileType;
     use ruff_db::vendored::VendoredPathBuf;
     use ruff_python_ast as ast;
     use starpls_common::Dialect;
+    use ty_python_semantic::lint::LintSource;
     use ty_python_semantic::Db;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
@@ -516,6 +519,80 @@ element = values.pop()
         }
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn boolean_conditions_follow_diagnostic_policy() {
+        let source = r#"
+def available():
+    return True
+
+def inspect(flag):
+    # type: (bool) -> None
+    known = True
+    mixed = True if flag else 1
+    assert available != None
+    if available != None and flag:
+        pass
+    if known == True:
+        pass
+    if mixed:
+        pass
+    if available:
+        pass
+"#;
+        for strict in [false, true] {
+            let (mut analysis, _) = Analysis::new_for_test();
+            if strict {
+                let settings = Arc::get_mut(&mut analysis.db.semantic).unwrap();
+                settings.rules.enable(
+                    crate::ty::diagnostics::registry()
+                        .get("redundant-condition-strict")
+                        .unwrap(),
+                    Severity::Warning,
+                    LintSource::Default,
+                );
+            }
+            let file = analysis
+                .open_document(
+                    Path::new("/boolean_conditions.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    source.to_owned(),
+                    1,
+                )
+                .unwrap();
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let file = db.starlark_program_file(file);
+            let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+            let mut actual: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let start =
+                        usize::from(diagnostic.primary_span().unwrap().range().unwrap().start());
+                    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                    (
+                        diagnostic.id().to_string(),
+                        source[line_start..].lines().next().unwrap().trim(),
+                    )
+                })
+                .collect();
+            let mut expected = vec![("redundant-condition".to_owned(), "if available:")];
+            if strict {
+                expected.extend(
+                    [
+                        "if available != None and flag:",
+                        "if known == True:",
+                        "if mixed:",
+                    ]
+                    .map(|line| ("redundant-condition-strict".to_owned(), line)),
+                );
+            }
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "strict={strict}");
+        }
     }
 
     #[test]

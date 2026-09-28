@@ -1058,36 +1058,22 @@ example(name="dynamic", mode=dynamic())
         let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
         enable_context(&mut analysis);
         let file = fixture.main_file();
-        for (edited, errors, redundant_conditions) in [
-            (source.to_owned(), vec!["ctx.missing"], 1),
+        for (edited, errors) in [
+            (source.to_owned(), vec!["ctx.missing"]),
             (
                 source.replace("values=[\"zstd\", \"gzip\"]", "values=[]"),
                 vec!["ctx.attrs", "ctx.missing"],
-                0,
             ),
             (
                 source.replace("default=\"zstd\"", "default=dynamic()"),
                 vec!["ctx.attrs", "ctx.missing"],
-                0,
             ),
-            (source.to_owned(), vec!["ctx.missing"], 1),
+            (source.to_owned(), vec!["ctx.missing"]),
         ] {
             analysis.update_file(file, edited.clone());
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.id().as_str() == "redundant-condition")
-                    .count(),
-                redundant_conditions,
-                "{diagnostics:?}"
-            );
-            let errors_found: Vec<_> = diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.id().as_str() != "redundant-condition")
-                .collect();
-            assert_eq!(errors_found.len(), errors.len(), "{diagnostics:?}");
-            for (diagnostic, expression) in errors_found.into_iter().zip(errors) {
+            assert_eq!(diagnostics.len(), errors.len(), "{diagnostics:?}");
+            for (diagnostic, expression) in diagnostics.into_iter().zip(errors) {
                 assert_eq!(diagnostic.id().as_str(), "unresolved-attribute");
                 assert_eq!(
                     usize::from(diagnostic.range().unwrap().start()),
