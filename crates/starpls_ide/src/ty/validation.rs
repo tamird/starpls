@@ -352,14 +352,14 @@ impl Analysis {
                             return_type_correspondence,
                             has_cycle_recovery,
                             has_errors,
-                            has_diagnostics_or_suppressions,
+                            has_checking_failures,
                             has_unproved_requirements,
                         } = model
                             .function_inference_facts(function_definition(db, source))
                             .expect("function contracts originate in a function declaration");
                         if !has_errors {
                             if has_cycle_recovery
-                                || has_diagnostics_or_suppressions
+                                || has_checking_failures
                                 || has_unproved_requirements
                                 || return_type_correspondence != Some(true)
                             {
@@ -400,7 +400,7 @@ impl Analysis {
                         .collect();
                     let TypeCheckResult {
                         diagnostics: source_diagnostics,
-                        has_suppressed_inference_diagnostics,
+                        has_suppressed_inference_failures,
                         has_unproved_requirements,
                     } = super::diagnostics::check_with_status(db, file);
                     checked.extend(source_diagnostics);
@@ -408,7 +408,7 @@ impl Analysis {
                         .iter()
                         .chain(&checked)
                         .any(|diagnostic| diagnostic.severity() == Severity::Error);
-                    if (has_suppressed_inference_diagnostics
+                    if (has_suppressed_inference_failures
                         || (has_unproved_requirements && !has_errors))
                         && !diagnostics.iter().chain(&checked).any(|diagnostic| {
                             diagnostic.id() == DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name())
@@ -1416,14 +1416,12 @@ fn compare_initializer<'db>(
         return_type_correspondence: _,
         has_cycle_recovery,
         has_errors,
-        has_diagnostics_or_suppressions,
+        has_checking_failures,
         has_unproved_requirements,
     } = model
         .function_inference_facts(definition)
         .expect("provider initializers originate in a function declaration");
-    if !has_errors
-        && (has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements)
-    {
+    if !has_errors && (has_cycle_recovery || has_checking_failures || has_unproved_requirements) {
         return Err(ContractError::Incomplete(format!(
             "Cannot prove initializer for `{name}`: {}",
             inference_failure_reasons(facts, false),
@@ -1778,15 +1776,15 @@ fn inference_failure_reasons(facts: FunctionInferenceFacts, require_return: bool
         return_type_correspondence,
         has_cycle_recovery,
         has_errors: _,
-        has_diagnostics_or_suppressions,
+        has_checking_failures,
         has_unproved_requirements,
     } = facts;
     let mut reasons = Vec::new();
     if has_cycle_recovery {
         reasons.push("type inference used recursive recovery");
     }
-    if has_diagnostics_or_suppressions {
-        reasons.push("diagnostics were reported or suppressed");
+    if has_checking_failures {
+        reasons.push("checking diagnostics were reported or suppressed");
     }
     if has_unproved_requirements {
         reasons.push("some operation inputs could not be proved");
@@ -1815,12 +1813,12 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
         return_type_correspondence: _,
         has_cycle_recovery,
         has_errors: _,
-        has_diagnostics_or_suppressions,
+        has_checking_failures,
         has_unproved_requirements,
     } = model
         .function_inference_facts(definition)
         .expect("function contracts originate in a function declaration");
-    if has_cycle_recovery || has_diagnostics_or_suppressions || has_unproved_requirements {
+    if has_cycle_recovery || has_checking_failures || has_unproved_requirements {
         return Err(ContractError::Incomplete(format!(
             "Cannot prove `{name}`: {}",
             inference_failure_reasons(facts, false),
@@ -1920,6 +1918,7 @@ fn report(reports: &mut Reports, file: File, range: TextRange, incomplete: bool,
 
 #[cfg(test)]
 mod tests {
+    use ruff_db::diagnostic::Severity;
     use starpls_hir::Db as _;
     use starpls_hir::Fixture;
 
@@ -1933,7 +1932,23 @@ mod tests {
     }
 
     fn validation_diagnostics(source: &str, stub: &str) -> Vec<super::Diagnostic> {
+        validation_diagnostics_with_rules(source, stub, &[])
+    }
+
+    fn validation_diagnostics_with_rules(
+        source: &str,
+        stub: &str,
+        rules: &[(&str, Severity)],
+    ) -> Vec<super::Diagnostic> {
         let (mut analysis, loader) = Analysis::new_for_test();
+        let settings = std::sync::Arc::get_mut(&mut analysis.db.semantic).unwrap();
+        for &(name, severity) in rules {
+            settings.validation_rules.enable(
+                crate::ty::diagnostics::registry().get(name).unwrap(),
+                severity,
+                ty_python_semantic::lint::LintSource::File,
+            );
+        }
         let mut fixture = Fixture::new(&mut analysis.db);
         let source = fixture.add_file(&mut analysis.db, "source.bzl", source);
         let stub = fixture.add_file(&mut analysis.db, "source.bzli", stub);
@@ -1953,6 +1968,79 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn advisory_diagnostics_preserve_implementation_proof() {
+        for (source, stub, expected) in [
+            (
+                "def make(value, empty):\n    if not empty: return value\n    return value\n",
+                "def make(value: int, empty: tuple[()]) -> int: ...\n",
+                vec!["redundant-condition"],
+            ),
+            (
+                "def make(value, empty):\n    if not empty: # ty: ignore[redundant-condition]\n        return value\n    return value\n",
+                "def make(value: int, empty: tuple[()]) -> int: ...\n",
+                vec![],
+            ),
+            (
+                "def make(): return 1\nVALUE = 1 if make else 2 # ty: ignore[redundant-condition]\n",
+                "def make() -> int: ...\n",
+                vec![],
+            ),
+            (
+                "def plain(value): return value\ndef make(value):\n    if plain: return value\n    return value\n",
+                "def plain(value: int) -> int: ...\ndef make(value: int) -> int: ...\n",
+                vec!["redundant-condition"],
+            ),
+            (
+                "def make(value):\n    len(value) # ty: ignore[invalid-argument-type]\n    return value\n",
+                "def make(value: int) -> int: ...\n",
+                vec!["incomplete-stub-validation"],
+            ),
+            (
+                "len(1) # ty: ignore[invalid-argument-type]\ndef make(): return 1\n",
+                "def make() -> int: ...\n",
+                vec!["incomplete-stub-validation"],
+            ),
+        ] {
+            assert_eq!(validate(source, stub), expected, "{source}");
+        }
+
+        for suppression in ["", " # ty: ignore[redundant-condition-strict]"] {
+            let diagnostics = validation_diagnostics_with_rules(
+                &format!("def make(value):\n    flag = True\n    if flag:{suppression}\n        pass\n    return value\n"),
+                "def make(value: int) -> int: ...\n",
+                &[("redundant-condition-strict", Severity::Warning)],
+            );
+            let actual: Vec<_> = diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.id().as_str(), diagnostic.severity()))
+                .collect();
+            let expected = if suppression.is_empty() {
+                vec![("redundant-condition-strict", Severity::Warning)]
+            } else {
+                vec![]
+            };
+            assert_eq!(actual, expected, "{suppression}");
+        }
+
+        let diagnostics = validation_diagnostics_with_rules(
+            "def make(value):\n    len(value)\n    return value\n",
+            "def make(value: int) -> int: ...\n",
+            &[("invalid-argument-type", Severity::Warning)],
+        );
+        let actual: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.id().as_str(), diagnostic.severity()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("invalid-argument-type", Severity::Warning),
+                ("incomplete-stub-validation", Severity::Error),
+            ]
+        );
     }
 
     #[test]
