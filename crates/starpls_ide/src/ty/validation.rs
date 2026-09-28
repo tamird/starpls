@@ -5579,6 +5579,29 @@ def collect(extra):
     }
 
     #[test]
+    fn list_copies_preserve_union_result_domains() {
+        let stub = r#"
+def is_list(value: object) -> TypeGuard[Sequence[object]]: ...
+def clone(value: str | Label | int | bool | list[Any] | None) -> str | Label | int | bool | list[Any] | None: ...
+"#;
+        for (result, expected) in [("value", vec![]), ("{}", vec!["invalid-return-type"])] {
+            let source = format!(
+                r#"
+_LIST_TYPE = type([])
+def is_list(value):
+    return type(value) == _LIST_TYPE
+
+def clone(value):
+    if is_list(value):
+        return list(value)
+    return {result}
+"#
+            );
+            assert_eq!(validate(&source, stub), expected, "return {result}");
+        }
+    }
+
+    #[test]
     fn opaque_parameter_inputs_check_consuming_operations() {
         assert!(validate(
             "def forward(callback): return callback\n",
