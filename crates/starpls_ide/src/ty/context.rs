@@ -670,7 +670,11 @@ impl<'a> Visitor<'a> for RegistrationCalls<'a> {
 mod tests {
     use ruff_python_ast::Stmt;
     use salsa::Setter;
+    use starpls_bazel::build::attribute::Discriminator;
     use starpls_hir::Db as _;
+    use ty_python_semantic::types::CallableTypeKind;
+    use ty_python_semantic::types::ParameterKind;
+    use ty_python_semantic::types::Type;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
 
@@ -1992,65 +1996,187 @@ example = repository_rule(implementation=implementation, attrs={
 
     #[test]
     fn macro_callbacks_inherit_native_attribute_metadata() {
-        use starpls_bazel::build::attribute::Discriminator;
-        let source = r#"def implementation(name, visibility, srcs, optional, **kwargs):
-    srcs
-    optional
-    native.example(srcs=srcs, optional=optional)
-example = macro(implementation=implementation, inherit_attrs=native.example)
-"#;
-        let (mut analysis, fixture) = Analysis::from_single_file_fixture(source);
-        enable_context(&mut analysis);
-        let builtins = analysis
-            .db
-            .get_builtin_defs(&starpls_common::Dialect::Bazel)
-            .builtins(&analysis.db)
-            .clone();
-        analysis
-            .set_builtin_defs(
-                builtins,
-                starpls_bazel::build::BuildLanguage {
-                    rule: vec![starpls_bazel::build::RuleDefinition {
-                        name: "example".to_owned(),
-                        attribute: [
-                            ("srcs", Discriminator::LabelList, true, false),
-                            ("optional", Discriminator::Boolean, false, true),
-                        ]
-                        .into_iter()
-                        .map(|(name, kind, mandatory, configurable)| {
-                            starpls_bazel::build::AttributeDefinition {
-                                name: name.to_owned(),
-                                r#type: kind as i32,
-                                mandatory: Some(mandatory),
-                                configurable: Some(configurable),
+        for erased in [false, true] {
+            let mut expected_signatures = None;
+            for keyword_parameters in [false, true] {
+                let parameters = if keyword_parameters {
+                    "name, visibility, **kwargs"
+                } else {
+                    "name, visibility, srcs, optional, **kwargs"
+                };
+                let (srcs, optional) = if keyword_parameters {
+                    ("kwargs[\"srcs\"]", "kwargs[\"optional\"]")
+                } else {
+                    ("srcs", "optional")
+                };
+                let parent = if erased {
+                    "erase(native.example)"
+                } else {
+                    "native.example"
+                };
+                let source = format!(
+                    "def erase(value: rule) -> rule: return value
+def implementation({parameters}):
+    name
+    visibility
+    {srcs}
+    {optional}
+    kwargs
+    native.example(srcs={srcs}, optional={optional})
+parent = {parent}
+example = macro(implementation=implementation, inherit_attrs=parent)
+"
+                );
+                let (mut analysis, fixture) = Analysis::from_single_file_fixture(&source);
+                enable_context(&mut analysis);
+                let builtins = analysis
+                    .db
+                    .get_builtin_defs(&starpls_common::Dialect::Bazel)
+                    .builtins(&analysis.db)
+                    .clone();
+                analysis
+                    .set_builtin_defs(
+                        builtins,
+                        starpls_bazel::build::BuildLanguage {
+                            rule: vec![starpls_bazel::build::RuleDefinition {
+                                name: "example".to_owned(),
+                                attribute: [
+                                    ("srcs", Discriminator::LabelList, true, false),
+                                    ("optional", Discriminator::Boolean, false, true),
+                                ]
+                                .into_iter()
+                                .map(|(name, kind, mandatory, configurable)| {
+                                    starpls_bazel::build::AttributeDefinition {
+                                        name: name.to_owned(),
+                                        r#type: kind as i32,
+                                        mandatory: Some(mandatory),
+                                        configurable: Some(configurable),
+                                        ..Default::default()
+                                    }
+                                })
+                                .collect(),
                                 ..Default::default()
-                            }
-                        })
-                        .collect(),
-                        ..Default::default()
-                    }],
-                },
-            )
-            .unwrap();
-        let snapshot = analysis.snapshot();
-        let diagnostics = snapshot.diagnostics(fixture.main_file()).unwrap();
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        check_field(
-            &snapshot,
-            fixture.main_file(),
-            source,
-            "    srcs",
-            "list[Label]",
-            "",
-        );
-        check_field(
-            &snapshot,
-            fixture.main_file(),
-            source,
-            "    optional",
-            "select[bool | None] | None",
-            "",
-        );
+                            }],
+                        },
+                    )
+                    .unwrap();
+                let snapshot = analysis.snapshot();
+                let file = fixture.main_file();
+                let db = &snapshot.db;
+                let program = db.starlark_program_file(file);
+                let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+                let model = SemanticModel::new(db, program);
+                let environment = model.program_environment();
+                let [_erase, implementation, parent, registration] = parsed.suite().as_slice()
+                else {
+                    panic!("expected callback and registration fixture");
+                };
+                let Stmt::FunctionDef(implementation) = implementation else {
+                    panic!("expected callback definition");
+                };
+                let Stmt::Assign(parent) = parent else {
+                    panic!("expected inherited parent");
+                };
+                let Stmt::Assign(registration) = registration else {
+                    panic!("expected macro registration");
+                };
+                let parent_type = parent.value.inferred_type(&model).unwrap();
+                let macro_type = registration.value.inferred_type(&model).unwrap();
+                let data = macro_type.provided_data(db, &environment).unwrap();
+                let data = data.downcast_ref::<super::factory::RuleData>().unwrap();
+                assert_eq!(data.complete, !erased);
+                assert!(data
+                    .attributes
+                    .iter()
+                    .all(|attribute| attribute.descriptor.is_some()));
+                assert_eq!(
+                    data.attributes
+                        .iter()
+                        .map(|attribute| attribute.name.as_str())
+                        .collect::<Vec<_>>(),
+                    if erased {
+                        vec!["name", "visibility"]
+                    } else {
+                        vec!["name", "visibility", "srcs", "optional"]
+                    }
+                );
+                let mut signatures = Vec::new();
+                macro_type.map_callable_signatures(
+                    db,
+                    &environment,
+                    CallableTypeKind::Regular,
+                    |signature| {
+                        assert_eq!(
+                            signature.parameters().iter().any(|parameter| matches!(
+                                parameter.kind(),
+                                ParameterKind::KeywordVariadic { .. }
+                            )),
+                            erased,
+                            "only the erased parent needs an open keyword signature"
+                        );
+                        signatures.push(
+                            Type::single_callable(db, signature.clone())
+                                .display(db, &environment)
+                                .to_string(),
+                        );
+                        signature
+                    },
+                );
+                assert!(
+                    !signatures.is_empty(),
+                    "macro must retain a callable signature"
+                );
+                if let Some(expected) = &expected_signatures {
+                    assert_eq!(
+                        &signatures, expected,
+                        "callback parameters must not change the public macro signature"
+                    );
+                } else {
+                    expected_signatures = Some(signatures);
+                }
+                let diagnostics = snapshot.diagnostics(file).unwrap();
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                if erased {
+                    assert!(
+                        matches!(parent_type, Type::NominalInstance(_)),
+                        "erasure must retain a nominal rule"
+                    );
+                    assert!(
+                        parent_type.provided_data(db, &environment).is_none(),
+                        "erased rule must lose native metadata"
+                    );
+                    assert_eq!(parent_type.display(db, &environment).to_string(), "rule");
+                }
+                let (srcs_type, optional_type) = if !erased && !keyword_parameters {
+                    ("list[Label]", "select[bool | None] | None")
+                } else {
+                    ("Unknown", "Unknown")
+                };
+                let [name, visibility, srcs, optional, kwargs, _forward] =
+                    implementation.body.as_slice()
+                else {
+                    panic!("expected callback field observations and native forwarding");
+                };
+                for (statement, expected) in [
+                    (name, "str"),
+                    (visibility, "list[Label]"),
+                    (srcs, srcs_type),
+                    (optional, optional_type),
+                    (kwargs, "dict[str, Unknown]"),
+                ] {
+                    let Stmt::Expr(statement) = statement else {
+                        panic!("expected callback field observation");
+                    };
+                    let ty = statement.value.inferred_type(&model).unwrap();
+                    assert_eq!(
+                        ty.display(db, &environment).to_string(),
+                        expected,
+                        "erased={erased}, kwargs={keyword_parameters}: {:?}",
+                        statement.range
+                    );
+                }
+            }
+        }
     }
 
     #[test]
