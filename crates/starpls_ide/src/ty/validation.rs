@@ -9,7 +9,6 @@ use ruff_db::diagnostic::DiagnosticId;
 use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use ruff_python_ast::name::Name;
-use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprContext;
 use ruff_python_ast::ExprName;
@@ -1571,7 +1570,7 @@ fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool 
         )
 }
 
-/// Contextual checking of structural returns can hide gradual child types.
+/// Check default and provider expression evidence and reject unchecked nested definitions.
 fn has_static_evidence(
     db: &Database,
     source: File,
@@ -1589,32 +1588,6 @@ fn has_static_evidence(
         conservative: bool,
     }
     impl Evidence<'_, '_> {
-        fn visit_expr_children(&mut self, expression: &Expr) {
-            if self.conservative {
-                match expression {
-                    Expr::Call(call) => {
-                        // Ordinary input proof owns the selected callable and receiver.
-                        // Recurse here so chained calls retain the same callee role.
-                        self.visit_expr_children(&call.func);
-                        self.visit_arguments(&call.arguments);
-                        return;
-                    }
-                    Expr::Compare(compare) => {
-                        if let Some((left, CmpOp::In | CmpOp::NotIn, receiver)) =
-                            compare.as_single()
-                        {
-                            // Ordinary input proof owns the receiver's containment contract.
-                            self.visit_expr(left);
-                            self.visit_expr_children(receiver);
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            visitor::walk_expr(self, expression);
-        }
-
         fn is_unreachable(&self, range: TextRange) -> bool {
             let index = self
                 .unreachable
@@ -1626,7 +1599,7 @@ fn has_static_evidence(
     }
     impl<'a> Visitor<'a> for Evidence<'_, '_> {
         fn visit_expr(&mut self, expression: &'a ruff_python_ast::Expr) {
-            if self.is_unreachable(expression.range()) {
+            if self.conservative || self.is_unreachable(expression.range()) {
                 return;
             }
             // Inference types the leaves of a binding pattern, not its container.
@@ -1636,14 +1609,14 @@ fn has_static_evidence(
                 _ => false,
             };
             if !binding_pattern
-                && !expression_has_evidence(self.model, expression, self.conservative)
+                && !expression_has_static_evidence(self.model, expression)
                 && !expression.inferred_type(self.model).is_some_and(|ty| {
                     plain_provider_fields(self.db, ty, &self.model.program_environment()).is_some()
                 })
             {
                 self.complete = false;
             }
-            self.visit_expr_children(expression);
+            visitor::walk_expr(self, expression);
         }
         fn visit_stmt(&mut self, statement: &'a ruff_python_ast::Stmt) {
             if self.is_unreachable(statement.range()) {
@@ -1719,30 +1692,8 @@ fn has_nominal_evidence<'db>(
 }
 
 fn expression_has_static_evidence(model: &SemanticModel<'_>, expression: &Expr) -> bool {
-    expression_has_evidence(model, expression, false)
-}
-
-fn expression_has_evidence(
-    model: &SemanticModel<'_>,
-    expression: &Expr,
-    conservative: bool,
-) -> bool {
     let environment = model.program_environment();
     expression.inferred_type(model).is_some_and(|ty| {
-        // The ordinary pass checks calls and storage in selected bodies.
-        if conservative {
-            if has_nominal_evidence(model.db(), &environment, ty) {
-                return true;
-            }
-            if matches!(ty, Type::Callable(_))
-                && ty.is_fully_static_except_any(model.db(), &environment)
-                && ty
-                    .top_materialization(model.db(), &environment)
-                    .satisfies_declared_output(model.db(), &environment, ty)
-            {
-                return true;
-            }
-        }
         let ty = ty
             .map_callable_signatures(
                 model.db(),
@@ -1752,13 +1703,6 @@ fn expression_has_evidence(
             )
             .unwrap_or(ty);
         ty.is_fully_static(model.db(), &environment)
-            || (conservative
-                && ty.is_fully_static_except_any(model.db(), &environment)
-                && ty.is_equivalent_to(
-                    model.db(),
-                    &environment,
-                    ty.top_materialization(model.db(), &environment),
-                ))
     })
 }
 
@@ -1826,7 +1770,7 @@ fn compare_function_body(db: &Database, source: Function, name: &str) -> Result<
     }
     if !has_static_evidence(db, source.file, function, true) {
         return Err(ContractError::Incomplete(format!(
-            "Cannot prove `{name}`: its implementation contains dynamic or unavailable expression types"
+            "Cannot prove `{name}`: a default value or nested definition could not be checked"
         )));
     }
     Ok(())
@@ -3078,9 +3022,25 @@ def make() -> _Runner: ...
                 &["incomplete-stub-validation"],
             ),
             (
-                "mutable callback storage",
+                "fresh callback storage",
                 "def make(): return [lambda: 1]\n",
                 "def make() -> list[Callable[..., int]]: ...\n",
+                &[],
+            ),
+            (
+                "retained callback storage",
+                r#"def make():
+    items: list[Callable[[], int]] = [lambda: 1]
+    run = lambda: items[0]()
+    return struct(items=items, run=run)
+"#,
+                r#"class _Result(Protocol):
+    @property
+    def items(self) -> list[Callable[..., int]]: ...
+    @property
+    def run(self) -> Callable[[], int]: ...
+def make() -> _Result: ...
+"#,
                 &["incomplete-stub-validation"],
             ),
         ] {
@@ -5363,7 +5323,7 @@ _starpls_Bzl_test_comparer: _ComparisonProbe
             (
                 "def chained(key): return key in TABLE == {}\n",
                 "def chained(key: str) -> bool: ...\n",
-                &["incomplete-stub-validation"],
+                &[],
             ),
             (
                 "def make(callback=lambda: 'string' in TABLE): return callback\n",
@@ -5415,6 +5375,46 @@ def collect(extra):
                 ),
                 ["incomplete-stub-validation"],
                 "{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_values_preserve_operation_requirements() {
+        for (body, expected) in [
+            ("json.decode('0')", &[] as &[&str]),
+            ("{}", &[]),
+            ("{'key': json.decode('0')}", &[]),
+            // Dictionary key types are unbounded; validation does not model hashing.
+            ("{json.decode('[]'): 1}", &[]),
+            ("{[0]: 1}", &[]),
+            (
+                "json.decode('0').missing_attribute",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "(lambda: json.decode('0').missing_attribute)()",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "for _ in json.decode('0'):\n        pass",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "[item for item in json.decode('0')]",
+                &["incomplete-stub-validation"],
+            ),
+            ("for _ in [json.decode('0')]:\n        pass", &[]),
+            (
+                "for _first, _second in (json.decode('0'),):\n        pass",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            let source = format!("def make():\n    {body}\n    return None\n");
+            assert_eq!(
+                validate(&source, "def make() -> None: ...\n"),
+                expected,
+                "{body}"
             );
         }
     }

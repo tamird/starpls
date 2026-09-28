@@ -234,7 +234,9 @@ omits a value requirement, and bare `Callable[..., R]` omits an input shape
 and checks `R`. Explicit callback input domains, mutable writes, and invariant
 storage require known compared types and strict type correspondence under
 their value bounds. Missing callable parameter types cannot establish an
-explicit input domain.
+explicit input domain. Fresh list literals use the declared element context.
+Separately typed lists must satisfy invariant correspondence with the declared
+list type.
 
 Validation checks paired function bodies using the inferred or declared types
 of their callees. Unpaired helper bodies participate in ordinary file checking;
@@ -257,9 +259,12 @@ checks.
 Function validation checks operations on parameters and module globals using
 conservative value bounds. For example, a `list[Any]` can be read as objects and
 copied into a fresh `list[object]`. Mutations and calls must be valid under those
-bounds.
-Other body expressions require static types, including the signatures of
-callable values.
+bounds. The same bounds apply when an input is assigned to a gradual local
+annotation. Validation checks the inferred types and declared contracts of
+operations; discarded values and fresh containers may have gradual types when
+those checks establish their requirements. Runtime preconditions that are not
+represented in these contracts, such as dictionary key hashability, remain
+subject to Bazel's runtime checks.
 
 Ordinary type errors retain their source diagnostics. Failed conservative
 checks and unresolved inference produce an incomplete result. Validation checks
