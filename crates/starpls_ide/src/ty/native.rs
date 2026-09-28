@@ -19,6 +19,19 @@ use starpls_common::Dialect;
 use ty_ide::Docstring;
 use ty_ide::MarkupKind;
 
+pub(super) const TYPING_ANNOTATIONS: &[&str] = &[
+    "Final",
+    "Callable",
+    "Protocol",
+    "TypedDict",
+    "TypeGuard",
+    "Unpack",
+    "Literal",
+    "Never",
+    "NotRequired",
+    "ReadOnly",
+];
+
 pub(super) struct DeclarationSource {
     pub(super) path: SystemVirtualPathBuf,
     pub(super) contents: String,
@@ -590,17 +603,7 @@ fn declarations(
     for name in classes.keys() {
         writeln!(output, "_starpls_annotation_{name} = _starpls_types.{name}")?;
     }
-    for name in [
-        "Final",
-        "Callable",
-        "Protocol",
-        "TypedDict",
-        "TypeGuard",
-        "Unpack",
-        "Literal",
-        "NotRequired",
-        "ReadOnly",
-    ] {
+    for name in TYPING_ANNOTATIONS {
         writeln!(
             output,
             "_starpls_annotation_{name} = _starpls_typing.{name}"

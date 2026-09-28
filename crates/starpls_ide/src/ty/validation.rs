@@ -1956,6 +1956,23 @@ mod tests {
     }
 
     #[test]
+    fn never_describes_empty_containers_in_interfaces() {
+        let stub = "def empty() -> dict[Never, Never]: ...\n";
+        assert_eq!(
+            validate("def empty(): return {}\n", stub),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            validate("def empty(): return {\"key\": 1}\n", stub),
+            ["invalid-return-type"]
+        );
+        assert_eq!(
+            validate("def empty(): return {}\nprint(Never)\n", stub),
+            ["unresolved-reference"]
+        );
+    }
+
+    #[test]
     fn validation_phase_changes_reuse_semantic_index() {
         use std::sync::atomic::Ordering;
 

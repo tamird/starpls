@@ -232,26 +232,10 @@ impl Database {
                 .map(|class| class.name.as_str())
                 .chain(starpls_bazel::BUILTINS_VALUES_DENY_LIST.iter().copied())
                 .chain([
-                    "str",
-                    "string",
-                    "Any",
-                    "Unknown",
-                    "unknown",
-                    "NoneType",
-                    "Sequence",
-                    "Iterable",
-                    "Final",
-                    "Callable",
-                    "Protocol",
-                    "TypedDict",
-                    "TypeGuard",
-                    "Unpack",
-                    "Literal",
-                    "NotRequired",
-                    "ReadOnly",
-                    "object",
-                    "property",
-                ]);
+                    "str", "string", "Any", "Unknown", "unknown", "NoneType", "Sequence",
+                    "Iterable", "object", "property",
+                ])
+                .chain(native::TYPING_ANNOTATIONS.iter().copied());
             return candidates
                 .filter(|name| {
                     matches!(
