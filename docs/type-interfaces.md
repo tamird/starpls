@@ -250,11 +250,12 @@ Declarations for selected functions govern calls from module initialization
 and selected bodies.
 Arguments must satisfy each declared input type, and every selected body is
 checked. A failure in any selected body makes validation unsuccessful. This
-support applies to original functions with nongeneric signatures and fixed,
-required parameters. Imported functions participate when their source and stub
-each export one definite function definition and that exact pair is selected.
-Defaults, variadic signatures, and other imports use the existing conservative
-checks.
+support applies to original functions with nongeneric signatures and fixed
+parameters. Parameters with defaults may be omitted; their actual source
+defaults still enter implementation checking. Imported functions participate
+when their source and stub each export one definite function definition and
+that exact pair is selected. Variadic signatures and other imports use the
+existing conservative checks.
 
 Function validation checks operations on parameters and module globals using
 conservative value bounds. For example, a `list[Any]` can be read as objects and

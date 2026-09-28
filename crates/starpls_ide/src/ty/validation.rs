@@ -1247,9 +1247,9 @@ fn plain_provider_fields<'db>(
     Some(fields)
 }
 
-pub(super) fn call_diagnostics(
-    db: &Database,
-    call: &ty_python_semantic::types::CheckedCall<'_, '_>,
+pub(super) fn call_diagnostics<'db>(
+    db: &'db Database,
+    call: &ty_python_semantic::types::CheckedCall<'_, 'db>,
 ) -> Vec<Diagnostic> {
     use ty_python_semantic::types::CheckedArgument;
 
@@ -1260,34 +1260,42 @@ pub(super) fn call_diagnostics(
         return Vec::new();
     }
     let environment = ty_python_semantic::ProgramEnvironment::from_file(call.file());
-    let check_argument = |subject: &str, name: &str, expected, missing, indeterminate| {
-        let (range, reason) = match call.argument(name) {
-            CheckedArgument::Value { ty, expression } => {
-                if ty.satisfies_declared_output(db, &environment, expected) {
-                    return None;
+    let check_argument =
+        |subject: &str, name: &str, expected, has_default, missing, indeterminate| {
+            let (range, reason) = match call.argument(name) {
+                CheckedArgument::Value { ty, expression } => {
+                    if ty.satisfies_declared_output(db, &environment, expected) {
+                        return None;
+                    }
+                    (
+                        expression.map_or(call.call().range(), Ranged::range),
+                        format!(
+                            "argument type `{}` does not preserve declared type `{}`",
+                            ty.display(db, &environment),
+                            expected.display(db, &environment),
+                        ),
+                    )
                 }
-                (
-                    expression.map_or(call.call().range(), Ranged::range),
-                    format!(
-                        "argument type `{}` does not preserve declared type `{}`",
-                        ty.display(db, &environment),
-                        expected.display(db, &environment),
-                    ),
-                )
-            }
-            CheckedArgument::Omitted => (call.call().range(), String::from(missing)),
-            CheckedArgument::Indeterminate => (call.call().range(), String::from(indeterminate)),
+                CheckedArgument::Omitted => {
+                    if has_default {
+                        return None;
+                    }
+                    (call.call().range(), String::from(missing))
+                }
+                CheckedArgument::Indeterminate => {
+                    (call.call().range(), String::from(indeterminate))
+                }
+            };
+            let mut diagnostic = Diagnostic::new(
+                DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
+                Severity::Error,
+                format!("Cannot prove {subject} `{name}`: {reason}"),
+            );
+            diagnostic.annotate(Annotation::primary(
+                Span::from(call.file().file(db)).with_range(range),
+            ));
+            Some(diagnostic)
         };
-        let mut diagnostic = Diagnostic::new(
-            DiagnosticId::Lint(INCOMPLETE_STUB_VALIDATION.name()),
-            Severity::Error,
-            format!("Cannot prove {subject} `{name}`: {reason}"),
-        );
-        diagnostic.annotate(Annotation::primary(
-            Span::from(call.file().file(db)).with_range(range),
-        ));
-        Some(diagnostic)
-    };
     let selected_signature = || {
         let ty = call.expression_type(&call.call().func)?;
         let function = ty.as_function_literal()?;
@@ -1305,6 +1313,9 @@ pub(super) fn call_diagnostics(
             .then_some(signature)
     };
     if let Some(signature) = selected_signature() {
+        if call.arguments_satisfy_declared_parameters(db) {
+            return Vec::new();
+        }
         return signature
             .parameters()
             .iter()
@@ -1313,6 +1324,7 @@ pub(super) fn call_diagnostics(
                     "argument",
                     parameter.name().expect("selected parameters have names"),
                     parameter.annotated_type(),
+                    parameter.has_default(),
                     "no argument establishes the required input",
                     "argument matching does not identify one definite input value",
                 )
@@ -1328,6 +1340,7 @@ pub(super) fn call_diagnostics(
                 "constructor field",
                 &field.name,
                 field.ty,
+                false,
                 "no argument establishes the required field",
                 "argument matching does not identify one definite field value",
             )
@@ -3776,12 +3789,15 @@ def forward(**kwargs: Unpack[_Keywords]) -> None: ...
 "#;
         let diagnostics = validate(source, stub);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(
-            validate(
-                source,
-                &stub.replace("name: str\n", "name: NotRequired[str]\n")
-            ),
-            ["incomplete-stub-validation"],
+        let diagnostics = validate(
+            source,
+            &stub.replace("name: str\n", "name: NotRequired[str]\n"),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),
+            "{diagnostics:?}",
         );
         let diagnostics = validate(
             source,
@@ -4883,6 +4899,149 @@ def make() -> _Runner: ...
                 validate(&source, "VALUE: int\n"),
                 ["incomplete-stub-validation"],
                 "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_function_calls_accept_declared_defaults() {
+        for (parameters, declarations, domain, calls) in [
+            (
+                "values = []",
+                "values: list[Any] = ...",
+                "list[Any]",
+                ["helper(values)", "helper()"],
+            ),
+            (
+                "values, flag = False",
+                "values: list[Any], flag: bool = ...",
+                "list[Any]",
+                ["helper(values)", "helper(values, flag=True)"],
+            ),
+            (
+                "*, values = {}",
+                "*, values: dict[str, list[Any]] = ...",
+                "dict[str, list[Any]]",
+                ["helper(values=values)", "helper()"],
+            ),
+        ] {
+            for call in calls {
+                let source = format!(
+                    "def helper({parameters}):
+    return len(values)
+def forward(values):
+    return {call}
+"
+                );
+                let stub = format!(
+                    "def helper({declarations}) -> int: ...
+def forward(values: {domain}) -> int: ...
+"
+                );
+                assert_eq!(validate(&source, &stub), Vec::<String>::new(), "{source}");
+            }
+        }
+        // An external declaration describes supplied arguments. The body may safely
+        // handle a different implementation default.
+        assert!(validate(
+            "def helper(value=None): return 0\ndef forward(): return helper()\n",
+            "def helper(value: int = ...) -> int: ...\ndef forward() -> int: ...\n",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn selected_function_defaults_keep_independent_obligations() {
+        for (source, stub, expected) in [
+            (
+                "def helper(value: int = 'bad') -> int: return 0\ndef forward(): return helper()\n",
+                "def helper(value: int = ...) -> int: ...\ndef forward() -> int: ...\n",
+                "invalid-parameter-default",
+            ),
+            (
+                "def helper(value='bad'): return value
+def forward(): return helper()
+",
+                "def helper(value: int = ...) -> int: ...
+def forward() -> int: ...
+",
+                "invalid-return-type",
+            ),
+            (
+                "def needs_int(value: int) -> int: return value
+def helper(value=needs_int('bad')): # ty: ignore[invalid-argument-type]
+    return value
+def forward(): return helper()
+",
+                "def helper(value: int = ...) -> int: ...
+def forward() -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+            (
+                "def opaque() -> Any: return []
+def helper(values=opaque()): return len(values)
+def forward(): return helper()
+",
+                "def helper(values: list[Any] = ...) -> int: ...
+def forward() -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+            (
+                "def helper(values): return len(values)
+def forward(): return helper()
+",
+                "def helper(values: list[Any]) -> int: ...
+def forward() -> int: ...
+",
+                "missing-argument",
+            ),
+            (
+                "def helper(values=[]):
+    values.append(1)
+    return len(values)
+def forward(values): return helper(values)
+",
+                "def helper(values: list[Any] = ...) -> int: ...
+def forward(values: list[Any]) -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+            (
+                "def helper(values: list[Any] = []) -> int:
+    values.append(1)
+    return len(values)
+def forward(values): return helper(values)
+",
+                "def forward(values: list[Any]) -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+            (
+                "def narrow(values: list[str]) -> int: return len(values)
+def helper(callback, flag=False): return 0
+def forward(): return helper(narrow)
+",
+                "def helper(callback: Callable[[list[Any]], int], flag: bool = ...) -> int: ...
+def forward() -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+            (
+                "def helper(values=[]): return len(values)
+def forward(values): return helper(*values)
+",
+                "def helper(values: list[Any] = ...) -> int: ...
+def forward(values: tuple[list[Any], ...]) -> int: ...
+",
+                "incomplete-stub-validation",
+            ),
+        ] {
+            let diagnostics = validate(source, stub);
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{source}: {diagnostics:?}",
             );
         }
     }
