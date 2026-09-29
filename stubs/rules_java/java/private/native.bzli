@@ -1,0 +1,9 @@
+class _Internal(Protocol):
+    @property
+    def google_legacy_api_enabled(self) -> Callable[[], bool]: ...
+
+    @type_check_only
+    def __getattr__(self, name: str) -> Any: ...
+
+
+def get_internal_java_common() -> _Internal: ...

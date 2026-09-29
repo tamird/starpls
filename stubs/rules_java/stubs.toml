@@ -1,0 +1,10 @@
+format-version = 1
+
+[source]
+repository = "@rules_java"
+module = "rules_java"
+versions = ["9.3.0"]
+
+[files]
+"java/private/java_common.bzl" = "java/private/java_common.bzli"
+"java/private/native.bzl" = "java/private/native.bzli"
