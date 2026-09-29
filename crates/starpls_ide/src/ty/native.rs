@@ -303,6 +303,14 @@ fn declarations(
         );
     }
     for class in classes.values() {
+        // These native instance types have no Starlark subclasses. Finality
+        // excludes unrelated provider types from group lookup results.
+        if matches!(
+            class.name.as_str(),
+            "DefaultInfo" | "PackageSpecificationInfo"
+        ) {
+            writeln!(body, "    @_starpls_typing.final")?;
+        }
         let parameter = match class.name.as_str() {
             "struct" => Some("_StructField"),
             "Provider" => Some("_ProviderValue"),
@@ -405,10 +413,11 @@ fn declarations(
                 body,
                 "        def __getitem__(self, key: _starpls_types.Provider[_starpls_types.PackageSpecificationInfo] | _starpls_typing.Callable[..., _starpls_types.PackageSpecificationInfo]) -> _starpls_types.PackageSpecificationInfo: ..."
             )?;
+            // A widened key can still identify a provider present on a group.
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
                 body,
-                "        def __getitem__(self: _starpls_types.Target[None], key: _starpls_types.Provider[_ProviderValue] | _starpls_typing.Callable[..., _ProviderValue]) -> _starpls_typing.Never: ..."
+                "        def __getitem__(self: _starpls_types.Target[None], key: _starpls_types.Provider[_ProviderValue] | _starpls_typing.Callable[..., _ProviderValue]) -> _starpls_ty_extensions.Intersection[_ProviderValue, _starpls_types.DefaultInfo[_starpls_types.depset[_starpls_types.File], None] | _starpls_types.PackageSpecificationInfo]: ..."
             )?;
             writeln!(body, "        @_starpls_typing.overload")?;
             writeln!(
@@ -641,7 +650,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\")\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -1824,6 +1833,18 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
             )
             .unwrap();
         for (receiver, key, expression, expected) in [
+            (
+                "Target[None]",
+                "Provider[object]",
+                "target[key]",
+                "DefaultInfo[depset[File], None] | PackageSpecificationInfo",
+            ),
+            (
+                "Target[None]",
+                "Callable[..., object]",
+                "target[key]",
+                "DefaultInfo[depset[File], None] | PackageSpecificationInfo",
+            ),
             ("Target[None]", "Unknown", "target[Info]", "Never"),
             (
                 "Target[FilesToRunProvider]",

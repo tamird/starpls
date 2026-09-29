@@ -3344,6 +3344,18 @@ def make() -> Info: ...
             );
             assert_eq!(validate(&source, &stub), expected, "{name}");
         }
+
+        for key in ["Provider[object]", "Callable[..., object]"] {
+            for (result, expected) in [("object", &[][..]), ("int", &["invalid-return-type"])] {
+                let stub =
+                    format!("def lookup(target: Target[None], key: {key}) -> {result}: ...\n");
+                assert_eq!(
+                    validate("def lookup(target, key): return target[key]\n", &stub),
+                    expected,
+                    "{key} -> {result}",
+                );
+            }
+        }
     }
 
     #[test]
