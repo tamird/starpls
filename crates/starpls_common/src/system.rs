@@ -236,6 +236,9 @@ impl SourceSystem {
     }
 
     pub fn document(&self, path: &SystemPath) -> Option<&OpenDocument> {
+        if self.documents.is_empty() {
+            return None;
+        }
         let path = self.source_path(path).ok()?;
         let Self {
             base: _,
@@ -400,17 +403,19 @@ impl System for SourceSystem {
         }
     }
     fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
-        let source = self.source_path(path)?;
-        if self.documents.contains_key(&source) {
-            return Ok(source);
-        }
         let Self {
             base,
-            documents: _,
+            documents,
             virtual_sources: _,
             aliases: _,
             revision: _,
         } = self;
+        if !documents.is_empty() {
+            let source = self.source_path(path)?;
+            if documents.contains_key(&source) {
+                return Ok(source);
+            }
+        }
         base.canonicalize_path(path)
     }
     fn is_same_file(&self, first: &SystemPath, second: &SystemPath) -> Result<bool> {
