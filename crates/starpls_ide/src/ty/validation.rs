@@ -3889,6 +3889,45 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
     }
 
     #[test]
+    fn mapping_interfaces_preserve_key_and_value_bounds() {
+        let source = r#"def copy(values):
+    return {key: value for key, value in values.items()}
+def forward(values):
+    return copy(values)
+"#;
+        let stub = r#"def copy(values: Mapping[str, object]) -> dict[str, object]: ...
+def forward(values: dict[str, int]) -> dict[str, object]: ...
+"#;
+        let diagnostics = validate(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let writer = source.replace(
+            "    return {key:",
+            "    values.update({\"key\": 0})\n    return {key:",
+        );
+        let diagnostics = validate(&writer, stub);
+        assert!(
+            diagnostics.iter().any(|id| id == "unresolved-attribute"),
+            "{diagnostics:?}"
+        );
+        for (stub, expected) in [
+            (
+                stub.replace("dict[str, int]", "dict[int, int]"),
+                "invalid-argument-type",
+            ),
+            (
+                stub.replace("-> dict[str, object]", "-> dict[str, int]"),
+                "invalid-return-type",
+            ),
+        ] {
+            let diagnostics = validate(source, &stub);
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
     fn borrowed_annotations_check_bodies_and_source_signatures() {
         for (source, expected) in [
             ("def compute(value):\n    return value + 1\n", None),

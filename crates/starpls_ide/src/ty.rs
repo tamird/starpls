@@ -249,7 +249,7 @@ impl Database {
                 .chain(starpls_bazel::BUILTINS_VALUES_DENY_LIST.iter().copied())
                 .chain([
                     "str", "string", "Any", "Unknown", "unknown", "NoneType", "Sequence",
-                    "Iterable", "object", "property",
+                    "Iterable", "Mapping", "object", "property",
                 ])
                 .chain(native::TYPING_ANNOTATIONS.iter().copied());
             return candidates
@@ -384,6 +384,12 @@ impl Database {
                 "Iterable" => {
                     return Some(ProvidedBindingValue::Value(
                         KnownClass::Iterable
+                            .to_class_literal(self, &ProgramEnvironment::from_file(file)),
+                    ))
+                }
+                "Mapping" => {
+                    return Some(ProvidedBindingValue::Value(
+                        KnownClass::Mapping
                             .to_class_literal(self, &ProgramEnvironment::from_file(file)),
                     ))
                 }

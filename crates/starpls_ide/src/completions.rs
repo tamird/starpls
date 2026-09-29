@@ -716,7 +716,7 @@ mod tests {
     fn native_annotation_completions_use_the_type_namespace() {
         let mut failures = Vec::new();
         let types = &[
-            "Info", "Label", "list", "set", "str", "string", "Sequence", "None", "Never",
+            "Info", "Label", "list", "set", "str", "string", "Sequence", "Mapping", "None", "Never",
         ][..];
         for (expression, expected) in [
             ("def f(value: $0): pass", types),

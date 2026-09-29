@@ -435,8 +435,19 @@ def consume(values):
     # type: (Iterable[int]) -> None
     pass
 
+def as_mapping(values):
+    # type: (dict[str, int]) -> Mapping[str, int]
+    return values
+
 values = [1, 2]
 mapping = {"one": 1}
+readonly = as_mapping(mapping)
+readonly_keys = readonly.keys()
+readonly_values = readonly.values()
+readonly_items = readonly.items()
+readonly_found = readonly.get("one")
+readonly_default = readonly.get("one", default="missing")
+readonly_keys.append("two")
 first(values)
 first((1, 2))
 first(range(2))
@@ -497,6 +508,12 @@ element = values.pop()
         for (name, expected) in [
             ("values", "list[int]"),
             ("mapping", "dict[str, int]"),
+            ("readonly", "Mapping[str, int]"),
+            ("readonly_keys", "list[str]"),
+            ("readonly_values", "Sequence[int]"),
+            ("readonly_items", "Sequence[tuple[str, int]]"),
+            ("readonly_found", "int | None"),
+            ("readonly_default", "int | Literal[\"missing\"]"),
             ("items", "list[tuple[str, int]]"),
             ("keys", "list[str]"),
             ("results", "list[int]"),

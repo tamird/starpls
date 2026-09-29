@@ -184,10 +184,12 @@ label(Label("//:target"))
             assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
         }
-        analysis.update_file(file, format!("{source}\nruntime_name = string\n"));
-        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].id().as_str(), "unresolved-reference");
+        for name in ["string", "Mapping"] {
+            analysis.update_file(file, format!("{source}\nruntime_name = {name}\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].id().as_str(), "unresolved-reference");
+        }
     }
 
     #[test]
