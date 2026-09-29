@@ -5751,14 +5751,20 @@ def read(value: list[str]) -> str: ...
     }
 
     #[test]
-    fn list_copies_preserve_union_result_domains() {
-        let stub = r#"
+    fn list_copies_preserve_result_domains() {
+        for stub in [
+            r#"
 def is_list(value: object) -> TypeGuard[Sequence[object]]: ...
 def clone(value: str | Label | int | bool | list[Any] | None) -> str | Label | int | bool | list[Any] | None: ...
-"#;
-        for (result, expected) in [("value", vec![]), ("{}", vec!["invalid-return-type"])] {
-            let source = format!(
-                r#"
+"#,
+            r#"
+def is_list(value: object) -> TypeIs[list[Any]]: ...
+def clone[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...
+"#,
+        ] {
+            for (result, expected) in [("value", vec![]), ("{}", vec!["invalid-return-type"])] {
+                let source = format!(
+                    r#"
 _LIST_TYPE = type([])
 def is_list(value):
     return type(value) == _LIST_TYPE
@@ -5768,8 +5774,17 @@ def clone(value):
         return list(value)
     return {result}
 "#
-            );
-            assert_eq!(validate(&source, stub), expected, "return {result}");
+                );
+                let diagnostics = validation_diagnostics(&source, stub);
+                let actual = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.id().as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "{stub}\nreturn {result}: {diagnostics:#?}"
+                );
+            }
         }
     }
 
