@@ -50,9 +50,11 @@ returns the replacement as a string or Label.
 The utility contracts declare `is_label` and `is_string` with `TypeGuard`.
 A true result narrows the input to `Label` or `str`, respectively.
 `is_list` uses `TypeIs[list[Any]]` to narrow list membership on both outcomes
-while preserving a caller's existing list element types. Implementation
-validation checks both implications of the native list comparison.
-The other four utility predicates accept `object` and return `bool`. The setting
+while preserving a caller's existing list element types. `is_select` uses
+`TypeIs[select[object]]` to distinguish selectors while preserving their
+existing value types. Implementation validation checks both implications of
+these native type comparisons. The other three utility predicates accept
+`object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.
 `_get_type_as_attr_type(object)` returns `None` or one of `string`,
