@@ -64,6 +64,66 @@ impl SemanticSettings {
     }
 }
 
+// Reading only stable inputs keeps interned file identities independent of loader revisions.
+#[salsa::tracked(returns(copy))]
+fn starlark_program_file(
+    db: &dyn interface::Db,
+    source: File,
+    context: (Dialect, Option<FileInfo>),
+) -> ProgramFile<'_> {
+    let (dialect, info) = context;
+    let file = starpls_common::File {
+        source,
+        dialect,
+        info,
+    };
+    let dialect = match dialect {
+        Dialect::Standard => "standard",
+        Dialect::Bazel => "bazel",
+    };
+    let context = match info {
+        None => "none",
+        Some(FileInfo::Bazel {
+            api_context,
+            is_external: _,
+        }) => match api_context {
+            APIContext::Bzl => "bzl",
+            APIContext::Build => "build",
+            APIContext::Module => "module",
+            APIContext::Repo => "repo",
+            APIContext::Workspace => "workspace",
+            APIContext::Prelude => "prelude",
+            APIContext::Cquery => "cquery",
+            APIContext::Vendor => "vendor",
+        },
+    };
+    let origin = if file.is_external() == Some(true) {
+        "external"
+    } else {
+        "local"
+    };
+    let namespace = Name::new(format!("starpls:{dialect}:{context}:{origin}"));
+    let default = Program::from_settings(db, db.program_settings());
+    let program = Program::with_semantic_namespace(
+        db,
+        default.python_platform(db),
+        default.resolver_environment(db),
+        &namespace,
+    );
+    let python_file = ruff_db::PythonFile::new_with_source_type(
+        db,
+        source,
+        program.python_version(db),
+        ruff_python_ast::PySourceType::Python,
+    );
+    let kind = if file.is_type_interface(db) {
+        ty_python_core::ProgramFileKind::Stub
+    } else {
+        ty_python_core::ProgramFileKind::Source
+    };
+    ProgramFile::from_python_file_with_kind(db, python_file, program, kind)
+}
+
 impl Database {
     pub(crate) fn set_native_metadata(
         &mut self,
@@ -93,51 +153,7 @@ impl Database {
             dialect,
             info,
         } = file;
-        let dialect = match dialect {
-            Dialect::Standard => "standard",
-            Dialect::Bazel => "bazel",
-        };
-        let context = match info {
-            None => "none",
-            Some(FileInfo::Bazel {
-                api_context,
-                is_external: _,
-            }) => match api_context {
-                APIContext::Bzl => "bzl",
-                APIContext::Build => "build",
-                APIContext::Module => "module",
-                APIContext::Repo => "repo",
-                APIContext::Workspace => "workspace",
-                APIContext::Prelude => "prelude",
-                APIContext::Cquery => "cquery",
-                APIContext::Vendor => "vendor",
-            },
-        };
-        let origin = if file.is_external() == Some(true) {
-            "external"
-        } else {
-            "local"
-        };
-        let namespace = Name::new(format!("starpls:{dialect}:{context}:{origin}"));
-        let default = Program::from_settings(self, &self.semantic.program);
-        let program = Program::with_semantic_namespace(
-            self,
-            default.python_platform(self),
-            default.resolver_environment(self),
-            &namespace,
-        );
-        let python_file = ruff_db::PythonFile::new_with_source_type(
-            self,
-            source,
-            program.python_version(self),
-            ruff_python_ast::PySourceType::Python,
-        );
-        let kind = if file.is_type_interface(self) {
-            ty_python_core::ProgramFileKind::Stub
-        } else {
-            ty_python_core::ProgramFileKind::Source
-        };
-        ProgramFile::from_python_file_with_kind(self, python_file, program, kind)
+        starlark_program_file(self, source, (dialect, info))
     }
 
     pub(crate) fn starlark_file(&self, file: ProgramFile<'_>) -> Option<starpls_common::File> {
@@ -640,8 +656,10 @@ impl ty_python_semantic::Db for Database {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     use ruff_python_ast::Stmt;
+    use salsa::plumbing::AsId;
     use starpls_bazel::build::attribute::Discriminator;
     use starpls_bazel::build::AttributeDefinition;
     use starpls_bazel::build::BuildLanguage;
@@ -649,11 +667,70 @@ mod tests {
     use starpls_bazel::APIContext;
     use starpls_common::Dialect;
     use starpls_common::FileInfo;
+    use starpls_hir::Fixture;
     use ty_python_semantic::types::Type;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
 
     use crate::Analysis;
+
+    #[salsa::tracked(returns(copy))]
+    fn loaded_program_file(
+        db: &dyn super::interface::Db,
+        source: ruff_db::files::File,
+    ) -> ty_python_core::ProgramFile<'_> {
+        db.environment().load_revision(db);
+        db.starlark_program_file(starpls_common::File {
+            source,
+            dialect: Dialect::Bazel,
+            info: Some(FileInfo::Bazel {
+                api_context: APIContext::Bzl,
+                is_external: false,
+            }),
+        })
+    }
+
+    #[test]
+    fn program_file_identity_survives_loader_revisions() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let file = fixture.add_file(&mut analysis.db, "target.bzl", "value = 1\n");
+        let others: Vec<_> = (0..1024)
+            .map(|index| fixture.add_file(&mut analysis.db, format!("other_{index}.bzl"), ""))
+            .collect();
+        // The first construction must occur inside the query that reads the loader revision.
+        let original = {
+            let program = loaded_program_file(&analysis.db, file.source);
+            ty_python_core::semantic_index(&analysis.db, program);
+            program.as_id()
+        };
+        for files in others.chunks(128) {
+            analysis.invalidate_loads();
+            for file in files {
+                loaded_program_file(&analysis.db, file.source);
+            }
+        }
+        {
+            let program = loaded_program_file(&analysis.db, file.source);
+            assert_eq!(program.as_id(), original);
+            analysis.db.executions.store(0, Ordering::Relaxed);
+            ty_python_core::semantic_index(&analysis.db, program);
+            assert_eq!(analysis.db.executions.load(Ordering::Relaxed), 0);
+        }
+        analysis.update_file(file, "value: int = 'bad'\n".to_owned());
+        let program = loaded_program_file(&analysis.db, file.source);
+        assert_eq!(program.as_id(), original);
+        analysis.db.executions.store(0, Ordering::Relaxed);
+        ty_python_core::semantic_index(&analysis.db, program);
+        assert!(analysis.db.executions.load(Ordering::Relaxed) > 0);
+        let diagnostics = ty_python_semantic::check_file_unwrap(&analysis.db, program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-assignment"),
+            "{diagnostics:?}"
+        );
+    }
 
     #[test]
     fn dictionary_constructor_keys_keep_argument_types() {

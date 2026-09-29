@@ -44,12 +44,17 @@ use crate::Database;
 
 #[salsa::db]
 pub(crate) trait Db: ty_python_semantic::Db + starpls_hir::Db {
+    /// Immutable for the lifetime of this database.
+    fn program_settings(&self) -> &ty_python_core::program::ProgramSettings;
     fn starlark_program_file(&self, file: File) -> ProgramFile<'_>;
     fn starlark_file(&self, file: ProgramFile<'_>) -> Option<File>;
 }
 
 #[salsa::db]
 impl Db for Database {
+    fn program_settings(&self) -> &ty_python_core::program::ProgramSettings {
+        &self.semantic.program
+    }
     fn starlark_program_file(&self, file: File) -> ProgramFile<'_> {
         Database::starlark_program_file(self, file)
     }
