@@ -143,6 +143,7 @@ pub(super) fn parameter_type<'db>(
         BuiltinFunction::BuildSetting(_) => return None,
         BuiltinFunction::Struct => return None,
         BuiltinFunction::StructGetattr => return None,
+        BuiltinFunction::Getattr => return None,
         BuiltinFunction::Provider => return None,
         BuiltinFunction::Transition => return None,
     };

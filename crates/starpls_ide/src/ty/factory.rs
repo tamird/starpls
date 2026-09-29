@@ -348,6 +348,7 @@ pub(super) enum BuiltinFunction {
     Macro,
     Struct,
     StructGetattr,
+    Getattr,
     Provider,
     Transition,
 }
@@ -410,6 +411,7 @@ pub(super) fn declaration<'db>(
         "aspect" => BuiltinFunction::Aspect,
         "macro" => BuiltinFunction::Macro,
         "struct" => BuiltinFunction::Struct,
+        "getattr" => BuiltinFunction::Getattr,
         "provider" => BuiltinFunction::Provider,
         "transition" => BuiltinFunction::Transition,
         _ => return None,
@@ -442,6 +444,7 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
         BuiltinFunction::Aspect => None,
         BuiltinFunction::Struct => structure(db, call),
         BuiltinFunction::StructGetattr => None,
+        BuiltinFunction::Getattr => call.getattr_return_type(db),
         BuiltinFunction::Provider => provider(db, call),
         BuiltinFunction::Transition => descriptor(
             db,

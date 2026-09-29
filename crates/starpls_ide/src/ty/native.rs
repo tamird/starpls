@@ -1135,7 +1135,12 @@ def check_literal_keys(attrs: dict[_starpls_typing.Literal["dep"], _starpls_type
         analysis
             .set_builtin_defs(builtins, Default::default())
             .unwrap();
-        let source = "label = Label(\"//pkg:target\")\nrelative = label.relative(\":other\")\n";
+        let source = r#"label = Label("//pkg:target")
+relative = label.relative(":other")
+name = json.encode(None)
+computed = getattr(struct(field='value'), name)
+called = computed()
+"#;
         let file = analysis
             .open_document(
                 Path::new("/main.bzl"),
@@ -1160,10 +1165,17 @@ def check_literal_keys(attrs: dict[_starpls_typing.Literal["dep"], _starpls_type
                 assignment.value.inferred_type(&model).unwrap()
             })
             .collect();
-        let [label, relative] = types.as_slice() else {
-            panic!("expected two assignments")
+        let [label, relative, name, computed, called] = types.as_slice() else {
+            panic!("expected five assignments")
         };
         assert_eq!(label, relative);
+        let environment = model.program_environment();
+        assert_eq!(
+            *name,
+            ty_python_semantic::types::KnownClass::Str.to_instance(db, &environment)
+        );
+        assert_eq!(computed.display(db, &environment).to_string(), "Any");
+        assert_eq!(called, computed);
         assert_eq!(
             label.display(db, &model.program_environment()).to_string(),
             "Label"
@@ -1232,6 +1244,11 @@ native.package_name()
             let build_source = r#"selected = sh_binary
 selected(name="global", srcs=["//:input"], use_bash_launcher=True)
 "#;
+            let getter_source = r#"def fallback_rule(**kwargs):
+    pass
+selected = getattr(native, "sh_binary", fallback_rule)
+selected(name="shell", srcs=["//:input"], use_bash_launcher=True)
+"#;
             for (path, source, callee, context) in [
                 (
                     "/main.bzl",
@@ -1240,6 +1257,7 @@ selected(name="global", srcs=["//:input"], use_bash_launcher=True)
                     APIContext::Bzl,
                 ),
                 ("/BUILD.bazel", build_source, "sh_binary", APIContext::Build),
+                ("/getter.bzl", getter_source, "selected", APIContext::Bzl),
             ] {
                 let info = Some(FileInfo::Bazel {
                     api_context: context,
@@ -1275,11 +1293,13 @@ selected(name="global", srcs=["//:input"], use_bash_launcher=True)
                 let [selected] = types.as_slice() else {
                     panic!("expected the selected rule value: {types:?}")
                 };
-                assert_eq!(
-                    selected.display(db, &env).to_string(),
-                    if precise { "sh_binary" } else { "Any" },
-                    "{path}"
-                );
+                if path != "/getter.bzl" || !precise {
+                    assert_eq!(
+                        selected.display(db, &env).to_string(),
+                        if precise { "sh_binary" } else { "Any" },
+                        "{path}"
+                    );
+                }
                 let diagnostics = snapshot.diagnostics(file).unwrap();
                 assert!(
                     diagnostics.is_empty(),

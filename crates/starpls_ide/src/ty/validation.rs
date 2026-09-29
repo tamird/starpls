@@ -4731,7 +4731,7 @@ def make() -> _Row: ...
     }
 
     #[test]
-    fn optional_native_getters_check_inputs_with_defaults() {
+    fn native_getattr_refines_literal_names() {
         for (expression, result, expected) in [
             ("getattr(value, 'field', 0)", "str | int", &[] as &[&str]),
             (
@@ -4739,15 +4739,24 @@ def make() -> _Row: ...
                 "str",
                 &["invalid-return-type"],
             ),
+            ("getattr(value, 'field')", "object", &[]),
+            ("getattr(value, name, 0)", "object", &[]),
+            ("getattr(value, name)", "object", &[]),
+            ("getattr(value, name)", "str", &["unsound-return-statement"]),
             (
-                "getattr(value, 'field')",
+                "getattr(value, name)()",
                 "object",
                 &["incomplete-stub-validation"],
             ),
+            ("getattr(value, 'field', None)", "str | None", &[]),
+            ("getattr(value, 0)", "object", &["invalid-argument-type"]),
             (
-                "getattr(value, name, 0)",
+                "getattr(x=value, name='field')",
                 "object",
-                &["incomplete-stub-validation"],
+                &[
+                    "positional-only-parameter-as-kwarg",
+                    "positional-only-parameter-as-kwarg",
+                ],
             ),
         ] {
             let source = format!("def make(value, name): return {expression}\n");
@@ -4767,6 +4776,34 @@ def make() -> _Row: ...
                 "def make() -> int: ...\n"
             ),
             ["invalid-return-type"],
+        );
+        assert_eq!(
+            validate(
+                "def make(value, name): return getattr(value, name)\n",
+                "def make(value: struct[object], name: str) -> object: ...\n"
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(value): return getattr(value, 'relative')\n",
+                "def make(value: Label) -> Callable[..., Label]: ...\n"
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(value): return getattr(value, '__len__')\n",
+                "def make(value: list[int]) -> Callable[..., int]: ...\n"
+            ),
+            ["incomplete-stub-validation"],
+        );
+        assert_eq!(
+            validate(
+                "def getattr(x, name): return 1\ndef make(value): return getattr(value, 'field')\n",
+                "def getattr(x: object, name: str) -> int: ...\ndef make(value: struct[str]) -> int: ...\n"
+            ),
+            Vec::<String>::new(),
         );
     }
 
