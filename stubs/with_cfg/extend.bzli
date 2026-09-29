@@ -1,5 +1,19 @@
+load(":providers.bzli", _RuleInfo = "RuleInfo")
+
+class _Initializer(Protocol):
+    def __call__(self, **kwargs: object) -> dict[str, object]: ...
+
+def _make_initializer(*, values: Mapping[str | Label, object]) -> _Initializer: ...
+
 def _initializer_base(
     *,
     kwargs: dict[str, object],
     values: Mapping[str | Label, object],
 ) -> dict[str, object]: ...
+
+def make_transitioned_rule(
+    *,
+    rule_info: _RuleInfo,
+    transition: transition,
+    values: Mapping[str | Label, object],
+) -> rule: ...

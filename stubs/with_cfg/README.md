@@ -43,6 +43,13 @@ keyword arguments and a read-only mapping of setting values keyed by strings
 or labels. The mapping accepts dictionaries with more specific value types.
 The helper returns a fresh string-keyed dictionary of objects, with validated
 setting names overriding matching keyword arguments.
+The factory declarations require the local 0.14.6 source patch that extracts
+`_make_initializer`. Its callback accepts arbitrary keyword objects and returns
+`dict[str, object]`; the constructor captures a read-only settings mapping.
+`make_transitioned_rule` takes that mapping, a `RuleInfo`, and a transition,
+and returns a rule. Implementation validation checks the factory, constructor,
+and initializer body. Bazel still enforces extension eligibility and the
+initializer's allowed attribute names and values.
 The wrapper interface declares `_replace_single_dep` with an `object`
 input, a Label-to-string memo dictionary, and an integer counter. Its
 callback takes the keyword arguments `name: str` and `exports: Label` and
