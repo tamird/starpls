@@ -39,9 +39,10 @@ use the shared `Builder` type for their receiver and result.
 `int`, `bool`, `list[Any]`, or `None`. It copies lists and returns other
 supported values unchanged. List inputs select `list[Any]` as the result.
 The extension interface declares `_initializer_base` with string-keyed
-keyword arguments and setting values keyed by strings or labels. It returns
-a fresh string-keyed dictionary of objects, with validated setting names
-overriding matching keyword arguments.
+keyword arguments and a read-only mapping of setting values keyed by strings
+or labels. The mapping accepts dictionaries with more specific value types.
+The helper returns a fresh string-keyed dictionary of objects, with validated
+setting names overriding matching keyword arguments.
 The wrapper interface declares `_replace_single_dep` with an `object`
 input, a Label-to-string memo dictionary, and an integer counter. Its
 callback takes the keyword arguments `name: str` and `exports: Label` and
