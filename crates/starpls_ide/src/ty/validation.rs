@@ -5680,6 +5680,19 @@ def read(value: list[str]) -> str: ...
             ["unsound-return-statement"],
         );
         let predicate = source.split("\ndef extend_values").next().unwrap();
+        let observed = format!(
+            "{predicate}\ndef observe():\n    value = json.decode('[]')\n    if is_list(value):\n        [item for item in value]\n"
+        );
+        let observed_stub =
+            "def is_list(value: object) -> TypeIs[list[Any]]: ...\ndef observe() -> None: ...\n";
+        assert_eq!(validate(&observed, observed_stub), Vec::<String>::new());
+        assert_eq!(
+            validate(
+                &observed.replace("if is_list(value):", "if True:"),
+                observed_stub
+            ),
+            ["incomplete-stub-validation"],
+        );
         assert_eq!(
             validate(
                 predicate,
