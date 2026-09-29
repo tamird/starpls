@@ -3973,6 +3973,78 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
     }
 
     #[test]
+    fn java_internal_api_preserves_optional_members() {
+        let helper = "def get_internal_java_common(): return java_common.internal_DO_NOT_USE()\n";
+        let source = format!(
+            r#"{helper}def enabled():
+    return get_internal_java_common().google_legacy_api_enabled()
+def maybe_factory():
+    return getattr(java_common, "internal_DO_NOT_USE", None)
+def merge():
+    return java_common.merge
+"#
+        );
+        let stub = r#"class _Internal(Protocol):
+    @property
+    def google_legacy_api_enabled(self) -> Callable[[], bool]: ...
+def get_internal_java_common() -> _Internal: ...
+def enabled() -> bool: ...
+def maybe_factory() -> Callable[[], _Internal] | None: ...
+def merge() -> Callable[..., Any]: ...
+"#;
+        let diagnostics = validate(&source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (source, stub, expected) in [
+            (
+                helper.replace(
+                    "return java_common.internal_DO_NOT_USE()",
+                    "return java_common.internal_DO_NOT_USE().google_legacy_api_enabled(True)",
+                ),
+                "def get_internal_java_common() -> bool: ...\n".to_owned(),
+                &["too-many-positional-arguments"] as &[&str],
+            ),
+            (
+                helper.replace(
+                    "return java_common.internal_DO_NOT_USE()",
+                    "return java_common.internal_DO_NOT_USE().google_legacy_api_enabled()",
+                ),
+                "def get_internal_java_common() -> str: ...\n".to_owned(),
+                &["invalid-return-type"],
+            ),
+            (
+                format!("{source}def unknown(): return java_common.unknown_member\n"),
+                format!("{stub}def unknown() -> object: ...\n"),
+                &["unresolved-attribute"],
+            ),
+            (
+                helper
+                    .replace("get_internal_java_common", "unknown")
+                    .replace(
+                        "return java_common.internal_DO_NOT_USE()",
+                        "return java_common.internal_DO_NOT_USE().unknown_member",
+                    ),
+                "def unknown() -> int: ...\n".to_owned(),
+                &["unsound-return-statement"],
+            ),
+        ] {
+            let diagnostics = validate(&source, &stub);
+            assert_eq!(diagnostics, expected, "{source}");
+        }
+        let diagnostics = validate(
+            "def require_factory(): return java_common\n",
+            r#"class _Internal(Protocol):
+    @property
+    def google_legacy_api_enabled(self) -> Callable[[], bool]: ...
+class _RequiredFactory(Protocol):
+    @property
+    def internal_DO_NOT_USE(self) -> Callable[[], _Internal]: ...
+def require_factory() -> _RequiredFactory: ...
+"#,
+        );
+        assert_eq!(diagnostics, ["invalid-return-type"]);
+    }
+
+    #[test]
     fn mapping_interfaces_preserve_key_and_value_bounds() {
         let source = r#"def copy(values):
     return {key: value for key, value in values.items()}

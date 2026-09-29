@@ -348,6 +348,15 @@ fn declarations(
                 "            legacy_globals: _starpls_types._LegacyGlobals = ..."
             )?;
         }
+        if class.name == "java_common"
+            && dialect == Dialect::Bazel
+            && classes.contains_key("struct")
+        {
+            names.insert("internal_DO_NOT_USE");
+            // Autoloads can replace the original native Java namespace.
+            writeln!(body, "        if _starpls_native_rule_available:")?;
+            writeln!(body, "            internal_DO_NOT_USE: _starpls_typing.Callable[[], _starpls_types._JavaCommonInternal] = ...")?;
+        }
         if class.name == "ToolchainInfo" {
             names.insert("__getattr__");
             writeln!(body, "        @_starpls_typing.type_check_only")?;
@@ -525,6 +534,17 @@ fn declarations(
                 }
             }
         }
+    }
+    if dialect == Dialect::Bazel
+        && classes.contains_key("java_common")
+        && classes.contains_key("struct")
+    {
+        body.push_str(
+            r#"    class _JavaCommonInternal(struct[_starpls_typing.Any]):
+        @_starpls_builtins.property
+        def google_legacy_api_enabled(self) -> _starpls_typing.Callable[[], _starpls_builtins.bool]: ...
+"#,
+        );
     }
     let mut rule_declarations = String::new();
     for (rule, value) in rules
