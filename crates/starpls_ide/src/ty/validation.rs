@@ -2023,15 +2023,19 @@ mod tests {
 
         use ruff_python_ast::HasNodeIndex;
         use salsa::Setter;
-        use ty_python_core::Db as _;
         use ty_python_semantic::FunctionInferenceMode;
 
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
+        let dependency = fixture.add_file(
+            &mut analysis.db,
+            "dependency.bzl",
+            "def forward(value): return value\n",
+        );
         let source = fixture.add_file(
             &mut analysis.db,
             "source.bzl",
-            "def selected(value): return value\ndef unselected(value): return value\n",
+            "load('dependency.bzl', 'forward')\ndef selected(value): return value\ndef unselected(value): return value\n",
         );
         let stub = fixture.add_file(
             &mut analysis.db,
@@ -2065,7 +2069,7 @@ mod tests {
             let mut scopes = Vec::new();
             for statement in &parsed.syntax().body {
                 let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
-                    panic!("expected function");
+                    continue;
                 };
                 owners.extend(
                     function
@@ -2079,6 +2083,14 @@ mod tests {
             }
             (owners, scopes)
         };
+        ty_python_core::semantic_index(&analysis.db, analysis.db.starlark_program_file(dependency));
+        let dependency_reused = |db: &crate::Database, phase: &str| {
+            let program = db.starlark_program_file(dependency);
+            db.executions.store(0, Ordering::Relaxed);
+            ty_python_core::semantic_index(db, program);
+            // The unselected parameter's annotation remains absent.
+            assert_eq!(db.executions.load(Ordering::Relaxed), 1, "{phase}");
+        };
         let modes = |db: &crate::Database| {
             let program = db.starlark_program_file(source);
             scopes
@@ -2089,6 +2101,7 @@ mod tests {
         environment
             .set_stub_validation(&mut analysis.db)
             .to(validation.clone());
+        dependency_reused(&analysis.db, "installation");
         assert_eq!(
             modes(&analysis.db),
             [
@@ -2110,22 +2123,29 @@ mod tests {
             environment
                 .set_stub_validation(&mut analysis.db)
                 .to(validation.clone());
+            dependency_reused(&analysis.db, &format!("{phase:?}"));
             let db = &analysis.db;
             let program = db.starlark_program_file(source);
-            // Revalidate annotation selections before checking that the index can be reused.
-            for owner in &owners {
-                let _ = db.provided_annotation(program, *owner);
-            }
             db.executions.store(0, Ordering::Relaxed);
             ty_python_core::semantic_index(db, program);
-            assert_eq!(db.executions.load(Ordering::Relaxed), 0);
+            // Recheck each parameter's annotation; equal answers preserve the index.
+            assert_eq!(db.executions.load(Ordering::Relaxed), owners.len());
             assert_eq!(modes(db), [expected, FunctionInferenceMode::Default]);
         }
         environment
             .set_stub_validation(&mut analysis.db)
             .to(previous.clone());
+        dependency_reused(&analysis.db, "restoration");
         assert_eq!(environment.stub_validation(&analysis.db), &previous);
         assert_eq!(modes(&analysis.db), [FunctionInferenceMode::Default; 2]);
+        let reports = analysis.validate_stubs(|_| true).unwrap();
+        assert!(
+            reports
+                .iter()
+                .all(|(_, diagnostics)| diagnostics.is_empty()),
+            "{reports:?}"
+        );
+        dependency_reused(&analysis.db, "validation");
     }
 
     #[test]
