@@ -5579,6 +5579,88 @@ def collect(extra):
     }
 
     #[test]
+    fn type_is_checks_list_operations_without_widening_writes() {
+        let source = r#"
+_LIST_TYPE = type([])
+def is_list(value):
+    return type(value) == _LIST_TYPE
+
+def extend_values(current, value):
+    if not is_list(current) or not is_list(value):
+        fail("Both values must be lists")
+    tail = value
+    if current[-len(tail):] == tail:
+        return current
+    return current + tail
+
+def read(value):
+    if is_list(value):
+        return value[0]
+    return ""
+"#;
+        let stub = r#"
+def is_list(value: object) -> TypeIs[list[Any]]: ...
+def extend_values(current: object, value: object) -> Sequence[object]: ...
+def read(value: list[str]) -> str: ...
+"#;
+        let diagnostics = validation_diagnostics(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        for (condition, expected) in [
+            ("not is_list(current)", "invalid-argument-type"),
+            ("not is_list(value)", "not-subscriptable"),
+        ] {
+            let diagnostics = validate(
+                &source.replace("not is_list(current) or not is_list(value)", condition),
+                stub,
+            );
+            assert!(
+                diagnostics.iter().any(|id| id == expected),
+                "{condition}: {diagnostics:?}",
+            );
+            assert!(
+                diagnostics.iter().any(|id| id == "unsupported-operator"),
+                "{condition}: {diagnostics:?}",
+            );
+        }
+        assert_eq!(
+            validate(
+                &source.replace(
+                    "return value[0]",
+                    "value.append(1)\n        return value[0]"
+                ),
+                stub,
+            ),
+            ["invalid-argument-type"],
+        );
+        assert_eq!(
+            validate(
+                &source.replace("return \"\"", "return 0"),
+                &stub.replace("value: list[str]) -> str", "value: object) -> int"),
+            ),
+            ["unsound-return-statement"],
+        );
+        let predicate = source.split("\ndef extend_values").next().unwrap();
+        assert_eq!(
+            validate(
+                predicate,
+                "def is_list(value: object) -> TypeIs[list[int]]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        // Both implications would be vacuous without the target/input legality check.
+        assert_eq!(
+            validate(
+                "def is_string(value): return type(value) == 'string'\n",
+                "def is_string(value: int) -> TypeIs[str]: ...\n",
+            ),
+            [
+                "incomplete-stub-validation",
+                "invalid-type-guard-definition"
+            ],
+        );
+    }
+
+    #[test]
     fn list_copies_preserve_union_result_domains() {
         let stub = r#"
 def is_list(value: object) -> TypeGuard[Sequence[object]]: ...

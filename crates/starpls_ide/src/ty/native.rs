@@ -25,6 +25,7 @@ pub(super) const TYPING_ANNOTATIONS: &[&str] = &[
     "Protocol",
     "TypedDict",
     "TypeGuard",
+    "TypeIs",
     "Unpack",
     "Literal",
     "Never",
