@@ -638,6 +638,11 @@ fn write_type_overloads(
         declared_classes
             .contains("Label")
             .then_some(("_starpls_types.Label", "Label")),
+    )
+    .chain(
+        declared_classes
+            .contains("select")
+            .then_some(("_starpls_types.select[_builtins.object]", "select")),
     ) {
         writeln!(output, "@_typing.overload")?;
         writeln!(

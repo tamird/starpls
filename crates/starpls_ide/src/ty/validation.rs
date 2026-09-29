@@ -5924,6 +5924,48 @@ def read(value: list[str]) -> str: ...
     }
 
     #[test]
+    fn type_is_select_preserves_value_domains() {
+        let predicate = r#"
+_SELECT_TYPE = type(select({"//conditions:default": []}))
+def is_select(value):
+    return type(value) == _SELECT_TYPE
+"#;
+        let predicate_stub = "def is_select(value: object) -> TypeIs[select[object]]: ...\n";
+        for (annotation, fallback) in [("int", "0"), ("list[str]", "[]")] {
+            let source = format!(
+                r#"{predicate}
+def selected(value):
+    if is_select(value):
+        return value
+    return select({{"//conditions:default": {fallback}}})
+
+def direct(value):
+    if not is_select(value):
+        return value
+    return {fallback}
+"#
+            );
+            let stub = format!(
+                "{predicate_stub}def selected(value: select[{annotation}] | {annotation}) -> select[{annotation}]: ...\ndef direct(value: select[{annotation}] | {annotation}) -> {annotation}: ...\n"
+            );
+            let diagnostics = validation_diagnostics(&source, &stub);
+            assert!(diagnostics.is_empty(), "{annotation}: {diagnostics:#?}");
+        }
+        assert_eq!(
+            validate(
+                predicate,
+                "def is_select(value: object) -> TypeIs[select[int]]: ...\n",
+            ),
+            ["incomplete-stub-validation"],
+        );
+        let source = format!(
+            "{predicate}def guess(value):\n    if is_select(value):\n        return value\n    return select({{'//conditions:default': 0}})\n"
+        );
+        let stub = format!("{predicate_stub}def guess(value: object) -> select[int]: ...\n");
+        assert_eq!(validate(&source, &stub), ["invalid-return-type"]);
+    }
+
+    #[test]
     fn list_copies_preserve_result_domains() {
         for stub in [
             r#"

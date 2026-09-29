@@ -559,7 +559,7 @@ impl ty_python_semantic::Db for Database {
             }
             "set" => KnownClass::Set.to_specialized_instance(self, &environment, &[unknown]),
             "tuple" => Type::homogeneous_tuple(self, &environment, unknown),
-            "Label" | "rule" | "macro" => {
+            "Label" | "rule" | "macro" | "select" => {
                 let binding = self.language_builtin(file, tag, BuiltinUsage::Annotation)?;
                 let class = binding.resolve_type(self)?;
                 if !matches!(class, Type::ClassLiteral(_)) {
@@ -868,6 +868,12 @@ def register(name: str, visibility: list[str] | None):
             ("set[int | str]", "value", "Literal[\"set\"]"),
             ("Label", "value", "Literal[\"Label\"]"),
             ("object", "Label('//pkg:target')", "Literal[\"Label\"]"),
+            ("select[list[str]]", "value", "Literal[\"select\"]"),
+            (
+                "object",
+                "select({'//conditions:default': []})",
+                "Literal[\"select\"]",
+            ),
             ("object", "value", "str"),
         ] {
             let source = format!(
@@ -929,6 +935,13 @@ def register(name: str, visibility: list[str] | None):
             ),
             ("set[str] | Target", "set", "set[str]", "Target"),
             ("Label | str", "Label", "Label", "str"),
+            ("select[int] | int", "select", "select[int]", "int"),
+            (
+                "select[list[str]] | list[str]",
+                "select",
+                "select[list[str]]",
+                "list[str]",
+            ),
             (
                 "Callable[..., None]",
                 "rule",
@@ -1039,6 +1052,27 @@ def register(name: str, visibility: list[str] | None):
                 "Label | str",
                 "Label",
                 "Label | str",
+            ),
+            (
+                "classify = type",
+                "classify",
+                "select[int] | int",
+                "select",
+                "select[int]",
+            ),
+            (
+                "def type(value): return \"select\"",
+                "type",
+                "select[int] | int",
+                "select",
+                "select[int] | int",
+            ),
+            (
+                "classify = type",
+                "classify",
+                "select[int] | int",
+                "select",
+                "select[int]",
             ),
         ] {
             let source = format!("{declarations}\ndef probe(value: {annotation}):\n    if {call}(value) == \"{tag}\":\n        return value # matched\n    return value\n");
