@@ -47,11 +47,12 @@ input, a Label-to-string memo dictionary, and an integer counter. Its
 callback takes the keyword arguments `name: str` and `exports: Label` and
 returns `None`. The helper validates the input as a string or Label and
 returns the replacement as a string or Label.
-The utility contracts declare `is_label`, `is_string`, and `is_list` as type
-guards. A true result narrows the input to `Label`, `str`, or the readonly
-`Sequence[object]` view, respectively. In the true branch, the list guard
-replaces any more specific list type with this readonly view. The other four
-utility predicates accept `object` and return `bool`. The setting
+The utility contracts declare `is_label` and `is_string` with `TypeGuard`.
+A true result narrows the input to `Label` or `str`, respectively.
+`is_list` uses `TypeIs[list[Any]]` to narrow list membership on both outcomes
+while preserving a caller's existing list element types. Implementation
+validation checks both implications of the native list comparison.
+The other four utility predicates accept `object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.
 `_get_type_as_attr_type(object)` returns `None` or one of `string`,
