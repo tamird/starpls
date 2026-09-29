@@ -3038,6 +3038,74 @@ def read(value: Label | str) -> str: ...
             validate("def make(): return struct(value=1)", stub),
             ["invalid-return-type"]
         );
+        let getter = r#"class _Getter(Protocol):
+    @property
+    def existing(self) -> int: ...
+    @type_check_only
+    def __getattr__(self, name: str) -> Any: ...
+class _RequiredField(Protocol):
+    @property
+    def missing(self) -> object: ...
+"#;
+        for (source, declaration, expected) in [
+            (
+                "def make(): return struct(existing=1)",
+                "def make() -> _Getter: ...",
+                &[] as &[&str],
+            ),
+            (
+                "def read(value): return value.existing",
+                "def read(value: _Getter) -> int: ...",
+                &[],
+            ),
+            (
+                "def read(value): return value.missing",
+                "def read(value: _Getter) -> object: ...",
+                &[],
+            ),
+            (
+                "def read(value): return value.missing",
+                "def read(value: _Getter) -> int: ...",
+                &["unsound-return-statement"],
+            ),
+            (
+                "def extract(value): return value.__getattr__",
+                "def extract(value: _Getter) -> Callable[[str], Any]: ...",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "def require(value): return value",
+                "def require(value: _Getter) -> _RequiredField: ...",
+                &["invalid-return-type"],
+            ),
+        ] {
+            let stub = format!("{getter}{declaration}\n");
+            assert_eq!(validate(source, &stub), expected, "{source}");
+        }
+        let getter = r#"class _Getter(Protocol):
+    @type_check_only
+    def __getattr__(self, name: str) -> int: ...
+"#;
+        for (source, declaration, expected) in [
+            (
+                "def read(value): return getattr(value, 'missing', None)",
+                "def read(value: _Getter) -> int: ...",
+                &["invalid-return-type"] as &[&str],
+            ),
+            (
+                "def read(value): return getattr(value, 'missing', None)",
+                "def read(value: _Getter) -> int | None: ...",
+                &[],
+            ),
+            (
+                "def read(value): return getattr(value, 'missing')",
+                "def read(value: _Getter) -> int: ...",
+                &[],
+            ),
+        ] {
+            let stub = format!("{getter}{declaration}\n");
+            assert_eq!(validate(source, &stub), expected, "{source}");
+        }
         let stub = "def make(value: struct[int]) -> Callable[[str], int]: ...\n";
         assert!(!validate("def make(value): return value.__getattr__", stub).is_empty());
         let stub = "class _Required(Protocol):\n    @property\n    def __getattr__(self) -> int: ...\ndef make() -> _Required: ...\n";

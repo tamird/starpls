@@ -172,13 +172,28 @@ describes indexing, and `__len__` describes `len(value)`. The same rule applies
 to iteration, containment, conversions, and Starlark unary and binary operators.
 A readonly property specifies an immutable stored field, including callable
 fields and fields named `__call__`.
-Attribute interception and Python class lifecycle methods use ordinary member
-requirements.
+Undecorated attribute interception and Python class lifecycle methods use
+ordinary member requirements.
 
-Other method declarations also require the member on the value's class. A property getter
-uses the same declaration body as a method. Only a single bare `@property`
-decorator is supported; provider declarations and runtime files do not support
-decorators.
+An explicit `@type_check_only` method supplies the signature used to check an
+operation. Explicit runtime attribute access follows the value's fields. A
+partial namespace combines named fields with gradual access through other
+names:
+
+```starlark
+class _Namespace(Protocol):
+    @property
+    def known(self) -> int: ...
+
+    @type_check_only
+    def __getattr__(self, name: str) -> Any: ...
+```
+
+Named properties establish the presence of required fields. The getter bounds
+values from successful lookups, and `getattr` includes a supplied default in its
+result.
+Other method declarations require the member on the value's class. Interface
+methods accept one bare `@property` or `@type_check_only` decorator.
 
 `struct[T]` bounds the values of existing fields. Required protocol fields need
 independent presence evidence, such as explicit constructor keywords or required

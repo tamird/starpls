@@ -285,10 +285,9 @@ impl Validator<'_> {
                     [] => true,
                     [decorator] => {
                         self.in_interface_class
-                            && decorator
-                                .expression
-                                .as_name_expr()
-                                .is_some_and(|name| name.id == "property")
+                            && decorator.expression.as_name_expr().is_some_and(|name| {
+                                matches!(name.id.as_str(), "property" | "type_check_only")
+                            })
                     }
                     _ => false,
                 };
@@ -798,6 +797,15 @@ mod tests {
             (
                 "class Builder(Base):\n    @property\n    def value(self) -> str: ...",
                 true,
+            ),
+            (
+                "class Getter(Protocol):\n    @type_check_only\n    def __getattr__(self, name: str) -> object: ...",
+                true,
+            ),
+            ("@type_check_only\ndef value() -> str: ...", false),
+            (
+                "class Getter(Protocol):\n    @type_check_only()\n    def __getattr__(self, name: str) -> object: ...",
+                false,
             ),
             ("@property\ndef value() -> str: ...", false),
             (

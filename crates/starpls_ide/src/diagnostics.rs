@@ -184,7 +184,7 @@ label(Label("//:target"))
             assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
             assert_eq!(diagnostics[0].id().as_str(), "invalid-argument-type");
         }
-        for name in ["string", "Mapping"] {
+        for name in ["string", "Mapping", "type_check_only"] {
             analysis.update_file(file, format!("{source}\nruntime_name = {name}\n"));
             let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
