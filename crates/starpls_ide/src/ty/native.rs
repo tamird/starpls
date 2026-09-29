@@ -287,6 +287,20 @@ fn declarations(
     }
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
+    if dialect == Dialect::Bazel {
+        // Bazel retains original callable providers here when autoload policy
+        // permits it. Other legacy members remain gradual.
+        body.push_str(
+            r#"    class _LegacyGlobals:
+        @_starpls_typing.overload
+        @_starpls_typing.type_check_only
+        def __getattr__(self, name: _starpls_typing.Literal["PyInfo", "PyRuntimeInfo"]) -> _starpls_typing.Callable[..., _starpls_typing.Any]: ...
+        @_starpls_typing.overload
+        @_starpls_typing.type_check_only
+        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_typing.Any: ...
+"#,
+        );
+    }
     for class in classes.values() {
         let parameter = match class.name.as_str() {
             "struct" => Some("_StructField"),
@@ -324,6 +338,15 @@ fn declarations(
             )?;
         }
         let mut names = BTreeSet::new();
+        if class.name == "native" && dialect == Dialect::Bazel {
+            names.insert("legacy_globals");
+            // The namespace can be absent under Bazel's autoload policy.
+            writeln!(body, "        if _starpls_native_rule_available:")?;
+            writeln!(
+                body,
+                "            legacy_globals: _starpls_types._LegacyGlobals = ..."
+            )?;
+        }
         if class.name == "ToolchainInfo" {
             names.insert("__getattr__");
             writeln!(body, "        @_starpls_typing.type_check_only")?;
@@ -1082,6 +1105,9 @@ mod tests {
     use starpls_common::Db as _;
     use starpls_common::FileInfo;
     use starpls_hir::Db;
+    use ty_python_semantic::types::DynamicType;
+    use ty_python_semantic::types::Type as TyType;
+    use ty_python_semantic::types::UnionType;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
 
@@ -1187,6 +1213,118 @@ called = computed()
         );
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn legacy_globals_preserve_optional_provider_keys() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins.clone(), Default::default())
+            .unwrap();
+        let source = r#"py = native.legacy_globals.PyInfo
+runtime = native.legacy_globals.PyRuntimeInfo
+nested_py = getattr(getattr(native, "legacy_globals", None), "PyInfo", None)
+nested_runtime = getattr(getattr(native, "legacy_globals", None), "PyRuntimeInfo", None)
+direct_default = getattr(native.legacy_globals, "PyInfo", None)
+cc = native.legacy_globals.CcInfo
+java = native.legacy_globals.JavaInfo
+other_default = getattr(native.legacy_globals, "CcInfo", None)
+computed_name = json.encode(None)
+computed = getattr(native.legacy_globals, computed_name, None)
+no_default = getattr(native.legacy_globals, "PyInfo")
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                Some(FileInfo::Bazel {
+                    api_context: APIContext::Bzl,
+                    is_external: false,
+                }),
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let snapshot = analysis.snapshot();
+        let db = &snapshot.db;
+        let program = db.starlark_program_file(file);
+        let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+        let model = SemanticModel::new(db, program);
+        let environment = model.program_environment();
+        let types: Vec<_> = parsed
+            .suite()
+            .iter()
+            .filter_map(Stmt::as_assign_stmt)
+            .map(|assignment| assignment.value.inferred_type(&model).unwrap())
+            .collect();
+        let [py, runtime, nested_py, nested_runtime, direct_default, cc, java, other_default, _name, computed, no_default] =
+            types.as_slice()
+        else {
+            panic!("expected the legacy member observations: {types:?}");
+        };
+        assert!(matches!(py, TyType::Callable(_)));
+        assert_eq!(py, runtime);
+        let optional =
+            UnionType::from_elements(db, &environment, [*py, TyType::none(db, &environment)]);
+        for actual in [nested_py, nested_runtime, direct_default] {
+            assert_eq!(*actual, optional);
+        }
+        for actual in [cc, java, other_default, computed, no_default] {
+            assert_eq!(*actual, TyType::Dynamic(DynamicType::Any));
+        }
+        let diagnostics = snapshot.diagnostics(file).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        drop(snapshot);
+
+        // Optional getter results cannot establish a required property.
+        let DeclarationSource { path, mut contents } =
+            generate(Dialect::Bazel, &builtins, &BuildLanguage::default()).unwrap();
+        contents.push_str(
+            r#"
+class _RequiredPy(_starpls_typing.Protocol):
+    @_starpls_builtins.property
+    def PyInfo(self) -> _starpls_typing.Callable[..., _starpls_typing.Any]: ...
+class _RequiredRuntime(_starpls_typing.Protocol):
+    @_starpls_builtins.property
+    def PyRuntimeInfo(self) -> _starpls_typing.Callable[..., _starpls_typing.Any]: ...
+def inspect_legacy(bridge: _starpls_types._LegacyGlobals, py: _RequiredPy, runtime: _RequiredRuntime):
+    bridge
+    py
+    runtime
+"#,
+        );
+        analysis
+            .db
+            .source_system_mut()
+            .set_virtual_source(&path, contents);
+        let file = analysis.db.files.try_virtual_file(&path).unwrap();
+        file.sync(&mut analysis.db);
+        let db = &analysis.db;
+        let program = ty_python_semantic::Db::program_file(db, file.file());
+        let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+        let model = SemanticModel::new(db, program);
+        let function = parsed
+            .suite()
+            .iter()
+            .filter_map(Stmt::as_function_def_stmt)
+            .find(|function| function.name.as_str() == "inspect_legacy")
+            .unwrap();
+        let types: Vec<_> = function
+            .body
+            .iter()
+            .filter_map(Stmt::as_expr_stmt)
+            .map(|statement| statement.value.inferred_type(&model).unwrap())
+            .collect();
+        let [bridge, py, runtime] = types.as_slice() else {
+            panic!("expected bridge and required property types: {types:?}");
+        };
+        for required in [py, runtime] {
+            assert!(!bridge.is_assignable_to(db, &model.program_environment(), *required));
+        }
     }
 
     #[test]

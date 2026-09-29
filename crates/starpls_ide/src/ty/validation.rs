@@ -3889,6 +3889,22 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
     }
 
     #[test]
+    fn legacy_globals_keep_presence_and_gradual_members_distinct() {
+        for key in ["PyInfo", "PyRuntimeInfo"] {
+            let source = format!(
+                "def make(): return getattr(getattr(native, 'legacy_globals', None), '{key}', None)\n"
+            );
+            let diagnostics = validate(&source, "def make() -> Callable[..., Any] | None: ...\n");
+            assert!(diagnostics.is_empty(), "{key}: {diagnostics:?}");
+        }
+        let diagnostics = validate(
+            "def make(): return native.legacy_globals.CcInfo\n",
+            "def make() -> Callable[..., Any]: ...\n",
+        );
+        assert_eq!(diagnostics, ["incomplete-stub-validation"]);
+    }
+
+    #[test]
     fn mapping_interfaces_preserve_key_and_value_bounds() {
         let source = r#"def copy(values):
     return {key: value for key, value in values.items()}

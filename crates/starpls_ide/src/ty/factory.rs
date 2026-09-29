@@ -382,7 +382,8 @@ pub(super) fn declaration<'db>(
             return None;
         }
         return match class.node(&parsed).name.as_str() {
-            "struct" => {
+            // The legacy namespace is also a struct with optional fields.
+            "struct" | "_LegacyGlobals" => {
                 (function.name.as_str() == "__getattr__").then_some(BuiltinFunction::StructGetattr)
             }
             "attr" => Some(BuiltinFunction::Attribute(attribute_kind(
