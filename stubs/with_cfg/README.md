@@ -31,8 +31,9 @@ implementation separately. The private module interface declares
 `get_rule_name`, `is_executable`, `is_test`, `_is_native`,
 `_supports_inheritance`, `_supports_extension`, `get_implicit_targets`, and
 `_all_providers`; implementation validation checks their bodies. The collector
-accepts iterable values and exposes its result as a readonly sequence of
-objects. Provider-specific operations require a more specific element contract.
+accepts the public provider-key domain, `Provider[Any] | Callable[..., Any]`,
+and exposes its result as a readonly sequence of objects. Bazel checks provider
+identity when these values are used as target keys.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
 `_clone_value_deeply` preserves the selected canonical type: `str`, `Label`,
