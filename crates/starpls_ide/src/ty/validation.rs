@@ -84,18 +84,27 @@ struct Contract {
     provider: Option<ProviderContract>,
 }
 
-// Track selections separately so unchanged answers survive a phase change.
-#[salsa::tracked(returns(copy))]
 pub(super) fn annotation(
     db: &dyn starpls_hir::Db,
     file: ruff_db::files::File,
     owner: NodeIndex,
 ) -> Option<ValidationAnnotation> {
+    file_annotations(db, file).get(&owner).copied()
+}
+
+// The semantic index consumes every annotation in a file. A File key avoids
+// reclaiming synthesized (file, node) argument keys between validation phases.
+#[salsa::tracked(returns(ref))]
+fn file_annotations(
+    db: &dyn starpls_hir::Db,
+    file: ruff_db::files::File,
+) -> FxHashMap<NodeIndex, ValidationAnnotation> {
     db.environment()
         .stub_validation(db)
         .annotations
-        .get(&(file, owner))
-        .copied()
+        .get(&file)
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[salsa::tracked(returns(ref))]
@@ -656,13 +665,17 @@ fn value_annotation(
         (semantic_index(db, stub_program).try_definition(statement) == Some(*declaration))
             .then_some(statement)
     })?;
-    validation.annotations.insert(
-        (source.source, target.node_index().load()),
-        ValidationAnnotation::ValueContract {
-            file: *stub,
-            owner: statement.node_index().load(),
-        },
-    );
+    validation
+        .annotations
+        .entry(source.source)
+        .or_default()
+        .insert(
+            target.node_index().load(),
+            ValidationAnnotation::ValueContract {
+                file: *stub,
+                owner: statement.node_index().load(),
+            },
+        );
     Some(())
 }
 
@@ -980,25 +993,33 @@ fn annotations(
             provider.clone(),
         );
     } else if stub_node.returns.is_some() {
-        validation.annotations.insert(
-            (source.file.source, source_node.node_index().load()),
-            ValidationAnnotation::Declaration {
-                file: stub.file,
-                owner: stub_node.node_index().load(),
-            },
-        );
+        validation
+            .annotations
+            .entry(source.file.source)
+            .or_default()
+            .insert(
+                source_node.node_index().load(),
+                ValidationAnnotation::Declaration {
+                    file: stub.file,
+                    owner: stub_node.node_index().load(),
+                },
+            );
     }
     for (parameter, annotation) in pairs {
         if annotation.annotation.is_none() {
             continue;
         }
-        validation.annotations.insert(
-            (source.file.source, parameter.node_index().load()),
-            ValidationAnnotation::Declaration {
-                file: stub.file,
-                owner: annotation.node_index().load(),
-            },
-        );
+        validation
+            .annotations
+            .entry(source.file.source)
+            .or_default()
+            .insert(
+                parameter.node_index().load(),
+                ValidationAnnotation::Declaration {
+                    file: stub.file,
+                    owner: annotation.node_index().load(),
+                },
+            );
     }
     Ok(())
 }
@@ -1480,7 +1501,10 @@ fn selected_execution_scope(
     let owns_function = |function: &StmtFunctionDef| {
         let owner = function.node_index().load();
         matches!(
-            validation.annotations.get(&(source.source, owner)),
+            validation
+                .annotations
+                .get(&source.source)
+                .and_then(|annotations| annotations.get(&owner)),
             Some(ValidationAnnotation::Declaration { file: _, owner: _ })
         ) || (validation.phase == StubValidationPhase::Ordinary
             && validation
@@ -1578,7 +1602,10 @@ fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool 
     let validation = db.environment().stub_validation(db);
     validation.phase == StubValidationPhase::Conservative
         && matches!(
-            validation.annotations.get(&(source.source, owner)),
+            validation
+                .annotations
+                .get(&source.source)
+                .and_then(|annotations| annotations.get(&owner)),
             Some(ValidationAnnotation::Declaration { file: _, owner: _ })
         )
 }
@@ -2018,12 +2045,107 @@ mod tests {
     }
 
     #[test]
+    fn validation_annotations_survive_other_files() {
+        use std::sync::atomic::Ordering;
+
+        use ruff_db::files::FileRootKind;
+        use ruff_db::system::SystemPath;
+        use ruff_db::Db as _;
+        use ruff_python_ast::HasNodeIndex;
+        use salsa::Setter;
+
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let root = analysis.db.files().try_add_root(
+            &analysis.db,
+            SystemPath::new("/annotation-project"),
+            FileRootKind::Project,
+        );
+        assert_eq!(
+            root.kind_at_time_of_creation(&analysis.db),
+            FileRootKind::Project
+        );
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let functions = |count| {
+            (0..count)
+                .map(|index| format!("def function_{index}(value): return value\n"))
+                .collect::<String>()
+        };
+        let source_text = functions(64);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "/annotation-project/source.bzl",
+            &source_text,
+        );
+        let others = (0..8)
+            .map(|index| {
+                fixture.add_file(
+                    &mut analysis.db,
+                    format!("/annotation-project/other_{index}.bzl"),
+                    &functions(256),
+                )
+            })
+            .collect::<Vec<_>>();
+        loader.add_files_from_fixture(&fixture);
+        let program = analysis.db.starlark_program_file(source);
+        let owners = {
+            let parsed =
+                ruff_db::parsed::parsed_module(&analysis.db, program.python_file(&analysis.db))
+                    .load(&analysis.db);
+            parsed
+                .syntax()
+                .body
+                .iter()
+                .flat_map(|statement| statement.as_function_def_stmt().unwrap().parameters.iter())
+                .map(|parameter| parameter.as_parameter().node_index().load())
+                .collect::<Vec<_>>()
+        };
+        ty_python_core::semantic_index(&analysis.db, program);
+        let environment = analysis.db.environment();
+        let mut validation = environment.stub_validation(&analysis.db).clone();
+        for (index, other) in others.into_iter().enumerate() {
+            validation.phase = if index % 2 == 0 {
+                starpls_hir::StubValidationPhase::Conservative
+            } else {
+                starpls_hir::StubValidationPhase::Ordinary
+            };
+            let revision = salsa::plumbing::current_revision(&analysis.db);
+            environment
+                .set_stub_validation(&mut analysis.db)
+                .to(validation.clone());
+            assert!(salsa::plumbing::current_revision(&analysis.db) > revision);
+            let program = analysis.db.starlark_program_file(other);
+            ty_python_core::semantic_index(&analysis.db, program);
+        }
+        // Equal selections can be revalidated without repairing retired query keys.
+        for owner in owners {
+            assert_eq!(super::annotation(&analysis.db, source.source, owner), None);
+        }
+        let program = analysis.db.starlark_program_file(source);
+        analysis.db.executions.store(0, Ordering::Relaxed);
+        ty_python_core::semantic_index(&analysis.db, program);
+        assert_eq!(analysis.db.executions.load(Ordering::Relaxed), 0);
+
+        analysis.update_file(source, format!("{source_text}extra = 1\n"));
+        let program = analysis.db.starlark_program_file(source);
+        analysis.db.executions.store(0, Ordering::Relaxed);
+        ty_python_core::semantic_index(&analysis.db, program);
+        assert!(analysis.db.executions.load(Ordering::Relaxed) > 0);
+        assert!(ty_python_core::place_table(
+            &analysis.db,
+            ty_python_core::global_scope(&analysis.db, program),
+        )
+        .symbol_id("extra")
+        .is_some());
+    }
+
+    #[test]
     fn validation_phase_changes_reuse_semantic_index() {
         use std::sync::atomic::Ordering;
 
-        use ruff_python_ast::HasNodeIndex;
         use salsa::Setter;
         use ty_python_semantic::FunctionInferenceMode;
+        use ty_python_semantic::HasType;
+        use ty_python_semantic::SemanticModel;
 
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
@@ -2060,29 +2182,50 @@ mod tests {
         super::annotations(&analysis.db, selected, declaration, None, &mut validation).unwrap();
         // Source syntax is fixed throughout these phase changes, so its node and scope IDs
         // can be reused without traversing the syntax tree after each change.
-        let (owners, scopes) = {
+        let scopes = {
             let db = &analysis.db;
             let program = db.starlark_program_file(source);
             let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
             let index = ty_python_core::semantic_index(db, program);
-            let mut owners = Vec::new();
             let mut scopes = Vec::new();
             for statement in &parsed.syntax().body {
                 let ruff_python_ast::Stmt::FunctionDef(function) = statement else {
                     continue;
                 };
-                owners.extend(
-                    function
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.as_parameter().node_index().load()),
-                );
                 scopes.push(
                     index.node_scope(ty_python_core::scope::NodeWithScopeRef::Function(function)),
                 );
             }
-            (owners, scopes)
+            scopes
         };
+        let returned_types = |db: &crate::Database| {
+            let program = db.starlark_program_file(source);
+            let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+            let model = SemanticModel::new(db, program);
+            parsed
+                .syntax()
+                .body
+                .iter()
+                .filter_map(|statement| statement.as_function_def_stmt())
+                .map(|function| {
+                    let [statement] = function.body.as_slice() else {
+                        panic!("expected one return statement");
+                    };
+                    let value = statement
+                        .as_return_stmt()
+                        .unwrap()
+                        .value
+                        .as_deref()
+                        .unwrap();
+                    value
+                        .inferred_type(&model)
+                        .unwrap()
+                        .display(db, &model.program_environment())
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(returned_types(&analysis.db), ["Unknown", "Unknown"]);
         ty_python_core::semantic_index(&analysis.db, analysis.db.starlark_program_file(dependency));
         let dependency_reused = |db: &crate::Database, phase: &str| {
             let program = db.starlark_program_file(dependency);
@@ -2101,7 +2244,12 @@ mod tests {
         environment
             .set_stub_validation(&mut analysis.db)
             .to(validation.clone());
+        let program = analysis.db.starlark_program_file(source);
+        analysis.db.executions.store(0, Ordering::Relaxed);
+        ty_python_core::semantic_index(&analysis.db, program);
+        assert!(analysis.db.executions.load(Ordering::Relaxed) > 1);
         dependency_reused(&analysis.db, "installation");
+        assert_eq!(returned_types(&analysis.db), ["int", "Unknown"]);
         assert_eq!(
             modes(&analysis.db),
             [
@@ -2128,15 +2276,20 @@ mod tests {
             let program = db.starlark_program_file(source);
             db.executions.store(0, Ordering::Relaxed);
             ty_python_core::semantic_index(db, program);
-            // Recheck each parameter's annotation; equal answers preserve the index.
-            assert_eq!(db.executions.load(Ordering::Relaxed), owners.len());
+            // Recheck the file's annotation map; equal answers preserve the index.
+            assert_eq!(db.executions.load(Ordering::Relaxed), 1);
             assert_eq!(modes(db), [expected, FunctionInferenceMode::Default]);
         }
         environment
             .set_stub_validation(&mut analysis.db)
             .to(previous.clone());
+        let program = analysis.db.starlark_program_file(source);
+        analysis.db.executions.store(0, Ordering::Relaxed);
+        ty_python_core::semantic_index(&analysis.db, program);
+        assert!(analysis.db.executions.load(Ordering::Relaxed) > 1);
         dependency_reused(&analysis.db, "restoration");
         assert_eq!(environment.stub_validation(&analysis.db), &previous);
+        assert_eq!(returned_types(&analysis.db), ["Unknown", "Unknown"]);
         assert_eq!(modes(&analysis.db), [FunctionInferenceMode::Default; 2]);
         let reports = analysis.validate_stubs(|_| true).unwrap();
         assert!(

@@ -58,7 +58,7 @@ pub trait Db: starpls_common::Db {
 pub struct StubValidation {
     pub phase: StubValidationPhase,
     pub annotations:
-        FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ValidationAnnotation>,
+        FxHashMap<ruff_db::files::File, FxHashMap<ruff_python_ast::NodeIndex, ValidationAnnotation>>,
     pub provider_returns:
         FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
     pub files: FxHashSet<ruff_db::files::File>,

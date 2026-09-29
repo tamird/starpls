@@ -953,11 +953,8 @@ fn selected_function_import(db: &dyn Db, source: File, interface: File, name: Na
     let Some(interface_owner) = function_node(interface) else {
         return false;
     };
-    db.environment()
-        .stub_validation(db)
-        .annotations
-        .get(&(source.source, source_owner))
-        == Some(&ValidationAnnotation::Declaration {
+    super::validation::annotation(db, source.source, source_owner)
+        == Some(ValidationAnnotation::Declaration {
             file: interface,
             owner: interface_owner,
         })
@@ -1091,13 +1088,17 @@ mod tests {
                 files: Default::default(),
             };
             validation.files.extend([caller.source, annotation.source]);
-            validation.annotations.insert(
-                (source.source, source_owner),
-                ValidationAnnotation::Declaration {
-                    file: interface,
-                    owner: interface_owner,
-                },
-            );
+            validation
+                .annotations
+                .entry(source.source)
+                .or_default()
+                .insert(
+                    source_owner,
+                    ValidationAnnotation::Declaration {
+                        file: interface,
+                        owner: interface_owner,
+                    },
+                );
             environment
                 .set_stub_validation(&mut analysis.db)
                 .to(validation);
@@ -1143,16 +1144,17 @@ mod tests {
             analysis.update_file(changed, text.clone());
             let mut validation = environment.stub_validation(&analysis.db).clone();
             validation.annotations.clear();
-            validation.annotations.insert(
-                (
-                    source.source,
+            validation
+                .annotations
+                .entry(source.source)
+                .or_default()
+                .insert(
                     node(&analysis.db, source).unwrap_or(source_owner),
-                ),
-                ValidationAnnotation::Declaration {
-                    file: interface,
-                    owner: node(&analysis.db, interface).unwrap_or(interface_owner),
-                },
-            );
+                    ValidationAnnotation::Declaration {
+                        file: interface,
+                        owner: node(&analysis.db, interface).unwrap_or(interface_owner),
+                    },
+                );
             environment
                 .set_stub_validation(&mut analysis.db)
                 .to(validation);
