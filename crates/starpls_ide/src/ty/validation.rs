@@ -4731,6 +4731,46 @@ def make() -> _Row: ...
     }
 
     #[test]
+    fn optional_native_getters_check_inputs_with_defaults() {
+        for (expression, result, expected) in [
+            ("getattr(value, 'field', 0)", "str | int", &[] as &[&str]),
+            (
+                "getattr(value, 'field', 0)",
+                "str",
+                &["invalid-return-type"],
+            ),
+            (
+                "getattr(value, 'field')",
+                "object",
+                &["incomplete-stub-validation"],
+            ),
+            (
+                "getattr(value, name, 0)",
+                "object",
+                &["incomplete-stub-validation"],
+            ),
+        ] {
+            let source = format!("def make(value, name): return {expression}\n");
+            let stub = format!("def make(value: struct[str], name: str) -> {result}: ...\n");
+            assert_eq!(validate(&source, &stub), expected, "{expression}");
+        }
+        assert_eq!(
+            validate(
+                "def make(): return getattr(struct(field='value'), 'field')\n",
+                "def make() -> str: ...\n"
+            ),
+            Vec::<String>::new(),
+        );
+        assert_eq!(
+            validate(
+                "def make(): return getattr(struct(field='value'), 'field')\n",
+                "def make() -> int: ...\n"
+            ),
+            ["invalid-return-type"],
+        );
+    }
+
+    #[test]
     fn selected_function_calls_check_declared_inputs() {
         let stub = r#"
 def _id(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...
