@@ -37,8 +37,8 @@ The pinned source sets `semantics.IS_BAZEL` to true. On that branch,
 `_get_message_bundle_info`, `_set_annotation_processing`, and
 `_java_toolchain_label` return `None`. `_get_constraints` returns a fresh empty
 list, described as `list[str]`. `_add_constraints` returns its input unchanged;
-its declaration accepts `object` and returns `object`. Inputs
-ignored by these Bazel branches accept `object`. Parameter names and defaults
-follow the source.
+its generic declaration preserves the input type in the result. Inputs ignored
+by these Bazel branches accept `object`. Parameter names and defaults follow
+the source.
 
 The declarations use the [MIT license](LICENSE-MIT).
