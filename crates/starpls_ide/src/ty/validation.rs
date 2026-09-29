@@ -3356,6 +3356,35 @@ def make() -> Info: ...
                 );
             }
         }
+
+        for (name, source, stub, expected) in [
+            (
+                "native provider key sequence",
+                "def make(): return [config_common.FeatureFlagInfo]\n",
+                "def make() -> Sequence[Provider[Any] | Callable[..., Any]]: ...\n",
+                &[][..],
+            ),
+            (
+                "provider result widening",
+                "def make(value): return value\n",
+                "def make(value: Provider[FeatureFlagInfo]) -> Provider[object]: ...\n",
+                &[],
+            ),
+            (
+                "provider result narrowing",
+                "def make(value): return value\n",
+                "def make(value: Provider[object]) -> Provider[FeatureFlagInfo]: ...\n",
+                &["invalid-return-type"],
+            ),
+            (
+                "unrelated provider result",
+                "def make(value): return value\n",
+                "def make(value: Provider[FeatureFlagInfo]) -> Provider[ToolchainInfo]: ...\n",
+                &["invalid-return-type"],
+            ),
+        ] {
+            assert_eq!(validate(source, stub), expected, "{name}");
+        }
     }
 
     #[test]
