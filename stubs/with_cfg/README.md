@@ -35,9 +35,9 @@ accepts iterable values and exposes its result as a readonly sequence of
 objects. Provider-specific operations require a more specific element contract.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
-`_clone_value_deeply` preserves the union of strings, labels, integers,
-booleans, lists of arbitrary elements, and `None`. It copies lists and returns
-other supported values unchanged.
+`_clone_value_deeply` preserves the selected canonical type: `str`, `Label`,
+`int`, `bool`, `list[Any]`, or `None`. It copies lists and returns other
+supported values unchanged. List inputs select `list[Any]` as the result.
 The extension interface declares `_initializer_base` with string-keyed
 keyword arguments and setting values keyed by strings or labels. It returns
 a fresh string-keyed dictionary of objects, with validated setting names
