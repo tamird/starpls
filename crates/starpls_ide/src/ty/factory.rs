@@ -1773,20 +1773,29 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
             }
         }
     }
+    // Untyped providers accept arbitrary field values; field reads remain unknown.
+    let value_type = KnownClass::Object.to_instance(db, &environment);
     let mut parameters: Vec<_> = fields
         .iter()
-        .map(|ProvidedField { name, ty, source }| {
-            let parameter = Parameter::keyword_only(name.clone())
-                .with_annotated_type(*ty)
-                .with_default_type(Type::unknown());
-            match source {
-                Some(source) => parameter.with_source_range(*source),
-                None => parameter,
-            }
-        })
+        .map(
+            |ProvidedField {
+                 name,
+                 ty: _,
+                 source,
+             }| {
+                let parameter = Parameter::keyword_only(name.clone())
+                    .with_annotated_type(value_type)
+                    .with_default_type(Type::unknown());
+                match source {
+                    Some(source) => parameter.with_source_range(*source),
+                    None => parameter,
+                }
+            },
+        )
         .collect();
     if open {
-        parameters.push(Parameter::keyword_variadic(Name::new("kwargs")));
+        parameters
+            .push(Parameter::keyword_variadic(Name::new("kwargs")).with_annotated_type(value_type));
     }
     let self_parameter = || Parameter::positional_only(Some(Name::new("self")));
     let init = if let Some(initializer) = initializer {

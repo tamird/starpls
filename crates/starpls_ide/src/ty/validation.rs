@@ -3653,6 +3653,26 @@ def make() -> _Runner: ...
 
     #[test]
     fn plain_provider_calls_check_stored_values() {
+        for (declaration, constructor) in [
+            ("Info = provider(fields=['value'])\n", "Info"),
+            ("Info = provider(fields={'value': 'Value documentation'})\n", "Info"),
+            ("Info = provider()\n", "Info"),
+            ("def initialize(value: int) -> dict[str, int]: return {'value': value}\nInfo, raw = provider(fields=['value'], init=initialize)\n", "raw"),
+        ] {
+            let source = format!("{declaration}def make(value): return {constructor}(value=value)\n");
+            let diagnostics = validate(&source, "def make(value: object) -> object: ...\n");
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+
+            let source = source.replace("(value=value)\n", "(value=value).value\n");
+            let diagnostics = validate(&source, "def make(value: object) -> int: ...\n");
+            assert_eq!(diagnostics, ["unsound-return-statement"], "{source}");
+        }
+        let source = "def initialize(value: int) -> dict[str, int]: return {'value': value}\nInfo, raw = provider(fields=['value'], init=initialize)\ndef make(value): return Info(value)\n";
+        assert_eq!(
+            validate(source, "def make(value: object) -> object: ...\n"),
+            ["invalid-argument-type"],
+        );
+
         let provider = "Info = provider(fields=['run'])\n";
         let declaration = r#"class Info:
     run: Final[Callable[[list[Any]], int]]
