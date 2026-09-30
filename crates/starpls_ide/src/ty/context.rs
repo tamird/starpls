@@ -1470,6 +1470,22 @@ example_test(name="test", timeout="short", size="small", flaky=True, shard_count
     context.file._tool
     context.executable._tool
     context.rule.attr.unselected
+    if hasattr(context.rule.attr, "deps"):
+        context.rule.attr.deps
+        for dep in context.rule.attr.deps:
+            print(dep)
+    if (hasattr(context.rule.files, "package_metadata") and
+        hasattr(context.rule.files, "compile_data") and
+        context.rule.files.package_metadata):
+        context.rule.files.compile_data
+        sorted(context.rule.files.compile_data, key=lambda file: file.path)
+        metadata = context.rule.files.package_metadata
+        if metadata:
+            len(metadata)
+            metadata[0]
+    if hasattr(context.files, "_tool"):
+        context.files._tool
+        context.files._tool[0].path
     _wrong_target: str = subject.files.to_list()
     _wrong_mode: int = context.attr.mode
     print(_wrong_target, _wrong_mode)
@@ -1521,6 +1537,38 @@ example = make_aspect(implementation=implementation, attrs={
             source,
             "    context.executable._tool",
             "File",
+            "\"_tool\"",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "        context.rule.attr.deps",
+            "Unknown",
+            "",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "        metadata = context.rule.files.package_metadata",
+            "Unknown & ~AlwaysFalsy",
+            "",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "        context.rule.files.compile_data",
+            "Unknown",
+            "",
+        );
+        check_field(
+            &snapshot,
+            file,
+            source,
+            "        context.files._tool",
+            "list[File]",
             "\"_tool\"",
         );
         let diagnostics = snapshot.diagnostics(file).unwrap();

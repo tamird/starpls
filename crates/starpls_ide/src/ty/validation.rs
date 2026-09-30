@@ -5788,13 +5788,22 @@ def _opaque() -> Callable[..., None]:
         let diagnostics = validate(source, stub);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let diagnostics = validate(
+            &source.replace(
+                "return value.attr.exports",
+                "return value.attr.exports[0].label",
+            ),
+            &stub.replace(
+                "def read(value: ctx[int, _Attrs]) -> Sequence[Target]",
+                "def read(value: ctx[int, _Attrs]) -> Label",
+            ),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let diagnostics = validate(
             &source.replace("return value.attr.exports", "return value.attr.exports[0]"),
             stub,
         );
         assert!(
-            diagnostics
-                .iter()
-                .any(|id| id == "unsound-return-statement"),
+            diagnostics.iter().any(|id| id == "invalid-return-type"),
             "{diagnostics:?}"
         );
         let diagnostics = validate(
