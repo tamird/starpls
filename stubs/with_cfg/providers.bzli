@@ -3,7 +3,7 @@ class RuleInfo:
     implicit_targets: Final[Iterable[str]]
     kind: Final[Callable[..., Any]]
     native: Final[bool]
-    providers: Final[Sequence[object]]
+    providers: Final[Sequence[Provider[Any] | Callable[..., Any]]]
     supports_extension: Final[bool]
     supports_inheritance: Final[bool]
     test: Final[bool]
@@ -15,7 +15,7 @@ class RuleInfo:
         implicit_targets: Iterable[str],
         kind: Callable[..., Any],
         native: bool,
-        providers: Sequence[object],
+        providers: Sequence[Provider[Any] | Callable[..., Any]],
         supports_extension: bool,
         supports_inheritance: bool,
         test: bool,
