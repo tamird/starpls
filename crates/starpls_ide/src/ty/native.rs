@@ -304,10 +304,11 @@ fn declarations(
     }
     for class in classes.values() {
         // These native instance types have no Starlark subclasses. Finality
-        // excludes unrelated provider types from group lookup results.
+        // preserves their comparison semantics and excludes unrelated provider
+        // types from group lookup results.
         if matches!(
             class.name.as_str(),
-            "DefaultInfo" | "PackageSpecificationInfo"
+            "DefaultInfo" | "PackageSpecificationInfo" | "FilesToRunProvider"
         ) {
             writeln!(body, "    @_starpls_typing.final")?;
         }

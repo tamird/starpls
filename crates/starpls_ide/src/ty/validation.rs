@@ -3345,6 +3345,12 @@ def make() -> Info: ...
             assert_eq!(validate(&source, &stub), expected, "{name}");
         }
 
+        let diagnostics = validate(
+            "def missing(value): return value == None\n",
+            "def missing(value: FilesToRunProvider | None) -> bool: ...\n",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
         for key in ["Provider[object]", "Callable[..., object]"] {
             for (result, expected) in [("object", &[][..]), ("int", &["invalid-return-type"])] {
                 let stub =
