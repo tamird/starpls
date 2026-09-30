@@ -5355,6 +5355,44 @@ def make() -> _Row: ...
 
     #[test]
     fn selected_function_calls_check_declared_inputs() {
+        for (argument, expected) in [
+            ("outer['inner']['value']", "incomplete-stub-validation"),
+            ("**outer['inner']", "invalid-argument-type"),
+        ] {
+            let source = format!(
+                r#"
+def _replace(outer: dict[str, dict[str, int | str]]) -> None:
+    outer['inner']['value'] = 42
+def _consume(value: str) -> None:
+    pass
+def make():
+    outer: dict[str, dict[str, int | str]] = {{'inner': {{'value': 'ok'}}}}
+    _replace(outer)
+    _consume({argument})
+    return 0
+"#
+            );
+            assert_eq!(
+                validate(&source, "def make() -> int: ...\n"),
+                [expected],
+                "{argument}",
+            );
+        }
+        let source = r#"
+def _integers(value: int) -> int:
+    return value
+def read(parent, incoming):
+    parent['inner'] = dict(incoming)
+    other = parent['inner'].get('parent')
+    parent['inner'] = {'value': 1}
+    if other != None:
+        other['inner'] = {'value': 'changed'}
+    return _integers(**parent['inner'])
+"#;
+        let stub = r#"
+def read(parent: dict[str, object], incoming: dict[str, dict[str, object]]) -> int: ...
+"#;
+        assert_eq!(validate(source, stub), ["incomplete-stub-validation"]);
         let stub = r#"
 def _id(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...
 def make(callback: Callable[[list[Any]], int]) -> Callable[[list[Any]], int]: ...
