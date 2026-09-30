@@ -25,8 +25,8 @@ def decompose_select_elements(value: object) -> list[
 ]: ...
 
 def _apply_func[K, V, R](
-    func: Callable[[object], R],
-    item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], object],
+    func: Callable[[V], R],
+    item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
 ) -> tuple[Literal[True], dict[K, R]] | tuple[Literal[False], R]: ...
 
 def _is_dict_element(
