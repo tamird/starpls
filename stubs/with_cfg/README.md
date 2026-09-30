@@ -31,9 +31,10 @@ implementation separately. The private module interface declares
 `get_rule_name`, `is_executable`, `is_test`, `_is_native`,
 `_supports_inheritance`, `_supports_extension`, `get_implicit_targets`, and
 `_all_providers`; implementation validation checks their bodies. The collector
-accepts `Provider[Any] | Callable[..., Any]` values and returns a readonly
-sequence with that element type. Bazel checks provider identity when these
-values are used as target keys.
+accepts `Provider[object] | Callable[..., object]` values and returns a readonly
+sequence with that element type. The shared result bound permits forwarding
+heterogeneous provider instances without assuming their fields. Bazel checks
+provider identity when these values are used as target keys.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
 `_clone_value_deeply` preserves the selected canonical type: `str`, `Label`,
@@ -103,7 +104,7 @@ using the validated Label and string predicates. It also declares
 returns a JSON string. Transition construction remains unproved.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. Its `providers` field and constructor argument use readonly
-sequences of `Provider[Any] | Callable[..., Any]`.
+sequences of `Provider[object] | Callable[..., object]`.
 The fluent builder's gradual body types and recursive return values can still
 leave its full validation incomplete.
 

@@ -5,5 +5,5 @@ def with_cfg(
     *,
     executable: bool | None = ...,
     implicit_targets: Iterable[str] | None = ...,
-    extra_providers: Iterable[Provider[Any] | Callable[..., Any]] | None = ...,
+    extra_providers: Iterable[Provider[object] | Callable[..., object]] | None = ...,
 ) -> _Builder: ...

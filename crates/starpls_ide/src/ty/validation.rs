@@ -3351,23 +3351,29 @@ def make() -> Info: ...
         );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
-        for key in ["Provider[object]", "Callable[..., object]"] {
-            for (result, expected) in [("object", &[][..]), ("int", &["invalid-return-type"])] {
-                let stub =
-                    format!("def lookup(target: Target[None], key: {key}) -> {result}: ...\n");
-                assert_eq!(
-                    validate("def lookup(target, key): return target[key]\n", &stub),
-                    expected,
-                    "{key} -> {result}",
-                );
+        for target in ["Target[None]", "Target[FilesToRunProvider] | Target[None]"] {
+            for key in [
+                "Provider[object]",
+                "Callable[..., object]",
+                "Provider[object] | Callable[..., object]",
+            ] {
+                for (result, expected) in [("object", &[][..]), ("int", &["invalid-return-type"])] {
+                    let stub =
+                        format!("def lookup(target: {target}, key: {key}) -> {result}: ...\n");
+                    assert_eq!(
+                        validate("def lookup(target, key): return target[key]\n", &stub),
+                        expected,
+                        "{target}[{key}] -> {result}",
+                    );
+                }
             }
         }
 
         for (name, source, stub, expected) in [
             (
-                "native provider key sequence",
-                "def make(): return [config_common.FeatureFlagInfo]\n",
-                "def make() -> Sequence[Provider[Any] | Callable[..., Any]]: ...\n",
+                "heterogeneous provider key sequence",
+                "Info = provider(fields=['value'])\ndef make(): return [config_common.FeatureFlagInfo, DefaultInfo, Info]\n",
+                "def make() -> Sequence[Provider[object] | Callable[..., object]]: ...\n",
                 &[][..],
             ),
             (
