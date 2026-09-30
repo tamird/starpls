@@ -47,7 +47,3 @@ def _apply_func[K, V, R](
     func: Callable[[V], R],
     item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
 ) -> tuple[Literal[True], dict[K, R]] | tuple[Literal[False], R]: ...
-
-def _is_dict_element(
-    item: tuple[Literal[True], dict[str | bool | int | None | Label, object]] | tuple[Literal[False], object],
-) -> bool: ...
