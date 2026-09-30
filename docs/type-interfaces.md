@@ -137,6 +137,24 @@ The default open form permits additional fields when accepting existing values.
 initializers. Their values have type `object`, and access through the contract
 permits reads. Declared fields retain their individual types and mutability.
 
+## Rule contexts
+
+`ctx[Value, Attrs]` specifies the build-setting value and the fields of
+`ctx.attr`. A protocol describes the attribute fields a helper requires:
+
+```starlark
+class _Attrs(Protocol):
+    @property
+    def exports(self) -> Sequence[Target]: ...
+
+def exported(context: ctx[object, _Attrs]) -> Sequence[Target]: ...
+```
+
+These contexts retain their native methods and work with native functions.
+`ctx` and `ctx[Value]` use the native open struct view for attributes.
+With context inference enabled, eligible rule and aspect registrations supply
+schemas from their attribute descriptors.
+
 ## Protocols
 
 A protocol describes values by their fields and methods:

@@ -1463,7 +1463,7 @@ pub(super) fn specialized_native_instance<'db>(
     name: &str,
     value: Type<'db>,
 ) -> Option<Type<'db>> {
-    let class = specialized_native_class(db, declarations, name, value)?;
+    let class = specialized_native_class(db, declarations, name, vec![value])?;
     class.to_instance_approximation(db, environment)
 }
 
@@ -1471,12 +1471,11 @@ pub(super) fn specialized_native_class<'db>(
     db: &'db Database,
     declarations: ProgramFile<'db>,
     name: &str,
-    value: Type<'db>,
+    arguments: Vec<Type<'db>>,
 ) -> Option<Type<'db>> {
-    // Callers select generated declarations with exactly one type parameter.
     let class = native_class(db, declarations, name)?;
     let class = class.as_class_literal()?;
-    let specialized = class.apply_specialization(db, |context| context.specialize(db, vec![value]));
+    let specialized = class.apply_specialization(db, |context| context.specialize(db, arguments));
     Some(Type::from(specialized))
 }
 

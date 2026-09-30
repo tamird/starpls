@@ -5782,6 +5782,35 @@ def _opaque() -> Callable[..., None]:
     }
 
     #[test]
+    fn context_attribute_schemas_preserve_native_contracts() {
+        let source = "def read(value):\n    coverage_common.instrumented_files_info(ctx=value, dependency_attributes=[\"exports\"])\n    return value.attr.exports\n";
+        let stub = "class _Attrs(Protocol):\n    @property\n    def exports(self) -> Sequence[Target]: ...\ndef read(value: ctx[int, _Attrs]) -> Sequence[Target]: ...\n";
+        let diagnostics = validate(source, stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let diagnostics = validate(
+            &source.replace("return value.attr.exports", "return value.attr.exports[0]"),
+            stub,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|id| id == "unsound-return-statement"),
+            "{diagnostics:?}"
+        );
+        let diagnostics = validate(
+            &source.replace("value.attr.exports", "value.attr.undeclared"),
+            stub,
+        );
+        assert!(
+            diagnostics.iter().any(|id| matches!(
+                id.as_str(),
+                "incomplete-stub-validation" | "unsound-return-statement"
+            )),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn membership_checks_selected_inputs() {
         use starpls_common::Db as _;
 

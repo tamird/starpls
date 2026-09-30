@@ -27,6 +27,7 @@ use ty_python_semantic::types::ide_support::CallSignatureDetails;
 use ty_python_semantic::types::DictionaryExtraItems;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
+use ty_python_semantic::types::DynamicType;
 use ty_python_semantic::types::KnownClass;
 use ty_python_semantic::types::Type;
 use ty_python_semantic::types::UnionType;
@@ -365,14 +366,20 @@ pub(super) fn parameter_type<'db>(
     } else {
         "ctx"
     };
-    let base = match rule.and_then(|rule| rule.build_setting) {
-        Some(setting_kind) => factory::specialized_native_class(
-            db,
-            declarations,
-            name,
-            setting_kind.value_type(db, &environment),
-        )?,
-        None => factory::native_class(db, declarations, name)?,
+    let base = if context_kind == ContextKind::Repository {
+        factory::native_class(db, declarations, name)?
+    } else {
+        let build_setting = rule
+            .and_then(|rule| rule.build_setting)
+            .map_or(Type::Dynamic(DynamicType::Any), |setting| {
+                setting.value_type(db, &environment)
+            });
+        let attributes = context_fields
+            .iter()
+            .find(|field| field.name == "attr")
+            .expect("every context has an attribute view")
+            .ty;
+        factory::specialized_native_class(db, declarations, name, vec![build_setting, attributes])?
     };
     let mut implications = Vec::new();
     // Valid single-file and executable prerequisites provide a File in each
@@ -1548,6 +1555,39 @@ example = make_aspect(implementation=implementation, attrs={
         analysis.update_file(file, source.to_owned());
         let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn inferred_context_satisfies_named_attribute_schema() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = starpls_hir::Fixture::new(&mut analysis.db);
+        enable_context(&mut analysis);
+        let helper = fixture.add_file(
+            &mut analysis.db,
+            "//:helper.bzl",
+            "def read(value): return value.attr.exports\n",
+        );
+        let interface = fixture.add_file(
+            &mut analysis.db,
+            "//:helper.bzli",
+            "class _Attrs(Protocol):\n    @property\n    def exports(self) -> Sequence[Target]: ...\ndef read(value: ctx[object, _Attrs]) -> Sequence[Target]: ...\n",
+        );
+        let file = fixture.add_file(&mut analysis.db, "//:defs.bzl", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(helper, interface)]).unwrap();
+        for (attrs, errors) in [
+            ("{'exports': attr.label_list()}", 0),
+            ("{'exports': attr.string()}", 1),
+            ("{}", 1),
+            ("{'exports': attr.label_list()}", 0),
+        ] {
+            analysis.update_file(file, format!("load(\"//:helper.bzl\", \"read\")\ndef implementation(context):\n    read(context)\n    return []\nexample = rule(implementation=implementation, attrs={attrs})\n"));
+            let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+            assert_eq!(diagnostics.len(), errors, "{attrs}: {diagnostics:?}");
+            if let [diagnostic] = diagnostics.as_slice() {
+                assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+            }
+        }
     }
 
     #[test]
