@@ -165,6 +165,16 @@ impl File {
                 .is_some_and(|extension| extension == "bzli")
     }
 
+    pub fn annotation_mode(self, db: &dyn Db) -> starpls_syntax::AnnotationMode {
+        if self.is_type_interface(db) {
+            starpls_syntax::AnnotationMode::Interface
+        } else if self.allows_native_annotations(db) {
+            starpls_syntax::AnnotationMode::Source
+        } else {
+            starpls_syntax::AnnotationMode::Disabled
+        }
+    }
+
     pub fn is_external(self) -> Option<bool> {
         let Self {
             source: _,
@@ -236,10 +246,13 @@ pub const PARSER_VERSION: ruff_python_ast::PythonVersion =
     ruff_python_ast::PythonVersion::latest_ty();
 
 /// The canonical Python-shaped parse. Starlark validation is applied separately.
-pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule {
+pub fn parsed_module(
+    db: &dyn Db,
+    file: impl Into<ruff_db::files::File>,
+) -> &ruff_db::parsed::ParsedModule {
     let file = ruff_db::PythonFile::new_with_source_type(
         db,
-        file.source,
+        file.into(),
         PARSER_VERSION,
         ruff_python_ast::PySourceType::Python,
     );
@@ -248,40 +261,63 @@ pub fn parsed_module(db: &dyn Db, file: File) -> &ruff_db::parsed::ParsedModule 
 
 /// Starlark validation and type comments for the canonical parsed revision.
 pub fn syntax_info(db: &dyn Db, file: File) -> &[starpls_syntax::TypeComment] {
-    &syntax_info_query(db, file.source, (file.dialect, file.info)).comments
+    &syntax_info_for_mode(db, file.source, file.annotation_mode(db)).comments
 }
 
 /// Unsupported subtrees from the same canonical validation result as syntax diagnostics.
 pub fn syntax_exclusions(db: &dyn Db, file: File) -> &[ruff_python_ast::NodeIndex] {
-    &syntax_info_query(db, file.source, (file.dialect, file.info)).excluded
+    &syntax_info_for_mode(db, file.source, file.annotation_mode(db)).excluded
 }
 
 pub fn syntax_diagnostics(db: &dyn Db, file: File) -> &[Diagnostic] {
-    &syntax_info_query(db, file.source, (file.dialect, file.info)).diagnostics
+    &syntax_info_for_mode(db, file.source, file.annotation_mode(db)).diagnostics
 }
 
 // Semantic annotation callbacks read this query during fixpoint inference,
 // where Salsa accumulators are unsupported. Reporting consumes these results.
 #[derive(Debug, PartialEq, Eq)]
-struct SyntaxInfo {
-    comments: Vec<starpls_syntax::TypeComment>,
-    excluded: Vec<ruff_python_ast::NodeIndex>,
+pub struct SyntaxInfo {
+    pub comments: Vec<starpls_syntax::TypeComment>,
+    pub excluded: Vec<ruff_python_ast::NodeIndex>,
     diagnostics: Box<[Diagnostic]>,
 }
 
-#[salsa::tracked(returns(ref))]
-fn syntax_info_query(
+/// Uses the physical source as the query key while preserving annotation mode.
+pub fn syntax_info_for_mode(
     db: &dyn Db,
     source: ruff_db::files::File,
-    context: (Dialect, Option<FileInfo>),
+    mode: starpls_syntax::AnnotationMode,
+) -> &SyntaxInfo {
+    match mode {
+        starpls_syntax::AnnotationMode::Disabled => syntax_info_disabled(db, source),
+        starpls_syntax::AnnotationMode::Source => syntax_info_source(db, source),
+        starpls_syntax::AnnotationMode::Interface => syntax_info_interface(db, source),
+    }
+}
+
+// Separate entries keep the memo on the source File. A synthesized (File, mode)
+// key can be reclaimed while validation temporarily queries other files.
+#[salsa::tracked(returns(ref))]
+fn syntax_info_disabled(db: &dyn Db, source: ruff_db::files::File) -> SyntaxInfo {
+    syntax_info_impl(db, source, starpls_syntax::AnnotationMode::Disabled)
+}
+
+#[salsa::tracked(returns(ref))]
+fn syntax_info_source(db: &dyn Db, source: ruff_db::files::File) -> SyntaxInfo {
+    syntax_info_impl(db, source, starpls_syntax::AnnotationMode::Source)
+}
+
+#[salsa::tracked(returns(ref))]
+fn syntax_info_interface(db: &dyn Db, source: ruff_db::files::File) -> SyntaxInfo {
+    syntax_info_impl(db, source, starpls_syntax::AnnotationMode::Interface)
+}
+
+fn syntax_info_impl(
+    db: &dyn Db,
+    file: ruff_db::files::File,
+    mode: starpls_syntax::AnnotationMode,
 ) -> SyntaxInfo {
-    let (dialect, info) = context;
-    let file = File {
-        source,
-        dialect,
-        info,
-    };
-    let contents = file.contents(db);
+    let contents = ruff_db::source::source_text(db, file);
     let mut diagnostics = Vec::new();
     if let Some(error) = contents.read_error() {
         diagnostics.push(diagnostic(
@@ -289,7 +325,7 @@ fn syntax_info_query(
             DiagnosticId::Io,
             Severity::Error,
             Default::default(),
-            format!("cannot read {}: {error}", file.path(db).display()),
+            format!("cannot read {}: {error}", file.path(db)),
             [],
         ));
     }
@@ -304,18 +340,7 @@ fn syntax_info_query(
             [],
         ));
     };
-    let excluded = starpls_syntax::validate(
-        &contents,
-        &parsed,
-        if file.is_type_interface(db) {
-            starpls_syntax::AnnotationMode::Interface
-        } else if file.allows_native_annotations(db) {
-            starpls_syntax::AnnotationMode::Source
-        } else {
-            starpls_syntax::AnnotationMode::Disabled
-        },
-        &mut errors,
-    );
+    let excluded = starpls_syntax::validate(&contents, &parsed, mode, &mut errors);
     let comments = starpls_syntax::parse_type_comments(&contents, parsed.tokens(), &mut errors);
     SyntaxInfo {
         comments,

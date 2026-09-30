@@ -7,11 +7,9 @@ pub use ruff_db::diagnostic::Severity;
 use ruff_db::diagnostic::Span;
 use starpls_syntax::TextRange;
 
-use crate::File;
-
 /// Creates a source diagnostic with the primary annotation used by the editor.
 pub fn diagnostic(
-    file: File,
+    file: impl Into<ruff_db::files::File>,
     id: DiagnosticId,
     severity: Severity,
     range: TextRange,
@@ -22,7 +20,7 @@ pub fn diagnostic(
         u32::from(range.start()).into(),
         u32::from(range.end()).into(),
     );
-    let mut annotation = Annotation::primary(Span::from(file.source).with_range(range));
+    let mut annotation = Annotation::primary(Span::from(file.into()).with_range(range));
     for tag in tags {
         annotation.push_tag(tag);
     }

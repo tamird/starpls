@@ -240,6 +240,63 @@ label(Label("//:target"))
                 "{path}: {diagnostics:?}"
             );
         }
+
+        for (path, body) in [("modes.bzl", "return value"), ("modes.bzli", "...")] {
+            let source =
+                format!("def identity(value: int) -> int:\n    # type: (int) -> int\n    {body}\n");
+            let comment_offset = ruff_text_size::TextSize::try_from(
+                source.find("# type: (int) -> int").unwrap() + "# type: (int) -> ".len(),
+            )
+            .unwrap();
+            let file = fixture.add_file(&mut analysis.db, path, &source);
+            let contexts = [
+                (
+                    starpls_common::Dialect::Bazel,
+                    starpls_bazel::APIContext::Bzl,
+                    false,
+                ),
+                (
+                    starpls_common::Dialect::Bazel,
+                    starpls_bazel::APIContext::Prelude,
+                    false,
+                ),
+                (
+                    starpls_common::Dialect::Standard,
+                    starpls_bazel::APIContext::Bzl,
+                    false,
+                ),
+                (
+                    starpls_common::Dialect::Bazel,
+                    starpls_bazel::APIContext::Bzl,
+                    true,
+                ),
+            ];
+            for (dialect, api_context, is_external) in contexts {
+                let contextual = starpls_common::File {
+                    source: file.source,
+                    dialect,
+                    info: Some(starpls_common::FileInfo::Bazel {
+                        api_context,
+                        is_external,
+                    }),
+                };
+                let admitted = dialect == starpls_common::Dialect::Bazel
+                    && api_context == starpls_bazel::APIContext::Bzl;
+                let diagnostics = starpls_common::syntax_diagnostics(&analysis.db, contextual);
+                assert_eq!(
+                    diagnostics.is_empty(),
+                    admitted,
+                    "{path}: {contextual:?}: {diagnostics:?}",
+                );
+                assert_eq!(
+                    starpls_hir::Source::new(&analysis.db)
+                        .type_comment_owner(contextual, comment_offset)
+                        .is_some(),
+                    admitted,
+                    "{path}: {contextual:?}",
+                );
+            }
+        }
     }
 
     #[test]

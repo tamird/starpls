@@ -664,6 +664,9 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::Ordering;
 
+    use ruff_db::files::FileRootKind;
+    use ruff_db::system::SystemPath;
+    use ruff_db::Db as _;
     use ruff_python_ast::Stmt;
     use salsa::plumbing::AsId;
     use starpls_bazel::build::attribute::Discriminator;
@@ -699,10 +702,29 @@ mod tests {
     #[test]
     fn program_file_identity_survives_loader_revisions() {
         let (mut analysis, _) = Analysis::new_for_test();
+        let root = analysis.db.files().try_add_root(
+            &analysis.db,
+            SystemPath::new("/source-project"),
+            FileRootKind::Project,
+        );
+        assert_eq!(
+            root.kind_at_time_of_creation(&analysis.db),
+            FileRootKind::Project
+        );
         let mut fixture = Fixture::new(&mut analysis.db);
-        let file = fixture.add_file(&mut analysis.db, "target.bzl", "value = 1\n");
+        let file = fixture.add_file(
+            &mut analysis.db,
+            "/source-project/target.bzl",
+            "value = 1\n",
+        );
         let others: Vec<_> = (0..1024)
-            .map(|index| fixture.add_file(&mut analysis.db, format!("other_{index}.bzl"), ""))
+            .map(|index| {
+                fixture.add_file(
+                    &mut analysis.db,
+                    format!("/source-project/other_{index}.bzl"),
+                    "value = 1\n",
+                )
+            })
             .collect();
         // The first construction must occur inside the query that reads the loader revision.
         let original = {
@@ -713,7 +735,8 @@ mod tests {
         for files in others.chunks(128) {
             analysis.invalidate_loads();
             for file in files {
-                loaded_program_file(&analysis.db, file.source);
+                let program = loaded_program_file(&analysis.db, file.source);
+                ty_python_core::semantic_index(&analysis.db, program);
             }
         }
         {

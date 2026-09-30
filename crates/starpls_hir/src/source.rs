@@ -73,31 +73,42 @@ struct SourceInfo {
 }
 
 fn source_info(db: &dyn Db, file: File) -> &SourceInfo {
-    source_info_query(db, file.source, (file.dialect, file.info))
+    match file.annotation_mode(db) {
+        starpls_syntax::AnnotationMode::Disabled => source_info_disabled(db, file.source),
+        starpls_syntax::AnnotationMode::Source => source_info_source(db, file.source),
+        starpls_syntax::AnnotationMode::Interface => source_info_interface(db, file.source),
+    }
+}
+
+// Keep source metadata on the same stable File keys as syntax metadata.
+#[salsa::tracked(returns(ref))]
+fn source_info_disabled(db: &dyn Db, source: ruff_db::files::File) -> SourceInfo {
+    source_info_impl(db, source, starpls_syntax::AnnotationMode::Disabled)
 }
 
 #[salsa::tracked(returns(ref))]
-fn source_info_query(
+fn source_info_source(db: &dyn Db, source: ruff_db::files::File) -> SourceInfo {
+    source_info_impl(db, source, starpls_syntax::AnnotationMode::Source)
+}
+
+#[salsa::tracked(returns(ref))]
+fn source_info_interface(db: &dyn Db, source: ruff_db::files::File) -> SourceInfo {
+    source_info_impl(db, source, starpls_syntax::AnnotationMode::Interface)
+}
+
+fn source_info_impl(
     db: &dyn Db,
-    source: ruff_db::files::File,
-    context: (starpls_common::Dialect, Option<starpls_common::FileInfo>),
+    file: ruff_db::files::File,
+    mode: starpls_syntax::AnnotationMode,
 ) -> SourceInfo {
-    let (dialect, info) = context;
-    let file = File {
-        source,
-        dialect,
-        info,
-    };
-    let source = file.contents(db);
+    let source = ruff_db::source::source_text(db, file);
     let parsed = starpls_common::parsed_module(db, file).load(db);
+    let syntax = starpls_common::syntax_info_for_mode(db, file, mode);
     let mut visitor = SourceVisitor {
         source: &source,
         tokens: parsed.tokens(),
-        comments: starpls_common::syntax_info(db, file),
-        excluded: starpls_common::syntax_exclusions(db, file)
-            .iter()
-            .copied()
-            .collect(),
+        comments: &syntax.comments,
+        excluded: syntax.excluded.iter().copied().collect(),
         info: SourceInfo {
             annotations: FxHashMap::default(),
             loads: FxHashMap::default(),
