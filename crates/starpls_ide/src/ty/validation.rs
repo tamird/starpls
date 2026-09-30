@@ -4278,6 +4278,87 @@ def forward(**kwargs: Unpack[_Keywords]) -> None: ...
                 assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}");
             }
         }
+
+        for (left, right, result, expected) in [
+            ("str", "str", "str", None),
+            ("str", "select[str]", "select[str]", None),
+            ("select[str]", "str", "select[str]", None),
+            ("select[str]", "select[str]", "select[str]", None),
+            ("str", "str | select[str]", "str | select[str]", None),
+            ("str", "select[str | None]", "select[str | None]", None),
+            ("select[str | None]", "str", "select[str | None]", None),
+            (
+                "select[str]",
+                "select[str | None]",
+                "select[str | None]",
+                None,
+            ),
+            (
+                "select[str | None]",
+                "select[str]",
+                "select[str | None]",
+                None,
+            ),
+            ("str", "select[Literal['x']]", "select[str]", None),
+            ("select[Literal['x']]", "str", "select[str]", None),
+            (
+                "str",
+                "select[str | None]",
+                "select[str]",
+                Some("invalid-return-type"),
+            ),
+            (
+                "select[str | None]",
+                "str",
+                "select[str]",
+                Some("invalid-return-type"),
+            ),
+            (
+                "str",
+                "select[Literal['x']]",
+                "select[Literal['x']]",
+                Some("invalid-return-type"),
+            ),
+            (
+                "select[Literal['x']]",
+                "str",
+                "select[Literal['x']]",
+                Some("invalid-return-type"),
+            ),
+            ("str", "select[str]", "int", Some("invalid-return-type")),
+            ("str", "int", "object", Some("unsupported-operator")),
+            ("str", "select[int]", "object", Some("unsupported-operator")),
+            ("str", "object", "object", Some("unsupported-operator")),
+            ("str", "Any", "object", Some("incomplete-stub-validation")),
+        ] {
+            let source = "def add(left, right):\n    return left + right\n";
+            let stub = format!("def add(left: {left}, right: {right}) -> {result}: ...\n");
+            let diagnostics = validate(source, &stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{stub}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}");
+            }
+        }
+        for (expression, expected) in [
+            ("value.__radd__('x')", None),
+            ("'x' + value", Some("unsupported-operator")),
+        ] {
+            let source = format!("def _radd(*args):\n    return 'x'\ndef add():\n    value = struct(__radd__=_radd)\n    return {expression}\n");
+            let stub = "def _radd(*args: object) -> str: ...\ndef add() -> str: ...\n";
+            let diagnostics = validate(&source, stub);
+            if let Some(expected) = expected {
+                assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{source}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
     }
 
     #[test]

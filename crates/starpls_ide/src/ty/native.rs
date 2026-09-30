@@ -723,7 +723,6 @@ fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
     for (methods, signatures) in [
         (["__add__", "__radd__"], &[
             ("_starpls_builtins.int", "_starpls_builtins.int", "_starpls_builtins.int"),
-            ("_starpls_builtins.str", "_starpls_builtins.str", "_starpls_builtins.str"),
             ("_starpls_typing.Sequence[_SelectLeft]", "_starpls_typing.Sequence[_SelectRight]", "_starpls_builtins.list[_SelectLeft | _SelectRight]"),
         ][..]),
         (["__or__", "__ror__"], &[
@@ -735,6 +734,17 @@ fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
                 writeln!(output, "        @_starpls_typing.overload")?;
                 writeln!(output, "        @_starpls_typing.type_check_only")?;
                 writeln!(output, "        def {method}(self: _starpls_types.select[None], other: None | _starpls_types.select[None], /) -> _starpls_types.select[None]: ...")?;
+                // A plain string preserves only the receiver's possible default marker.
+                // Keep selector operands separate because they can introduce another marker.
+                for (receiver, operand, result) in [
+                    ("_starpls_builtins.str | None", "_starpls_builtins.str", "_starpls_builtins.str | _SelectValue"),
+                    ("_starpls_builtins.str", "_starpls_types.select[_starpls_builtins.str]", "_starpls_builtins.str"),
+                    ("_starpls_builtins.str | None", "_starpls_types.select[_starpls_builtins.str | None]", "_starpls_builtins.str | None"),
+                ] {
+                    writeln!(output, "        @_starpls_typing.overload")?;
+                    writeln!(output, "        @_starpls_typing.type_check_only")?;
+                    writeln!(output, "        def {method}(self: _starpls_types.select[{receiver}], other: {operand}, /) -> _starpls_types.select[{result}]: ...")?;
+                }
             }
             for nullable in ["", " | None"] {
                 for (receiver, operand, result) in signatures {
