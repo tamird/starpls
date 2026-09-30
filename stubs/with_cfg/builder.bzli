@@ -16,4 +16,43 @@ def _reset_on_attrs(
     mutable_has_been_built: list[bool],
 ) -> _Builder: ...
 
+@overload
 def _clone_value_deeply[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...
+
+# Parsed select values also include dictionaries, which pass through unchanged.
+@overload
+def _clone_value_deeply(
+    value: (
+        str | bool | int | None | Label
+        | list[str | bool | int | None | Label]
+        | dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label | list[str | bool | int | None | Label],
+        ]
+        | dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label
+            | list[str | bool | int | None | Label]
+            | dict[
+                str | bool | int | None | Label,
+                str | bool | int | None | Label | list[str | bool | int | None | Label],
+            ],
+        ]
+    ),
+) -> (
+    str | bool | int | None | Label
+    | list[str | bool | int | None | Label]
+    | dict[
+        str | bool | int | None | Label,
+        str | bool | int | None | Label | list[str | bool | int | None | Label],
+    ]
+    | dict[
+        str | bool | int | None | Label,
+        str | bool | int | None | Label
+        | list[str | bool | int | None | Label]
+        | dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label | list[str | bool | int | None | Label],
+        ],
+    ]
+): ...
