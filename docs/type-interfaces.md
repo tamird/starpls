@@ -24,6 +24,24 @@ when present and source inference otherwise. Annotations are resolved in the
 stub's scope. Stubs are trusted contracts; implementation validation is a
 separate check.
 
+### Overloaded functions
+
+Use `@overload` on consecutive declarations with the same name to describe
+multiple call signatures. `overload` is available in the annotation namespace:
+
+```starlark
+@overload
+def identity(value: int) -> int: ...
+
+@overload
+def identity(value: str) -> str: ...
+```
+
+Calls use the complete overload family. Each declaration has its own parameter
+and result annotations and may declare type parameters. Overload families must
+contain at least two declarations. Ty checks the declarations and resolves calls
+using its ordinary overload rules.
+
 ### Shared declarations
 
 Stub loads accept `.bzl` and `.bzli` labels. For example, `shared.bzli` can
@@ -255,10 +273,17 @@ def identity(value):
 
 The type parameters retain their declaration scope, and each call specializes
 them independently. Generic contracts with missing stub annotations or source
-annotations produce an incomplete result, as do overloaded and conflicting
-function contracts. `--ignore_pattern` selects implementation
-files and reexported bodies to exclude. Callers use the trusted stub contracts
-independently of validation results.
+annotations produce an incomplete result, as do conflicting function contracts.
+`--ignore_pattern` selects implementation files and reexported bodies to exclude.
+Callers use the trusted stub contracts independently of validation results.
+
+For an overloaded function, validation checks the implementation independently
+against every declaration. Each pass checks the body, the source defaults, and
+parameter compatibility using that declaration's annotations and type parameter
+scope. Every pass must succeed. Calls to the function, including recursive calls
+and calls through loads, use the complete overload family throughout validation.
+Distinct stub functions claiming the same implementation remain conflicting
+contracts.
 
 Equivalent function signatures may include `Any` when their other type
 components are fully known. Ordinary inferred return types must establish the

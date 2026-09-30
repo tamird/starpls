@@ -82,6 +82,37 @@ struct Contract {
     name: Name,
     range: TextRange,
     provider: Option<ProviderContract>,
+    cases: Vec<Function>,
+}
+
+pub(super) fn function_contract<'db>(
+    db: &'db Database,
+    definition: Definition<'db>,
+) -> Option<ty_python_semantic::types::FunctionType<'db>> {
+    let DefinitionKind::Function(function) = definition.kind(db) else {
+        return None;
+    };
+    let &(file, owner) = db
+        .environment()
+        .stub_validation(db)
+        .function_contracts
+        .get(&(definition.file(db), function.node_key().index()))?;
+    let program = db.starlark_program_file(file);
+    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
+    let ruff_python_ast::AnyRootNodeRef::Stmt(Stmt::FunctionDef(function)) =
+        parsed.get_by_index(owner)
+    else {
+        return None;
+    };
+    let [definition] = semantic_index(db, program).definitions(function) else {
+        return None;
+    };
+    let Type::FunctionLiteral(function) =
+        SemanticModel::new(db, program).definition_type(*definition)
+    else {
+        return None;
+    };
+    Some(function)
 }
 
 pub(super) fn annotation(
@@ -193,223 +224,278 @@ impl Analysis {
                     }
                 }
             }
-            for (&source, owner) in &mut owners {
-                if let Ok(stub) = *owner {
-                    let provider = contracts
-                        .iter()
-                        .find(|contract| contract.source == source && contract.stub == stub)
-                        .and_then(|contract| contract.provider.as_ref());
-                    if let Err(reason) = annotations(db, source, stub, provider, &mut validation) {
-                        *owner = Err(reason);
-                    }
-                }
-            }
-            for contract in &contracts {
-                let Contract {
-                    source,
-                    stub,
-                    name,
-                    range,
-                    provider: _,
-                } = contract;
-                reports.entry(source.file).or_default();
-                if let Err(reason) = owners[source] {
-                    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
-                    if let Err(ContractError::Incompatible(message)) = compare_function(
-                        db,
-                        source.file,
-                        name,
-                        model.definition_type(function_definition(db, *source)),
-                        model.definition_type(function_definition(db, *stub)),
-                    ) {
-                        report(&mut reports, source.file, *range, false, message);
-                    }
-                    report(
-                        &mut reports,
-                        source.file,
-                        *range,
-                        true,
-                        format!("Cannot validate `{name}`: {reason}"),
-                    );
-                }
-            }
-            for value in &mut values {
-                value.initializer_checked = value_annotation(db, value, &mut validation).is_some();
-            }
             validation
                 .files
                 .extend(contracts.iter().map(|contract| contract.source.file.source));
-            environment.set_stub_validation(db).to(validation.clone());
-            // Infer exported values from source with the borrowed signatures installed.
-            // Keeping redirection disabled here avoids proving a reexport against itself.
-            for value in values {
-                let ValueContract {
-                    source,
-                    stub,
-                    name,
-                    range,
-                    initializer_checked,
-                } = value;
-                if initializer_checked {
-                    // Ordinary assignment diagnostics check the initializer. Its contextual
-                    // binding type would only repeat the borrowed contract here.
-                    continue;
-                }
-                let actual = ProvidedBindingValue::Export {
-                    file: db.starlark_program_file(source),
-                    name: name.clone(),
-                }
-                .resolve_type(db);
-                let expected = ProvidedBindingValue::Export {
-                    file: db.starlark_program_file(stub),
-                    name: name.clone(),
-                }
-                .resolve_type(db);
-                if let (Some(actual), Some(expected)) = (actual, expected) {
-                    let environment = ty_python_semantic::ProgramEnvironment::from_file(
-                        db.starlark_program_file(stub),
-                    );
-                    let result = if matches!(expected, Type::ClassLiteral(_))
-                        && super::interface::provider_definition(db, expected, &environment)
-                            .is_some()
-                    {
-                        compare_provider(db, source, stub, &name, actual, expected, None)
-                    } else if matches!(actual, Type::NominalInstance(_))
-                        && actual.provided_data(db, &environment).is_some_and(|data| {
-                            data.downcast_ref::<super::factory::ProviderData>()
-                                .is_some()
-                        })
-                    {
-                        let origin =
-                            super::interface::provider_implementation(db, source, expected);
-                        let data = actual
-                            .provided_data(db, &environment)
-                            .and_then(|data| data.downcast_ref::<super::factory::ProviderData>())
-                            .expect("provider instance metadata checked above");
-                        if origin.is_some_and(|(_, origin)| origin == data.origin) {
-                            Err(ContractError::Incomplete(format!("Cannot prove `{name}`: original provider instances do not retain field-value evidence")))
-                        } else {
-                            compare(db, stub, &name, actual, expected)
+            let mut checked_reports = Reports::default();
+            let case_count = contracts
+                .iter()
+                .map(|contract| contract.cases.len())
+                .max()
+                .unwrap_or(1);
+            for case in 0..case_count {
+                // Discovery and exported values are invariant across cases. Only functions
+                // with another declaration need new body proofs. Ty checks their whole files
+                // again so ordinary diagnostics and suppressed obligations remain covered.
+                let mut case_owners = owners.clone();
+                validation.phase = StubValidationPhase::Ordinary;
+                for (&source, owner) in &mut case_owners {
+                    if let Ok(stub) = *owner {
+                        let contract = contracts
+                            .iter()
+                            .find(|contract| contract.source == source && contract.stub == stub)
+                            .expect("owners come from discovered contracts");
+                        let Some(&declaration) = contract.cases.get(case) else {
+                            continue;
+                        };
+                        if let Err(reason) = annotations(
+                            db,
+                            source,
+                            declaration,
+                            contract.provider.as_ref(),
+                            &mut validation,
+                        ) {
+                            *owner = Err(reason);
+                        } else if contract.cases.len() > 1 {
+                            if let (Some(source_owner), Some(stub_owner)) =
+                                (function_owner(db, source), function_owner(db, stub))
+                            {
+                                validation.function_contracts.insert(
+                                    (source.file.source, source_owner),
+                                    (stub.file, stub_owner),
+                                );
+                            } else {
+                                *owner = Err("function source is unavailable");
+                            }
                         }
-                    } else if actual.provided_data(db, &environment).is_some_and(|data| {
-                        data.downcast_ref::<super::factory::ProviderData>()
-                            .is_some()
-                    }) {
-                        match callable_signature(db, &environment, expected) {
+                    }
+                }
+                for contract in &contracts {
+                    let Contract {
+                        source,
+                        stub,
+                        name,
+                        range,
+                        provider: _,
+                        cases: _,
+                    } = contract;
+                    if contract.cases.get(case).is_none() {
+                        continue;
+                    }
+                    reports.entry(source.file).or_default();
+                    if let Err(reason) = case_owners[source] {
+                        let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+                        if let Err(ContractError::Incompatible(message)) = compare_function(
+                            db,
+                            source.file,
+                            name,
+                            model.definition_type(function_definition(db, *source)),
+                            model.definition_type(function_definition(db, *stub)),
+                        ) {
+                            report(&mut reports, source.file, *range, false, message);
+                        }
+                        report(
+                            &mut reports,
+                            source.file,
+                            *range,
+                            true,
+                            format!("Cannot validate `{name}`: {reason}"),
+                        );
+                    }
+                }
+                if case == 0 {
+                    for value in &mut values {
+                        value.initializer_checked =
+                            value_annotation(db, value, &mut validation).is_some();
+                    }
+                }
+                environment.set_stub_validation(db).to(validation.clone());
+                // Infer exported values from source with the borrowed signatures installed.
+                // Keeping redirection disabled here avoids proving a reexport against itself.
+                if case == 0 {
+                    for value in values.drain(..) {
+                        let ValueContract {
+                            source,
+                            stub,
+                            name,
+                            range,
+                            initializer_checked,
+                        } = value;
+                        if initializer_checked {
+                            // Ordinary assignment diagnostics check the initializer. Its contextual
+                            // binding type would only repeat the borrowed contract here.
+                            continue;
+                        }
+                        let actual = ProvidedBindingValue::Export {
+                            file: db.starlark_program_file(source),
+                            name: name.clone(),
+                        }
+                        .resolve_type(db);
+                        let expected = ProvidedBindingValue::Export {
+                            file: db.starlark_program_file(stub),
+                            name: name.clone(),
+                        }
+                        .resolve_type(db);
+                        if let (Some(actual), Some(expected)) = (actual, expected) {
+                            let environment = ty_python_semantic::ProgramEnvironment::from_file(
+                                db.starlark_program_file(stub),
+                            );
+                            let result = if matches!(expected, Type::ClassLiteral(_))
+                                && super::interface::provider_definition(db, expected, &environment)
+                                    .is_some()
+                            {
+                                compare_provider(db, source, stub, &name, actual, expected, None)
+                            } else if matches!(actual, Type::NominalInstance(_))
+                                && actual.provided_data(db, &environment).is_some_and(|data| {
+                                    data.downcast_ref::<super::factory::ProviderData>()
+                                        .is_some()
+                                })
+                            {
+                                let origin =
+                                    super::interface::provider_implementation(db, source, expected);
+                                let data = actual
+                                    .provided_data(db, &environment)
+                                    .and_then(|data| {
+                                        data.downcast_ref::<super::factory::ProviderData>()
+                                    })
+                                    .expect("provider instance metadata checked above");
+                                if origin.is_some_and(|(_, origin)| origin == data.origin) {
+                                    Err(ContractError::Incomplete(format!("Cannot prove `{name}`: original provider instances do not retain field-value evidence")))
+                                } else {
+                                    compare(db, stub, &name, actual, expected)
+                                }
+                            } else if actual.provided_data(db, &environment).is_some_and(|data| {
+                                data.downcast_ref::<super::factory::ProviderData>()
+                                    .is_some()
+                            }) {
+                                match callable_signature(db, &environment, expected) {
                             Some(signature) => compare_provider(db, source, stub, &name, actual, signature.return_type(), Some(signature)),
                             None => Err(ContractError::Incomplete(format!("Cannot validate `{name}`: raw constructor has no single callable contract"))),
                         }
-                    } else {
-                        compare(db, stub, &name, actual, expected)
-                    };
-                    if let Err(error) = result {
-                        let error = if ty_python_semantic::types::any_over_type(
-                            db,
-                            &environment,
-                            expected,
-                            expected.is_fully_static(db, &environment),
-                            |ty| matches!(ty, Type::TypedDict(_)),
-                        ) {
-                            ContractError::Incomplete(format!(
+                            } else {
+                                compare(db, stub, &name, actual, expected)
+                            };
+                            if let Err(error) = result {
+                                let error = if ty_python_semantic::types::any_over_type(
+                                    db,
+                                    &environment,
+                                    expected,
+                                    expected.is_fully_static(db, &environment),
+                                    |ty| matches!(ty, Type::TypedDict(_)),
+                                ) {
+                                    ContractError::Incomplete(format!(
                                 "Cannot prove `{name}`: inferred type `{}` does not establish the dictionary fields of `{}`",
                                 actual.display(db, &environment),
                                 expected.display(db, &environment),
                             ))
-                        } else {
-                            error
-                        };
-                        error.report(&mut reports, stub, range);
-                    }
-                } else {
-                    report(
-                        &mut reports,
-                        stub,
-                        range,
-                        true,
-                        format!("Cannot resolve the contract for `{name}`"),
-                    );
-                }
-            }
-            environment.set_type_interfaces(db).to(interfaces.clone());
-            let mut body_checks = Vec::new();
-            for contract in contracts {
-                let Contract {
-                    source,
-                    stub,
-                    name,
-                    range,
-                    provider,
-                } = contract;
-                if owners[&source].is_err() {
-                    continue;
-                }
-                let model = SemanticModel::new(db, db.starlark_program_file(source.file));
-                let actual = model.definition_type(function_definition(db, source));
-                let expected = model.definition_type(function_definition(db, stub));
-                let result = if let Some(ProviderContract {
-                    stub: file,
-                    class,
-                    allowed_fields: _,
-                }) = provider
-                {
-                    let result = compare_initializer(db, source, stub, &name, file, class);
-                    if result.is_ok()
-                        && !model
-                            .function_inference_facts(function_definition(db, source))
-                            .expect("provider initializers originate in a function declaration")
-                            .has_errors
-                    {
-                        body_checks.push((source, name.clone(), range));
-                    }
-                    result
-                } else {
-                    let result = compare_function(db, source.file, &name, actual, expected);
-                    if result.is_ok() {
-                        let facts @ FunctionInferenceFacts {
-                            return_type_correspondence,
-                            has_cycle_recovery,
-                            has_errors,
-                            has_checking_failures,
-                            has_unproved_requirements,
-                        } = model
-                            .function_inference_facts(function_definition(db, source))
-                            .expect("function contracts originate in a function declaration");
-                        if !has_errors {
-                            if has_cycle_recovery
-                                || has_checking_failures
-                                || has_unproved_requirements
-                                || return_type_correspondence != Some(true)
-                            {
-                                ContractError::Incomplete(format!(
-                                    "Cannot prove `{name}`: {}",
-                                    inference_failure_reasons(facts, true)
-                                ))
-                                .report(
-                                    &mut reports,
-                                    source.file,
-                                    range,
-                                );
-                            } else {
-                                body_checks.push((source, name.clone(), range));
+                                } else {
+                                    error
+                                };
+                                error.report(&mut reports, stub, range);
                             }
+                        } else {
+                            report(
+                                &mut reports,
+                                stub,
+                                range,
+                                true,
+                                format!("Cannot resolve the contract for `{name}`"),
+                            );
                         }
                     }
-                    result
-                };
-                if let Err(error) = result {
-                    error.report(&mut reports, source.file, range);
+                    environment.set_type_interfaces(db).to(interfaces.clone());
                 }
-            }
-            validation.phase = StubValidationPhase::Conservative;
-            environment.set_stub_validation(db).to(validation.clone());
-            for (source, name, range) in body_checks {
-                if let Err(error) = compare_function_body(db, source, &name) {
-                    error.report(&mut reports, source.file, range);
+                let mut body_checks = Vec::new();
+                for contract in &contracts {
+                    let Contract {
+                        source,
+                        stub: _,
+                        name,
+                        range,
+                        provider,
+                        cases,
+                    } = contract;
+                    let (source, range) = (*source, *range);
+                    let Some(&declaration) = cases.get(case) else {
+                        continue;
+                    };
+                    if case_owners[&source].is_err() {
+                        continue;
+                    }
+                    let model = SemanticModel::new(db, db.starlark_program_file(source.file));
+                    let stub = declaration;
+                    let (actual, expected) = if cases.len() > 1 {
+                        (declaration_type(db, source), declaration_type(db, stub))
+                    } else {
+                        (
+                            model.definition_type(function_definition(db, source)),
+                            model.definition_type(function_definition(db, stub)),
+                        )
+                    };
+                    let result = if let Some(ProviderContract {
+                        stub: file,
+                        class,
+                        allowed_fields: _,
+                    }) = provider.clone()
+                    {
+                        let result = compare_initializer(db, source, stub, name, file, class);
+                        if result.is_ok()
+                            && !model
+                                .function_inference_facts(function_definition(db, source))
+                                .expect("provider initializers originate in a function declaration")
+                                .has_errors
+                        {
+                            body_checks.push((source, name.clone(), range));
+                        }
+                        result
+                    } else {
+                        let result = compare_function(db, source.file, name, actual, expected);
+                        if result.is_ok() {
+                            let facts @ FunctionInferenceFacts {
+                                return_type_correspondence,
+                                has_cycle_recovery,
+                                has_errors,
+                                has_checking_failures,
+                                has_unproved_requirements,
+                            } = model
+                                .function_inference_facts(function_definition(db, source))
+                                .expect("function contracts originate in a function declaration");
+                            if !has_errors {
+                                if has_cycle_recovery
+                                    || has_checking_failures
+                                    || has_unproved_requirements
+                                    || return_type_correspondence != Some(true)
+                                {
+                                    ContractError::Incomplete(format!(
+                                        "Cannot prove `{name}`: {}",
+                                        inference_failure_reasons(facts, true)
+                                    ))
+                                    .report(
+                                        &mut reports,
+                                        source.file,
+                                        range,
+                                    );
+                                } else {
+                                    body_checks.push((source, name.clone(), range));
+                                }
+                            }
+                        }
+                        result
+                    };
+                    if let Err(error) = result {
+                        error.report(&mut reports, source.file, range);
+                    }
                 }
-            }
-            validation.phase = StubValidationPhase::Ordinary;
-            environment.set_stub_validation(db).to(validation);
-            let mut reports: Vec<_> = reports
+                validation.phase = StubValidationPhase::Conservative;
+                environment.set_stub_validation(db).to(validation.clone());
+                for (source, name, range) in body_checks {
+                    if let Err(error) = compare_function_body(db, source, &name) {
+                        error.report(&mut reports, source.file, range);
+                    }
+                }
+                validation.phase = StubValidationPhase::Ordinary;
+                environment.set_stub_validation(db).to(validation.clone());
+                let case_reports: Vec<_> = std::mem::take(&mut reports)
                 .into_iter()
                 .map(|(file, diagnostics)| {
                     let mut checked: Vec<_> = starpls_hir::diagnostics_for_file(db, file)
@@ -445,6 +531,23 @@ impl Analysis {
                     (file, checked)
                 })
                 .collect();
+                for (file, diagnostics) in case_reports {
+                    let existing = checked_reports.entry(file).or_default();
+                    for diagnostic in diagnostics {
+                        if case == 0
+                            || !existing.iter().any(|previous| {
+                                previous.id() == diagnostic.id()
+                                    && previous.primary_span() == diagnostic.primary_span()
+                                    && previous.concise_message().to_string()
+                                        == diagnostic.concise_message().to_string()
+                            })
+                        {
+                            existing.push(diagnostic);
+                        }
+                    }
+                }
+            }
+            let mut reports: Vec<_> = checked_reports.into_iter().collect();
             reports.sort_by(|(left, _), (right, _)| left.path(db).cmp(right.path(db)));
             reports
         }));
@@ -593,12 +696,30 @@ fn discover(
             }
             let parsed =
                 ruff_db::parsed::parsed_module(db, source_definition.python_file(db)).load(db);
+            let cases = match expected {
+                Type::FunctionLiteral(function_type) => function_type
+                    .iter_overloads_and_implementation(db)
+                    .map(|declaration| function(db, declaration.definition(db)))
+                    .collect::<Option<Vec<_>>>(),
+                _ => Some(vec![stub_function]),
+            };
+            let Some(cases) = cases else {
+                report(
+                    reports,
+                    stub,
+                    range,
+                    true,
+                    format!("Cannot validate `{name}`: an overload source is unavailable"),
+                );
+                continue;
+            };
             contracts.push(Contract {
                 source: source_function,
                 stub: stub_function,
                 name: name.clone(),
                 range: source_definition.kind(db).target_range(&parsed),
                 provider: None,
+                cases,
             });
         } else {
             values.push(ValueContract {
@@ -869,6 +990,7 @@ fn provider_initializer(
             class: class_node.node_index().load(),
             allowed_fields: allowed,
         }),
+        cases: vec![constructor],
     }))
 }
 
@@ -889,6 +1011,26 @@ fn function_definition(db: &Database, function: Function) -> Definition<'_> {
         unreachable!("a function syntax node has one definition")
     };
     *definition
+}
+
+fn function_owner(db: &Database, function: Function) -> Option<NodeIndex> {
+    let DefinitionKind::Function(function) = function_definition(db, function).kind(db) else {
+        return None;
+    };
+    Some(function.node_key().index())
+}
+
+fn declaration_type<'db>(db: &'db Database, function: Function) -> Type<'db> {
+    let definition = function_definition(db, function);
+    let model = SemanticModel::new(db, definition.program_file(db));
+    let Type::FunctionLiteral(function) = model.definition_type(definition) else {
+        return Type::unknown();
+    };
+    function
+        .iter_overloads_and_implementation(db)
+        .find(|declaration| declaration.definition(db) == definition)
+        .map(|declaration| Type::single_callable(db, declaration.signature(db)))
+        .unwrap_or_else(Type::unknown)
 }
 
 pub(super) fn provider_return_type<'db>(
@@ -972,9 +1114,20 @@ fn annotations(
     let stub_parsed = ruff_db::parsed::parsed_module(db, stub_definition.python_file(db)).load(db);
     let source_node = source_kind.node(&source_parsed);
     let stub_node = stub_kind.node(&stub_parsed);
+    let stub_overload = if let Type::FunctionLiteral(function) =
+        SemanticModel::new(db, stub_definition.program_file(db)).definition_type(stub_definition)
+    {
+        function
+            .iter_overloads_and_implementation(db)
+            .any(|declaration| {
+                declaration.definition(db) == stub_definition && declaration.is_overload(db)
+            })
+    } else {
+        false
+    };
     if source_node.type_params.is_some()
         || source_kind.has_decorators()
-        || stub_kind.has_decorators()
+        || (stub_kind.has_decorators() && !(stub_overload && stub_node.decorator_list.len() == 1))
     {
         return Err("generic or decorated functions require a dedicated implementation contract");
     }
@@ -1962,6 +2115,206 @@ mod tests {
             .into_iter()
             .flat_map(|(_, diagnostics)| diagnostics)
             .collect()
+    }
+
+    #[test]
+    fn overload_contracts_check_every_body_case() {
+        for (first, second) in [("int", "str"), ("str", "int")] {
+            let stub = format!("@overload\ndef copy(value: {first}) -> {first}: ...\n@overload\ndef copy(value: {second}) -> {second}: ...\n");
+            assert_eq!(
+                validate("def copy(value): return value\n", &stub),
+                Vec::<String>::new()
+            );
+            let diagnostics = validation_diagnostics("def copy(value): return 1\n", &stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
+                "{diagnostics:#?}"
+            );
+            let diagnostics = validation_diagnostics(
+                "def copy(value): return 1 # ty: ignore[invalid-return-type]\n",
+                &stub,
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id().as_str() == "incomplete-stub-validation"),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overload_contracts_preserve_local_caller_family() {
+        let stub = "@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: str) -> str: ...\ndef helper() -> str: ...\n";
+        for source in [
+            "def copy(value): return value\ndef helper(): return copy('ok')\n",
+            "def copy(value):\n    if type(value) == 'int':\n        copy('ok')\n    return value\ndef helper(): return copy('ok')\n",
+        ] {
+            let diagnostics = validation_diagnostics(source, stub);
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn overload_contracts_preserve_loaded_caller_family() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let helper = fixture.add_file(
+            &mut analysis.db,
+            "helper.bzl",
+            "def copy(value): return value\n",
+        );
+        let helper_stub = fixture.add_file(&mut analysis.db, "helper.bzli", "@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: str) -> str: ...\n");
+        let caller = fixture.add_file(
+            &mut analysis.db,
+            "caller.bzl",
+            "load('helper.bzl', 'copy')\ndef caller(value): return copy(value)\n",
+        );
+        let caller_stub = fixture.add_file(
+            &mut analysis.db,
+            "caller.bzli",
+            "def caller(value: str) -> str: ...\n",
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_type_interfaces([(helper, helper_stub), (caller, caller_stub)])
+            .unwrap();
+        for body in ["return copy(value)", "copy(value)\n    return 'ok'"] {
+            analysis.update_file(
+                caller,
+                format!("load('helper.bzl', 'copy')\ndef caller(value):\n    {body}\n"),
+            );
+            for (annotation, rejected) in [
+                ("str", false),
+                ("tuple[()]", true),
+                ("Any", true),
+                ("str", false),
+            ] {
+                analysis.update_file(
+                    caller_stub,
+                    format!("def caller(value: {annotation}) -> str: ...\n"),
+                );
+                let reports = analysis.validate_stubs(|_| true).unwrap();
+                assert_eq!(
+                    reports
+                        .iter()
+                        .flat_map(|(_, diagnostics)| diagnostics)
+                        .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                    rejected,
+                    "{annotation}: {reports:#?}"
+                );
+            }
+        }
+        for parameter in ["bytes", "str"] {
+            analysis.update_file(helper_stub, format!("@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: {parameter}) -> {parameter}: ...\n"));
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            assert_eq!(
+                reports
+                    .iter()
+                    .flat_map(|(_, diagnostics)| diagnostics)
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                parameter == "bytes",
+                "{parameter}: {reports:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overload_contracts_clone_finite_and_parser_domains() {
+        let scalar = "str | bool | int | None | Label";
+        let value = format!("{scalar} | list[{scalar}]");
+        let compound = format!("{value} | dict[{scalar}, {value}]");
+        let parsed = format!("{compound} | dict[{scalar}, {compound}]");
+        let stub = format!(
+            "def is_list(value: object) -> TypeIs[list[Any]]: ...\n\
+             @overload\n\
+             def copy[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...\n\
+             @overload\n\
+             def copy(value: {parsed}) -> {parsed}: ...\n"
+        );
+        let predicate =
+            "_LIST_TYPE = type([])\ndef is_list(value): return type(value) == _LIST_TYPE\n";
+        let source = "def copy(value):\n    if is_list(value):\n        return list(value)\n    return value\n";
+        let diagnostics = validation_diagnostics(&format!("{predicate}{source}"), &stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let append_int = "def copy(value):\n    if is_list(value):\n        result = list(value)\n        result.append(1)\n        return result\n    return value\n";
+        let finite_stub = "def is_list(value: object) -> TypeIs[list[Any]]: ...\ndef copy[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...\n";
+        for contract in [finite_stub, &stub] {
+            let diagnostics = validation_diagnostics(&format!("{predicate}{append_int}"), contract);
+            assert!(diagnostics.is_empty(), "{contract}: {diagnostics:#?}");
+        }
+        let narrow_stub = "def is_list(value: object) -> TypeIs[list[Any]]: ...\n@overload\ndef copy[T: (str, list[str])](value: T) -> T: ...\n@overload\ndef copy(value: int) -> int: ...\n";
+        let diagnostics = validation_diagnostics(&format!("{predicate}{append_int}"), narrow_stub);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error),
+            "{diagnostics:#?}"
+        );
+        for source in [
+            "def copy(value):\n    if is_list(value):\n        result = list(value)\n        result.append({})\n        return result\n    return value\n",
+            "def copy(value): return {'x': struct()}\n",
+            "def opaque() -> Any: return []\ndef copy(value): return opaque()\n",
+            "def opaque() -> Any: return []\ndef copy(value):\n    len(opaque())\n    return value\n",
+        ] {
+            let diagnostics = validation_diagnostics(&format!("{predicate}{source}"), &stub);
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.severity() == Severity::Error), "{source}: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn overload_contracts_reject_layout_defaults_and_alias_collisions() {
+        for (source, stub) in [
+            ("def copy(value): return value\n", "@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: str, extra: int) -> str: ...\n"),
+            ("def copy(value=1): return value\n", "@overload\ndef copy(value: int = ...) -> int: ...\n@overload\ndef copy(value: str = ...) -> str: ...\n"),
+            ("def copy(value): return value\nalias = copy\n", "@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: str) -> str: ...\ndef alias(value: bool) -> bool: ...\n"),
+            ("def copy(value): return value\n", "@overload\ndef copy(value: int) -> int: ...\n"),
+        ] {
+            let diagnostics = validation_diagnostics(source, stub);
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.severity() == Severity::Error), "{source}\n{stub}: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn overload_contracts_recheck_after_edits() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(
+            &mut analysis.db,
+            "source.bzl",
+            "def copy(value): return value\n",
+        );
+        let stub_text = "@overload\ndef copy(value: int) -> int: ...\n@overload\ndef copy(value: str) -> str: ...\n";
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", stub_text);
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+        let previous = analysis
+            .db
+            .environment()
+            .stub_validation(&analysis.db)
+            .clone();
+        for (text, rejected) in [
+            (stub_text.to_owned(), false),
+            (stub_text.replace("-> str", "-> int"), true),
+            (stub_text.to_owned(), false),
+        ] {
+            analysis.update_file(stub, text);
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            assert_eq!(
+                reports
+                    .iter()
+                    .flat_map(|(_, diagnostics)| diagnostics)
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                rejected,
+                "{reports:#?}"
+            );
+            assert_eq!(
+                analysis.db.environment().stub_validation(&analysis.db),
+                &previous
+            );
+        }
     }
 
     #[test]

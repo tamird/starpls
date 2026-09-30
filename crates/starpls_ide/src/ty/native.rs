@@ -32,6 +32,7 @@ pub(super) const TYPING_ANNOTATIONS: &[&str] = &[
     "NotRequired",
     "ReadOnly",
     "type_check_only",
+    "overload",
 ];
 
 pub(super) struct DeclarationSource {

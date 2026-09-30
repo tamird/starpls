@@ -483,6 +483,13 @@ impl ty_python_core::Db for Database {
 
 #[salsa::db]
 impl ty_python_semantic::Db for Database {
+    fn provided_function_contract<'db>(
+        &'db self,
+        definition: Definition<'db>,
+    ) -> Option<ty_python_semantic::types::FunctionType<'db>> {
+        validation::function_contract(self, definition)
+    }
+
     fn function_inference_mode(
         &self,
         scope: ty_python_core::scope::ScopeId<'_>,

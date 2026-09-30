@@ -283,12 +283,11 @@ impl Validator<'_> {
                 } = def;
                 let supported_decorators = match decorator_list.as_slice() {
                     [] => true,
-                    [decorator] => {
-                        self.in_interface_class
-                            && decorator.expression.as_name_expr().is_some_and(|name| {
-                                matches!(name.id.as_str(), "property" | "type_check_only")
-                            })
-                    }
+                    [decorator] => decorator.expression.as_name_expr().is_some_and(|name| {
+                        (self.annotation_mode == AnnotationMode::Interface && name.id == "overload")
+                            || (self.in_interface_class
+                                && matches!(name.id.as_str(), "property" | "type_check_only"))
+                    }),
                     _ => false,
                 };
                 if *is_async
@@ -774,6 +773,8 @@ mod tests {
             ("value: int = ...", true),
             ("def f(value, other: int = ...) -> string: ...", true),
             ("def f[T](value: T) -> T: ...", true),
+            ("@overload\ndef f(value: int) -> int: ...", true),
+            ("@overload()\ndef f(value: int) -> int: ...", false),
             ("def f():\n    \"Documentation\"\n    pass", true),
             (
                 "class Info:\n    value: str\n    def __init__(self, *, value: str) -> None: ...",

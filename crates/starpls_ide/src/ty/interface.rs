@@ -953,6 +953,15 @@ fn selected_function_import(db: &dyn Db, source: File, interface: File, name: Na
     let Some(interface_owner) = function_node(interface) else {
         return false;
     };
+    if db
+        .environment()
+        .stub_validation(db)
+        .function_contracts
+        .get(&(source.source, source_owner))
+        == Some(&(interface, interface_owner))
+    {
+        return true;
+    }
     super::validation::annotation(db, source.source, source_owner)
         == Some(ValidationAnnotation::Declaration {
             file: interface,
@@ -1086,6 +1095,7 @@ mod tests {
                 annotations: Default::default(),
                 provider_returns: Default::default(),
                 files: Default::default(),
+                function_contracts: Default::default(),
             };
             validation.files.extend([caller.source, annotation.source]);
             validation

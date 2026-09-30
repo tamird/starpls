@@ -57,11 +57,18 @@ pub trait Db: starpls_common::Db {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StubValidation {
     pub phase: StubValidationPhase,
-    pub annotations:
-        FxHashMap<ruff_db::files::File, FxHashMap<ruff_python_ast::NodeIndex, ValidationAnnotation>>,
+    pub annotations: FxHashMap<
+        ruff_db::files::File,
+        FxHashMap<ruff_python_ast::NodeIndex, ValidationAnnotation>,
+    >,
     pub provider_returns:
         FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
     pub files: FxHashSet<ruff_db::files::File>,
+    /// Complete caller signatures, separate from the declaration checking each body.
+    pub function_contracts: FxHashMap<
+        (ruff_db::files::File, ruff_python_ast::NodeIndex),
+        (File, ruff_python_ast::NodeIndex),
+    >,
 }
 
 /// The inference view active during synchronous implementation validation.
