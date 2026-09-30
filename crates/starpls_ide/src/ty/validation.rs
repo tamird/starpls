@@ -352,7 +352,16 @@ impl Analysis {
                     allowed_fields: _,
                 }) = provider
                 {
-                    compare_initializer(db, source, stub, &name, file, class)
+                    let result = compare_initializer(db, source, stub, &name, file, class);
+                    if result.is_ok()
+                        && !model
+                            .function_inference_facts(function_definition(db, source))
+                            .expect("provider initializers originate in a function declaration")
+                            .has_errors
+                    {
+                        body_checks.push((source, name.clone(), range));
+                    }
+                    result
                 } else {
                     let result = compare_function(db, source.file, &name, actual, expected);
                     if result.is_ok() {
@@ -1506,10 +1515,9 @@ fn selected_execution_scope(
                 .get(&source.source)
                 .and_then(|annotations| annotations.get(&owner)),
             Some(ValidationAnnotation::Declaration { file: _, owner: _ })
-        ) || (validation.phase == StubValidationPhase::Ordinary
-            && validation
-                .provider_returns
-                .contains_key(&(source.source, owner)))
+        ) || validation
+            .provider_returns
+            .contains_key(&(source.source, owner))
     };
     // Selected named implementations include their nested expression scopes.
     // Module initialization includes eager comprehensions. Owned inline defaults
@@ -1601,13 +1609,15 @@ fn selected_execution_scope(
 fn conservative_function(db: &Database, source: File, owner: NodeIndex) -> bool {
     let validation = db.environment().stub_validation(db);
     validation.phase == StubValidationPhase::Conservative
-        && matches!(
+        && (matches!(
             validation
                 .annotations
                 .get(&source.source)
                 .and_then(|annotations| annotations.get(&owner)),
             Some(ValidationAnnotation::Declaration { file: _, owner: _ })
-        )
+        ) || validation
+            .provider_returns
+            .contains_key(&(source.source, owner)))
 }
 
 /// Check default and provider expression evidence and reject unchecked nested definitions.
@@ -3988,6 +3998,20 @@ def raw(*, value: Callable[..., Any]) -> Info: ...
 
     #[test]
     fn provider_initializer_proof_tracks_gradual_evidence() {
+        for (result, expected) in [
+            ("str", &[] as &[&str]),
+            ("Literal['ok']", &["incomplete-stub-validation"]),
+        ] {
+            let helper =
+                "def _rewrite(values: dict[str, str]) -> None:\n    values['value'] = 'changed'\n";
+            let source = format!("{helper}def read(values):\n    values['value'] = 'ok'\n    _rewrite(values)\n    return values['value']\n");
+            let stub = format!("def read(values: dict[str, str]) -> {result}: ...\n");
+            assert_eq!(validate(&source, &stub), expected, "named {result}");
+
+            let source = format!("{helper}def _init(values):\n    values['value'] = 'ok'\n    _rewrite(values)\n    return {{'value': values['value']}}\nInfo, _ = provider(fields=['value'], init=_init)\n");
+            let stub = format!("class Info:\n    value: Final[{result}]\n    def __init__(self, values: dict[str, str]) -> None: ...\n");
+            assert_eq!(validate(&source, &stub), expected, "provider {result}");
+        }
         let stub = "class Info:\n    value: Final[list[int]]\n    def __init__(self, xs: list[int]) -> None: ...\n";
         for source in [
             "def _init(xs):\n    return {'value': xs}\nInfo, _ = provider(fields=['value'], init=_init)\n",
