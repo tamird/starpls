@@ -230,6 +230,8 @@ mod tests {
         for (kind, suppression) in [
             ("malformed", "# ty: ignore["),
             ("unknown", "# ty: ignore[nonexistent-rule]"),
+            ("type-malformed", "# type: ignore[ty:"),
+            ("type-unknown", "# type: ignore[ty:nonexistent-rule]"),
         ] {
             let mut checker = local_checker_with_options(
                 &format!("checker-suppression-{kind}"),

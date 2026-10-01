@@ -153,7 +153,10 @@ pub(crate) fn type_comment_body(p: &mut Parser) {
     match p.current() {
         T![ignore] => {
             let m = p.start();
-            p.bump(T![ignore]);
+            // Ty owns suppression codes and malformed-directive diagnostics.
+            while !p.at(EOF) {
+                p.bump_any();
+            }
             m.complete(p, IGNORE_TYPE);
         }
         T!['('] => {
