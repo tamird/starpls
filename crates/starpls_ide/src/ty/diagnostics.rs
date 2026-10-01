@@ -38,7 +38,6 @@ use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::unreachable_ranges;
 use ty_python_semantic::types::ide_support::unused_definitions;
 use ty_python_semantic::types::Type;
-use ty_python_semantic::types::TypeCheckResult;
 use ty_python_semantic::ProgramEnvironment;
 use ty_python_semantic::SemanticModel;
 
@@ -69,14 +68,6 @@ static DEPRECATED_ARGUMENT: LintMetadata = lint(
     "Reports deprecated arguments to Starlark builtins.",
 );
 
-pub(super) static INVALID_STUB_IMPLEMENTATION: LintMetadata = lint(
-    "invalid-stub-implementation",
-    "Reports implementations incompatible with their stubs.",
-);
-pub(super) static INCOMPLETE_STUB_VALIDATION: LintMetadata = lint(
-    "incomplete-stub-validation",
-    "Reports stub contracts that could not be proved.",
-);
 pub(super) static INVALID_BUILD_ANNOTATION: LintMetadata = lint(
     "invalid-build-annotation",
     "Reports BUILD annotations without a unique source assignment.",
@@ -95,8 +86,6 @@ pub(super) fn registry() -> &'static LintRegistry {
             &UNUSED_DEFINITION,
             &UNREACHABLE_CODE,
             &DEPRECATED_ARGUMENT,
-            &INVALID_STUB_IMPLEMENTATION,
-            &INCOMPLETE_STUB_VALIDATION,
             &INVALID_PROVIDER_INTERFACE,
             &INVALID_BUILD_ANNOTATION,
         ] {
@@ -132,28 +121,7 @@ pub(super) fn rules(use_code_flow_analysis: bool) -> RuleSelection {
     rules
 }
 
-pub(super) fn validation_rules() -> RuleSelection {
-    let mut rules = rules(true);
-    for name in [
-        "unsound-return-statement",
-        "unsound-assignment",
-        "invalid-stub-implementation",
-        "incomplete-stub-validation",
-    ] {
-        rules.enable(
-            registry().get(name).expect("validation lint is registered"),
-            Severity::Error,
-            LintSource::Default,
-        );
-    }
-    rules
-}
-
 pub(crate) fn check(db: &Database, file: File) -> Vec<Diagnostic> {
-    check_with_status(db, file).diagnostics
-}
-
-pub(super) fn check_with_status(db: &Database, file: File) -> TypeCheckResult {
     let mut diagnostics = Vec::new();
     let program_file = db.starlark_program_file(file);
     let parsed = ruff_db::parsed::parsed_module(db, program_file.python_file(db)).load(db);

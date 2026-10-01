@@ -153,15 +153,12 @@ workspace-relative file or subtree. Use `./vendor` to limit a single name to
 the workspace root. Patterns are literal names and paths; paths use lexical
 normalization and must stay within the workspace. These CLI exclusions
 apply to recursive discovery, explicit paths, `--files-from`, configured
-interface roots, and implementation validation, and appear in `excluded_inputs`.
-Excluded files can still be loaded as dependencies of selected files or used
-as contracts during validation. Validating a selected implementation can
-therefore report diagnostics in its excluded stub. Installed stub declarations
+interface roots, and appear in `excluded_inputs`. Excluded files can still
+be loaded as dependencies of selected files. Installed stub declarations
 remain available to callers.
 
 Checking resolves loads requested by the selected files and by inference of
-their dependencies. `--validate-stubs` also resolves loads requested by
-implementation validation. Generated dependency trees can contain many
+their dependencies. Generated dependency trees can contain many
 files whose exports selected analysis never needs; resolving loads on
 demand avoids their Bazel repository mapping queries. `--audit-loads`
 traverses the entire transitive load graph, including unused imports, and
@@ -241,13 +238,6 @@ Bazel workspace root; both files must exist and be readable. Duplicate source ma
 Names loaded from the mapped `.bzl` module use stub declarations when present and source
 inference otherwise. Stubs may load provider types for use in annotations. Function bodies
 use `...` or `pass`, and optional defaults use `= ...`.
-
-Validate the registered implementations with `starpls check --validate-stubs`.
-The check borrows missing function annotations from each stub, checks the body,
-and compares exported types. Errors distinguish incompatible implementations
-from contracts that cannot be proved, including dynamic types and unsupported
-parameter correspondence. `--ignore_pattern` excludes matching implementation
-files or directories. Caller checking continues to use the selected stubs.
 
 ## Experimental features
 

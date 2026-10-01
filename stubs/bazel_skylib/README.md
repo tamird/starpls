@@ -30,7 +30,6 @@ manifest = "@bazel_skylib_stubs//:stubs.toml"
 ```
 
 Starpls uses these declarations for loads from the public Skylib modules in
-batch checking and the language server. `starpls check --validate-stubs` also
-checks their implementations and reports contracts that cannot be proved.
+batch checking and the language server.
 
 Licensed under the [MIT license](LICENSE-MIT).

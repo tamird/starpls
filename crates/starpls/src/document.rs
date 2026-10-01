@@ -1801,9 +1801,18 @@ pub(crate) mod source_tests {
             );
         }
 
+        let caller = analysis
+            .open_document(
+                &workspace.join("caller.bzl"),
+                Dialect::Bazel,
+                None,
+                "load(':defs.bzl', 'read')\nread(struct(value=1))\n".into(),
+                0,
+            )
+            .unwrap();
         for (revision, field_type, expected) in [
             (0, "int", vec![]),
-            (1, "str", vec!["invalid-return-type"]),
+            (1, "str", vec!["invalid-argument-type"]),
             (2, "int", vec![]),
         ] {
             if revision != 0 {
@@ -1817,10 +1826,11 @@ pub(crate) mod source_tests {
                     )
                     .unwrap();
             }
-            let reports = analysis.validate_stubs(|_| true).unwrap();
-            let diagnostics: Vec<_> = reports
-                .into_iter()
-                .flat_map(|(_, diagnostics)| diagnostics)
+            let diagnostics: Vec<_> = analysis
+                .snapshot()
+                .diagnostics(caller)
+                .unwrap()
+                .iter()
                 .map(|diagnostic| diagnostic.id().as_str().to_owned())
                 .collect();
             assert_eq!(diagnostics, expected, "{field_type}");

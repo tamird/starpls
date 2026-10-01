@@ -18,6 +18,4 @@ upgrading rules_rs. Generated repositories have their own identities, so
 the selected rules_rs module version belongs to the generating extension.
 
 Additional source exports use ordinary source inference. Downstream
-extensions to the metadata schema can supply their own stub. Independent
-`--validate-stubs` checking can report incomplete validation when source
-inference aggregates the dictionary's field types.
+extensions to the metadata schema can supply their own stub.

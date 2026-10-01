@@ -1220,7 +1220,10 @@ fn quoted(value: &str) -> String {
 mod tests {
     use std::path::Path;
 
+    use ruff_db::diagnostic::Severity;
+    use ruff_db::diagnostic::UnifiedFile;
     use ruff_python_ast::Stmt;
+    use ruff_text_size::Ranged;
     use starpls_bazel::build::attribute::Discriminator;
     use starpls_bazel::build::AttributeDefinition;
     use starpls_bazel::build::RuleDefinition;
@@ -1270,12 +1273,19 @@ def check_literal_keys(attrs: dict[_starpls_typing.Literal["dep"], _starpls_type
             .filter_map(Stmt::as_function_def_stmt)
             .find(|function| function.name.as_str() == "check_literal_keys")
             .unwrap();
-        let definition =
-            ty_python_core::semantic_index(db, file).expect_single_definition(function);
-        let facts = SemanticModel::new(db, file)
-            .function_inference_facts(definition)
-            .unwrap();
-        assert!(!facts.has_errors, "{facts:?}");
+        let errors: Vec<_> = ty_python_semantic::types::check_types(db, file)
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.severity() == Severity::Error
+                    && diagnostic.primary_span().is_some_and(|span| {
+                        span.file() == &UnifiedFile::Ty(file.file(db))
+                            && span
+                                .range()
+                                .is_some_and(|range| function.range().contains_range(range))
+                    })
+            })
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

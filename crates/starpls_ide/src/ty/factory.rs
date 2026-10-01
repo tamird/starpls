@@ -2035,7 +2035,6 @@ pub(super) fn native_class<'db>(
 
 #[cfg(test)]
 mod tests {
-    use ty_python_semantic::types::DynamicType;
     use ty_python_semantic::HasType;
     use ty_python_semantic::SemanticModel;
 
@@ -2702,21 +2701,6 @@ target("positional")
                 Type::none(db, &environment),
             ),
         );
-        let omitted = Type::single_callable(
-            db,
-            Signature::new(
-                Parameters::from_annotation(
-                    db,
-                    [
-                        Parameter::variadic(Name::new("args"))
-                            .with_annotated_type(Type::Dynamic(DynamicType::Any)),
-                        Parameter::keyword_variadic(Name::new("kwargs"))
-                            .with_annotated_type(Type::Dynamic(DynamicType::Any)),
-                    ],
-                ),
-                Type::none(db, &environment),
-            ),
-        );
         for name in ["target", "inherited"] {
             let ty = ProvidedBindingValue::Export {
                 file: program,
@@ -2727,14 +2711,6 @@ target("positional")
             let data = ty.provided_data(db, &environment).unwrap();
             assert!(!data.downcast_ref::<RuleData>().unwrap().complete);
             assert!(ty.is_assignable_to(db, &environment, named), "{name}");
-            assert!(
-                !ty.satisfies_declared_output(db, &environment, named),
-                "{name}"
-            );
-            assert!(
-                ty.satisfies_declared_output(db, &environment, omitted),
-                "{name}"
-            );
         }
         let help = snapshot
             .signature_help(FilePosition { file_id: file, pos })

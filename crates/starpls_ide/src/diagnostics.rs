@@ -21,6 +21,7 @@ pub(crate) fn diagnostics(db: &Database, file_id: File) -> Vec<Diagnostic> {
 mod tests {
     use std::sync::Arc;
 
+    use ruff_db::diagnostic::Severity;
     use salsa::Setter;
     use starpls_hir::Db as _;
     use starpls_hir::Fixture;
@@ -41,6 +42,128 @@ mod tests {
             )
             .unwrap();
         (analysis, fixture)
+    }
+
+    #[test]
+    fn selector_runtime_kind_ordinary_diagnostics() {
+        let mut failures = Vec::new();
+        for (body, parameters, ordinary_error) in [
+            // Integer construction leaves kind unknown because int hides Java representation.
+            ("select({'//:a': 1}) + 2", "", false),
+            ("2 + select({'//:a': 1})", "", false),
+            ("select({'//:a': 1}) + 2147483648", "", false),
+            ("select({'//:a': 1}) | select({'//:b': 2})", "", true),
+            (
+                "select(value) + select(value)",
+                "value: Mapping[str, str | None]",
+                false,
+            ),
+            ("value + value", "value: select[str]", false),
+            // This payload admits both list-first and None-first selectors.
+            ("value + None", "value: select[list[str] | None]", false),
+            ("None + value", "value: select[list[str] | None]", false),
+            // Reflected dispatch accepts this selected dictionary.
+            ("{} | select({'//:a': {'x': 1}})", "", false),
+            ("('x',) + select({'//:a': [1]})", "", false),
+            // Empty plain dictionaries compose with nullable selected dictionaries.
+            (
+                "select({'//:a': {'x': 1}, '//conditions:default': None}) | {} | select({'//:a': {'x': 1}, '//conditions:default': None})",
+                "",
+                false,
+            ),
+        ] {
+            let (analysis, fixture) = native_analysis(&format!("def make({parameters}):\n    {body}\n"));
+            let ordinary = analysis.snapshot().diagnostics(fixture.main_file()).unwrap();
+            if ordinary
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                != ordinary_error
+            {
+                failures.push(format!("ordinary {body}: {ordinary:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn native_callable_receivers_are_positional_only() {
+        for callable in ["rule", "macro"] {
+            for (parameters, body, expected) in [
+                (
+                    format!("callback: {callable}, *, name: str, **kwargs: object"),
+                    "callback(name=name, **kwargs)",
+                    &[][..],
+                ),
+                (
+                    format!("callback: {callable}"),
+                    "callback(name='target', self=1)",
+                    &[][..],
+                ),
+                (
+                    format!("callback: {callable}"),
+                    "callback(name=1)",
+                    &["invalid-argument-type"][..],
+                ),
+                (
+                    format!("callback: {callable}"),
+                    "callback('target')",
+                    &["too-many-positional-arguments", "missing-argument"][..],
+                ),
+            ] {
+                let source = format!("def make({parameters}) -> None:\n    {body}\n");
+                let (analysis, fixture) = native_analysis(&source);
+                let diagnostics = analysis
+                    .snapshot()
+                    .diagnostics(fixture.main_file())
+                    .unwrap();
+                let ids: Vec<_> = diagnostics.iter().map(|d| d.id().as_str()).collect();
+                assert_eq!(ids, expected, "{source}: {diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_getattr_refines_literal_names() {
+        for (source, expected) in [
+            ("def read() -> str: return getattr(struct(field='value'), 'field')\n", &[][..]),
+            ("def read() -> int: return getattr(struct(field='value'), 'field')\n", &["invalid-return-type"][..]),
+            ("def read(value: struct[object], name: str) -> object: return getattr(value, name)\n", &[][..]),
+            ("def read(value: struct[str]) -> object: return getattr(value, 0)\n", &["invalid-argument-type"][..]),
+        ] {
+            let (analysis, fixture) = native_analysis(source);
+            let diagnostics = analysis.snapshot().diagnostics(fixture.main_file()).unwrap();
+            let ids: Vec<_> = diagnostics.iter().map(|d| d.id().as_str()).collect();
+            assert_eq!(ids, expected, "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn type_predicates_preserve_bool_and_int_branches() {
+        for (kind, fallback, other, other_fallback) in
+            [("bool", "False", "int", "0"), ("int", "0", "bool", "False")]
+        {
+            let source = format!(
+                "_TYPE = type({fallback})\ndef is_kind(value: object) -> TypeIs[{kind}]:\n    return type(value) == _TYPE\ndef read(value: object) -> {kind}:\n    if is_kind(value):\n        return value\n    return {fallback}\ndef other(value: {kind} | {other}) -> {other}:\n    if is_kind(value):\n        return {other_fallback}\n    return value\n"
+            );
+            let (analysis, fixture) = native_analysis(&source);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            let wrong = source.replace("return value", &format!("return {other_fallback}"));
+            let (analysis, fixture) = native_analysis(&wrong);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.id().as_str() == "invalid-return-type"),
+                "{wrong}: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

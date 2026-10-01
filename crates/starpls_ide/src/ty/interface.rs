@@ -9,8 +9,10 @@ use ruff_python_ast::statement_visitor::StatementVisitor;
 use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
 use ruff_python_ast::NodeIndex;
+use ruff_python_ast::Parameter;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtClassDef;
+use ruff_python_ast::StmtFunctionDef;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashMap;
@@ -21,7 +23,6 @@ use starpls_common::Dialect;
 use starpls_common::File;
 use starpls_common::FileInfo;
 use starpls_hir::Db as _;
-use starpls_hir::ValidationAnnotation;
 use ty_python_core::definition::Definition;
 use ty_python_core::definition::DefinitionKind;
 use ty_python_core::global_scope;
@@ -565,12 +566,6 @@ impl Database {
         name: &str,
     ) -> ProgramFile<'db> {
         if let Some(interface) = self.type_interface(from, source) {
-            if !from.is_type_interface(self)
-                && super::validation::is_validation_file(self, from.source)
-                && selected_function_import(self, source, interface, Name::new(name))
-            {
-                return self.starlark_program_file(source);
-            }
             let file = self.starlark_program_file(interface);
             if !export_definitions(self, file, name).is_empty() {
                 return file;
@@ -626,12 +621,8 @@ fn provider_pairs(db: &dyn Db) -> FxHashMap<(ProgramFile<'_>, u32), Vec<Definiti
             let [implementation] = implementations.as_slice() else {
                 continue;
             };
-            let Some(origin) = provider_origin(
-                db,
-                *implementation,
-                ProviderPart::Constructor,
-                &mut FxHashSet::default(),
-            ) else {
+            let Some(origin) = provider_origin(db, *implementation, &mut FxHashSet::default())
+            else {
                 continue;
             };
             let definitions = pairs.entry(origin).or_default();
@@ -743,7 +734,6 @@ pub(super) fn plain_provider_schema<'db>(
 fn provider_origin<'db>(
     db: &'db dyn Db,
     definition: Definition<'db>,
-    part: ProviderPart,
     visited: &mut FxHashSet<Definition<'db>>,
 ) -> Option<(ProgramFile<'db>, u32)> {
     if !visited.insert(definition) {
@@ -765,18 +755,12 @@ fn provider_origin<'db>(
                     let [Expr::Tuple(tuple)] = parent.targets.as_slice() else {
                         return None;
                     };
-                    let [constructor, raw] = tuple.elts.as_slice() else {
+                    let [constructor, _raw] = tuple.elts.as_slice() else {
                         return None;
                     };
-                    let target = match part {
-                        ProviderPart::Constructor => constructor,
-                        ProviderPart::Raw => raw,
-                    };
-                    if target.range() != assignment.target(&parsed).range() {
+                    if constructor.range() != assignment.target(&parsed).range() {
                         return None;
                     }
-                } else if matches!(part, ProviderPart::Raw) {
-                    return None;
                 }
                 Some((file, call.node_index().load().as_u32()?))
             }
@@ -791,7 +775,7 @@ fn provider_origin<'db>(
                 let [definition] = definitions.as_slice() else {
                     return None;
                 };
-                provider_origin(db, definition.definition()?, part, visited)
+                provider_origin(db, definition.definition()?, visited)
             }
             _ => None,
         },
@@ -802,47 +786,10 @@ fn provider_origin<'db>(
             let [definition] = definitions.as_slice() else {
                 return None;
             };
-            provider_origin(db, *definition, part, visited)
+            provider_origin(db, *definition, visited)
         }
         _ => None,
     }
-}
-
-pub(super) fn provider_implementation<'db>(
-    db: &'db Database,
-    source: File,
-    class: Type<'db>,
-) -> Option<(ProgramFile<'db>, FileRange)> {
-    let environment = ProgramEnvironment::from_file(db.starlark_program_file(source));
-    let class = provider_definition(db, class, &environment)?;
-    provider_export_origin(db, source, &class.name(db)?, ProviderPart::Constructor)
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum ProviderPart {
-    Constructor,
-    Raw,
-}
-
-pub(super) fn provider_export_origin<'db>(
-    db: &'db dyn Db,
-    source: File,
-    name: &str,
-    part: ProviderPart,
-) -> Option<(ProgramFile<'db>, FileRange)> {
-    let definitions = export_definitions(db, db.starlark_program_file(source), name);
-    let [definition] = definitions.as_slice() else {
-        return None;
-    };
-    let (program, node) = provider_origin(db, *definition, part, &mut FxHashSet::default())?;
-    let parsed = ruff_db::parsed::parsed_module(db, program.python_file(db)).load(db);
-    Some((
-        program,
-        FileRange::new(
-            program.file(db),
-            parsed.get_by_index(NodeIndex::from(node)).range(),
-        ),
-    ))
 }
 
 /// Read annotation types and origins from Ty's class scope, including recursive fields.
@@ -929,46 +876,6 @@ pub(super) fn is_implementation_contract<'db>(
     }
 }
 
-/// Preserve an exact selected implementation across a runtime import.
-/// Tracking the decision isolates cross-file definition changes from caller inference.
-#[salsa::tracked(returns(copy))]
-fn selected_function_import(db: &dyn Db, source: File, interface: File, name: Name) -> bool {
-    let function_node = |file| {
-        let scope = global_scope(db, db.starlark_program_file(file));
-        let symbol = place_table(db, scope).symbol_id(&name)?;
-        let mut bindings = use_def_map(db, scope).end_of_scope_symbol_bindings(symbol);
-        let binding = bindings.next()?;
-        if bindings.next().is_some() {
-            return None;
-        }
-        let definition = binding.binding.definition()?;
-        let DefinitionKind::Function(function) = definition.kind(db) else {
-            return None;
-        };
-        Some(function.node_key().index())
-    };
-    let Some(source_owner) = function_node(source) else {
-        return false;
-    };
-    let Some(interface_owner) = function_node(interface) else {
-        return false;
-    };
-    if db
-        .environment()
-        .stub_validation(db)
-        .function_contracts
-        .get(&(source.source, source_owner))
-        == Some(&(interface, interface_owner))
-    {
-        return true;
-    }
-    super::validation::annotation(db, source.source, source_owner)
-        == Some(ValidationAnnotation::Declaration {
-            file: interface,
-            owner: interface_owner,
-        })
-}
-
 pub(crate) fn export_definitions<'db>(
     db: &'db dyn Db,
     file: ProgramFile<'db>,
@@ -985,18 +892,52 @@ pub(crate) fn export_definitions<'db>(
         .collect()
 }
 
+pub(crate) fn parameter_pairs<'a>(
+    source: &'a StmtFunctionDef,
+    stub: &'a StmtFunctionDef,
+) -> Result<Vec<(&'a Parameter, &'a Parameter)>, &'static str> {
+    let source = &source.parameters;
+    let stub = &stub.parameters;
+    if source.posonlyargs.len() != stub.posonlyargs.len()
+        || source.args.len() != stub.args.len()
+        || source.kwonlyargs.len() != stub.kwonlyargs.len()
+        || source.vararg.is_some() != stub.vararg.is_some()
+        || source.kwarg.is_some() != stub.kwarg.is_some()
+    {
+        return Err("parameter layouts differ");
+    }
+    let mut pairs: Vec<_> = source
+        .posonlyargs
+        .iter()
+        .chain(&source.args)
+        .zip(stub.posonlyargs.iter().chain(stub.args.iter()))
+        .map(|(source, stub)| (&source.parameter, &stub.parameter))
+        .collect();
+    for parameter in &source.kwonlyargs {
+        let Some(annotation) = stub
+            .kwonlyargs
+            .iter()
+            .find(|stub| stub.parameter.name.id == parameter.parameter.name.id)
+        else {
+            return Err("keyword-only parameter names differ");
+        };
+        pairs.push((&parameter.parameter, &annotation.parameter));
+    }
+    if let (Some(source), Some(stub)) = (&source.vararg, &stub.vararg) {
+        pairs.push((source, stub));
+    }
+    if let (Some(source), Some(stub)) = (&source.kwarg, &stub.kwarg) {
+        pairs.push((source, stub));
+    }
+    Ok(pairs)
+}
+
 #[cfg(test)]
 mod tests {
-    use salsa::Setter;
     use starpls_bazel::APIContext;
     use starpls_common::Dialect;
     use starpls_common::FileInfo;
-    use starpls_hir::Db as _;
     use starpls_hir::Fixture;
-    use starpls_hir::StubValidation;
-    use starpls_hir::StubValidationPhase;
-    use starpls_hir::ValidationAnnotation;
-    use ty_python_core::definition::DefinitionKind;
 
     use crate::Analysis;
     use crate::FilePosition;
@@ -1053,143 +994,6 @@ mod tests {
                 "{name}",
             );
         }
-    }
-
-    #[test]
-    fn selected_function_imports_require_definite_pairs() {
-        let (mut analysis, loader) = Analysis::new_for_test();
-        let mut fixture = Fixture::new(&mut analysis.db);
-        let function = "def forward(value): return value\n";
-        let declaration = "def forward(value: object) -> object: ...\n";
-        let source = fixture.add_file(&mut analysis.db, "source.bzl", function);
-        let other = fixture.add_file(&mut analysis.db, "other.bzl", function);
-        let interface = fixture.add_file(&mut analysis.db, "shared.bzli", declaration);
-        let caller = fixture.add_file(&mut analysis.db, "caller.bzl", "");
-        let annotation = fixture.add_file(&mut analysis.db, "caller.bzli", "");
-        loader.add_files_from_fixture(&fixture);
-        analysis
-            .set_type_interfaces([(source, interface), (other, interface)])
-            .unwrap();
-        // The broad export candidates let these rows pair a function even when an
-        // unavailable or competing binding prevents preserving its import identity.
-        let node = |db: &crate::Database, file| {
-            super::export_definitions(db, db.starlark_program_file(file), "forward")
-                .into_iter()
-                .find_map(|definition| {
-                    let DefinitionKind::Function(function) = definition.kind(db) else {
-                        return None;
-                    };
-                    Some(function.node_key().index())
-                })
-        };
-        let source_owner = node(&analysis.db, source).unwrap();
-        let interface_owner = node(&analysis.db, interface).unwrap();
-        let environment = analysis.db.environment();
-        let previous = environment.stub_validation(&analysis.db).clone();
-        for phase in [
-            StubValidationPhase::Ordinary,
-            StubValidationPhase::Conservative,
-        ] {
-            let mut validation = StubValidation {
-                phase,
-                annotations: Default::default(),
-                provider_returns: Default::default(),
-                files: Default::default(),
-                function_contracts: Default::default(),
-            };
-            validation.files.extend([caller.source, annotation.source]);
-            validation
-                .annotations
-                .entry(source.source)
-                .or_default()
-                .insert(
-                    source_owner,
-                    ValidationAnnotation::Declaration {
-                        file: interface,
-                        owner: interface_owner,
-                    },
-                );
-            environment
-                .set_stub_validation(&mut analysis.db)
-                .to(validation);
-            for (from, loaded, expected) in [
-                (caller, source, source),
-                (caller, other, interface),
-                (annotation, source, interface),
-                (other, source, interface),
-            ] {
-                assert_eq!(
-                    analysis.db.load_export_file(from, loaded, "forward"),
-                    analysis.db.starlark_program_file(expected),
-                );
-            }
-        }
-        for (changed, text, definite) in [
-            (
-                source,
-                format!("{function}if False:\n    forward = None\n"),
-                true,
-            ),
-            (source, format!("if flag:\n    {function}"), false),
-            (
-                source,
-                format!("{function}if flag:\n    def forward(value): return value\n"),
-                false,
-            ),
-            (source, format!("{function}forward = forward\n"), false),
-            (source, "load('other.bzl', 'forward')\n".to_owned(), false),
-            (source, function.to_owned(), true),
-            (
-                interface,
-                "forward: Callable[[object], object]\n".to_owned(),
-                false,
-            ),
-            (
-                interface,
-                "load('other.bzl', 'forward')\n".to_owned(),
-                false,
-            ),
-            (interface, declaration.to_owned(), true),
-        ] {
-            analysis.update_file(changed, text.clone());
-            let mut validation = environment.stub_validation(&analysis.db).clone();
-            validation.annotations.clear();
-            validation
-                .annotations
-                .entry(source.source)
-                .or_default()
-                .insert(
-                    node(&analysis.db, source).unwrap_or(source_owner),
-                    ValidationAnnotation::Declaration {
-                        file: interface,
-                        owner: node(&analysis.db, interface).unwrap_or(interface_owner),
-                    },
-                );
-            environment
-                .set_stub_validation(&mut analysis.db)
-                .to(validation);
-            assert_eq!(
-                super::selected_function_import(&analysis.db, source, interface, "forward".into(),),
-                definite,
-                "{text}",
-            );
-            if changed == source {
-                assert_eq!(
-                    analysis.db.load_export_file(caller, source, "forward"),
-                    analysis
-                        .db
-                        .starlark_program_file(if definite { source } else { interface }),
-                    "{text}",
-                );
-            }
-        }
-        environment
-            .set_stub_validation(&mut analysis.db)
-            .to(previous);
-        assert_eq!(
-            analysis.db.load_export_file(caller, source, "forward"),
-            analysis.db.starlark_program_file(interface),
-        );
     }
 
     #[test]
@@ -1397,7 +1201,6 @@ mod tests {
         loader.add_files_from_fixture(&fixture);
         analysis.set_type_interfaces([(source, stub)]).unwrap();
         assert!(analysis.snapshot().diagnostics(source).unwrap().is_empty());
-        assert!(analysis.validate_stubs(|_| true).unwrap().is_empty());
     }
 
     #[test]
@@ -2130,18 +1933,6 @@ value = unmapped.value
                 .count(),
             2,
             "{diagnostics:?}"
-        );
-        let reports = analysis
-            .validate_stubs(|path| path.file_name().unwrap() == "source.bzl")
-            .unwrap();
-        assert_eq!(
-            reports
-                .iter()
-                .flat_map(|(_, diagnostics)| diagnostics)
-                .filter(|diagnostic| diagnostic.id().as_str() == "invalid-provider-interface")
-                .count(),
-            2,
-            "{reports:?}"
         );
         analysis.update_file(interface, class.into());
         for text in [

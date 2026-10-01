@@ -25,8 +25,7 @@ manifest = "@bazel_features_stubs//:stubs.toml"
 ```
 
 The manifest checks the selected source version. Starpls uses the declarations
-to check callers; `starpls check --validate-stubs` checks all ten parser and
-utility bodies. Public feature records are inferred from their source using
-the helper contracts.
+to check callers. Public feature records are inferred from their source
+using the helper contracts.
 
 The declarations in this package use the [MIT license](LICENSE-MIT).

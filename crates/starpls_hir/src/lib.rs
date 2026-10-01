@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
 use starpls_bazel::Builtins;
 use starpls_common::Dialect;
 use starpls_common::File;
@@ -53,52 +52,6 @@ pub trait Db: starpls_common::Db {
     fn get_all_workspace_targets(&self) -> Arc<Vec<String>>;
 }
 
-/// Syntax correspondence used by a synchronous stub validation pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StubValidation {
-    pub phase: StubValidationPhase,
-    pub annotations: FxHashMap<
-        ruff_db::files::File,
-        FxHashMap<ruff_python_ast::NodeIndex, ValidationAnnotation>,
-    >,
-    pub provider_returns:
-        FxHashMap<(ruff_db::files::File, ruff_python_ast::NodeIndex), ProviderContract>,
-    pub files: FxHashSet<ruff_db::files::File>,
-    /// Complete caller signatures, separate from the declaration checking each body.
-    pub function_contracts: FxHashMap<
-        (ruff_db::files::File, ruff_python_ast::NodeIndex),
-        (File, ruff_python_ast::NodeIndex),
-    >,
-}
-
-/// The inference view active during synchronous implementation validation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StubValidationPhase {
-    #[default]
-    Ordinary,
-    Conservative,
-}
-
-/// The kind of source check selected by the validation overlay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValidationAnnotation {
-    Declaration {
-        file: File,
-        owner: ruff_python_ast::NodeIndex,
-    },
-    ValueContract {
-        file: File,
-        owner: ruff_python_ast::NodeIndex,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProviderContract {
-    pub stub: File,
-    pub class: ruff_python_ast::NodeIndex,
-    pub allowed_fields: Box<[ruff_python_ast::name::Name]>,
-}
-
 /// Inputs shared by semantic queries. Input identities remain stable when the
 /// host changes configuration or discovers previously unavailable modules.
 #[salsa::input(debug)]
@@ -117,8 +70,6 @@ pub struct Environment {
     pub load_revision: u64,
     #[returns(ref)]
     pub type_interfaces: FxHashMap<ruff_db::files::File, (File, File)>,
-    #[returns(ref)]
-    pub stub_validation: StubValidation,
 }
 
 impl Environment {
@@ -134,7 +85,6 @@ impl Environment {
             Arc::default(),
             0,
             FxHashMap::default(),
-            StubValidation::default(),
         )
     }
 

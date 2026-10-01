@@ -35,7 +35,6 @@ mod native;
 #[cfg(test)]
 mod skylib_tests;
 mod support;
-pub(crate) mod validation;
 
 pub(crate) use diagnostics::check;
 pub(crate) use factory::Documentation;
@@ -45,7 +44,6 @@ pub(crate) struct SemanticSettings {
     program: ProgramSettings,
     rules: RuleSelection,
     rules_with_flow_diagnostics: RuleSelection,
-    validation_rules: RuleSelection,
     analysis: AnalysisSettings,
 }
 
@@ -58,7 +56,6 @@ impl SemanticSettings {
             program,
             rules: diagnostics::rules(false),
             rules_with_flow_diagnostics: diagnostics::rules(true),
-            validation_rules: diagnostics::validation_rules(),
             analysis: AnalysisSettings::default(),
         }
     }
@@ -460,50 +457,12 @@ impl ty_python_core::Db for Database {
         starpls_hir::Source::new(self)
             .type_comment_annotation(file, owner)
             .map(ty_python_core::ProvidedAnnotation::Range)
-            .or_else(|| {
-                let annotation = validation::annotation(self, file.source, owner)?;
-                Some(match annotation {
-                    starpls_hir::ValidationAnnotation::Declaration { file, owner } => {
-                        ty_python_core::ProvidedAnnotation::External {
-                            file: self.starlark_program_file(file),
-                            owner,
-                        }
-                    }
-                    starpls_hir::ValidationAnnotation::ValueContract { file, owner } => {
-                        ty_python_core::ProvidedAnnotation::ExternalValueContract {
-                            file: self.starlark_program_file(file),
-                            owner,
-                        }
-                    }
-                })
-            })
             .or_else(|| interface::build_annotation(self, file, owner))
     }
 }
 
 #[salsa::db]
 impl ty_python_semantic::Db for Database {
-    fn provided_function_contract<'db>(
-        &'db self,
-        definition: Definition<'db>,
-    ) -> Option<ty_python_semantic::types::FunctionType<'db>> {
-        validation::function_contract(self, definition)
-    }
-
-    fn function_inference_mode(
-        &self,
-        scope: ty_python_core::scope::ScopeId<'_>,
-    ) -> ty_python_semantic::FunctionInferenceMode {
-        validation::function_inference_mode(self, scope)
-    }
-
-    fn provided_return_type<'db>(
-        &'db self,
-        definition: Definition<'db>,
-    ) -> Option<ty_python_semantic::provided::ProvidedReturnType<'db>> {
-        validation::provider_return_type(self, definition)
-    }
-
     fn provided_parameter_type<'db>(
         &'db self,
         definition: Definition<'db>,
@@ -517,7 +476,7 @@ impl ty_python_semantic::Db for Database {
     ) -> ty_python_semantic::provided::ProvidedCallResult<'db> {
         ty_python_semantic::provided::ProvidedCallResult {
             return_type: factory::result(self, call),
-            diagnostics: validation::call_diagnostics(self, call),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -654,10 +613,8 @@ impl ty_python_semantic::Db for Database {
         &self.semantic.program.python_version
     }
 
-    fn rule_selection(&self, file: File) -> &RuleSelection {
-        if validation::is_validation_file(self, file) {
-            &self.semantic.validation_rules
-        } else if self.environment().options(self).use_code_flow_analysis {
+    fn rule_selection(&self, _file: File) -> &RuleSelection {
+        if self.environment().options(self).use_code_flow_analysis {
             &self.semantic.rules_with_flow_diagnostics
         } else {
             &self.semantic.rules

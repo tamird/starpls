@@ -498,7 +498,7 @@ fn pair_definitions<'db>(db: &'db Database, search: &mut Search<'db>) -> anyhow:
             };
             let other_parsed = parsed_module(db, other).load(db);
             let peer = peer.node(&other_parsed);
-            let pairs = crate::ty::validation::parameter_pairs(function, peer)
+            let pairs = crate::ty::interface::parameter_pairs(function, peer)
                 .map_err(anyhow::Error::msg)?;
             let Some((parameter, peer)) = pairs
                 .into_iter()

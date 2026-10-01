@@ -23,8 +23,7 @@ manifest = "@rules_java_stubs//:stubs.toml"
 ```
 
 The manifest checks the selected source version. Starpls uses these contracts
-to check callers; `starpls check --validate-stubs` checks all seven selected
-function bodies against the declarations.
+to check callers.
 
 `get_internal_java_common` returns a partial namespace with the zero-argument
 `google_legacy_api_enabled` Boolean callback. `_make_java_common` returns a
