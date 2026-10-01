@@ -7877,6 +7877,45 @@ def read(value: list[str]) -> str: ...
     }
 
     #[test]
+    fn type_predicates_preserve_bool_and_int() {
+        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
+        for (kind, fallback, other, other_fallback) in
+            [("bool", "False", "int", "0"), ("int", "0", "bool", "False")]
+        {
+            let name = format!("is_{kind}");
+            let declaration = utils
+                .lines()
+                .find(|line| line.starts_with(&format!("def {name}(")))
+                .unwrap();
+            let comparison = "type(value) == _TYPE";
+            let predicate =
+                format!("_TYPE = type({fallback})\ndef {name}(value):\n    return {comparison}\n");
+            let source = format!(
+                "{predicate}def read(value):\n    if {name}(value):\n        return value\n    return {fallback}\ndef other(value):\n    if {name}(value):\n        return {other_fallback}\n    return value\n"
+            );
+            let stub = format!(
+                "{declaration}\ndef read(value: object) -> {kind}: ...\ndef other(value: {kind} | {other}) -> {other}: ...\n"
+            );
+            let diagnostics = validation_diagnostics(&source, &stub);
+            assert!(diagnostics.is_empty(), "{kind}: {diagnostics:#?}");
+            for replacement in [
+                format!("type(value) == type({other_fallback})"),
+                "False".to_owned(),
+                "True".to_owned(),
+            ] {
+                assert_eq!(
+                    validate(
+                        &format!("def {name}(value):\n    return {replacement}\n"),
+                        declaration,
+                    ),
+                    ["incomplete-stub-validation"],
+                    "{kind}: {replacement}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn type_is_dict_preserves_key_and_value_types() {
         let predicate =
             "_DICT_TYPE = type({})\ndef is_dict(value):\n    return type(value) == _DICT_TYPE\n";
