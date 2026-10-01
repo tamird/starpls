@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use annotate_snippets::Level;
@@ -44,6 +45,10 @@ pub(crate) struct CheckCommand {
     #[clap(long, value_name = "PATH")]
     files_from: Option<PathBuf>,
 
+    /// Read a Bazel source from PHYSICAL and check it at LOGICAL; repeat for more files.
+    #[clap(long, value_name = "LOGICAL=PHYSICAL")]
+    source_overlay: Vec<SourceOverlay>,
+
     /// Select Bazel sources and .bzli interfaces.
     #[clap(long)]
     bazel_only: bool,
@@ -76,6 +81,29 @@ pub(crate) struct CheckCommand {
 
     #[command(flatten)]
     pub(crate) type_interfaces: super::type_interface::TypeInterfaceOptions,
+}
+
+#[derive(Clone, Debug)]
+struct SourceOverlay {
+    logical: PathBuf,
+    physical: PathBuf,
+}
+
+impl FromStr for SourceOverlay {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((logical, physical)) = value.split_once('=') else {
+            return Err("expected LOGICAL=PHYSICAL".to_owned());
+        };
+        if logical.is_empty() || physical.is_empty() {
+            return Err("LOGICAL and PHYSICAL must both be nonempty paths".to_owned());
+        }
+        Ok(Self {
+            logical: logical.into(),
+            physical: physical.into(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +275,182 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
             assert_eq!(report["diagnostics"]["errors"], 1);
         }
+    }
+
+    fn overlay_checker(
+        name: &str,
+        overlays: &[(&str, &str, &str)],
+    ) -> (Checker, Arc<TestBazelClient>) {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(name);
+        let external = root.join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let mut options = CheckCommand::default();
+        for (logical, physical, contents) in overlays {
+            let physical = root.join(physical);
+            std::fs::write(&physical, contents).unwrap();
+            options.source_overlay.push(super::SourceOverlay {
+                logical: external.join(logical),
+                physical,
+            });
+        }
+        let client = Arc::new(TestBazelClient::default());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let loader =
+            DefaultFileLoader::new(client.clone(), root.clone(), None, external, sender, true);
+        let info = starpls_bazel::client::BazelInfo {
+            workspace: root,
+            ..Default::default()
+        };
+        let (analysis, loader) = options
+            .prepare_analysis(loader, &info, Default::default())
+            .unwrap();
+        (
+            Checker::new(analysis, info, vec![], &[], loader, receiver, &options).unwrap(),
+            client,
+        )
+    }
+
+    #[test]
+    fn source_overlays_check_unfetched_build_files() {
+        let (mut checker, client) = overlay_checker(
+            "overlay-unfetched-build",
+            &[(
+                "stubs+/BUILD.bazel",
+                "build.txt",
+                "print(glob(['*.txt']))\n",
+            )],
+        );
+        checker.report_diagnostics(None).unwrap();
+        assert_eq!(checker.files.len(), 1);
+        assert!(client.fetch_requests.lock().unwrap().is_empty());
+        assert!(!checker
+            .bazel_info
+            .workspace
+            .join("external/stubs+")
+            .exists());
+    }
+
+    #[test]
+    fn source_overlays_use_virtual_package_boundaries() {
+        let (mut checker, client) = overlay_checker(
+            "overlay-virtual-packages",
+            &[
+                ("stubs+/nested/BUILD.bazel", "build.txt", ""),
+                (
+                    "stubs+/nested/sub/helper.bzl",
+                    "helper.txt",
+                    "load(':dep.bzl', 'value')\nresult: str = value\n",
+                ),
+                ("stubs+/nested/dep.bzl", "dep.txt", "value = 'right'\n"),
+                ("stubs+/dep.bzl", "wrong.txt", "value = 42\n"),
+            ],
+        );
+        checker.report_diagnostics(None).unwrap();
+        assert_eq!(checker.files.len(), 4);
+        assert!(client.fetch_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_overlays_fetch_dependencies_in_the_installed_repository() {
+        let (mut checker, client) = overlay_checker(
+            "overlay-demanded-dependency",
+            &[(
+                "stubs+/BUILD.bazel",
+                "build.txt",
+                "load('@dep//:defs.bzl', 'consume')\nconsume(42)\n",
+            )],
+        );
+        client.fetch_files.lock().unwrap().insert(
+            "rules+".to_owned(),
+            (
+                checker
+                    .bazel_info
+                    .workspace
+                    .join("external/rules+/defs.bzl"),
+                "def consume(value: str) -> None:\n    print(value)\n".to_owned(),
+            ),
+        );
+        let result = checker.check_files().unwrap();
+        assert!(result.loads.unresolved.is_empty());
+        let [(_, diagnostics)] = result.diagnostics.as_slice() else {
+            panic!("{:?}", result.diagnostics)
+        };
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("{diagnostics:?}")
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+        assert!(!checker
+            .bazel_info
+            .workspace
+            .join("external/stubs+")
+            .exists());
+    }
+
+    #[test]
+    fn source_overlays_preserve_missing_dependency_errors() {
+        let (mut checker, client) = overlay_checker(
+            "overlay-missing-dependency",
+            &[(
+                "stubs+/nested/BUILD.bazel",
+                "build.txt",
+                "load(':missing.bzl', 'value')\nprint(value)\n",
+            )],
+        );
+        client
+            .fetch_failures
+            .lock()
+            .unwrap()
+            .insert("stubs+".to_owned(), "archive unavailable".to_owned());
+        let report_path = checker.bazel_info.workspace.join("report.json");
+        assert!(checker.report_diagnostics(Some(&report_path)).is_err());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["unresolved_loads"].as_array().unwrap().len(), 1);
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["stubs+"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn source_overlays_share_warm_buffers_with_distinct_repository_contexts() {
+        let name = "overlay-shared-buffer";
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(name);
+        for repository in ["stubs+", "other+"] {
+            let directory = root.join("external").join(repository);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::os::unix::fs::symlink(root.join("shared.txt"), directory.join("BUILD.bazel"))
+                .unwrap();
+        }
+        let source = "load('@dep//:defs.bzl', 'consume')\nconsume(42)\n";
+        let (mut checker, client) = overlay_checker(
+            name,
+            &[
+                ("stubs+/BUILD.bazel", "shared.txt", source),
+                ("other+/BUILD.bazel", "shared.txt", source),
+            ],
+        );
+        for (repository, annotation) in [("rules+", "str"), ("wrong+", "int")] {
+            client.fetch_files.lock().unwrap().insert(
+                repository.to_owned(),
+                (
+                    root.join("external").join(repository).join("defs.bzl"),
+                    format!("def consume(value: {annotation}) -> None:\n    print(value)\n"),
+                ),
+            );
+        }
+        let result = checker.check_files().unwrap();
+        assert!(result.loads.unresolved.is_empty());
+        assert_eq!(result.diagnostics.len(), 2);
+        let snapshot = checker.analysis.snapshot();
+        for (file, diagnostics) in result.diagnostics {
+            let expected = usize::from(snapshot.path(file).ends_with("stubs+/BUILD.bazel"));
+            assert_eq!(diagnostics.len(), expected, "{diagnostics:?}");
+            if let Some(diagnostic) = diagnostics.first() {
+                assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+            }
+        }
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+", "wrong+"]);
     }
 
     #[test]
@@ -1364,6 +1568,40 @@ impl CheckCommand {
             },
         )?;
         analysis.set_builtin_defs(load_bazel_builtins(), rules)?;
+        let mut overlays = HashSet::new();
+        for SourceOverlay { logical, physical } in &self.source_overlay {
+            let logical = starpls_common::absolute_path(logical)?;
+            anyhow::ensure!(
+                overlays.insert(logical.clone()),
+                "duplicate source overlay for {}",
+                logical.display()
+            );
+            let Some((Dialect::Bazel, context)) =
+                document::source_kind(&info.workspace, &logical, &[])
+            else {
+                anyhow::bail!(
+                    "source overlay requires a Bazel path: {}",
+                    logical.display()
+                );
+            };
+            let contents = std::fs::read_to_string(physical)
+                .with_context(|| format!("cannot read source overlay {}", physical.display()))?;
+            let file_info = context.map(|api_context| FileInfo::Bazel {
+                api_context,
+                is_external: false,
+            });
+            if let Some(document) = analysis.document(&logical) {
+                anyhow::ensure!(
+                    document.contents == contents,
+                    "conflicting source overlays for {} and {}",
+                    document.path,
+                    logical.display()
+                );
+                analysis.file(&logical, Dialect::Bazel, file_info)?;
+            } else {
+                analysis.open_document(&logical, Dialect::Bazel, file_info, contents, 0)?;
+            }
+        }
         prepared.install(&mut analysis, &info.workspace)?;
         Ok((analysis, loader))
     }
@@ -1536,7 +1774,7 @@ impl Checker {
         };
 
         let interfaces = checker.analysis.type_interface_files();
-        if paths.is_empty() && interfaces.is_empty() {
+        if paths.is_empty() && interfaces.is_empty() && options.source_overlay.is_empty() {
             checker.input_errors.push(InputError {
                 path: checker.bazel_info.workspace.clone(),
                 message: "no input paths or configured interfaces were selected".to_owned(),
@@ -1554,10 +1792,26 @@ impl Checker {
             }
         }
         drop(snapshot);
+        for SourceOverlay {
+            logical,
+            physical: _,
+        } in &options.source_overlay
+        {
+            let logical = starpls_common::absolute_path(logical)?;
+            if checker.ignored_paths.contains(&logical) {
+                checker.exclusions.insert(logical, Exclusion::Ignored);
+            } else {
+                checker.load_file(&logical, true, extensions, options.bazel_only)?;
+            }
+        }
         for path in paths {
             let path = starpls_common::absolute_path(Path::new(&path))?;
             if checker.ignored_paths.contains(&path) {
                 checker.exclusions.insert(path, Exclusion::Ignored);
+                continue;
+            }
+            if checker.analysis.document(&path).is_some() {
+                checker.load_file(&path, true, extensions, options.bazel_only)?;
                 continue;
             }
             let mut walk = WalkDir::new(&path).into_iter();

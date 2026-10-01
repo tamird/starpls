@@ -156,6 +156,14 @@ Unused suppressions, malformed directives, and unknown Ty rule names are
 errors. A check fails when it reports an error, including a suppression
 whose diagnostic has been fixed.
 
+For a BUILD file or `.bzl` source installed by a repository rule, use
+`--source-overlay LOGICAL=PHYSICAL`. Each mapping selects the logical
+file and reads its contents from the physical source. Relative paths use
+the current directory. Loads use the logical repository and
+package; an overlaid BUILD file establishes its package boundary. This
+allows checking owned sources before Bazel downloads their repositories.
+Dependencies are fetched as ordinary load resolution requires them.
+
 For `starpls check`, repeat `--ignore_pattern` to exclude inputs. A bare name
 such as `vendor` matches that file or directory name anywhere in a path.
 A path such as `project/tools/vendor` uses exact components to exclude that

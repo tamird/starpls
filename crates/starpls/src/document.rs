@@ -593,7 +593,7 @@ impl DefaultFileLoader {
         }
         let repository = self.resolve_repository(label, &repository)?;
         let resolved_path = if label.is_relative() {
-            package_for_path(from_path, &repository.root)?
+            package_for_path(db.system(), from_path, &repository.root)?
         } else {
             repository.root.join(label.package())
         }
@@ -1114,7 +1114,7 @@ impl FileLoader for DefaultFileLoader {
                 self.ensure_repository(&repository)?;
                 let root = repository.root;
                 let package = if label.is_relative() {
-                    package_for_path(&from_path, &root)?
+                    package_for_path(db.system(), &from_path, &root)?
                 } else {
                     PathBuf::new()
                 };
@@ -1187,7 +1187,11 @@ impl FileLoader for DefaultFileLoader {
     }
 }
 
-fn package_for_path(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+fn package_for_path(
+    system: &dyn ruff_db::system::System,
+    path: &Path,
+    root: &Path,
+) -> anyhow::Result<PathBuf> {
     if !path.starts_with(root) {
         bail!(
             "{} is outside repository {}",
@@ -1196,8 +1200,21 @@ fn package_for_path(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
         );
     }
     for directory in path.ancestors().skip(1) {
-        if directory.join("BUILD").try_exists()? || directory.join("BUILD.bazel").try_exists()? {
-            return Ok(directory.to_path_buf());
+        for name in ["BUILD", "BUILD.bazel"] {
+            let build = directory.join(name);
+            let build = starpls_common::system_path(&build)?;
+            match system.path_metadata(build) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_file() {
+                        return Ok(directory.to_path_buf());
+                    }
+                }
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error.into());
+                    }
+                }
+            }
         }
         if directory == root {
             return Ok(root.to_path_buf());
@@ -2285,7 +2302,12 @@ pub(crate) mod source_tests {
             external.join("stubs+")
         );
         assert_eq!(
-            super::package_for_path(&installed, &repository.root).unwrap(),
+            super::package_for_path(
+                &ruff_db::system::OsSystem::default(),
+                &installed,
+                &repository.root,
+            )
+            .unwrap(),
             external.join("stubs+")
         );
         let error = loader
