@@ -57,6 +57,9 @@ input, a Label-to-string memo dictionary, and an integer counter. Its
 callback takes the keyword arguments `name: str` and `exports: Label` and
 returns `None`. The helper validates the input as a string or Label and
 returns the replacement as a string or Label.
+`_filter_frontend_exec_properties(object)` returns `dict[str, object]`.
+Its local source patch accepts `None`, validates dictionaries and string keys,
+and preserves property values while selecting the frontend's execution groups.
 The utility contracts declare `is_label` and `is_string` with `TypeGuard`.
 A true result narrows the input to `Label` or `str`, respectively.
 `is_list` and `is_dict` use `TypeIs` to narrow container membership while
