@@ -4702,6 +4702,48 @@ def make() -> Info: ...
     }
 
     #[test]
+    fn native_callable_receivers_are_positional_only() {
+        for callable in ["rule", "macro"] {
+            let forwarding = format!(
+                "def make(callback: {callable}, *, name: str, **kwargs: object) -> None: ...\n"
+            );
+            assert_eq!(
+                validate(
+                    "def make(callback, *, name, **kwargs): callback(name=name, **kwargs)\n",
+                    &forwarding,
+                ),
+                Vec::<String>::new(),
+                "{callable} forwarding",
+            );
+            let stub = format!("def make(callback: {callable}) -> None: ...\n");
+            for (source, expected) in [
+                (
+                    "def make(callback): callback(name='target', self=1)\n",
+                    &[][..],
+                ),
+                (
+                    "def make(callback): callback(name=1)\n",
+                    &["invalid-argument-type"][..],
+                ),
+                (
+                    "def make(callback): callback('target')\n",
+                    &["too-many-positional-arguments", "missing-argument"][..],
+                ),
+            ] {
+                assert_eq!(validate(source, &stub), expected, "{callable}: {source}");
+            }
+            assert_eq!(
+                validate(
+                    "def make(callback, *, name, **kwargs):\n    kwargs['name'] = name\n    callback(name=name, **kwargs)\n",
+                    &forwarding,
+                ),
+                ["incomplete-stub-validation"],
+                "{callable} duplicate name",
+            );
+        }
+    }
+
+    #[test]
     fn callback_keyword_variadic_context_checks_body() {
         let stub = r#"class _Collect(Protocol):
     def __call__(self, *, name: str, **values: int) -> int: ...

@@ -435,7 +435,7 @@ fn declarations(
             names.insert("__call__");
             writeln!(
                 body,
-                "        def __call__(self, *, name: _starpls_builtins.str, **kwargs: _starpls_typing.Any) -> None: ..."
+                "        def __call__(self, /, *, name: _starpls_builtins.str, **kwargs: _starpls_typing.Any) -> None: ..."
             )?;
         }
         for field in &class.field {
