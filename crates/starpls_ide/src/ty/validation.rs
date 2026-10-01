@@ -7503,9 +7503,12 @@ def read(value: list[str]) -> str: ...
     fn type_is_dict_preserves_key_and_value_types() {
         let predicate =
             "_DICT_TYPE = type({})\ndef is_dict(value):\n    return type(value) == _DICT_TYPE\n";
-        let predicate_stub = "def is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\n";
+        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
+        let (_, overloads) = utils.split_once("@overload").unwrap();
+        let (overloads, _) = overloads.split_once("\ndef is_int").unwrap();
+        let overloads = format!("@overload{overloads}");
         let source = format!("{predicate}\ndef read(value):\n    if is_dict(value):\n        return value['x']\n    return ''\n");
-        let stub = format!("{predicate_stub}\ndef read(value: dict[str, str] | str) -> str: ...\n");
+        let stub = format!("{overloads}\ndef read(value: dict[str, str] | str) -> str: ...\n");
         let diagnostics = validation_diagnostics(&source, &stub);
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         // A gradual target leaves its negative materialization unspecified.
@@ -7533,6 +7536,36 @@ def read(value: list[str]) -> str: ...
                 "def is_dict(value: object) -> TypeIs[dict[str, str]]: ...\n"
             ),
             ["incomplete-stub-validation"],
+        );
+
+        let source = format!("{predicate}\ndef caller(value): return is_dict(value)\n");
+        for (input, output, rejected) in [
+            ("dict[str, str]", "Literal[True]", false),
+            ("Any", "bool", false),
+            ("object", "bool", false),
+            ("Any", "Literal[True]", true),
+            ("object", "Literal[True]", true),
+            ("dict[str, str] | str", "Literal[True]", true),
+        ] {
+            let stub = format!("{overloads}\ndef caller(value: {input}) -> {output}: ...\n");
+            let diagnostics = validation_diagnostics(&source, &stub);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                rejected,
+                "{input} -> {output}: {diagnostics:#?}",
+            );
+        }
+        let diagnostics = validation_diagnostics(
+            &predicate.replace("type(value) == _DICT_TYPE", "False"),
+            &overloads,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error),
+            "{diagnostics:#?}",
         );
     }
 
