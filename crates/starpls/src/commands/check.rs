@@ -196,6 +196,58 @@ mod tests {
     }
 
     #[test]
+    fn unused_suppressions_fail_the_check() {
+        for (kind, suppression) in [
+            ("ty", "# ty: ignore[invalid-assignment]"),
+            ("type", "# type: ignore"),
+            ("type-rule", "# type: ignore[ty:invalid-assignment]"),
+        ] {
+            for (value, expected_errors) in [("1", 0), ("'valid'", 1)] {
+                let mut checker = local_checker_with_options(
+                    &format!("checker-suppression-{kind}-{expected_errors}"),
+                    &[(
+                        "source.bzl",
+                        &format!("value: str = {value} {suppression}\n"),
+                    )],
+                    CheckCommand {
+                        paths: vec!["source.bzl".to_owned()],
+                        ..Default::default()
+                    },
+                );
+                let report_path = checker.bazel_info.workspace.join("coverage.json");
+                let result = checker.report_diagnostics(Some(&report_path));
+                assert_eq!(result.is_err(), expected_errors != 0, "{result:?}");
+                let report: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+                assert_eq!(report["diagnostics"]["errors"], expected_errors);
+                assert_eq!(report["diagnostics"]["warnings"], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_suppressions_fail_the_check() {
+        for (kind, suppression) in [
+            ("malformed", "# ty: ignore["),
+            ("unknown", "# ty: ignore[nonexistent-rule]"),
+        ] {
+            let mut checker = local_checker_with_options(
+                &format!("checker-suppression-{kind}"),
+                &[("source.bzl", &format!("value = 42 {suppression}\n"))],
+                CheckCommand {
+                    paths: vec!["source.bzl".to_owned()],
+                    ..Default::default()
+                },
+            );
+            let report_path = checker.bazel_info.workspace.join("coverage.json");
+            assert!(checker.report_diagnostics(Some(&report_path)).is_err());
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+            assert_eq!(report["diagnostics"]["errors"], 1);
+        }
+    }
+
+    #[test]
     fn demand_checking_skips_unused_transitive_loads() {
         for audit in [false, true] {
             let mut checker = local_checker(

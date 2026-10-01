@@ -99,16 +99,23 @@ pub(super) fn registry() -> &'static LintRegistry {
 pub(super) fn rules(use_code_flow_analysis: bool) -> RuleSelection {
     let registry = registry();
     let mut rules = RuleSelection::from_registry(registry);
-    // Starpls accepts suppressions without diagnosing their style or unused comments.
     for name in [
         "unused-ignore-comment",
         "unused-type-ignore-comment",
         "invalid-ignore-comment",
         "ignore-comment-unknown-rule",
-        "blanket-ignore-comment",
     ] {
-        rules.disable(registry.get(name).expect("Ty registers suppression lints"));
+        rules.enable(
+            registry.get(name).expect("Ty registers suppression lints"),
+            Severity::Error,
+            LintSource::Default,
+        );
     }
+    rules.disable(
+        registry
+            .get("blanket-ignore-comment")
+            .expect("Ty registers suppression lints"),
+    );
     if use_code_flow_analysis {
         rules.enable(
             registry

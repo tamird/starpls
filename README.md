@@ -146,6 +146,16 @@ sources and `.bzli` interfaces and records other inputs as exclusions.
 Recursive discovery stops at nested repository roots. Explicit paths use
 their existing repository context, including Bazel's external directory.
 
+Suppress a diagnostic on its source line with a rule-specific comment:
+
+```starlark
+value: str = 42  # ty: ignore[invalid-assignment]
+```
+
+Unused suppressions, malformed directives, and unknown Ty rule names are
+errors. A check fails when it reports an error, including a suppression
+whose diagnostic has been fixed.
+
 For `starpls check`, repeat `--ignore_pattern` to exclude inputs. A bare name
 such as `vendor` matches that file or directory name anywhere in a path.
 A path such as `project/tools/vendor` uses exact components to exclude that
@@ -174,8 +184,7 @@ load failures.
 `--progress` reports load discovery, repository mapping batches, fetches,
 and file checking on stderr. The JSON report separates selected files,
 completed checks, loaded dependencies, exclusions, input failures, and
-unresolved loads. Configured implementation validation adds its checked
-source files to the completed checks. Repository names are canonical;
+unresolved loads. Repository names are canonical;
 the empty name denotes the main repository, and `null` denotes a source
 without a known Bazel repository context.
 
