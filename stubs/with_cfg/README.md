@@ -72,10 +72,14 @@ the negative branch unproved because these contracts have gradual element types.
 `is_select` uses
 `TypeIs[select[object, object]]` to distinguish selectors while preserving their
 existing value types. Implementation validation checks both implications of
-these native type comparisons. `is_bool` and `is_int` use `TypeIs` to narrow both branches to the
-distinct Starlark boolean and integer domains. The setting
-interface declares `make_valid_identifier(str) -> str` and
-`validate_and_get_attr_name(str | Label) -> str`.
+these native type comparisons. `is_bool` and `is_int` use `TypeIs` to narrow
+both branches to the distinct Starlark boolean and integer domains.
+Source type comments declare
+`make_valid_identifier(str) -> str` and
+`validate_and_get_attr_name(str | Label) -> str` in `setting.bzl`.
+Using the 0.14.6 release requires the corresponding source-comment patch.
+The setting interface retains the attribute type names: the source comment
+parser does not yet accept their `Literal` return types.
 `_get_type_as_attr_type(object)` returns `None` or one of `string`,
 `string_list`, `label`, `label_list`, `int`, `int_list`, and `bool`.
 It selects the name from the value or the first element of a nonempty
