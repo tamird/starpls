@@ -7,7 +7,9 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
+use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use starpls_bazel::attr::AttributeKind;
 use starpls_hir::Db as _;
@@ -26,6 +28,7 @@ use ty_python_semantic::types::CheckedCall;
 use ty_python_semantic::types::DictionaryExtraItems;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
+use ty_python_semantic::types::DynamicType;
 use ty_python_semantic::types::KnownClass;
 use ty_python_semantic::types::Parameter;
 use ty_python_semantic::types::ParameterDefault;
@@ -109,7 +112,13 @@ impl RuleData {
             } else {
                 UnionType::from_elements(db, environment, [value, none])
             };
-            specialized_native_instance(db, environment, declarations, "select", alternatives)
+            specialized_native_instance(
+                db,
+                environment,
+                declarations,
+                "select",
+                vec![alternatives, Type::Dynamic(DynamicType::Any)],
+            )
         };
         let value = match attribute.configurable() {
             Some(configurable) => {
@@ -351,6 +360,7 @@ pub(super) enum BuiltinFunction {
     Getattr,
     Provider,
     Transition,
+    Select,
 }
 
 // Keep parse and lexical-owner dependencies behind a small, backdated declaration identity.
@@ -415,6 +425,7 @@ pub(super) fn declaration<'db>(
         "getattr" => BuiltinFunction::Getattr,
         "provider" => BuiltinFunction::Provider,
         "transition" => BuiltinFunction::Transition,
+        "select" => BuiltinFunction::Select,
         _ => return None,
     })
 }
@@ -444,6 +455,7 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
         BuiltinFunction::Macro => rule(db, call, RuleKind::Macro),
         BuiltinFunction::Aspect => None,
         BuiltinFunction::Struct => structure(db, call),
+        BuiltinFunction::Select => selector(db, call),
         BuiltinFunction::StructGetattr => None,
         BuiltinFunction::Getattr => call.getattr_return_type(db),
         BuiltinFunction::Provider => provider(db, call),
@@ -454,6 +466,70 @@ pub(super) fn result<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Opt
             ProvidedData::new(StarlarkTransition),
         ),
     }
+}
+
+fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<'db>> {
+    if call.has_binding_errors() {
+        return None;
+    }
+    let CheckedArgument::Value { ty: _, expression } = call.argument("x") else {
+        return None;
+    };
+    let expression = expression?;
+    let Expr::Dict(dictionary) = expression else {
+        return None;
+    };
+    // Unpacking, unknown keys, and repeated keys do not establish the first entry.
+    let mut keys = rustc_hash::FxHashSet::default();
+    for item in &dictionary.items {
+        let key = item.key.as_ref()?;
+        let Expr::StringLiteral(key) = key else {
+            return None;
+        };
+        if !keys.insert(key.value.to_str()) {
+            return None;
+        }
+    }
+    let first = dictionary.items.first()?;
+    let value = match &first.value {
+        Expr::UnaryOp(unary) => {
+            if !matches!(unary.op, UnaryOp::UAdd | UnaryOp::USub) {
+                return None;
+            }
+            let Expr::NumberLiteral(_) = unary.operand.as_ref() else {
+                return None;
+            };
+            unary.operand.as_ref()
+        }
+        value => value,
+    };
+    let kind = match value {
+        Expr::NoneLiteral(_) => "none",
+        Expr::BooleanLiteral(_) => "bool",
+        Expr::StringLiteral(_) => "str",
+        Expr::NumberLiteral(number) => match &number.value {
+            Number::Int(_) => "int",
+            Number::Float(_) => return None,
+            Number::Complex { real: _, imag: _ } => return None,
+        },
+        Expr::List(_) => "list",
+        Expr::Tuple(_) => "list",
+        Expr::Dict(_) => "dict",
+        _ => return None,
+    };
+    let environment = ProgramEnvironment::from_file(call.file());
+    let (_, specialization) = call.return_type().class_specialization(db, &environment)?;
+    let [payload, _kind] = specialization.types(db) else {
+        return None;
+    };
+    let declaration = call.declaration()?;
+    specialized_native_instance(
+        db,
+        &environment,
+        declaration.program_file(db),
+        "select",
+        vec![*payload, Type::string_literal(db, kind)],
+    )
 }
 
 fn descriptor<'db>(
@@ -1447,7 +1523,7 @@ fn configurable_input<'db>(
         &environment,
         declaration.program_file(db),
         "select",
-        alternatives,
+        vec![alternatives, Type::Dynamic(DynamicType::Any)],
     )?;
     Some(UnionType::from_elements(
         db,
@@ -1461,9 +1537,9 @@ pub(super) fn specialized_native_instance<'db>(
     environment: &ProgramEnvironment<'db>,
     declarations: ProgramFile<'db>,
     name: &str,
-    value: Type<'db>,
+    arguments: Vec<Type<'db>>,
 ) -> Option<Type<'db>> {
-    let class = specialized_native_class(db, declarations, name, vec![value])?;
+    let class = specialized_native_class(db, declarations, name, arguments)?;
     class.to_instance_approximation(db, environment)
 }
 
@@ -2685,13 +2761,13 @@ target_test($0name="valid", exports="//:input", count=1)
         assert!(
             signature
                 .label
-                .contains("exports: Label | str | select[Label | str | None]"),
+                .contains("exports: Label | str | select[Label | str | None, Any]"),
             "{help:?}"
         );
         assert!(
             signature
                 .label
-                .contains("count: int | select[int | None] | None = ..."),
+                .contains("count: int | select[int | None, Any] | None = ..."),
             "{help:?}"
         );
         assert!(!signature.label.contains("**kwargs"), "{help:?}");
@@ -2748,13 +2824,14 @@ target($0name="valid", before=1, after=2)
         assert!(
             parameters
                 .iter()
-                .any(|parameter| parameter.label == "before: int | select[int | None] | None = ..."),
+                .any(|parameter| parameter.label
+                    == "before: int | select[int | None, Any] | None = ..."),
             "{help:?}"
         );
         assert!(
             parameters
                 .iter()
-                .any(|parameter| parameter.label == "after: int | select[int | None]"),
+                .any(|parameter| parameter.label == "after: int | select[int | None, Any]"),
             "{help:?}"
         );
         assert!(!signature.label.contains("**kwargs"), "{help:?}");

@@ -317,7 +317,7 @@ fn declarations(
             "struct" => Some("_StructField"),
             "Provider" => Some("_ProviderValue"),
             "depset" => Some("_DepsetElement"),
-            "select" => Some("_SelectValue"),
+            "select" => Some("_SelectValue, _SelectKind"),
             "Target" => Some("_DefaultInfoFilesToRun"),
             "FilesToRunProvider" => Some("_Executable"),
             "DefaultInfo" => Some("_DefaultInfoFiles, _DefaultInfoFilesToRun"),
@@ -654,7 +654,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\nfrom ty_extensions._internal import Unknown as _starpls_unknown\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectKind = _starpls_typing.TypeVar(\"_SelectKind\", covariant=True, default=_starpls_typing.Any)\n_SelectPeerValue = _starpls_typing.TypeVar(\"_SelectPeerValue\")\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -696,11 +696,10 @@ fn write_type_overloads(
             .contains("Label")
             .then_some(("_starpls_types.Label", "Label")),
     )
-    .chain(
-        declared_classes
-            .contains("select")
-            .then_some(("_starpls_types.select[_builtins.object]", "select")),
-    ) {
+    .chain(declared_classes.contains("select").then_some((
+        "_starpls_types.select[_builtins.object, _builtins.object]",
+        "select",
+    ))) {
         writeln!(output, "@_typing.overload")?;
         writeln!(
             output,
@@ -716,43 +715,89 @@ fn write_type_overloads(
     Ok(())
 }
 
-// Selector concatenation is deferred until attribute conversion. Integer,
-// string, sequence, and mapping overloads model the attribute value domains.
-// Nullable overloads preserve default markers but cannot model the first-branch
-// runtime kind that Bazel uses to accept or reject a concatenation.
+// Bazel accepts concatenation only when first-branch runtime classes agree
+// (with one shared category for Java lists). Payload types describe the later
+// attribute conversion independently of that runtime-kind requirement.
 fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
-    for (methods, signatures) in [
-        (["__add__", "__radd__"], &[
-            ("_starpls_builtins.int", "_starpls_builtins.int", "_starpls_builtins.int"),
-            ("_starpls_typing.Sequence[_SelectLeft]", "_starpls_typing.Sequence[_SelectRight]", "_starpls_builtins.list[_SelectLeft | _SelectRight]"),
-        ][..]),
-        (["__or__", "__ror__"], &[
-            ("_starpls_typing.Mapping[_SelectKeyLeft, _SelectLeft]", "_starpls_typing.Mapping[_SelectKeyRight, _SelectRight]", "_starpls_builtins.dict[_SelectKeyLeft | _SelectKeyRight, _SelectLeft | _SelectRight]"),
-        ][..]),
-    ] {
-        for method in methods {
-            if matches!(method, "__add__" | "__radd__") {
+    let domains = [
+        (
+            "str",
+            "_starpls_builtins.str",
+            "_starpls_builtins.str",
+            "_starpls_builtins.str",
+            "add",
+        ),
+        (
+            "int",
+            "_starpls_builtins.int",
+            "_starpls_builtins.int",
+            "_starpls_builtins.int",
+            "add",
+        ),
+        (
+            "list",
+            "_starpls_typing.Sequence[_SelectLeft]",
+            "_starpls_typing.Sequence[_SelectRight]",
+            "_starpls_builtins.list[_SelectLeft | _SelectRight]",
+            "add",
+        ),
+        (
+            "dict",
+            "_starpls_typing.Mapping[_SelectKeyLeft, _SelectLeft]",
+            "_starpls_typing.Mapping[_SelectKeyRight, _SelectRight]",
+            "_starpls_builtins.dict[_SelectKeyLeft | _SelectKeyRight, _SelectLeft | _SelectRight]",
+            "or",
+        ),
+    ];
+    for operation in ["add", "or"] {
+        for reflected in ["", "r"] {
+            if operation == "add" {
                 writeln!(output, "        @_starpls_typing.overload")?;
                 writeln!(output, "        @_starpls_typing.type_check_only")?;
-                writeln!(output, "        def {method}(self: _starpls_types.select[None], other: None | _starpls_types.select[None], /) -> _starpls_types.select[None]: ...")?;
-                // A plain string preserves only the receiver's possible default marker.
-                // Keep selector operands separate because they can introduce another marker.
-                for (receiver, operand, result) in [
-                    ("_starpls_builtins.str | None", "_starpls_builtins.str", "_starpls_builtins.str | _SelectValue"),
-                    ("_starpls_builtins.str", "_starpls_types.select[_starpls_builtins.str]", "_starpls_builtins.str"),
-                    ("_starpls_builtins.str | None", "_starpls_types.select[_starpls_builtins.str | None]", "_starpls_builtins.str | None"),
-                ] {
+                writeln!(output, "        def __{reflected}add__(self: _starpls_types.select[None, _starpls_typing.Literal[\"none\"]], other: _starpls_types.select[None, _starpls_typing.Literal[\"none\"]], /) -> _starpls_types.select[None, _starpls_typing.Literal[\"none\"]]: ...")?;
+            }
+            for (kind, receiver, operand, result, native_operation) in domains {
+                let plain_operand = match kind {
+                    "list" => "_starpls_builtins.list[_SelectRight] | _starpls_builtins.tuple[_SelectRight, ...]",
+                    // Bazel 9.2 requires the same Java implementation class. The Starlark
+                    // dict type covers several implementations, including ctx.var's
+                    // tracked dictionary.
+                    // Unknown preserves content inference while refusing proof of this
+                    // unrepresented requirement, including through operator protocols.
+                    "dict" => "_starpls_ty_extensions.Intersection[_starpls_builtins.dict[_SelectKeyRight, _SelectRight], _starpls_unknown]",
+                    // Integer values also have several native representations.
+                    "int" => "_starpls_ty_extensions.Intersection[_starpls_builtins.int, _starpls_unknown]",
+                    _ => operand,
+                };
+                let required_kind = format!("_starpls_typing.Literal[\"{kind}\"]");
+                if operation == native_operation {
+                    // Project the receiver's None contribution independently of merged elements.
                     writeln!(output, "        @_starpls_typing.overload")?;
                     writeln!(output, "        @_starpls_typing.type_check_only")?;
-                    writeln!(output, "        def {method}(self: _starpls_types.select[{receiver}], other: {operand}, /) -> _starpls_types.select[{result}]: ...")?;
+                    writeln!(output, "        def __{reflected}{operation}__(self: _starpls_types.select[{receiver} | None, {required_kind}], other: {plain_operand}, /) -> _starpls_types.select[{result} | _starpls_ty_extensions.Intersection[_SelectValue, None], _SelectKind]: ...")?;
+                    // The peer supplies both the element shape and its whole nullable payload.
+                    let native_requirement = if kind == "int" {
+                        ", _starpls_unknown"
+                    } else {
+                        ""
+                    };
+                    let selected = format!("_starpls_ty_extensions.Intersection[_starpls_types.select[{operand} | None, {required_kind}], _starpls_types.select[_SelectPeerValue, {required_kind}]{native_requirement}]");
+                    writeln!(output, "        @_starpls_typing.overload")?;
+                    writeln!(output, "        @_starpls_typing.type_check_only")?;
+                    writeln!(output, "        def __{reflected}{operation}__(self: _starpls_types.select[{receiver} | None, {required_kind}], other: {selected}, /) -> _starpls_types.select[{result} | _starpls_ty_extensions.Intersection[_SelectValue | _SelectPeerValue, None], _SelectKind]: ...")?;
+                }
+                if operation == "add" {
+                    // A None first branch retains its kind even with dictionary payloads.
+                    let selected = format!("_starpls_ty_extensions.Intersection[_starpls_types.select[{operand} | None, _starpls_typing.Literal[\"none\"]], _starpls_types.select[_SelectPeerValue, _starpls_typing.Literal[\"none\"]]]");
+                    writeln!(output, "        @_starpls_typing.overload")?;
+                    writeln!(output, "        @_starpls_typing.type_check_only")?;
+                    writeln!(output, "        def __{reflected}add__(self: _starpls_types.select[{receiver} | None, _starpls_typing.Literal[\"none\"]], other: {selected}, /) -> _starpls_types.select[{result} | _starpls_ty_extensions.Intersection[_SelectValue | _SelectPeerValue, None], _SelectKind]: ...")?;
                 }
             }
-            for nullable in ["", " | None"] {
-                for (receiver, operand, result) in signatures {
-                    writeln!(output, "        @_starpls_typing.overload")?;
-                    writeln!(output, "        @_starpls_typing.type_check_only")?;
-                    writeln!(output, "        def {method}(self: _starpls_types.select[{receiver}{nullable}], other: {operand} | _starpls_types.select[{operand}{nullable}], /) -> _starpls_types.select[{result}{nullable}]: ...")?;
-                }
+            if operation == "add" {
+                writeln!(output, "        @_starpls_typing.overload")?;
+                writeln!(output, "        @_starpls_typing.type_check_only")?;
+                writeln!(output, "        def __{reflected}add__(self: _starpls_types.select[_SelectValue, _starpls_typing.Literal[\"none\"]], other: None, /) -> _starpls_types.select[_SelectValue | None, _starpls_typing.Literal[\"none\"]]: ...")?;
             }
         }
     }
@@ -2582,7 +2627,7 @@ def excluded_kinds():
                 assert!(
                     signature
                         .label
-                        .contains("generator_custom: str | select[str | None] | None = None"),
+                        .contains("generator_custom: str | select[str | None, Any] | None = None"),
                     "{signature:?}"
                 );
             }

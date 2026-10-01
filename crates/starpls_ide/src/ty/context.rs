@@ -147,6 +147,7 @@ pub(super) fn parameter_type<'db>(
         BuiltinFunction::Getattr => return None,
         BuiltinFunction::Provider => return None,
         BuiltinFunction::Transition => return None,
+        BuiltinFunction::Select => return None,
     };
     let parameter_count = if context_kind == ContextKind::Aspect {
         2
@@ -518,12 +519,13 @@ fn field_type<'db>(
         // Successful executable/single-artifact prerequisites exclude targets
         // without FilesToRunProvider. Other dependencies can be environment groups.
         let provider = if attribute.executable == Some(true) {
+            let file = native("File")?;
             factory::specialized_native_instance(
                 db,
                 environment,
                 declarations,
                 "FilesToRunProvider",
-                native("File")?,
+                vec![file],
             )?
         } else {
             native("FilesToRunProvider")?
@@ -533,7 +535,7 @@ fn field_type<'db>(
             environment,
             declarations,
             "Target",
-            provider,
+            vec![provider],
         )?;
         if attribute.executable == Some(true) || attribute.single_file == Some(true) {
             Some(target)
@@ -543,7 +545,7 @@ fn field_type<'db>(
                 environment,
                 declarations,
                 "Target",
-                Type::none(db, environment),
+                vec![Type::none(db, environment)],
             )?;
             Some(UnionType::from_elements(db, environment, [target, group]))
         }
@@ -2237,7 +2239,7 @@ example = macro(implementation=implementation, inherit_attrs=parent)
                     assert_eq!(parent_type.display(db, &environment).to_string(), "rule");
                 }
                 let (srcs_type, optional_type) = if !erased && !keyword_parameters {
-                    ("list[Label]", "select[bool | None] | None")
+                    ("list[Label]", "select[bool | None, Any] | None")
                 } else {
                     ("Unknown", "Unknown")
                 };

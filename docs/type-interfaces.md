@@ -155,6 +155,37 @@ The default open form permits additional fields when accepting existing values.
 initializers. Their values have type `object`, and access through the contract
 permits reads. Declared fields retain their individual types and mutability.
 
+## Selectors
+
+`select[T]` describes configurable values whose branches have type `T`.
+Starpls also tracks the first branch's runtime kind when its value is a
+supported literal and the dictionary keys are distinct string literals. The
+kind determines which selector operations Bazel accepts. For example, selectors
+whose first branch is `None` combine with `+`, including when later branches are
+dictionaries; selectors whose first branch is a dictionary combine with `|`.
+
+Inferred types display this information as a second parameter, such as
+`select[dict[str, int] | None, Literal["none"]]`. List and tuple branches share
+the `"list"` kind. Combined selectors preserve their kind and include the
+nullable contributions of both operands in their branch type.
+
+`select[T]` defaults the kind to `Any`, so annotations can describe branch
+values while leaving runtime kind unspecified. Dynamic mappings also retain
+an unspecified kind. Integer literals retain the `"int"` category. Bazel uses
+several native integer representations, so integer operands carry an `Unknown`
+compatibility requirement. Implementation validation refuses to prove operations
+on integer-first selectors until their native representations can be distinguished.
+
+A predicate testing for any selector uses `TypeIs[select[object, object]]`.
+The second `object` covers every kind, so both outcomes of the predicate can
+narrow its argument. A gradual kind describes an unspecified subset instead.
+
+Bazel 9.2 also distinguishes dictionary implementations that share Starlark's
+`dict` type. Starpls infers the contents of `selector | dictionary`, but
+implementation validation reports the dictionary input as unproved. This also
+applies to fresh dictionary literals and copies, whose native implementation
+class is absent from the static type.
+
 ## Rule contexts
 
 `ctx[Value, Attrs]` specifies the build-setting value and the fields of

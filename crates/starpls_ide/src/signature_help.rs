@@ -224,10 +224,9 @@ fallback = unknown({{}})
                 .unwrap()
                 .unwrap();
             assert!(rule_hover.contents.value.contains("(function)"));
-            assert!(rule_hover
-                .contents
-                .value
-                .contains(&format!("foo: str | select[str | None] | None = {default}")));
+            assert!(rule_hover.contents.value.contains(&format!(
+                "foo: str | select[str | None, Any] | None = {default}"
+            )));
             assert!(rule_hover.contents.value.contains("Rule documentation."));
             let field_hover = analysis
                 .snapshot()
@@ -239,10 +238,9 @@ fallback = unknown({{}})
                 })
                 .unwrap()
                 .unwrap();
-            assert!(field_hover
-                .contents
-                .value
-                .contains(&format!("foo: str | select[str | None] | None = {default}")));
+            assert!(field_hover.contents.value.contains(&format!(
+                "foo: str | select[str | None, Any] | None = {default}"
+            )));
             let fallback_help = analysis
                 .snapshot()
                 .signature_help(FilePosition {
@@ -271,7 +269,7 @@ fallback = unknown({{}})
                 .unwrap();
             assert_eq!(
                 parameter.label,
-                format!("foo: str | select[str | None] | None = {default}")
+                format!("foo: str | select[str | None, Any] | None = {default}")
             );
             assert!(signature
                 .documentation
@@ -357,12 +355,12 @@ base = rule(implementation=implementation, attrs={{
             for (name, expected, doc) in [
                 (
                     "original:",
-                    format!("original: {ty} | select[{ty} | None] | None = None"),
+                    format!("original: {ty} | select[{ty} | None, Any] | None = None"),
                     "Inherited documentation.",
                 ),
                 (
                     "overridden:",
-                    "overridden: int | select[int | None] | None = 3".to_owned(),
+                    "overridden: int | select[int | None, Any] | None = 3".to_owned(),
                     "Own documentation.",
                 ),
             ] {

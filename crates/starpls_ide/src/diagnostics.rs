@@ -600,8 +600,8 @@ example(name="omitted", tool="//:tool", _private=None)
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
         for (name, expected) in [
-            ("srcs", "select[list[Label] | None]"),
-            ("combined", "select[list[Label | Unknown] | None]"),
+            ("srcs", "select[list[Label] | None, Any]"),
+            ("combined", "select[list[Label | Unknown] | None, Any]"),
         ] {
             let hover = analysis
                 .snapshot()
@@ -811,29 +811,45 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
 "#;
         let (mut analysis, fixture) = native_analysis(source);
         let file = fixture.main_file();
+        let mut mismatches = Vec::new();
         for (name, expected) in [
-            ("integer_right", "select[int]"),
-            ("integer_left", "select[int]"),
-            ("integer_pair", "select[int]"),
-            ("integer_defaulted", "select[int | None]"),
-            ("none_right", "select[None]"),
-            ("none_left", "select[None]"),
-            ("none_pair", "select[None]"),
-            ("known_mixed", "select[list[str | int]]"),
-            ("declared_mixed", "select[list[str | int]]"),
-            ("nullable_mixed", "select[list[str | int] | None]"),
-            ("known_empty", "select[list[str | Unknown]]"),
-            ("known_empty_left", "select[list[str | Unknown]]"),
-            ("nullable_empty", "select[list[str | Unknown] | None]"),
+            ("integer_right", "select[int, Literal[\"int\"]]"),
+            ("integer_left", "select[int, Literal[\"int\"]]"),
+            ("integer_pair", "select[int, Literal[\"int\"]]"),
+            ("integer_defaulted", "select[int | None, Literal[\"int\"]]"),
+            ("none_right", "select[None, Literal[\"none\"]]"),
+            ("none_left", "select[None, Literal[\"none\"]]"),
+            ("none_pair", "select[None, Literal[\"none\"]]"),
+            ("known_mixed", "select[list[str | int], Literal[\"list\"]]"),
+            ("declared_mixed", "select[list[str | int], Any]"),
+            (
+                "nullable_mixed",
+                "select[list[str | int] | None, Literal[\"list\"]]",
+            ),
+            (
+                "known_empty",
+                "select[list[str | Unknown], Literal[\"list\"]]",
+            ),
+            (
+                "known_empty_left",
+                "select[list[str | Unknown], Literal[\"list\"]]",
+            ),
+            (
+                "nullable_empty",
+                "select[list[str | Unknown] | None, Literal[\"list\"]]",
+            ),
             (
                 "mapping_empty",
-                "select[dict[str | Unknown, int | Unknown]]",
+                "select[dict[str | Unknown, int | Unknown], Literal[\"dict\"]]",
             ),
             (
                 "mapping_empty_left",
-                "select[dict[str | Unknown, int | Unknown]]",
+                "select[dict[str | Unknown, int | Unknown], Literal[\"dict\"]]",
             ),
-            ("gradual_elements", "select[list[str | Unknown]]"),
+            (
+                "gradual_elements",
+                "select[list[str | Unknown], Literal[\"list\"]]",
+            ),
             ("gradual_operand", "Unknown"),
         ] {
             let hover = analysis
@@ -844,15 +860,15 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
                 })
                 .unwrap()
                 .unwrap();
-            assert!(
-                hover
-                    .contents
-                    .value
-                    .contains(&format!("{name}: {expected}\n")),
-                "{}",
-                hover.contents.value
-            );
+            if !hover
+                .contents
+                .value
+                .contains(&format!("{name}: {expected}\n"))
+            {
+                mismatches.push(hover.contents.value);
+            }
         }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
         let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         for (statement, expected) in [
@@ -919,8 +935,23 @@ mapping_before = {"a": 1} | select({"//:condition": {"b": "c"}}) # type: select[
             ),
             ("select({'//:condition': 1}) + 'a'", "unsupported-operator"),
             ("select({'//:condition': 1}) + True", "unsupported-operator"),
-            ("defaulted + None", "unsupported-operator"),
-            ("None + defaulted", "unsupported-operator"),
+            ("select({'//:condition': 1}) + None", "unsupported-operator"),
+            (
+                "select({'//:condition': -1}) + None",
+                "unsupported-operator",
+            ),
+            ("None + select({'//:condition': 1})", "unsupported-operator"),
+            (
+                "(select({'//:condition': 1}) + 2) + None",
+                "unsupported-operator",
+            ),
+            (
+                "None + (2 + select({'//:condition': 1}))",
+                "unsupported-operator",
+            ),
+            // The annotation on defaulted erases its kind; nullable_values retains it.
+            ("nullable_values + None", "unsupported-operator"),
+            ("None + nullable_values", "unsupported-operator"),
             (
                 "select({'//:condition': None}) | None",
                 "unsupported-operator",

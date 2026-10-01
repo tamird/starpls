@@ -2318,6 +2318,336 @@ mod tests {
     }
 
     #[test]
+    fn selector_dictionary_inputs_need_runtime_class() {
+        let selected = "select({'//:a': {'x': 'x'}})";
+        for (operand, parameter) in [
+            ("value", "value: dict[str, str]"),
+            ("value.var", "value: ctx"),
+            // Fresh allocations also lose their Java class in the dict type.
+            ("dict(value.var)", "value: ctx"),
+            ("{'x': 'x'}", ""),
+        ] {
+            for expression in [
+                format!("{selected} | {operand}"),
+                format!("{operand} | {selected}"),
+            ] {
+                let parameter_name = if parameter.is_empty() { "" } else { "value" };
+                let diagnostics = validation_diagnostics(
+                    &format!("def make({parameter_name}): {expression}\n"),
+                    &format!("def make({parameter}) -> None: ...\n"),
+                );
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.id().as_str() == "incomplete-stub-validation"),
+                    "{expression}: {diagnostics:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selector_protocols_preserve_native_requirements() {
+        for (selected, operand, payload, method, operator) in [
+            (
+                "select({'//:a': {'x': 'x'}})",
+                "dict[str, str]",
+                "dict[str, str]",
+                "or",
+                "|",
+            ),
+            ("select({'//:a': 1})", "int", "int", "add", "+"),
+            (
+                "select({'//:a': 1})",
+                "select[int, Literal['int']]",
+                "int",
+                "add",
+                "+",
+            ),
+        ] {
+            for (reflected, expression) in [
+                ("", format!("value {operator} other")),
+                ("r", format!("other {operator} value")),
+            ] {
+                for decorator in ["", "    @type_check_only\n"] {
+                    let source = format!(
+                        "def invoke(value, other):\n    {expression}\ndef make(other):\n    invoke({selected}, other)\n"
+                    );
+                    let stub = format!(
+                        "class _Operator(Protocol):\n{decorator}    def __{reflected}{method}__(self, __other: {operand}) -> select[{payload}]: ...\ndef invoke(value: _Operator, other: {operand}) -> None: ...\ndef make(other: {operand}) -> None: ...\n"
+                    );
+                    let diagnostics = validation_diagnostics(&source, &stub);
+                    assert!(
+                        diagnostics
+                            .iter()
+                            .any(|diagnostic| {
+                                diagnostic.id().as_str() == "incomplete-stub-validation"
+                                    && diagnostic.primary_span().and_then(|span| span.range()).is_some_and(|range| {
+                                        &source[range] == selected
+                                    })
+                            }),
+                        "{selected} {operand} __{reflected}{method}__ {decorator:?}: {diagnostics:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selector_runtime_kind_controls() {
+        let none = "select({'//conditions:default': None, '//:a': {'x': 1}})";
+        let none_integer = "select({'//conditions:default': None, '//:a': 1})";
+        let dictionary = "select({'//:a': {'x': 1}, '//conditions:default': None})";
+        let mut failures = Vec::new();
+        for (expression, proved) in [
+            (format!("{none} + {none}"), true),
+            (format!("{none_integer} + {none_integer}"), true),
+            (format!("{none} | {none}"), false),
+            (format!("{dictionary} | {dictionary}"), true),
+            (format!("{dictionary} + {dictionary}"), false),
+            (format!("{none} + {dictionary}"), false),
+            (format!("{dictionary} + {none}"), false),
+            (format!("{none} | {dictionary}"), false),
+            (format!("{dictionary} | {none}"), false),
+            (format!("None + {none} + {none}"), true),
+            (format!("{none} + None + {dictionary}"), false),
+            (format!("{dictionary} | {{}} | {none}"), false),
+            (format!("{dictionary} | {{'y': 2}} | {dictionary}"), false),
+            (format!("{dictionary} | {dictionary} | {dictionary}"), true),
+            ("select({'//:a': [1]}) + ('x',)".to_owned(), true),
+            (
+                "select({'//:a': 1}) + select({'//:b': True})".to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': 'x'}) + select({'//:b': []})".to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': ['x']}) + select({'//:b': [1]})".to_owned(),
+                true,
+            ),
+            (
+                "select({'//:a': 1}) + select({'//:b': 2})".to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': 1}) + select({'//:b': 2147483648})".to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': 2147483648}) + select({'//:b': 2147483649})".to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': 9223372036854775808}) + select({'//:b': 9223372036854775809})"
+                    .to_owned(),
+                false,
+            ),
+            (
+                "select({'//:a': 2147483648}) + select({'//:b': 9223372036854775808})".to_owned(),
+                false,
+            ),
+            ("select({'//:a': 1}) + 2147483648".to_owned(), false),
+        ] {
+            let source = format!("def make():\n    {expression}\n");
+            let diagnostics = validation_diagnostics(&source, "def make() -> None: ...\n");
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                == proved
+            {
+                failures.push(format!("{expression}: {diagnostics:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn selector_runtime_kind_unknown_inputs() {
+        for (body, parameters) in [
+            ("select(value) + select(value)", "value: Mapping[str, str]"),
+            (
+                "select({'//:a': value}) + select({'//:a': value})",
+                "value: Any",
+            ),
+            (
+                "select({'//:a': value}) + select({'//:a': value})",
+                "value: str | list[str]",
+            ),
+            (
+                "select({key: 'a', '//:b': 'b'}) + select({'//:c': 'c'})",
+                "key: str",
+            ),
+            (
+                "select({'//:a': 'a', '//:a': 'b'}) + select({'//:c': 'c'})",
+                "",
+            ),
+        ] {
+            let source = format!(
+                "def make({}):\n    {body}\n",
+                parameters.split(':').next().unwrap()
+            );
+            let stub = format!("def make({parameters}) -> None: ...\n");
+            let diagnostics = validation_diagnostics(&source, &stub);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                "{body}: {diagnostics:#?}"
+            );
+        }
+        for (expression, result) in [
+            ("select({'//:a': 'x'})", "select[str]"),
+            ("'prefix' + select({'//:a': 'x'})", "select[str]"),
+            ("select({'//:a': 'x'}) + 'suffix'", "select[str]"),
+            (
+                "select({'//:a': ['x']}) + select({'//:b': [1]})",
+                "select[list[str | int]]",
+            ),
+            (
+                "select({'//:a': {'x': 1}}) | select({'//:b': {'y': 'value'}})",
+                "select[dict[str, int | str]]",
+            ),
+            ("select({'//:a': []})", "select[list[str]]"),
+            ("select({'//:a': {'x': 1}})", "select[dict[str, int]]"),
+        ] {
+            let source = format!("def make(): return {expression}\n");
+            let diagnostics =
+                validation_diagnostics(&source, &format!("def make() -> {result}: ...\n"));
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn selector_runtime_kind_nullable_payloads() {
+        let mut failures = Vec::new();
+        for expression in [
+            "select({'//:a': ['x'], '//conditions:default': None}) + [1]",
+            "select({'//:a': ['x']}) + select({'//:b': [1], '//conditions:default': None})",
+            "select({'//:a': ['x'], '//conditions:default': None}) + select({'//:b': [1], '//conditions:default': None})",
+        ] {
+            let diagnostics = validation_diagnostics(
+                &format!("def make(): return {expression}\n"),
+                "def make() -> select[list[str | int] | None]: ...\n",
+            );
+            if !diagnostics.is_empty() {
+                failures.push(format!("{expression}: {diagnostics:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn selector_runtime_kind_ordinary_and_strict() {
+        let mut failures = Vec::new();
+        for (body, parameters, ordinary_error) in [
+            // Integer construction leaves kind unknown because int hides Java representation.
+            ("select({'//:a': 1}) + 2", "", false),
+            ("2 + select({'//:a': 1})", "", false),
+            ("select({'//:a': 1}) + 2147483648", "", false),
+            ("select({'//:a': 1}) | select({'//:b': 2})", "", true),
+            (
+                "select(value) + select(value)",
+                "value: Mapping[str, str]",
+                false,
+            ),
+            ("value + value", "value: select[str]", false),
+            // This payload admits both list-first and None-first selectors.
+            ("value + None", "value: select[list[str] | None]", false),
+            ("None + value", "value: select[list[str] | None]", false),
+            // Ordinary reflected dispatch succeeds, but its input proof remains unavailable.
+            ("{} | select({'//:a': {'x': 1}})", "", false),
+            ("('x',) + select({'//:a': [1]})", "", false),
+            // An empty dictionary also lacks a complete operand proof.
+            (
+                "select({'//:a': {'x': 1}, '//conditions:default': None}) | {} | select({'//:a': {'x': 1}, '//conditions:default': None})",
+                "",
+                false,
+            ),
+        ] {
+            let (mut analysis, loader) = Analysis::new_for_test();
+            let mut fixture = Fixture::new(&mut analysis.db);
+            let source = fixture.add_file(
+                &mut analysis.db,
+                "source.bzl",
+                &format!("def make({parameters}):\n    {body}\n"),
+            );
+            let stub = fixture.add_file(
+                &mut analysis.db,
+                "source.bzli",
+                &format!("def make({parameters}) -> None: ...\n"),
+            );
+            loader.add_files_from_fixture(&fixture);
+            analysis
+                .set_builtin_defs(
+                    starpls_bazel::decode_builtins(include_bytes!(
+                        "../../../starpls/src/builtin/builtin.pb"
+                    ))
+                    .unwrap(),
+                    Default::default(),
+                )
+                .unwrap();
+            analysis.set_type_interfaces([(source, stub)]).unwrap();
+            let ordinary = analysis.snapshot().diagnostics(source).unwrap();
+            if ordinary
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                != ordinary_error
+            {
+                failures.push(format!("ordinary {body}: {ordinary:#?}"));
+            }
+            let reports = analysis.validate_stubs(|_| true).unwrap();
+            if !reports
+                .iter()
+                .flat_map(|(_, diagnostics)| diagnostics)
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("strict {body}: {reports:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn selector_runtime_kind_does_not_replace_payload_proof() {
+        let diagnostics = validation_diagnostics(
+            "def small(): return select({'//:a': 1}) + select({'//:b': 2})\ndef large(): return select({'//:a': 2147483648}) + select({'//:b': 2147483649})\ndef make(): small() + large()\n",
+            "def make() -> None: ...\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error),
+            "integer helper results: {diagnostics:#?}"
+        );
+        let diagnostics = validation_diagnostics(
+            "def make(value): return select({'//:a': {'x': value}})\n",
+            "def make(value: Any) -> select[dict[str, str]]: ...\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error),
+            "{diagnostics:#?}"
+        );
+        for operator in ["+", "|"] {
+            let diagnostics = validation_diagnostics(
+                &format!(
+                    "def make(flag):\n    value = select({{'//conditions:default': None, '//:a': {{'x': 1}}}}) if flag else select({{'//:a': {{'x': 1}}, '//conditions:default': None}})\n    value {operator} value\n"
+                ),
+                "def make(flag: bool) -> None: ...\n",
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                "{operator}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn advisory_diagnostics_preserve_implementation_proof() {
         for (source, stub, expected) in [
             (
@@ -4658,55 +4988,106 @@ def forward(**kwargs: Unpack[_Keywords]) -> None: ...
 
         for (left, right, result, expected) in [
             ("str", "str", "str", None),
-            ("str", "select[str]", "select[str]", None),
-            ("select[str]", "str", "select[str]", None),
-            ("select[str]", "select[str]", "select[str]", None),
-            ("str", "str | select[str]", "str | select[str]", None),
-            ("str", "select[str | None]", "select[str | None]", None),
-            ("select[str | None]", "str", "select[str | None]", None),
             (
-                "select[str]",
-                "select[str | None]",
-                "select[str | None]",
+                "str",
+                "select[str, Literal['str']]",
+                "select[str, Literal['str']]",
                 None,
             ),
             (
-                "select[str | None]",
-                "select[str]",
-                "select[str | None]",
+                "select[str, Literal['str']]",
+                "str",
+                "select[str, Literal['str']]",
                 None,
             ),
-            ("str", "select[Literal['x']]", "select[str]", None),
-            ("select[Literal['x']]", "str", "select[str]", None),
             (
-                "str",
-                "select[str | None]",
-                "select[str]",
-                Some("invalid-return-type"),
-            ),
-            (
-                "select[str | None]",
-                "str",
-                "select[str]",
-                Some("invalid-return-type"),
+                "select[str, Literal['str']]",
+                "select[str, Literal['str']]",
+                "select[str, Literal['str']]",
+                None,
             ),
             (
                 "str",
-                "select[Literal['x']]",
-                "select[Literal['x']]",
+                "str | select[str, Literal['str']]",
+                "str | select[str, Literal['str']]",
+                None,
+            ),
+            (
+                "str",
+                "select[str | None, Literal['str']]",
+                "select[str | None, Literal['str']]",
+                None,
+            ),
+            (
+                "select[str | None, Literal['str']]",
+                "str",
+                "select[str | None, Literal['str']]",
+                None,
+            ),
+            (
+                "select[str, Literal['str']]",
+                "select[str | None, Literal['str']]",
+                "select[str | None, Literal['str']]",
+                None,
+            ),
+            (
+                "select[str | None, Literal['str']]",
+                "select[str, Literal['str']]",
+                "select[str | None, Literal['str']]",
+                None,
+            ),
+            (
+                "str",
+                "select[Literal['x'], Literal['str']]",
+                "select[str, Literal['str']]",
+                None,
+            ),
+            (
+                "select[Literal['x'], Literal['str']]",
+                "str",
+                "select[str, Literal['str']]",
+                None,
+            ),
+            (
+                "str",
+                "select[str | None, Literal['str']]",
+                "select[str, Literal['str']]",
                 Some("invalid-return-type"),
             ),
             (
-                "select[Literal['x']]",
+                "select[str | None, Literal['str']]",
                 "str",
-                "select[Literal['x']]",
+                "select[str, Literal['str']]",
                 Some("invalid-return-type"),
             ),
-            ("str", "select[str]", "int", Some("invalid-return-type")),
+            (
+                "str",
+                "select[Literal['x'], Literal['str']]",
+                "select[Literal['x'], Literal['str']]",
+                Some("invalid-return-type"),
+            ),
+            (
+                "select[Literal['x'], Literal['str']]",
+                "str",
+                "select[Literal['x'], Literal['str']]",
+                Some("invalid-return-type"),
+            ),
+            (
+                "str",
+                "select[str, Literal['str']]",
+                "int",
+                Some("invalid-return-type"),
+            ),
             ("str", "int", "object", Some("unsupported-operator")),
             ("str", "select[int]", "object", Some("unsupported-operator")),
             ("str", "object", "object", Some("unsupported-operator")),
             ("str", "Any", "object", Some("incomplete-stub-validation")),
+            (
+                "str",
+                "select[str]",
+                "select[str]",
+                Some("incomplete-stub-validation"),
+            ),
         ] {
             let source = "def add(left, right):\n    return left + right\n";
             let stub = format!("def add(left: {left}, right: {right}) -> {result}: ...\n");
@@ -6732,7 +7113,8 @@ _SELECT_TYPE = type(select({"//conditions:default": []}))
 def is_select(value):
     return type(value) == _SELECT_TYPE
 "#;
-        let predicate_stub = "def is_select(value: object) -> TypeIs[select[object]]: ...\n";
+        let predicate_stub =
+            "def is_select(value: object) -> TypeIs[select[object, object]]: ...\n";
         for (annotation, fallback) in [("int", "0"), ("list[str]", "[]")] {
             let source = format!(
                 r#"{predicate}
@@ -6752,6 +7134,12 @@ def direct(value):
             );
             let diagnostics = validation_diagnostics(&source, &stub);
             assert!(diagnostics.is_empty(), "{annotation}: {diagnostics:#?}");
+            // A gradual predicate can cover fewer kinds, so its negative branch
+            // cannot establish that every selector was excluded.
+            let gradual = stub.replace("select[object, object]", "select[object]");
+            assert!(validate(&source, &gradual)
+                .iter()
+                .any(|id| id == "incomplete-stub-validation"),);
         }
         assert_eq!(
             validate(

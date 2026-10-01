@@ -61,7 +61,7 @@ The utility contracts declare `is_label` and `is_string` with `TypeGuard`.
 A true result narrows the input to `Label` or `str`, respectively.
 `is_list` uses `TypeIs[list[Any]]` to narrow list membership on both outcomes
 while preserving a caller's existing list element types. `is_select` uses
-`TypeIs[select[object]]` to distinguish selectors while preserving their
+`TypeIs[select[object, object]]` to distinguish selectors while preserving their
 existing value types. Implementation validation checks both implications of
 these native type comparisons. The other three utility predicates accept
 `object` and return `bool`. The setting
