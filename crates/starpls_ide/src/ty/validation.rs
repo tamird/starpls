@@ -2539,6 +2539,43 @@ mod tests {
     }
 
     #[test]
+    fn selector_boolean_addition() {
+        let boolean = "select({'//:a': True})";
+        let nullable = "select({'//:a': False, '//conditions:default': None})";
+        let none = "select({'//conditions:default': None, '//:a': True})";
+        for (expression, result) in [
+            (format!("{boolean} + {boolean}"), "select[bool]"),
+            (format!("{boolean} + False"), "select[bool]"),
+            (format!("False + {boolean}"), "select[bool]"),
+            (format!("{nullable} + False"), "select[bool | None]"),
+            (format!("{boolean} + {nullable}"), "select[bool | None]"),
+            (format!("{none} + {none}"), "select[bool | None]"),
+        ] {
+            let diagnostics = validation_diagnostics(
+                &format!("def make(): return {expression}\n"),
+                &format!("def make() -> {result}: ...\n"),
+            );
+            assert!(diagnostics.is_empty(), "{expression}: {diagnostics:#?}");
+        }
+        for (expression, parameters) in [
+            ("value + value", "value: select[bool]"),
+            ("value + False", "value: select[bool]"),
+            ("False + value", "value: select[bool]"),
+        ] {
+            let diagnostics = validation_diagnostics(
+                &format!("def make(value):\n    {expression}\n"),
+                &format!("def make({parameters}) -> None: ...\n"),
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                "{expression}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn selector_runtime_kind_ordinary_and_strict() {
         let mut failures = Vec::new();
         for (body, parameters, ordinary_error) in [

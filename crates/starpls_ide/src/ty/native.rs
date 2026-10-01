@@ -721,6 +721,13 @@ fn write_type_overloads(
 fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
     let domains = [
         (
+            "bool",
+            "_starpls_builtins.bool",
+            "_starpls_builtins.bool",
+            "_starpls_builtins.bool",
+            "add",
+        ),
+        (
             "str",
             "_starpls_builtins.str",
             "_starpls_builtins.str",

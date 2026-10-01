@@ -762,6 +762,38 @@ partial(name="ok", value=select({"//:condition": "ok"}))
     }
 
     #[test]
+    fn boolean_selector_addition() {
+        let boolean = "select({'//:a': True})";
+        let none = "select({'//conditions:default': None, '//:a': True})";
+        for (expression, valid) in [
+            (format!("{boolean} + {boolean}"), true),
+            (format!("{boolean} + False"), true),
+            (format!("False + {boolean}"), true),
+            (format!("{boolean} | {boolean}"), false),
+            (format!("{boolean} | False"), false),
+            (format!("False | {boolean}"), false),
+            (format!("{boolean} + 1"), false),
+            (format!("1 + {boolean}"), false),
+            (format!("{boolean} + select({{'//:b': 1}})"), false),
+            (format!("select({{'//:b': 1}}) + {boolean}"), false),
+            (format!("{boolean} + {none}"), false),
+            (format!("{none} + {boolean}"), false),
+            ("True + False".to_owned(), false),
+        ] {
+            let (analysis, fixture) = native_analysis(&expression);
+            let diagnostics = analysis
+                .snapshot()
+                .diagnostics(fixture.main_file())
+                .unwrap();
+            assert_eq!(
+                diagnostics.is_empty(),
+                valid,
+                "{expression}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn selects_preserve_alternatives_and_deferred_operations() {
         let source = r#"
 strings = {"//:condition": ["a"], "//conditions:default": []}
