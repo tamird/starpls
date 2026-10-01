@@ -3307,7 +3307,7 @@ mod tests {
                 ", default"
             };
             let source = format!(
-                "{predicate}def reset(value{source_parameters}):\n    decoded = json.decode(value{argument})\n    if not is_dict(decoded):\n        fail('Expected a dictionary')\n    return decoded\n"
+                "{predicate}def reset(value{source_parameters}):\n    decoded = json.decode(value{argument})\n    if not is_dict(decoded):\n        fail('Expected dict, got {{}}'.format(type(decoded)))\n    return decoded\n"
             );
             let stub =
                 format!("{predicate_stub}def reset(value: str{parameters}) -> {result}: ...\n");

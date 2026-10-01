@@ -100,10 +100,15 @@ parser's mapped item domain: true tags carry dictionaries with the parser's
 key union and `object` values, and false tags carry `object`. It returns `bool`.
 These contracts describe successful results; select mapping and recombination
 remain unproved.
-The transition interface declares `_get_settings_key(str | Label) -> str`,
-using the validated Label and string predicates. It also declares
-`_encode_settings(dict[str, object]) -> str`: successful settings encoding
-returns a JSON string. Transition construction remains unproved.
+The transition interface declares `make_transition` with string or Label
+operation keys and the operations `set` and `extend`. It returns a native
+`transition`. Its callback receives `dict[str, object]` settings and a
+`struct[object]` of attributes, and returns `dict[str, object]` settings.
+These contracts require the local 0.14.6 source patch that checks saved
+settings are strings, extension operands are lists, and decoded reset
+settings are JSON objects. `decode_original_settings(str, Label)` returns
+the checked dictionary. `_get_settings_key(str | Label)` returns `str`,
+and `_encode_settings(dict[str, object])` returns a JSON string.
 `RuleInfo` declares its eight readonly fields and required constructor
 arguments. Its `providers` field and constructor argument use readonly
 sequences of `Provider[object] | Callable[..., object]`.
