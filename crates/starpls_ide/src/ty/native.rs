@@ -2082,7 +2082,7 @@ archive_override(module_name='patched', url='https://example.com/source.tar.gz',
                 "Target[None]",
                 "Callable[..., Any]",
                 "target[key]",
-                "Unknown",
+                "(Unknown & DefaultInfo[depset[File], None]) | (Unknown & PackageSpecificationInfo)",
             ),
         ] {
             let source = format!(
