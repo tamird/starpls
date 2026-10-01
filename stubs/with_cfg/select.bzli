@@ -40,10 +40,27 @@ def decompose_select_elements(value: object) -> list[
             ],
         ],
     ]
-    | tuple[Literal[False], object]
+    | tuple[
+        Literal[False],
+        str | bool | int | None | Label
+        | list[str | bool | int | None | Label]
+        | dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label | list[str | bool | int | None | Label],
+        ]
+        | dict[
+            str | bool | int | None | Label,
+            str | bool | int | None | Label
+            | list[str | bool | int | None | Label]
+            | dict[
+                str | bool | int | None | Label,
+                str | bool | int | None | Label | list[str | bool | int | None | Label],
+            ],
+        ],
+    ]
 ]: ...
 
 def _apply_func[K, V, R](
     func: Callable[[V], R],
-    item: tuple[Literal[True], dict[K, V]] | tuple[Literal[False], V],
+    item: tuple[Literal[True], Mapping[K, V]] | tuple[Literal[False], V],
 ) -> tuple[Literal[True], dict[K, R]] | tuple[Literal[False], R]: ...
