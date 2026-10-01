@@ -309,7 +309,7 @@ fn declarations(
         // types from group lookup results.
         if matches!(
             class.name.as_str(),
-            "DefaultInfo" | "PackageSpecificationInfo" | "FilesToRunProvider"
+            "DefaultInfo" | "PackageSpecificationInfo" | "FilesToRunProvider" | "Target"
         ) {
             writeln!(body, "    @_starpls_typing.final")?;
         }
@@ -672,10 +672,11 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\nfrom ty_extensions._internal import Unknown as _starpls_unknown\n\n_JsonDefault = _starpls_typing.TypeVar(\"_JsonDefault\")\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectKind = _starpls_typing.TypeVar(\"_SelectKind\", covariant=True, default=_starpls_typing.Any)\n_SelectPeerValue = _starpls_typing.TypeVar(\"_SelectPeerValue\")\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport _starpls_allocations\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\nfrom ty_extensions._internal import Unknown as _starpls_unknown\n\n_JsonDefault = _starpls_typing.TypeVar(\"_JsonDefault\")\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectKind = _starpls_typing.TypeVar(\"_SelectKind\", covariant=True, default=_starpls_typing.Any)\n_SelectPeerValue = _starpls_typing.TypeVar(\"_SelectPeerValue\")\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
+    output.push_str("_starpls_annotation_ExactDict = _starpls_allocations.dict\n\n");
     for name in classes.keys() {
         writeln!(output, "_starpls_annotation_{name} = _starpls_types.{name}")?;
     }
@@ -797,9 +798,16 @@ fn write_select_operators(output: &mut String) -> anyhow::Result<()> {
                 let required_kind = format!("_starpls_typing.Literal[\"{kind}\"]");
                 if operation == native_operation {
                     // Project the receiver's None contribution independently of merged elements.
-                    writeln!(output, "        @_starpls_typing.overload")?;
-                    writeln!(output, "        @_starpls_typing.type_check_only")?;
-                    writeln!(output, "        def __{reflected}{operation}__(self: _starpls_types.select[{receiver} | None, {required_kind}], other: {plain_operand}, /) -> _starpls_types.select[{result} | _starpls_ty_extensions.Intersection[_SelectValue, None], _SelectKind]: ...")?;
+                    let exact_operand = (kind == "dict")
+                        .then_some("_starpls_allocations.dict[_SelectKeyRight, _SelectRight]");
+                    for plain_operand in exact_operand
+                        .into_iter()
+                        .chain(std::iter::once(plain_operand))
+                    {
+                        writeln!(output, "        @_starpls_typing.overload")?;
+                        writeln!(output, "        @_starpls_typing.type_check_only")?;
+                        writeln!(output, "        def __{reflected}{operation}__(self: _starpls_types.select[{receiver} | None, {required_kind}], other: {plain_operand}, /) -> _starpls_types.select[{result} | _starpls_ty_extensions.Intersection[_SelectValue, None], _SelectKind]: ...")?;
+                    }
                     // The peer supplies both the element shape and its whole nullable payload.
                     let native_requirement = if kind == "int" {
                         ", _starpls_unknown"

@@ -155,6 +155,13 @@ The default open form permits additional fields when accepting existing values.
 initializers. Their values have type `object`, and access through the contract
 permits reads. Declared fields retain their individual types and mutability.
 
+`ExactDict[K, V]` describes dictionaries allocated by dictionary literals,
+comprehensions, `dict()`, and dictionary union. It preserves the same invariant
+key and value types as `dict[K, V]` and can carry allocation information through
+callback parameters and results. Ordinary `dict` and `TypedDict` annotations
+cover dictionaries supplied by Bazel as well as these allocations. A native
+`type(value) == "dict"` check identifies that broader category.
+
 ## Selectors
 
 `select[T]` describes configurable values whose branches have type `T`.
@@ -185,11 +192,11 @@ A predicate testing for any selector uses `TypeIs[select[object, object]]`.
 The second `object` covers every kind, so both outcomes of the predicate can
 narrow its argument. A gradual kind describes an unspecified subset instead.
 
-Bazel 9.2 also distinguishes dictionary implementations that share Starlark's
-`dict` type. Starpls infers the contents of `selector | dictionary`, but
-implementation validation reports the dictionary input as unproved. This also
-applies to fresh dictionary literals and copies, whose native implementation
-class is absent from the static type.
+Bazel 9.2 distinguishes dictionary implementations that share Starlark's
+`dict` type. An `ExactDict` branch establishes the `"dict"` selector kind, and
+an `ExactDict` operand supports `|` with selectors of that kind. Operations
+on a broadly annotated dictionary retain their ordinary inferred result;
+implementation validation requires the allocation information as well.
 
 ## Rule contexts
 

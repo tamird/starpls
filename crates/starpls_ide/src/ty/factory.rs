@@ -481,6 +481,7 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
         if ![KnownClass::Dict, KnownClass::Mapping]
             .into_iter()
             .any(|known| Type::from(class) == known.to_class_literal(db, &environment))
+            && !is_exact_dictionary_class(db, &environment, Type::from(class))
         {
             return None;
         }
@@ -572,10 +573,24 @@ fn selector_value_kind<'db>(
         }
     }
     let (class, _specialization) = value.class_specialization(db, environment)?;
+    if is_exact_dictionary_class(db, environment, Type::from(class)) {
+        return Some("dict");
+    }
     [KnownClass::List, KnownClass::Tuple]
         .into_iter()
         .any(|known| Type::from(class) == known.to_class_literal(db, environment))
         .then_some("list")
+}
+
+fn is_exact_dictionary_class<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    class: Type<'db>,
+) -> bool {
+    KnownClass::Dict
+        .provided_allocation_class(db, environment)
+        .map(Type::from)
+        == Some(class)
 }
 
 fn descriptor<'db>(

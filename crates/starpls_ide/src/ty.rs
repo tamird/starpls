@@ -521,6 +521,33 @@ impl ty_python_semantic::Db for Database {
         }
     }
 
+    fn provided_allocation_class<'db>(
+        &'db self,
+        program: Program<'db>,
+        class: KnownClass,
+    ) -> Option<ProvidedBindingValue<'db>> {
+        if class != KnownClass::Dict {
+            return None;
+        }
+        let namespace = program.semantic_namespace(self).as_ref()?;
+        let mut parts = namespace.as_str().split(':');
+        if parts.next()? != "starpls" {
+            return None;
+        }
+        let dialect = match parts.next()? {
+            "standard" => Dialect::Standard,
+            "bazel" => Dialect::Bazel,
+            _ => return None,
+        };
+        let declarations = self.get_builtin_defs(&dialect);
+        declarations.builtins(self);
+        let native_file = self.files.try_virtual_file(&native::path(dialect))?;
+        Some(ProvidedBindingValue::Export {
+            file: self.program_file(native_file.file()),
+            name: Name::new("_starpls_annotation_ExactDict"),
+        })
+    }
+
     fn provided_function_type_check_only(&self, definition: Definition<'_>) -> bool {
         interface::is_operation_declaration(self, definition)
             || support::is_operation_declaration(self, definition)
@@ -792,6 +819,37 @@ consume(**invalid)
                 >= source.find("consume(**invalid)").unwrap(),
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn exact_dictionary_display() {
+        for expression in [
+            "{'x': 1}",
+            "dict(x=1)",
+            "{key: 1 for key in ['x']}",
+            "{'x': 1} | {'y': 2}",
+        ] {
+            let source = format!("value = {expression}\nvalue\n");
+            let (analysis, fixture) = Analysis::from_single_file_fixture(&source);
+            let program = analysis.db.starlark_program_file(fixture.main_file());
+            let env = ty_python_semantic::ProgramEnvironment::from_file(program);
+            assert!(ty_python_semantic::types::KnownClass::Dict
+                .provided_allocation_class(&analysis.db, &env)
+                .is_some());
+            let hover = analysis
+                .snapshot()
+                .hover(crate::FilePosition {
+                    file_id: fixture.main_file(),
+                    pos: (source.rfind("value").unwrap() as u32).into(),
+                })
+                .unwrap()
+                .unwrap();
+            assert!(
+                hover.contents.value.contains(": dict[str, int]\n"),
+                "{}",
+                hover.contents.value
+            );
+        }
     }
 
     #[test]

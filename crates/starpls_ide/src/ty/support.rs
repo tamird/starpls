@@ -24,6 +24,7 @@ use zip::CompressionMethod;
 
 const PRIMITIVES: &str = include_str!("primitives.pyi");
 const COLLECTIONS: &str = include_str!("collections.pyi");
+const ALLOCATIONS: &str = include_str!("allocations.pyi");
 const SCALARS: [&str; 4] = ["int", "float", "tuple", "range"];
 
 /// Members used by Starlark syntax and builtins. Attribute interception,
@@ -162,6 +163,9 @@ fn build(base: &VendoredFileSystem) -> anyhow::Result<VendoredFileSystem> {
         let contents = assemble(&original, declarations, scalars).with_context(|| path)?;
         replacements.insert(path, contents);
     }
+    let mut versions = base.read_to_string("stdlib/VERSIONS")?;
+    versions.push_str("\n_starpls_allocations: 3.0-\n");
+    replacements.insert("stdlib/VERSIONS", versions);
     let mut builder = VendoredFileSystemBuilder::new(CompressionMethod::Stored);
     let mut directories = vec![VendoredPathBuf::new()];
     while let Some(directory) = directories.pop() {
@@ -185,6 +189,7 @@ fn build(base: &VendoredFileSystem) -> anyhow::Result<VendoredFileSystem> {
         replacements.is_empty(),
         "Missing support declaration entries"
     );
+    builder.add_file("stdlib/_starpls_allocations.pyi", ALLOCATIONS)?;
     let archive = builder.finish()?;
     Ok(archive)
 }
@@ -364,7 +369,10 @@ mod tests {
             let entries = base.read_directory(&directory).collect::<Vec<_>>();
             assert_eq!(
                 entries,
-                archive.read_directory(&directory).collect::<Vec<_>>()
+                archive
+                    .read_directory(&directory)
+                    .filter(|entry| entry.path().as_str() != "stdlib/_starpls_allocations.pyi")
+                    .collect::<Vec<_>>()
             );
             for entry in entries {
                 match entry.file_type() {
@@ -381,6 +389,10 @@ mod tests {
                                 replacements += 1;
                                 assemble(&original, super::COLLECTIONS, &[]).unwrap()
                             }
+                            "stdlib/VERSIONS" => {
+                                replacements += 1;
+                                format!("{original}\n_starpls_allocations: 3.0-\n")
+                            }
                             _ => original,
                         };
                         assert_eq!(actual, expected, "{}", entry.path());
@@ -388,7 +400,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(replacements, 2);
+        assert_eq!(replacements, 3);
     }
 
     #[test]
@@ -523,7 +535,7 @@ element = values.pop()
             ("offset", "int"),
             ("compared", "bool"),
             ("found", "int | Literal[\"missing\"]"),
-            ("copied", "dict[int | str, int | str]"),
+            ("copied", "dict[str | int, str | int]"),
             ("copied_keywords", "dict[str | int, str | int]"),
             ("mixed_keys", "dict[str | int, int]"),
             ("element", "int"),

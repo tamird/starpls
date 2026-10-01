@@ -5,6 +5,7 @@
 
 from typing import Collection, TYPE_CHECKING
 from typing_extensions import Never
+from _starpls_allocations import dict as _AllocatedDict
 
 # Every Starlark value is an object; equality accepts any two values.
 # These operation signatures are internal to the checker.
@@ -311,9 +312,13 @@ class set(AbstractSet[_T]):
     def update(self, *others: Collection[_T]) -> None:
         """Add elements from the other collections."""
 
-@final
 @disjoint_base
 class dict(Mapping[_KT, _VT]):
+    @type_check_only
+    class _SupportsROr(Protocol[_T_contra, _T_co]):
+        @type_check_only
+        def __ror__(self, other: _T_contra, /) -> _T_co: ...
+
     if TYPE_CHECKING:
         __hash__: ClassVar[None]
     @overload
@@ -344,10 +349,18 @@ class dict(Mapping[_KT, _VT]):
     def __setitem__(self, key: _KT, value: _VT, /) -> None: ...
     @type_check_only
     def __contains__(self: dict[_T, _S], key: object, /) -> bool: ...
+    @overload
     @type_check_only
-    def __or__(self, other: dict[_T1, _T2], /) -> dict[_KT | _T1, _VT | _T2]: ...
+    def __or__(self, other: dict[_T1, _T2], /) -> _AllocatedDict[_KT | _T1, _VT | _T2]: ...
+    @overload
+    @type_check_only
+    def __or__(self, other: _SupportsROr[Self, _S], /) -> _S: ...
+    @overload
     @type_check_only
     def __ior__(self, other: dict[_KT, _VT], /) -> Self: ...
+    @overload
+    @type_check_only
+    def __ior__(self, other: _SupportsROr[Self, _S], /) -> _S: ...
     def clear(self) -> None:
         """Remove every dictionary entry."""
     @overload

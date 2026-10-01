@@ -10,6 +10,7 @@ rust_library(
         "@crates//:salsa": "salsa",
     },
     compile_data = [
+        "src/ty/allocations.pyi",
         "src/ty/collections.pyi",
         "src/ty/primitives.pyi",
         "src/ty/starlark.pyi",

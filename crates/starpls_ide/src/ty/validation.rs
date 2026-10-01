@@ -2445,14 +2445,147 @@ mod tests {
     }
 
     #[test]
+    fn exact_dictionary_construction() {
+        let mut failures = Vec::new();
+        for (source, stub) in [
+            ("def make(): return {'x': 'ok'}\n", "def make() -> ExactDict[str, str]: ...\n"),
+            ("def make(): return {}\n", "def make() -> ExactDict[str, int]: ...\n"),
+            ("def make(): return {'x': {}}\n", "def make() -> ExactDict[str, ExactDict[str, int]]: ...\n"),
+            ("def make(): return {key: key for key in ['x']}\n", "def make() -> ExactDict[str, str]: ...\n"),
+            ("def make(): return dict(x='ok')\n", "def make() -> ExactDict[str, str]: ...\n"),
+            ("def make(value): return dict(value)\n", "def make(value: dict[str, str]) -> ExactDict[str, str]: ...\n"),
+            ("def make(value):\n    constructor = dict\n    return constructor(value)\n", "def make(value: dict[str, str]) -> ExactDict[str, str]: ...\n"),
+            ("def consume(value): return None\ndef make():\n    value = {}\n    consume(value)\n    return None\n", "def consume(value: ExactDict[str, int]) -> None: ...\ndef make() -> None: ...\n"),
+            ("def make():\n    value = {'x': 'ok', 'y': 1}\n    return value['x']\n", "def make() -> str: ...\n"),
+            ("def make():\n    value = {'x': 'ok'}\n    alias = value\n    alias['x'] = 'new'\n    return value\n", "def make() -> ExactDict[str, str]: ...\n"),
+            ("def copy(value): return dict(value)\ndef apply(func, value): return func(value)\ndef make(value): return apply(copy, value)\n", "def copy(value: dict[str, str]) -> ExactDict[str, str]: ...\ndef apply(func: Callable[[dict[str, str]], ExactDict[str, str]], value: dict[str, str]) -> ExactDict[str, str]: ...\ndef make(value: dict[str, str]) -> ExactDict[str, str]: ...\n"),
+            ("def make(): return {'x': 'ok'}\n", "class _Row(TypedDict):\n    x: str\ndef make() -> _Row: ...\n"),
+            ("def make(value):\n    if type(value) == type({}):\n        return value\n    return {}\n", "def make(value: dict[str, str] | int) -> dict[str, str]: ...\n"),
+        ] {
+            let diagnostics = validation_diagnostics(source, stub);
+            if !diagnostics.is_empty() { failures.push(format!("{source}\n{stub}\n{diagnostics:#?}")); }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn exact_dictionary_erasure() {
+        let mut failures = Vec::new();
+        for (source, stub) in [
+            ("def make(value): return value\n", "def make(value: dict[str, str]) -> ExactDict[str, str]: ...\n"),
+            ("def make(value): return value\n", "class _Row(TypedDict, extra_items=str):\n    x: NotRequired[str]\ndef make(value: _Row) -> ExactDict[str, str]: ...\n"),
+            ("def make(value): return {'x': value}\n", "def make(value: Any) -> ExactDict[str, str]: ...\n"),
+            ("def make(value): return dict(value.var)\n", "def make(value: ctx) -> ExactDict[str, str]: ...\n"),
+            ("def make(value):\n    if type(value) == type({}):\n        return value\n    return {}\n", "def make(value: object) -> ExactDict[Any, Any]: ...\n"),
+            ("def make(value): return value()\n", "def make(value: Callable[[], dict[str, str]]) -> ExactDict[str, str]: ...\n"),
+            ("def make():\n    value = {'x': 'ok'}\n    value['x'] = 1\n    return value\n", "def make() -> ExactDict[str, str]: ...\n"),
+        ] {
+            let diagnostics = validation_diagnostics(source, stub);
+            if !diagnostics.iter().any(|diagnostic| diagnostic.severity() == Severity::Error) { failures.push(format!("{source}\n{stub}\n{diagnostics:#?}")); }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn exact_dictionary_selector_operations() {
+        let mut failures = Vec::new();
+        for expression in [
+            "select({'//:a': {'x': 'ok'}}) | {'y': 'value'}",
+            "{'y': 'value'} | select({'//:a': {'x': 'ok'}})",
+            "({'y': 'value'} | {'z': 'other'}) | select({'//:a': {'x': 'ok'}})",
+            "select({'//:a': dict(x='ok')}) | {'y': 'value'}",
+            "select({'//:a': {key: key for key in ['x']}}) | {'y': 'value'}",
+        ] {
+            let diagnostics = validation_diagnostics(
+                &format!("def make(): return {expression}\n"),
+                "def make() -> select[dict[str, str], Literal['dict']]: ...\n",
+            );
+            if !diagnostics.is_empty() {
+                failures.push(format!("{expression}: {diagnostics:#?}"));
+            }
+        }
+        for (parameter, expression, proved) in [
+            (
+                "value: ExactDict[str, str]",
+                "select({'//:a': value}) | value",
+                true,
+            ),
+            (
+                "value: dict[str, str]",
+                "select({'//:a': value}) | value",
+                false,
+            ),
+            (
+                "value: dict[str, str]",
+                "select({'//:a': {'x': 'ok'}}) | value",
+                false,
+            ),
+            ("value: Any", "select({'//:a': {'x': 'ok'}}) | value", false),
+        ] {
+            let diagnostics = validation_diagnostics(
+                &format!("def make(value): {expression}\n"),
+                &format!("def make({parameter}) -> None: ...\n"),
+            );
+            if diagnostics.is_empty() != proved {
+                failures.push(format!("{parameter}: {expression}: {diagnostics:#?}"));
+            }
+        }
+        for (other, result, proved) in [
+            ("dict[str, str]", "ExactDict[str, str]", true),
+            (
+                "select[dict[str, str], Literal['dict']]",
+                "select[dict[str, str], Literal['dict']]",
+                true,
+            ),
+            (
+                "dict[str, str] | select[dict[str, str], Literal['dict']]",
+                "dict[str, str] | select[dict[str, str], Literal['dict']]",
+                true,
+            ),
+            ("dict[str, int]", "ExactDict[str, str]", false),
+            ("select[dict[str, str]]", "object", false),
+            ("Any", "object", false),
+        ] {
+            let diagnostics = validation_diagnostics(
+                "def make(value, other):\n    value |= other\n    return value\n",
+                &format!("def make(value: ExactDict[str, str], other: {other}) -> {result}: ...\n"),
+            );
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                == proved
+            {
+                failures.push(format!("inplace {other}: {diagnostics:#?}"));
+            }
+        }
+        let diagnostics = validation_diagnostics(
+            "def make(value):\n    original = value\n    value |= select({'//:a': {'x': 1}})\n    return original, value\n",
+            "def make(value: ExactDict[str, str]) -> tuple[ExactDict[str, str], select[dict[str, str | int], Literal['dict']]]: ...\n",
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!("alias: {diagnostics:#?}"));
+        }
+        for operation in ["|", "|="] {
+            let diagnostics = validation_diagnostics(
+                &format!("def reflected(value): return 42\ndef make():\n    value = {{'x': 'ok'}}\n    value {operation} struct(__ror__=reflected)\n"),
+                "def reflected(value: ExactDict[str, str]) -> int: ...\ndef make() -> None: ...\n",
+            );
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("struct field {operation}: {diagnostics:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
     fn selector_dictionary_inputs_need_runtime_class() {
         let selected = "select({'//:a': {'x': 'x'}})";
         for (operand, parameter) in [
             ("value", "value: dict[str, str]"),
             ("value.var", "value: ctx"),
-            // Fresh allocations also lose their Java class in the dict type.
-            ("dict(value.var)", "value: ctx"),
-            ("{'x': 'x'}", ""),
         ] {
             for expression in [
                 format!("{selected} | {operand}"),
@@ -2539,7 +2672,7 @@ mod tests {
             (format!("None + {none} + {none}"), true),
             (format!("{none} + None + {dictionary}"), false),
             (format!("{dictionary} | {{}} | {none}"), false),
-            (format!("{dictionary} | {{'y': 2}} | {dictionary}"), false),
+            (format!("{dictionary} | {{'y': 2}} | {dictionary}"), true),
             (format!("{dictionary} | {dictionary} | {dictionary}"), true),
             ("select({'//:a': [1]}) + ('x',)".to_owned(), true),
             (
