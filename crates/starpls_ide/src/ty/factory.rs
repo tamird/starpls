@@ -7,9 +7,7 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::HasNodeIndex;
-use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
-use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use starpls_bazel::attr::AttributeKind;
 use starpls_hir::Db as _;
@@ -26,6 +24,7 @@ use ty_python_semantic::types::CallableTypeKind;
 use ty_python_semantic::types::CheckedArgument;
 use ty_python_semantic::types::CheckedCall;
 use ty_python_semantic::types::DictionaryExtraItems;
+use ty_python_semantic::types::DictionaryFirstEntry;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::DynamicType;
@@ -472,26 +471,35 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     if call.has_binding_errors() {
         return None;
     }
-    let CheckedArgument::Value { ty, expression } = call.argument("x") else {
+    let CheckedArgument::Value { ty, expression: _ } = call.argument("x") else {
         return None;
     };
     let environment = ProgramEnvironment::from_file(call.file());
-    let kind = expression.and_then(selector_literal_kind).or_else(|| {
-        let (class, specialization) = ty.class_specialization(db, &environment)?;
-        if ![KnownClass::Dict, KnownClass::Mapping]
-            .into_iter()
-            .any(|known| Type::from(class) == known.to_class_literal(db, &environment))
-            && !is_exact_dictionary_class(db, &environment, Type::from(class))
-        {
-            return None;
+    let kind = match call
+        .dictionary_argument(db, "x")
+        .map(|dictionary| dictionary.first_entry)
+    {
+        Some(DictionaryFirstEntry::Entry { key: _, value }) => {
+            selector_value_kind(db, &environment, value)
         }
-        let [_key, value] = specialization.types(db) else {
-            return None;
-        };
-        // A successful select has a first branch. Uniform outer value types
-        // establish its native category without depending on dictionary order.
-        selector_value_kind(db, &environment, *value)
-    })?;
+        Some(DictionaryFirstEntry::Empty) => None,
+        Some(DictionaryFirstEntry::Unknown) | None => {
+            let (class, specialization) = ty.class_specialization(db, &environment)?;
+            if ![KnownClass::Dict, KnownClass::Mapping]
+                .into_iter()
+                .any(|known| Type::from(class) == known.to_class_literal(db, &environment))
+                && !is_exact_dictionary_class(db, &environment, Type::from(class))
+            {
+                return None;
+            }
+            let [_key, value] = specialization.types(db) else {
+                return None;
+            };
+            // A successful select has a first branch. Uniform outer value types
+            // establish its native category without depending on dictionary order.
+            selector_value_kind(db, &environment, *value)
+        }
+    }?;
     let (_, specialization) = call.return_type().class_specialization(db, &environment)?;
     let [payload, _kind] = specialization.types(db) else {
         return None;
@@ -506,55 +514,14 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     )
 }
 
-fn selector_literal_kind(expression: &Expr) -> Option<&'static str> {
-    let Expr::Dict(dictionary) = expression else {
-        return None;
-    };
-    // Unpacking, unknown keys, and repeated keys do not establish the first entry.
-    let mut keys = rustc_hash::FxHashSet::default();
-    for item in &dictionary.items {
-        let key = item.key.as_ref()?;
-        let Expr::StringLiteral(key) = key else {
-            return None;
-        };
-        if !keys.insert(key.value.to_str()) {
-            return None;
-        }
-    }
-    let first = dictionary.items.first()?;
-    let value = match &first.value {
-        Expr::UnaryOp(unary) => {
-            if !matches!(unary.op, UnaryOp::UAdd | UnaryOp::USub) {
-                return None;
-            }
-            let Expr::NumberLiteral(_) = unary.operand.as_ref() else {
-                return None;
-            };
-            unary.operand.as_ref()
-        }
-        value => value,
-    };
-    Some(match value {
-        Expr::NoneLiteral(_) => "none",
-        Expr::BooleanLiteral(_) => "bool",
-        Expr::StringLiteral(_) => "str",
-        Expr::NumberLiteral(number) => match &number.value {
-            Number::Int(_) => "int",
-            Number::Float(_) => return None,
-            Number::Complex { real: _, imag: _ } => return None,
-        },
-        Expr::List(_) => "list",
-        Expr::Tuple(_) => "list",
-        Expr::Dict(_) => "dict",
-        _ => return None,
-    })
-}
-
 fn selector_value_kind<'db>(
     db: &'db Database,
     environment: &ProgramEnvironment<'db>,
     value: Type<'db>,
 ) -> Option<&'static str> {
+    if value.as_int_literal().is_some() {
+        return Some("int");
+    }
     if let Type::Union(union) = value {
         let (first, rest) = union.elements(db).split_first()?;
         let kind = selector_value_kind(db, environment, *first)?;
@@ -1019,6 +986,7 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
         CheckedArgument::Omitted => Some(DictionaryItems {
             items: Box::default(),
             extra_items: DictionaryExtraItems::Closed,
+            first_entry: DictionaryFirstEntry::Empty,
         }),
         CheckedArgument::Value {
             ty: _,
@@ -1029,11 +997,13 @@ fn rule<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>, kind: RuleKind) -> 
     let own_attributes = own_attributes.unwrap_or(DictionaryItems {
         items: Box::default(),
         extra_items: DictionaryExtraItems::Value(Type::unknown()),
+        first_entry: DictionaryFirstEntry::Unknown,
     });
     let is_complete = own_attributes.is_complete();
     let DictionaryItems {
         items,
         extra_items: _,
+        first_entry: _,
     } = own_attributes;
     let is_complete = is_complete && items.iter().all(DictionaryItem::is_required);
     complete &= is_complete;
@@ -1779,6 +1749,7 @@ fn structure<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type
                 let Some(DictionaryItems {
                     items,
                     extra_items: _,
+                    first_entry: _,
                 }) = call.dictionary_items(db, &keyword.value)
                 else {
                     continue;
@@ -1888,6 +1859,7 @@ fn provider<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
                     let DictionaryItems {
                         items,
                         extra_items: _,
+                        first_entry: _,
                     } = mapping;
                     open = !is_complete || items.iter().any(|item| !item.is_required());
                     for DictionaryItem {

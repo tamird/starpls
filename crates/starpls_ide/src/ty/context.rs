@@ -25,6 +25,7 @@ use ty_python_semantic::provided::ProvidedInstanceFields;
 use ty_python_semantic::types::ide_support::resolved_call_signature;
 use ty_python_semantic::types::ide_support::CallSignatureDetails;
 use ty_python_semantic::types::DictionaryExtraItems;
+use ty_python_semantic::types::DictionaryFirstEntry;
 use ty_python_semantic::types::DictionaryItem;
 use ty_python_semantic::types::DictionaryItems;
 use ty_python_semantic::types::DynamicType;
@@ -179,16 +180,19 @@ pub(super) fn parameter_type<'db>(
             Some(attrs) => model.dictionary_items(attrs).unwrap_or(DictionaryItems {
                 items: Box::default(),
                 extra_items: DictionaryExtraItems::Value(Type::unknown()),
+                first_entry: DictionaryFirstEntry::Unknown,
             }),
             None => DictionaryItems {
                 items: Box::default(),
                 extra_items: DictionaryExtraItems::Closed,
+                first_entry: DictionaryFirstEntry::Empty,
             },
         };
         let is_complete = mapping.is_complete();
         let DictionaryItems {
             items,
             extra_items: _,
+            first_entry: _,
         } = mapping;
         let is_complete = is_complete && items.iter().all(DictionaryItem::is_required);
         aspect_attributes = items
@@ -312,6 +316,7 @@ pub(super) fn parameter_type<'db>(
                         let DictionaryItems {
                             items,
                             extra_items: _,
+                            first_entry: _,
                         } = mapping;
                         let is_complete =
                             is_complete && items.iter().all(DictionaryItem::is_required);
