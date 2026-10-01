@@ -3140,6 +3140,7 @@ dependencies = [
 name = "ty_python_semantic"
 version = "0.0.15"
 dependencies = [
+ "arrayvec",
  "bitflags 2.13.2",
  "char_str",
  "compact_str",
