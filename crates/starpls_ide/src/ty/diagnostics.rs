@@ -62,7 +62,7 @@ static UNUSED_DEFINITION: LintMetadata = lint(
     "unused-definition",
     "Reports unused private and local definitions.",
 );
-static UNREACHABLE_CODE: LintMetadata =
+pub(super) static UNREACHABLE_CODE: LintMetadata =
     lint("unreachable-code", "Reports code that cannot be reached.");
 static DEPRECATED_ARGUMENT: LintMetadata = lint(
     "deprecated-argument",
@@ -259,14 +259,7 @@ pub(super) fn check_with_status(db: &Database, file: File) -> TypeCheckResult {
     }
     if options.use_code_flow_analysis {
         for unreachable in unreachable_ranges(db, program_file) {
-            diagnostics.push(tagged(
-                file,
-                unreachable.range,
-                &UNREACHABLE_CODE,
-                Severity::Warning,
-                DiagnosticTag::Unnecessary,
-                "Code is unreachable".to_owned(),
-            ));
+            diagnostics.push(unreachable_code(file, unreachable.range));
         }
     }
     let fail = db
@@ -340,6 +333,17 @@ fn may_export_rule<'db>(
     exportable
         .iter()
         .any(|base| !ty.is_disjoint_from(db, environment, *base))
+}
+
+pub(super) fn unreachable_code(file: File, range: TextRange) -> Diagnostic {
+    tagged(
+        file,
+        range,
+        &UNREACHABLE_CODE,
+        Severity::Warning,
+        DiagnosticTag::Unnecessary,
+        "Code is unreachable".to_owned(),
+    )
 }
 
 fn tagged(

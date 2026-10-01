@@ -228,6 +228,7 @@ impl Analysis {
                 .files
                 .extend(contracts.iter().map(|contract| contract.source.file.source));
             let mut checked_reports = Reports::default();
+            let mut unreachable_reports: FxHashMap<File, Vec<TextRange>> = FxHashMap::default();
             let case_count = contracts
                 .iter()
                 .map(|contract| contract.cases.len())
@@ -528,6 +529,30 @@ impl Analysis {
                     // These outcomes include suppressed checking obligations. Source lint
                     // suppressions cannot establish that a contract was validated.
                     checked.extend(diagnostics);
+                    let mut unreachable = Vec::new();
+                    checked.retain(|diagnostic| {
+                        if diagnostic.id()
+                            != DiagnosticId::Lint(super::diagnostics::UNREACHABLE_CODE.name())
+                        {
+                            return true;
+                        }
+                        let range = diagnostic
+                            .primary_span()
+                            .and_then(|span| span.range())
+                            .expect("unreachable diagnostics have source ranges");
+                        unreachable.push(range);
+                        false
+                    });
+                    match unreachable_reports.entry(file) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(unreachable);
+                        }
+                        Entry::Occupied(mut entry) => {
+                            // A branch can be unreachable for one overload and necessary for
+                            // another. Preserve only ranges that no checked context reaches.
+                            *entry.get_mut() = intersect_unreachable_ranges(entry.get(), &unreachable);
+                        }
+                    }
                     (file, checked)
                 })
                 .collect();
@@ -547,6 +572,13 @@ impl Analysis {
                     }
                 }
             }
+            for (file, ranges) in unreachable_reports {
+                checked_reports.entry(file).or_default().extend(
+                    ranges
+                        .into_iter()
+                        .map(|range| super::diagnostics::unreachable_code(file, range)),
+                );
+            }
             let mut reports: Vec<_> = checked_reports.into_iter().collect();
             reports.sort_by(|(left, _), (right, _)| left.path(db).cmp(right.path(db)));
             reports
@@ -558,6 +590,23 @@ impl Analysis {
             Err(payload) => std::panic::resume_unwind(payload),
         }))
     }
+}
+
+// Ty returns disjoint ranges in source order; intersections preserve that order.
+fn intersect_unreachable_ranges(left: &[TextRange], right: &[TextRange]) -> Vec<TextRange> {
+    let mut intersection = Vec::new();
+    let (mut left_index, mut right_index) = (0, 0);
+    while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
+        if let Some(range) = left.intersect(*right).filter(|range| !range.is_empty()) {
+            intersection.push(range);
+        }
+        if left.end() <= right.end() {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    intersection
 }
 
 fn discover(
@@ -2142,6 +2191,80 @@ mod tests {
                     .any(|diagnostic| diagnostic.id().as_str() == "incomplete-stub-validation"),
                 "{diagnostics:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn overload_contracts_report_shared_unreachable_code() {
+        use salsa::Setter;
+
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let environment = analysis.db.environment();
+        let mut options = environment.options(&analysis.db).clone();
+        options.use_code_flow_analysis = true;
+        environment.set_options(&mut analysis.db).to(options);
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "source.bzl", "");
+        let stub = fixture.add_file(&mut analysis.db, "source.bzli", "");
+        loader.add_files_from_fixture(&fixture);
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        analysis.set_type_interfaces([(source, stub)]).unwrap();
+
+        for (first, second) in [
+            ("str", "int"),
+            ("int", "str"),
+            ("str", "str | int"),
+            ("str | int", "str"),
+        ] {
+            analysis.update_file(stub, format!("@overload\ndef copy(value: {first}) -> {first}: ...\n@overload\ndef copy(value: {second}) -> {second}: ...\n"));
+            for (body, expected) in [
+                (
+                    "def copy(value):
+    if type(value) == 'string':
+        return value
+    return value
+",
+                    Vec::new(),
+                ),
+                (
+                    "def copy(value):
+    if type(value) == 'string':
+        if False:
+            fail('always unreachable')
+        return value
+    return value
+",
+                    vec![("unreachable-code", "fail('always unreachable')")],
+                ),
+                (
+                    "def copy(value):
+    if type(value) == 'string':
+        return 1
+    return value
+",
+                    vec![("invalid-return-type", "1")],
+                ),
+            ] {
+                analysis.update_file(source, body.to_owned());
+                let reports = analysis.validate_stubs(|_| true).unwrap();
+                let actual: Vec<_> = reports
+                    .iter()
+                    .flat_map(|(_, diagnostics)| diagnostics)
+                    .map(|diagnostic| {
+                        let range = diagnostic.primary_span().unwrap().range().unwrap();
+                        (diagnostic.id().as_str(), body[range].trim())
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "{first}, {second}: {body}");
+            }
         }
     }
 
