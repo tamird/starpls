@@ -59,11 +59,13 @@ returns `None`. The helper validates the input as a string or Label and
 returns the replacement as a string or Label.
 The utility contracts declare `is_label` and `is_string` with `TypeGuard`.
 A true result narrows the input to `Label` or `str`, respectively.
-`is_list` uses `TypeIs[list[Any]]` to narrow list membership on both outcomes
-while preserving a caller's existing list element types. `is_select` uses
+`is_list` and `is_dict` use `TypeIs` to narrow container membership while
+preserving a caller's existing element types. Conservative validation may leave
+the negative branch unproved because these contracts have gradual element types.
+`is_select` uses
 `TypeIs[select[object, object]]` to distinguish selectors while preserving their
 existing value types. Implementation validation checks both implications of
-these native type comparisons. The other three utility predicates accept
+these native type comparisons. The other two utility predicates accept
 `object` and return `bool`. The setting
 interface declares `make_valid_identifier(str) -> str` and
 `validate_and_get_attr_name(str | Label) -> str`.

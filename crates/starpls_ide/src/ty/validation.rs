@@ -7269,6 +7269,43 @@ def read(value: list[str]) -> str: ...
     }
 
     #[test]
+    fn type_is_dict_preserves_key_and_value_types() {
+        let predicate =
+            "_DICT_TYPE = type({})\ndef is_dict(value):\n    return type(value) == _DICT_TYPE\n";
+        let predicate_stub = "def is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\n";
+        let source = format!("{predicate}\ndef read(value):\n    if is_dict(value):\n        return value['x']\n    return ''\n");
+        let stub = format!("{predicate_stub}\ndef read(value: dict[str, str] | str) -> str: ...\n");
+        let diagnostics = validation_diagnostics(&source, &stub);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        // A gradual target leaves its negative materialization unspecified.
+        assert_eq!(
+            validate(&source.replace("return ''", "return value"), &stub),
+            ["incomplete-stub-validation"],
+        );
+        for assignment in ["value[1] = 'x'", "value['x'] = 1"] {
+            let diagnostics = validate(
+                &source.replace(
+                    "return value['x']",
+                    &format!("{assignment}\n        return value['x']"),
+                ),
+                &stub,
+            );
+            assert_eq!(
+                diagnostics,
+                ["invalid-assignment"],
+                "{assignment}: {diagnostics:?}"
+            );
+        }
+        assert_eq!(
+            validate(
+                predicate,
+                "def is_dict(value: object) -> TypeIs[dict[str, str]]: ...\n"
+            ),
+            ["incomplete-stub-validation"],
+        );
+    }
+
+    #[test]
     fn type_is_select_preserves_value_domains() {
         let predicate = r#"
 _SELECT_TYPE = type(select({"//conditions:default": []}))
