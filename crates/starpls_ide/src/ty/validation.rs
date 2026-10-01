@@ -2845,15 +2845,26 @@ mod tests {
                 failures.push(format!("{source}\n{stub}\n{diagnostics:#?}"));
             }
         }
-        let diagnostics = validation_diagnostics(
-            "def make(conditions):\n    first = conditions.values()[0]\n    if first == None:\n        return select(conditions)\n    fail('first value is not None')\n",
-            "def make(conditions: ExactDict[str, None | ExactDict[str, str]]) -> select[None | ExactDict[str, str], Literal['none']]: ...\n",
-        );
-        if !diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity() == Severity::Error)
-        {
-            failures.push(format!("guarded arbitrary map: {diagnostics:#?}"));
+        for (body, kind, proved) in [
+            ("return select(conditions)", "none", true),
+            ("return select(conditions)", "dict", false),
+            (
+                "conditions.clear()\n        conditions['//:replacement'] = {'value': 'changed'}\n        return select(conditions)",
+                "none",
+                false,
+            ),
+        ] {
+            let source = format!("def make(conditions):\n    first = conditions.values()[0]\n    if first == None:\n        {body}\n    fail('first value is not None')\n");
+            let stub = format!("def make(conditions: ExactDict[str, None | ExactDict[str, str]]) -> select[None | ExactDict[str, str], Literal['{kind}']]: ...\n");
+            let diagnostics = validation_diagnostics(&source, &stub);
+            let matches = if proved {
+                diagnostics.is_empty()
+            } else {
+                diagnostics.iter().any(|diagnostic| diagnostic.severity() == Severity::Error)
+            };
+            if !matches {
+                failures.push(format!("{source}\n{stub}\n{diagnostics:#?}"));
+            }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     }
