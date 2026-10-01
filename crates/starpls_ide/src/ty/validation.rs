@@ -3511,10 +3511,17 @@ mod tests {
         }
     }
 
+    fn with_cfg_dict_predicate_stub() -> String {
+        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
+        let (_, overloads) = utils.split_once("@overload").unwrap();
+        let (overloads, _) = overloads.split_once("\ndef is_int").unwrap();
+        format!("@overload{overloads}")
+    }
+
     #[test]
     fn json_decode_preserves_guarded_results_and_defaults() {
         let predicate = "def is_dict(value): return type(value) == 'dict'\n";
-        let predicate_stub = "def is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\n";
+        let predicate_stub = with_cfg_dict_predicate_stub();
         for (parameters, argument, result, expected) in [
             ("", "", "dict[str, object]", None),
             ("", "", "dict[str, int]", Some("unsound-return-statement")),
@@ -7744,10 +7751,7 @@ def read(value: list[str]) -> str: ...
     fn type_is_dict_preserves_key_and_value_types() {
         let predicate =
             "_DICT_TYPE = type({})\ndef is_dict(value):\n    return type(value) == _DICT_TYPE\n";
-        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
-        let (_, overloads) = utils.split_once("@overload").unwrap();
-        let (overloads, _) = overloads.split_once("\ndef is_int").unwrap();
-        let overloads = format!("@overload{overloads}");
+        let overloads = with_cfg_dict_predicate_stub();
         let source = format!("{predicate}\ndef read(value):\n    if is_dict(value):\n        return value['x']\n    return ''\n");
         let stub = format!("{overloads}\ndef read(value: dict[str, str] | str) -> str: ...\n");
         let diagnostics = validation_diagnostics(&source, &stub);
