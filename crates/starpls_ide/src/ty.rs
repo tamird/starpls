@@ -32,8 +32,6 @@ mod factory;
 pub(crate) mod interface;
 pub(crate) mod load;
 mod native;
-#[cfg(test)]
-mod skylib_tests;
 mod support;
 
 pub(crate) use diagnostics::check;

@@ -1,6 +1,0 @@
-module(
-    name = "rules_java_stubs",
-    version = "0.1.0",
-)
-
-bazel_dep(name = "rules_java", version = "9.3.0")

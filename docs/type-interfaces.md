@@ -21,8 +21,7 @@ are available in annotation expressions.
 
 For each name loaded from a mapped `.bzl` module, Starpls uses the stub declaration
 when present and source inference otherwise. Annotations are resolved in the
-stub's scope. Stubs are trusted contracts; implementation validation is a
-separate check.
+stub's scope. Call checking trusts the stub declarations.
 
 ### Overloaded functions
 
@@ -80,9 +79,6 @@ function declarations are unsupported. Source type comments take precedence.
 Ty checks the initializer, subsequent uses, and mutations against the annotation
 in the BUILD host context.
 
-Implementation validation applies to `.bzl` contracts. BUILD annotations
-participate in ordinary source checking.
-
 ## Providers
 
 A provider export is declared as a class with readonly fields and an explicit
@@ -107,10 +103,6 @@ Starpls follows source aliases and reexports to pair the class with a unique
 source instances, callers, annotations, and `Target` lookups. Multiple distinct
 classes claiming the same declaration are an error. A stub may expose a subset
 of the fields allowed by the source provider.
-
-Validation of plain provider calls compares each stored value with its declared
-readonly type using the output constraints described below. Callback input
-domains and mutable nested storage must satisfy their declared requirements.
 
 For a provider with an initializer, `__init__` describes the initializer's public
 arguments. An exported raw constructor has its own declaration:
@@ -185,8 +177,7 @@ value categories retain an unspecified kind, as do integer and dictionary value
 types with several native representations. Integer literals retain the `"int"`
 category, and literal dictionary branches retain the `"dict"` kind. Bazel uses
 several native integer representations, so integer operands carry an `Unknown`
-compatibility requirement. Implementation validation refuses to prove operations
-on integer-first selectors until their native representations can be distinguished.
+compatibility requirement.
 
 A predicate testing for any selector uses `TypeIs[select[object, object]]`.
 The second `object` covers every kind, so both outcomes of the predicate can
@@ -195,8 +186,7 @@ narrow its argument. A gradual kind describes an unspecified subset instead.
 Bazel 9.2 distinguishes dictionary implementations that share Starlark's
 `dict` type. An `ExactDict` branch establishes the `"dict"` selector kind, and
 an `ExactDict` operand supports `|` with selectors of that kind. Operations
-on a broadly annotated dictionary retain their ordinary inferred result;
-implementation validation requires the allocation information as well.
+on a broadly annotated dictionary retain their ordinary inferred result.
 
 ## Rule contexts
 

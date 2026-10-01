@@ -1,8 +1,0 @@
-exports_files([
-    "LICENSE-MIT",
-    "MODULE.bazel",
-    "README.md",
-    "java/private/java_common.bzli",
-    "java/private/native.bzli",
-    "stubs.toml",
-])

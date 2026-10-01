@@ -31,9 +31,6 @@ rust_test(
     },
     compile_data = [
         "//crates/starpls:src/builtin/builtin.pb",
-        "//stubs/bazel_skylib:rules/copy_file.bzli",
-        "//stubs/bazel_skylib:rules/write_file.bzli",
-        "//stubs/rules_rs:data.bzli",
     ],
     crate = ":starpls_ide",
     deps = all_crate_deps(normal_dev = True),

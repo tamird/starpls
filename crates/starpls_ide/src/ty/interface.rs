@@ -1488,7 +1488,55 @@ def make() -> _Builder: ...
     }
 
     #[test]
-    fn rules_rs_metadata_stub_preserves_field_types() {
+    fn stub_keyword_navigation_uses_the_declaration() {
+        let (mut analysis, loader) = Analysis::new_for_test();
+        let mut fixture = Fixture::new(&mut analysis.db);
+        let source = fixture.add_file(&mut analysis.db, "@rules//:defs.bzl", "");
+        let declaration = "def task(*, name: str) -> None: ...\n";
+        let interface = fixture.add_file(&mut analysis.db, "defs.bzli", declaration);
+        let caller_text = "load('@rules//:defs.bzl', 'task')\ntask(name='demo')\n";
+        let caller = fixture.add_file_with_options(
+            &mut analysis.db,
+            "BUILD.bazel",
+            caller_text,
+            Dialect::Bazel,
+            Some(FileInfo::Bazel {
+                api_context: APIContext::Build,
+                is_external: false,
+            }),
+        );
+        loader.add_files_from_fixture(&fixture);
+        analysis.set_type_interfaces([(source, interface)]).unwrap();
+        let locations = analysis
+            .snapshot()
+            .goto_definition(
+                FilePosition {
+                    file_id: caller,
+                    pos: (caller_text.find("name").unwrap() as u32).into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let [LocationLink::Local {
+            target_file_id,
+            origin_selection_range: _,
+            target_range: _,
+            target_selection_range,
+        }] = locations.as_slice()
+        else {
+            panic!("{locations:?}")
+        };
+        assert_eq!(*target_file_id, interface.source);
+        assert_eq!(
+            &declaration[usize::from(target_selection_range.start())
+                ..usize::from(target_selection_range.end())],
+            "name",
+        );
+    }
+
+    #[test]
+    fn typed_dictionary_interfaces_preserve_field_types() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
         let source = fixture.add_file(
@@ -1499,9 +1547,17 @@ def make() -> _Builder: ...
         let interface = fixture.add_file(
             &mut analysis.db,
             "data.bzli",
-            include_str!("../../../../stubs/rules_rs/data.bzli"),
+            r#"class _Entry(TypedDict, extra_items=ReadOnly[object]):
+    name: str
+    aliases: dict[str, str]
+    deps: list[str]
+    by_platform: NotRequired[dict[str, list[str]]]
+    config: NotRequired[str]
+
+DEP_DATA: dict[str, _Entry]
+"#,
         );
-        let caller_text = "load('data.bzl', 'DEP_DATA', 'EXTRA')\nrow = DEP_DATA['sample']\nname: str = row['crate_name']\nalias: str = row['aliases']['//:dep']\nbinary: str = row.get('binaries', {}).keys()[0]\nplatform_deps: list[str] = row.get('dev_deps_by_platform', {}).values()[0]\nfeatures: list[str] = row['crate_features']\nlint: str | None = row.get('lint_config')\nextra: str = EXTRA\nplatforms: object = row['platforms']\n";
+        let caller_text = "load('data.bzl', 'DEP_DATA', 'EXTRA')\nrow = DEP_DATA['sample']\nname: str = row['name']\nalias: str = row['aliases']['//:dep']\nbinary: str = row['aliases'].keys()[0]\nplatform_deps: list[str] = row.get('by_platform', {}).values()[0]\nfeatures: list[str] = row['deps']\nlint: str | None = row.get('config')\nextra: str = EXTRA\nplatforms: object = row['platforms']\n";
         let caller = fixture.add_file(&mut analysis.db, "main.bzl", caller_text);
         loader.add_files_from_fixture(&fixture);
         analysis.set_type_interfaces([(source, interface)]).unwrap();
@@ -1511,6 +1567,10 @@ def make() -> _Builder: ...
         }
         for (statement, expected) in [
             ("row['deps'].append(42)", "invalid-argument-type"),
+            (
+                "row.get('by_platform', {}).values()[0].append(42)",
+                "invalid-argument-type",
+            ),
             (
                 "platform_name: str = row['platforms']",
                 "invalid-assignment",

@@ -1,8 +1,0 @@
-exports_files([
-    "LICENSE-MIT",
-    "MODULE.bazel",
-    "README.md",
-    "rules/copy_file.bzli",
-    "rules/write_file.bzli",
-    "stubs.toml",
-])
