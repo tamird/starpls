@@ -5618,6 +5618,114 @@ def make() -> _Row: ...
     }
 
     #[test]
+    fn starlark_list_addition_delegation() {
+        let mut failures = Vec::new();
+        for (other, result, proved) in [
+            ("list[str]", "list[str]", true),
+            (
+                "select[list[str], Literal['list']]",
+                "select[list[str], Literal['list']]",
+                true,
+            ),
+            (
+                "select[list[int], Literal['list']]",
+                "select[list[str | int], Literal['list']]",
+                true,
+            ),
+            (
+                "select[list[str] | None, Literal['list']]",
+                "select[list[str] | None, Literal['list']]",
+                true,
+            ),
+            (
+                "list[str] | select[list[str], Literal['list']]",
+                "list[str] | select[list[str], Literal['list']]",
+                true,
+            ),
+            ("list[int]", "list[str]", false),
+            ("tuple[str, ...]", "list[str]", false),
+            ("str", "list[str]", false),
+            ("select[str, Literal['str']]", "select[str]", false),
+            ("select[list[str]]", "select[list[str]]", false),
+            ("Any", "list[str]", false),
+            ("list[Any]", "list[str]", false),
+        ] {
+            let diagnostics = validation_diagnostics(
+                "def make(value, other):\n    value += other\n    return value\n",
+                &format!("def make(value: list[str], other: {other}) -> {result}: ...\n"),
+            );
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                == proved
+            {
+                failures.push(format!("{other} -> {result}: {diagnostics:#?}"));
+            }
+        }
+        for other in ["Any", "select[list[str]]"] {
+            let diagnostics = validation_diagnostics(
+                "def make(value, other):\n    value += other\n",
+                &format!("def make(value: list[str], other: {other}) -> None: ...\n"),
+            );
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("ignored result {other}: {diagnostics:#?}"));
+            }
+        }
+        for other in ["tuple[str, ...]", "str", "Any", "select[list[str]]"] {
+            let diagnostics = validation_diagnostics(
+                "def make(value, other):\n    return value + other\n",
+                &format!("def make(value: list[str], other: {other}) -> object: ...\n"),
+            );
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("invalid addition {other}: {diagnostics:#?}"));
+            }
+        }
+        let selected = "select[list[str], Literal['list']]";
+        let combined = format!("list[str] | {selected}");
+        for (value, other, result) in [
+            ("list[str]", selected, selected),
+            (&combined, "list[str]", &combined),
+            (&combined, &combined, &combined),
+        ] {
+            for operation in ["return value + other", "value += other\n    return value"] {
+                let diagnostics = validation_diagnostics(
+                    &format!("def make(value, other):\n    {operation}\n"),
+                    &format!("def make(value: {value}, other: {other}) -> {result}: ...\n"),
+                );
+                if !diagnostics.is_empty() {
+                    failures.push(format!("{value}, {other}, {operation}: {diagnostics:#?}"));
+                }
+            }
+        }
+        let diagnostics = validation_diagnostics(
+            "def make(value):\n    original = value\n    value += select({'//:a': [1]})\n    return original, value\n",
+            "def make(value: list[str]) -> tuple[list[str], select[list[str | int], Literal['list']]]: ...\n",
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!("original list: {diagnostics:#?}"));
+        }
+        for operation in ["+", "+="] {
+            let diagnostics = validation_diagnostics(
+                &format!("def reflected(values): return 42\ndef make():\n    value = ['x']\n    value {operation} struct(__radd__=reflected)\n"),
+                "def reflected(values: list[str]) -> int: ...\ndef make() -> None: ...\n",
+            );
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("struct field {operation}: {diagnostics:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn augmented_storage_checks_local_and_module_values() {
         for (input, expected) in [
             (
