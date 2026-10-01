@@ -37,9 +37,9 @@ heterogeneous provider instances without assuming their fields. Bazel checks
 provider identity when these values are used as target keys.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
-`_clone_value_deeply` preserves the selected canonical type: `str`, `Label`,
-`int`, `bool`, `list[Any]`, or `None`. It copies lists and returns other
-supported values unchanged. List inputs select `list[Any]` as the result.
+`_clone_value_deeply` preserves scalar types, list element types, and
+dictionary key and value types. It makes a shallow list copy and returns
+other supported values unchanged.
 The extension interface declares `_initializer_base` with string-keyed
 keyword arguments and a read-only mapping of setting values keyed by strings
 or labels. The mapping accepts dictionaries with more specific value types.

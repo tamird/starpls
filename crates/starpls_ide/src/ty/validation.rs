@@ -2345,38 +2345,42 @@ mod tests {
     }
 
     #[test]
-    fn overload_contracts_clone_finite_and_parser_domains() {
+    fn overload_contracts_preserve_cloned_value_types() {
         let scalar = "str | bool | int | None | Label";
         let value = format!("{scalar} | list[{scalar}]");
         let compound = format!("{value} | dict[{scalar}, {value}]");
         let parsed = format!("{compound} | dict[{scalar}, {compound}]");
-        let stub = format!(
-            "def is_list(value: object) -> TypeIs[list[Any]]: ...\n\
-             @overload\n\
-             def copy[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...\n\
-             @overload\n\
-             def copy(value: {parsed}) -> {parsed}: ...\n"
-        );
+        let builder = include_str!("../../../../stubs/with_cfg/builder.bzli");
+        let (_, overloads) = builder.split_once("@overload").unwrap();
+        let overloads = overloads.replace("_clone_value_deeply", "copy");
+        let stub =
+            format!("def is_list(value: object) -> TypeIs[list[Any]]: ...\n@overload{overloads}");
         let predicate =
             "_LIST_TYPE = type([])\ndef is_list(value): return type(value) == _LIST_TYPE\n";
         let source = "def copy(value):\n    if is_list(value):\n        return list(value)\n    return value\n";
-        let diagnostics = validation_diagnostics(&format!("{predicate}{source}"), &stub);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-        let append_int = "def copy(value):\n    if is_list(value):\n        result = list(value)\n        result.append(1)\n        return result\n    return value\n";
-        let finite_stub = "def is_list(value: object) -> TypeIs[list[Any]]: ...\ndef copy[T: (str, Label, int, bool, list[Any], None)](value: T) -> T: ...\n";
-        for contract in [finite_stub, &stub] {
-            let diagnostics = validation_diagnostics(&format!("{predicate}{append_int}"), contract);
-            assert!(diagnostics.is_empty(), "{contract}: {diagnostics:#?}");
+        let caller_source = format!("{predicate}{source}\ndef caller(value): return copy(value)\n");
+        for annotation in [
+            "list[str]",
+            "dict[str, int]",
+            "bool",
+            "list[dict[str, list[int]]]",
+            &parsed,
+        ] {
+            let caller_stub =
+                format!("{stub}\ndef caller(value: {annotation}) -> {annotation}: ...\n");
+            let diagnostics = validation_diagnostics(&caller_source, &caller_stub);
+            assert!(diagnostics.is_empty(), "{annotation}: {diagnostics:#?}");
         }
-        let narrow_stub = "def is_list(value: object) -> TypeIs[list[Any]]: ...\n@overload\ndef copy[T: (str, list[str])](value: T) -> T: ...\n@overload\ndef copy(value: int) -> int: ...\n";
-        let diagnostics = validation_diagnostics(&format!("{predicate}{append_int}"), narrow_stub);
+        let caller_stub = format!("{stub}\ndef caller(value: list[str]) -> list[int]: ...\n");
+        let diagnostics = validation_diagnostics(&caller_source, &caller_stub);
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.severity() == Severity::Error),
+                .any(|diagnostic| diagnostic.id().as_str() == "invalid-return-type"),
             "{diagnostics:#?}"
         );
         for source in [
+            "def copy(value):\n    if is_list(value):\n        result = list(value)\n        result.append(1)\n        return result\n    return value\n",
             "def copy(value):\n    if is_list(value):\n        result = list(value)\n        result.append({})\n        return result\n    return value\n",
             "def copy(value): return {'x': struct()}\n",
             "def opaque() -> Any: return []\ndef copy(value): return opaque()\n",
