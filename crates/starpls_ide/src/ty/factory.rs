@@ -472,10 +472,40 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
     if call.has_binding_errors() {
         return None;
     }
-    let CheckedArgument::Value { ty: _, expression } = call.argument("x") else {
+    let CheckedArgument::Value { ty, expression } = call.argument("x") else {
         return None;
     };
-    let expression = expression?;
+    let environment = ProgramEnvironment::from_file(call.file());
+    let kind = expression.and_then(selector_literal_kind).or_else(|| {
+        let (class, specialization) = ty.class_specialization(db, &environment)?;
+        if ![KnownClass::Dict, KnownClass::Mapping]
+            .into_iter()
+            .any(|known| Type::from(class) == known.to_class_literal(db, &environment))
+        {
+            return None;
+        }
+        let [_key, value] = specialization.types(db) else {
+            return None;
+        };
+        // A successful select has a first branch. Uniform outer value types
+        // establish its native category without depending on dictionary order.
+        selector_value_kind(db, &environment, *value)
+    })?;
+    let (_, specialization) = call.return_type().class_specialization(db, &environment)?;
+    let [payload, _kind] = specialization.types(db) else {
+        return None;
+    };
+    let declaration = call.declaration()?;
+    specialized_native_instance(
+        db,
+        &environment,
+        declaration.program_file(db),
+        "select",
+        vec![*payload, Type::string_literal(db, kind)],
+    )
+}
+
+fn selector_literal_kind(expression: &Expr) -> Option<&'static str> {
     let Expr::Dict(dictionary) = expression else {
         return None;
     };
@@ -503,7 +533,7 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
         }
         value => value,
     };
-    let kind = match value {
+    Some(match value {
         Expr::NoneLiteral(_) => "none",
         Expr::BooleanLiteral(_) => "bool",
         Expr::StringLiteral(_) => "str",
@@ -516,20 +546,36 @@ fn selector<'db>(db: &'db Database, call: &CheckedCall<'_, 'db>) -> Option<Type<
         Expr::Tuple(_) => "list",
         Expr::Dict(_) => "dict",
         _ => return None,
-    };
-    let environment = ProgramEnvironment::from_file(call.file());
-    let (_, specialization) = call.return_type().class_specialization(db, &environment)?;
-    let [payload, _kind] = specialization.types(db) else {
-        return None;
-    };
-    let declaration = call.declaration()?;
-    specialized_native_instance(
-        db,
-        &environment,
-        declaration.program_file(db),
-        "select",
-        vec![*payload, Type::string_literal(db, kind)],
-    )
+    })
+}
+
+fn selector_value_kind<'db>(
+    db: &'db Database,
+    environment: &ProgramEnvironment<'db>,
+    value: Type<'db>,
+) -> Option<&'static str> {
+    if let Type::Union(union) = value {
+        let (first, rest) = union.elements(db).split_first()?;
+        let kind = selector_value_kind(db, environment, *first)?;
+        return rest
+            .iter()
+            .all(|value| selector_value_kind(db, environment, *value) == Some(kind))
+            .then_some(kind);
+    }
+    for (class, kind) in [
+        (KnownClass::Str, "str"),
+        (KnownClass::Bool, "bool"),
+        (KnownClass::NoneType, "none"),
+    ] {
+        if value.is_subtype_of(db, environment, class.to_instance(db, environment)) {
+            return Some(kind);
+        }
+    }
+    let (class, _specialization) = value.class_specialization(db, environment)?;
+    [KnownClass::List, KnownClass::Tuple]
+        .into_iter()
+        .any(|known| Type::from(class) == known.to_class_literal(db, environment))
+        .then_some("list")
 }
 
 fn descriptor<'db>(

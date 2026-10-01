@@ -2466,7 +2466,10 @@ mod tests {
     #[test]
     fn selector_runtime_kind_unknown_inputs() {
         for (body, parameters) in [
-            ("select(value) + select(value)", "value: Mapping[str, str]"),
+            (
+                "select(value) + select(value)",
+                "value: Mapping[str, str | int]",
+            ),
             (
                 "select({'//:a': value}) + select({'//:a': value})",
                 "value: Any",
@@ -2476,11 +2479,11 @@ mod tests {
                 "value: str | list[str]",
             ),
             (
-                "select({key: 'a', '//:b': 'b'}) + select({'//:c': 'c'})",
+                "select({key: 'a', '//:b': 1}) + select({'//:c': 'c'})",
                 "key: str",
             ),
             (
-                "select({'//:a': 'a', '//:a': 'b'}) + select({'//:c': 'c'})",
+                "select({'//:a': 'a', '//:a': 1}) + select({'//:c': 'c'})",
                 "",
             ),
         ] {
@@ -2517,6 +2520,128 @@ mod tests {
                 validation_diagnostics(&source, &format!("def make() -> {result}: ...\n"));
             assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
         }
+    }
+
+    #[test]
+    fn selector_runtime_kind_uniform_mappings() {
+        let mut failures = Vec::new();
+        for (parameter, expression, result, proved) in [
+            (
+                "Mapping[str, str]",
+                "select(value) + 'suffix'",
+                "select[str, Literal['str']]",
+                true,
+            ),
+            (
+                "dict[str, str]",
+                "'prefix' + select(value)",
+                "select[str, Literal['str']]",
+                true,
+            ),
+            (
+                "Mapping[str, bool]",
+                "select(value) + False",
+                "select[bool, Literal['bool']]",
+                true,
+            ),
+            (
+                "Mapping[str, None]",
+                "select(value) + None",
+                "select[None, Literal['none']]",
+                true,
+            ),
+            (
+                "Mapping[str, list[str]]",
+                "select(value) + ['suffix']",
+                "select[list[str], Literal['list']]",
+                true,
+            ),
+            (
+                "Mapping[str, tuple[str, ...]]",
+                "select(value) + ['suffix']",
+                "select[list[str], Literal['list']]",
+                true,
+            ),
+            (
+                "Mapping[str, list[str] | tuple[str, ...]]",
+                "select(value)",
+                "select[list[str] | tuple[str, ...], Literal['list']]",
+                true,
+            ),
+            (
+                "str",
+                "select({value: 'a', '//:b': 'b'}) + 'suffix'",
+                "select[str, Literal['str']]",
+                true,
+            ),
+            (
+                "str",
+                "select({'//:a': value, '//:a': 'b'}) + 'suffix'",
+                "select[str, Literal['str']]",
+                true,
+            ),
+            (
+                "Mapping[str, int]",
+                "select(value) + 1",
+                "select[int]",
+                false,
+            ),
+            (
+                "Mapping[str, dict[str, str]]",
+                "select(value) | select(value)",
+                "select[dict[str, str]]",
+                false,
+            ),
+            (
+                "Mapping[str, str | None]",
+                "select(value) + 'suffix'",
+                "select[str | None]",
+                false,
+            ),
+            (
+                "Mapping[str, Any]",
+                "select(value)",
+                "select[str, Literal['str']]",
+                false,
+            ),
+            ("Any", "select(value)", "select[str, Literal['str']]", false),
+            (
+                "Any",
+                "select({'//:a': value})",
+                "select[str, Literal['str']]",
+                false,
+            ),
+            (
+                "Mapping[str, list[Any]]",
+                "select(value)",
+                "select[list[str], Literal['list']]",
+                false,
+            ),
+        ] {
+            let source = format!("def make(value): return {expression}\n");
+            let stub = format!("def make(value: {parameter}) -> {result}: ...\n");
+            let diagnostics = validation_diagnostics(&source, &stub);
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+                != proved
+            {
+                failures.push(format!("{stub}{source}{diagnostics:#?}"));
+            }
+        }
+        for parameter in ["Any", "Mapping[str, Any]", "Mapping[str, Unknown]"] {
+            let diagnostics = validation_diagnostics(
+                "def make(value):\n    select(value) + 'suffix'\n",
+                &format!("def make(value: {parameter}) -> None: ...\n"),
+            );
+            if !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity() == Severity::Error)
+            {
+                failures.push(format!("{parameter}: {diagnostics:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -2586,7 +2711,7 @@ mod tests {
             ("select({'//:a': 1}) | select({'//:b': 2})", "", true),
             (
                 "select(value) + select(value)",
-                "value: Mapping[str, str]",
+                "value: Mapping[str, str | None]",
                 false,
             ),
             ("value + value", "value: select[str]", false),

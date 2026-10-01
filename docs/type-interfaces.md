@@ -159,9 +159,12 @@ permits reads. Declared fields retain their individual types and mutability.
 
 `select[T]` describes configurable values whose branches have type `T`.
 Starpls also tracks the first branch's runtime kind when its value is a
-supported literal and the dictionary keys are distinct string literals. The
-kind determines which selector operations Bazel accepts. For example, selectors
-whose first branch is `None` combine with `+`, including when later branches are
+supported literal and the dictionary keys are distinct string literals. It
+also recognizes mappings whose values all have one runtime category: strings,
+booleans, `None`, or lists and tuples. For these mappings, every possible first
+branch has the same kind. The kind determines which selector operations Bazel
+accepts. For example, selectors whose first branch is `None` combine with `+`,
+including when later branches are
 dictionaries; selectors whose first branch is a dictionary combine with `|`.
 
 Inferred types display this information as a second parameter, such as
@@ -170,8 +173,10 @@ the `"list"` kind. Combined selectors preserve their kind and include the
 nullable contributions of both operands in their branch type.
 
 `select[T]` defaults the kind to `Any`, so annotations can describe branch
-values while leaving runtime kind unspecified. Dynamic mappings also retain
-an unspecified kind. Integer literals retain the `"int"` category. Bazel uses
+values while leaving runtime kind unspecified. Mappings with unknown or mixed
+value categories retain an unspecified kind, as do integer and dictionary value
+types with several native representations. Integer literals retain the `"int"`
+category, and literal dictionary branches retain the `"dict"` kind. Bazel uses
 several native integer representations, so integer operands carry an `Unknown`
 compatibility requirement. Implementation validation refuses to prove operations
 on integer-first selectors until their native representations can be distinguished.
