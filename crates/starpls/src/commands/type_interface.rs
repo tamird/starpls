@@ -224,208 +224,113 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_with_cfg_package_matches_its_source_version() {
+    fn packages_resolve_shared_types_and_check_source_versions() {
         let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-            .join("with-cfg-stubs");
-        let workspace = root.join("workspace");
-        let external = root.join("external");
-        let source = external.join("with_cfg.bzl+");
-        let stubs = external.join("with_cfg_stubs+");
-        for directory in [&workspace, &source, &stubs] {
-            std::fs::create_dir_all(directory).unwrap();
-        }
-        std::fs::write(source.join("with_cfg.bzl"), "def with_cfg(kind): pass\n").unwrap();
-        std::fs::create_dir_all(source.join("with_cfg/private")).unwrap();
-        std::fs::write(source.join("with_cfg/private/with_cfg.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/providers.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/setting.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/extend.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/frontend.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/select.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/transition.bzl"), "").unwrap();
-        std::fs::write(source.join("with_cfg/private/wrapper.bzl"), "").unwrap();
-        std::fs::write(
-            source.join("with_cfg/private/builder.bzl"),
-            "def make_builder(rule_info): return rule_info\n",
-        )
-        .unwrap();
-        let caller_text = "load('@with_cfg.bzl//with_cfg/private:builder.bzl', 'make_builder')\nresult = make_builder('source')\n";
-        std::fs::write(workspace.join("caller.bzl"), caller_text).unwrap();
-        std::fs::write(
-            source.join("with_cfg/private/utils.bzl"),
-            "def is_label(value): return type(value) == type(Label('//:bogus'))\n",
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("stubs.toml"),
-            include_str!("../../../../stubs/with_cfg/stubs.toml"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("with_cfg.bzli"),
-            include_str!("../../../../stubs/with_cfg/with_cfg.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("wrapper.bzli"),
-            include_str!("../../../../stubs/with_cfg/wrapper.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("types.bzli"),
-            include_str!("../../../../stubs/with_cfg/types.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("builder.bzli"),
-            include_str!("../../../../stubs/with_cfg/builder.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("extend.bzli"),
-            include_str!("../../../../stubs/with_cfg/extend.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("frontend.bzli"),
-            include_str!("../../../../stubs/with_cfg/frontend.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("select.bzli"),
-            include_str!("../../../../stubs/with_cfg/select.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("transition.bzli"),
-            include_str!("../../../../stubs/with_cfg/transition.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("utils.bzli"),
-            include_str!("../../../../stubs/with_cfg/utils.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("private_helpers.bzli"),
-            include_str!("../../../../stubs/with_cfg/private_helpers.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("providers.bzli"),
-            include_str!("../../../../stubs/with_cfg/providers.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            stubs.join("setting.bzli"),
-            include_str!("../../../../stubs/with_cfg/setting.bzli"),
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.join("starpls.toml"),
-            "[[stub-packages]]\nmanifest = '@with_cfg_stubs//:stubs.toml'\n",
-        )
-        .unwrap();
-        for version in ["0.14.6", "0.14.7"] {
-            let mut client = crate::document::source_tests::TestBazelClient::default();
-            client.repository_mappings.insert(
-                "".into(),
-                std::sync::Arc::new(
-                    [
-                        ("with_cfg_stubs".into(), "with_cfg_stubs+".into()),
-                        ("with_cfg.bzl".into(), "with_cfg.bzl+".into()),
-                    ]
-                    .into(),
-                ),
-            );
-            client.repository_mappings.insert(
-                "with_cfg_stubs+".into(),
-                std::sync::Arc::new([("with_cfg.bzl".into(), "with_cfg.bzl+".into())].into()),
-            );
-            client.selected_modules.insert(
-                "with_cfg.bzl+".into(),
-                starpls_bazel::client::SelectedModule {
-                    name: "with_cfg.bzl".into(),
-                    version: Some(version.into()),
-                },
-            );
-            let (sender, _) = crossbeam_channel::unbounded();
-            let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
-                std::sync::Arc::new(client),
-                workspace.clone(),
-                None,
-                external.clone(),
-                sender,
-                true,
-            ));
-            let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
-            if version == "0.14.6" {
+            .join("package-source-versions");
+        for colocated in [false, true] {
+            let workspace = root.join(format!("{colocated}"));
+            let external = workspace.join("external");
+            let source = external.join("rules+");
+            let stubs = if colocated {
+                source.join("stubs")
+            } else {
+                external.join("stubs+")
+            };
+            for directory in [&workspace, &source, &stubs] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(stubs.join("BUILD.bazel"), "").unwrap();
+            std::fs::write(
+                source.join("defs.bzl"),
+                "def declared(value): return value\ndef inferred(value): return value\n",
+            )
+            .unwrap();
+            let caller_text = "load('@rules//:defs.bzl', 'declared', 'inferred')\nresult = inferred('source')\nvalue = declared('ok').name\n";
+            std::fs::write(workspace.join("caller.bzl"), caller_text).unwrap();
+            std::fs::write(
+                stubs.join("stubs.toml"),
+                "format-version = 1\n[source]\nrepository = '@rules'\nmodule = 'rules'\nversions = ['1.0']\n[files]\n'defs.bzl' = 'defs.bzli'\n",
+            )
+            .unwrap();
+            std::fs::write(
+                stubs.join("defs.bzli"),
+                "load(':types.bzli', _Value='Value')\ndef declared(value: str) -> _Value: ...\n",
+            )
+            .unwrap();
+            std::fs::write(
+                stubs.join("types.bzli"),
+                "class Value(Protocol):\n    @property\n    def name(self) -> str: ...\n",
+            )
+            .unwrap();
+            let manifest = if colocated {
+                "@rules//stubs:stubs.toml"
+            } else {
+                "@stubs//:stubs.toml"
+            };
+            std::fs::write(
+                workspace.join("starpls.toml"),
+                format!("[[stub-packages]]\nmanifest = '{manifest}'\n"),
+            )
+            .unwrap();
+            for version in ["1.0", "1.1"] {
+                let mut client = crate::document::source_tests::TestBazelClient::default();
+                client.repository_mappings.insert(
+                    "".into(),
+                    std::sync::Arc::new(
+                        [
+                            ("stubs".into(), "stubs+".into()),
+                            ("rules".into(), "rules+".into()),
+                        ]
+                        .into(),
+                    ),
+                );
+                for repository in ["stubs+", "rules+"] {
+                    client.repository_mappings.insert(
+                        repository.into(),
+                        std::sync::Arc::new([("rules".into(), "rules+".into())].into()),
+                    );
+                }
+                client.selected_modules.insert(
+                    "rules+".into(),
+                    starpls_bazel::client::SelectedModule {
+                        name: "rules".into(),
+                        version: Some(version.into()),
+                    },
+                );
+                let (sender, _) = crossbeam_channel::unbounded();
+                let loader = std::sync::Arc::new(crate::document::DefaultFileLoader::new(
+                    std::sync::Arc::new(client),
+                    workspace.clone(),
+                    None,
+                    external.clone(),
+                    sender,
+                    true,
+                ));
+                let prepared = super::TypeInterfaceOptions::default().prepare(&loader, &workspace);
+                if version != "1.0" {
+                    let message = format!("{:#}", prepared.unwrap_err());
+                    assert!(
+                        message.contains("selected version 1.1") && message.contains("accepts 1.0"),
+                        "{message}"
+                    );
+                    continue;
+                }
                 let prepared = prepared.unwrap();
-                let actual = prepared
-                    .registrations
-                    .iter()
-                    .map(|registration| {
-                        let super::Registration {
-                            source,
-                            interface,
-                            origin: _,
-                        } = registration;
-                        (source.clone(), interface.clone())
-                    })
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                assert_eq!(actual.len(), prepared.registrations.len());
-                let expected = std::collections::BTreeMap::from([
-                    (source.join("with_cfg.bzl"), stubs.join("with_cfg.bzli")),
-                    (
-                        source.join("with_cfg/private/builder.bzl"),
-                        stubs.join("builder.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/extend.bzl"),
-                        stubs.join("extend.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/frontend.bzl"),
-                        stubs.join("frontend.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/select.bzl"),
-                        stubs.join("select.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/transition.bzl"),
-                        stubs.join("transition.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/providers.bzl"),
-                        stubs.join("providers.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/setting.bzl"),
-                        stubs.join("setting.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/utils.bzl"),
-                        stubs.join("utils.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/with_cfg.bzl"),
-                        stubs.join("private_helpers.bzli"),
-                    ),
-                    (
-                        source.join("with_cfg/private/wrapper.bzl"),
-                        stubs.join("wrapper.bzli"),
-                    ),
-                ]);
-                assert_eq!(actual, expected);
+                let [super::Registration {
+                    source: registered_source,
+                    interface: registered_interface,
+                    origin: _,
+                }] = prepared.registrations.as_slice()
+                else {
+                    panic!("{prepared:?}");
+                };
+                assert_eq!(*registered_source, source.join("defs.bzl"));
+                assert_eq!(*registered_interface, stubs.join("defs.bzli"));
                 let mut analysis = starpls_ide::Analysis::new(loader, Default::default()).unwrap();
-                analysis
-                    .set_builtin_defs(crate::server::load_bazel_builtins(), Default::default())
-                    .unwrap();
                 prepared.install(&mut analysis, &workspace).unwrap();
                 let interface = analysis
                     .file(
-                        &stubs.join("with_cfg.bzli"),
+                        &stubs.join("defs.bzli"),
                         starpls_common::Dialect::Bazel,
                         None,
                     )
@@ -437,9 +342,9 @@ mod tests {
                         None,
                     )
                     .unwrap();
-                let builder = analysis
+                let implementation = analysis
                     .file(
-                        &source.join("with_cfg/private/builder.bzl"),
+                        &source.join("defs.bzl"),
                         starpls_common::Dialect::Bazel,
                         None,
                     )
@@ -459,7 +364,7 @@ mod tests {
                     .goto_definition(
                         starpls_ide::FilePosition {
                             file_id: caller,
-                            pos: (caller_text.rfind("make_builder").unwrap() as u32).into(),
+                            pos: (caller_text.rfind("inferred").unwrap() as u32).into(),
                         },
                         false,
                     )
@@ -474,14 +379,7 @@ mod tests {
                 else {
                     panic!("{locations:?}");
                 };
-                assert_eq!(*target_file_id, builder.source);
-            } else {
-                let message = format!("{:#}", prepared.unwrap_err());
-                assert!(
-                    message.contains("selected version 0.14.7")
-                        && message.contains("accepts 0.14.6"),
-                    "{message}"
-                );
+                assert_eq!(*target_file_id, implementation.source);
             }
         }
         std::fs::remove_dir_all(root).unwrap();

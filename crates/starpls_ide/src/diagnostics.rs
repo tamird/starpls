@@ -1794,25 +1794,32 @@ def _unused_function() -> rule:
     }
 
     #[test]
-    fn with_cfg_stub_preserves_fluent_types_and_rule_exports() {
+    fn shared_protocol_preserves_fluent_types_and_rule_exports() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
-        let implementation = fixture.add_file(
-            &mut analysis.db,
-            "with_cfg.bzl",
-            "def with_cfg(kind): pass\n",
-        );
+        let implementation =
+            fixture.add_file(&mut analysis.db, "builder.bzl", "def builder(kind): pass\n");
         let interface = fixture.add_file(
             &mut analysis.db,
-            "with_cfg.bzli",
-            include_str!("../../../stubs/with_cfg/with_cfg.bzli"),
+            "builder.bzli",
+            "load(':types.bzli', _Builder='Builder')\ndef builder(kind: Callable[..., None]) -> _Builder: ...\n",
         );
         let types = fixture.add_file(
             &mut analysis.db,
             ":types.bzli",
-            include_str!("../../../stubs/with_cfg/types.bzli"),
+            r#"class _Set(Protocol):
+    def __call__(self, name: str, value: int) -> Builder: ...
+
+class Builder(Protocol):
+    @property
+    def set(self) -> _Set: ...
+    @property
+    def clone(self) -> Callable[[], Builder]: ...
+    @property
+    def build(self) -> Callable[[], tuple[Callable[..., None], rule | None]]: ...
+"#,
         );
-        let source = "load('with_cfg.bzl', wrap='with_cfg')\ndef macro(**kwargs): pass\nwrapped, _internal = wrap(macro).set('compilation_mode', 'dbg').set('platforms', select({'//conditions:default': [Label('//:platform')]})).extend('copt', select({'//conditions:default': ['-O0']})).resettable(Label('//:saved')).reset_on_attrs('deps').clone().build()\ndef use():\n    wrapped(name='target')\n";
+        let source = "load('builder.bzl', 'builder')\ndef macro(**kwargs): pass\nwrapped, _internal = builder(macro).set(name='count', value=1).clone().build()\ndef use():\n    wrapped(name='target')\n";
         let caller = fixture.add_file(&mut analysis.db, "main.bzl", source);
         loader.add_files_from_fixture(&fixture);
         analysis
@@ -1832,11 +1839,9 @@ def _unused_function() -> rule:
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
         for invalid in [
-            "wrap(42)",
-            "wrap(macro).set(42, 'value')",
-            "wrap(macro).set('mode', {})",
-            "wrap(macro).extend('copt', '-O0')",
-            "wrap(macro).resettable('//:saved')",
+            "builder(42)",
+            "builder(macro).set(42, 1)",
+            "builder(macro).set('count', 'value')",
         ] {
             analysis.update_file(caller, format!("{source}{invalid}\n"));
             let diagnostics = analysis.snapshot().diagnostics(caller).unwrap();

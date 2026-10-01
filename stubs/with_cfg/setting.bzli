@@ -1,7 +1,0 @@
-def _get_type_as_attr_type(value: object) -> Literal[
-    "string", "string_list", "label", "label_list", "int", "int_list", "bool"
-] | None: ...
-
-def get_attr_type(attr: object) -> Literal[
-    "string", "string_list", "label", "label_list", "int", "int_list", "bool"
-]: ...

@@ -1,9 +1,0 @@
-load(":types.bzli", _Builder = "Builder")
-
-def with_cfg(
-    kind: Callable[..., Any],
-    *,
-    executable: bool | None = ...,
-    implicit_targets: Iterable[str] | None = ...,
-    extra_providers: Iterable[Provider[object] | Callable[..., object]] | None = ...,
-) -> _Builder: ...

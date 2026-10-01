@@ -1837,42 +1837,35 @@ def make() -> _Builder: ...
     }
 
     #[test]
-    fn with_cfg_rule_info_preserves_provider_identity() {
+    fn partial_provider_interface_preserves_source_identity() {
         let (mut analysis, loader) = Analysis::new_for_test();
         let mut fixture = Fixture::new(&mut analysis.db);
-        let fields = concat!(
-            "['executable', 'implicit_targets', 'kind', 'native', 'providers', ",
-            "'supports_extension', 'supports_inheritance', 'test']"
-        );
-        let arguments = concat!(
-            "executable=True, implicit_targets=['%{name}'], kind=lambda: None, ",
-            "native=False, providers=[], supports_extension=True, ",
-            "supports_inheritance=False, test=False"
-        );
+        let fields = "['enabled']";
+        let arguments = "enabled=True";
         let source = fixture.add_file(
             &mut analysis.db,
             "providers.bzl",
             &format!(
-                r#"RuleInfo = provider(fields={fields})
-SettingInfo = provider(fields=['operation', 'value'])
-def consume(value: RuleInfo) -> RuleInfo:
+                r#"Info = provider(fields={fields})
+Unmapped = provider(fields=['value'])
+def consume(value: Info) -> Info:
     return value
-original = RuleInfo({arguments})
+original = Info({arguments})
 "#
             ),
         );
         let interface = fixture.add_file(
             &mut analysis.db,
             "providers.bzli",
-            include_str!("../../../../stubs/with_cfg/providers.bzli"),
+            "class Info:\n    enabled: Final[bool]\n    def __init__(self, *, enabled: bool) -> None: ...\n",
         );
         let caller_text = format!(
-            r#"load('providers.bzl', 'RuleInfo', 'SettingInfo', 'consume', 'original')
-item = consume(RuleInfo({arguments}))
-flag = item.executable
+            r#"load('providers.bzl', 'Info', 'Unmapped', 'consume', 'original')
+item = consume(Info({arguments}))
+flag = item.enabled
 previous = consume(original)
-setting = SettingInfo(operation='set', value=1)
-value = setting.value
+unmapped = Unmapped(value=1)
+value = unmapped.value
 "#
         );
         let caller = fixture.add_file(&mut analysis.db, "main.bzl", &caller_text);
@@ -1895,12 +1888,12 @@ value = setting.value
         let hover = snapshot
             .hover(FilePosition {
                 file_id: caller,
-                pos: (caller_text.find("item.executable").unwrap() as u32 + 5).into(),
+                pos: (caller_text.find("item.enabled").unwrap() as u32 + 5).into(),
             })
             .unwrap()
             .unwrap();
         assert!(
-            hover.contents.value.contains("executable: bool"),
+            hover.contents.value.contains("enabled: bool"),
             "{}",
             hover.contents.value
         );
@@ -1908,7 +1901,7 @@ value = setting.value
             .goto_definition(
                 FilePosition {
                     file_id: caller,
-                    pos: (caller_text.rfind("SettingInfo").unwrap() as u32).into(),
+                    pos: (caller_text.rfind("Unmapped").unwrap() as u32).into(),
                 },
                 false,
             )
@@ -1928,15 +1921,12 @@ value = setting.value
         for (bad_call, expected) in [
             (
                 format!(
-                    "RuleInfo({})",
-                    arguments.replace("executable=True", "executable='bad'")
+                    "Info({})",
+                    arguments.replace("enabled=True", "enabled='bad'")
                 ),
                 "invalid-argument-type",
             ),
-            (
-                format!("RuleInfo({})", arguments.replace(", test=False", "")),
-                "missing-argument",
-            ),
+            ("Info()".to_owned(), "missing-argument"),
             (
                 format!("Other = provider(fields={fields})\nconsume(Other({arguments}))"),
                 "invalid-argument-type",

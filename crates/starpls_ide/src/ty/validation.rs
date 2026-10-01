@@ -2350,11 +2350,10 @@ mod tests {
         let value = format!("{scalar} | list[{scalar}]");
         let compound = format!("{value} | dict[{scalar}, {value}]");
         let parsed = format!("{compound} | dict[{scalar}, {compound}]");
-        let builder = include_str!("../../../../stubs/with_cfg/builder.bzli");
-        let (_, overloads) = builder.split_once("@overload").unwrap();
-        let overloads = overloads.replace("_clone_value_deeply", "copy");
-        let stub =
-            format!("def is_list(value: object) -> TypeIs[list[Any]]: ...\n@overload{overloads}");
+        let stub = "def is_list(value: object) -> TypeIs[list[Any]]: ...\n\
+            @overload\ndef copy[T](value: list[T]) -> list[T]: ...\n\
+            @overload\ndef copy[K, V](value: dict[K, V]) -> dict[K, V]: ...\n\
+            @overload\ndef copy[T: (str, Label, int, bool, None)](value: T) -> T: ...\n";
         let predicate =
             "_LIST_TYPE = type([])\ndef is_list(value): return type(value) == _LIST_TYPE\n";
         let source = "def copy(value):\n    if is_list(value):\n        return list(value)\n    return value\n";
@@ -2386,7 +2385,7 @@ mod tests {
             "def opaque() -> Any: return []\ndef copy(value): return opaque()\n",
             "def opaque() -> Any: return []\ndef copy(value):\n    len(opaque())\n    return value\n",
         ] {
-            let diagnostics = validation_diagnostics(&format!("{predicate}{source}"), &stub);
+            let diagnostics = validation_diagnostics(&format!("{predicate}{source}"), stub);
             assert!(diagnostics.iter().any(|diagnostic| diagnostic.severity() == Severity::Error), "{source}: {diagnostics:#?}");
         }
     }
@@ -3598,17 +3597,15 @@ mod tests {
         }
     }
 
-    fn with_cfg_dict_predicate_stub() -> String {
-        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
-        let (_, overloads) = utils.split_once("@overload").unwrap();
-        let (overloads, _) = overloads.split_once("\ndef is_int").unwrap();
-        format!("@overload{overloads}")
+    fn overloaded_dict_predicate_stub() -> &'static str {
+        "@overload\ndef is_dict[K, V](value: dict[K, V]) -> Literal[True]: ...\n\
+            @overload\ndef is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\n"
     }
 
     #[test]
     fn json_decode_preserves_guarded_results_and_defaults() {
         let predicate = "def is_dict(value): return type(value) == 'dict'\n";
-        let predicate_stub = with_cfg_dict_predicate_stub();
+        let predicate_stub = overloaded_dict_predicate_stub();
         for (parameters, argument, result, expected) in [
             ("", "", "dict[str, object]", None),
             ("", "", "dict[str, int]", Some("unsound-return-statement")),
@@ -7878,15 +7875,11 @@ def read(value: list[str]) -> str: ...
 
     #[test]
     fn type_predicates_preserve_bool_and_int() {
-        let utils = include_str!("../../../../stubs/with_cfg/utils.bzli");
         for (kind, fallback, other, other_fallback) in
             [("bool", "False", "int", "0"), ("int", "0", "bool", "False")]
         {
             let name = format!("is_{kind}");
-            let declaration = utils
-                .lines()
-                .find(|line| line.starts_with(&format!("def {name}(")))
-                .unwrap();
+            let declaration = format!("def {name}(value: object) -> TypeIs[{kind}]: ...\n");
             let comparison = "type(value) == _TYPE";
             let predicate =
                 format!("_TYPE = type({fallback})\ndef {name}(value):\n    return {comparison}\n");
@@ -7906,7 +7899,7 @@ def read(value: list[str]) -> str: ...
                 assert_eq!(
                     validate(
                         &format!("def {name}(value):\n    return {replacement}\n"),
-                        declaration,
+                        &declaration,
                     ),
                     ["incomplete-stub-validation"],
                     "{kind}: {replacement}",
@@ -7919,7 +7912,7 @@ def read(value: list[str]) -> str: ...
     fn type_is_dict_preserves_key_and_value_types() {
         let predicate =
             "_DICT_TYPE = type({})\ndef is_dict(value):\n    return type(value) == _DICT_TYPE\n";
-        let overloads = with_cfg_dict_predicate_stub();
+        let overloads = overloaded_dict_predicate_stub();
         let source = format!("{predicate}\ndef read(value):\n    if is_dict(value):\n        return value['x']\n    return ''\n");
         let stub = format!("{overloads}\ndef read(value: dict[str, str] | str) -> str: ...\n");
         let diagnostics = validation_diagnostics(&source, &stub);
@@ -7972,7 +7965,7 @@ def read(value: list[str]) -> str: ...
         }
         let diagnostics = validation_diagnostics(
             &predicate.replace("type(value) == _DICT_TYPE", "False"),
-            &overloads,
+            overloads,
         );
         assert!(
             diagnostics
