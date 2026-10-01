@@ -1988,6 +1988,7 @@ dependencies = [
 [[package]]
 name = "ruff_annotate_snippets"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anstyle",
  "memchr",
@@ -1997,6 +1998,7 @@ dependencies = [
 [[package]]
 name = "ruff_cache"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "char_str",
  "filetime",
@@ -2010,6 +2012,7 @@ dependencies = [
 [[package]]
 name = "ruff_db"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anstyle",
  "arc-swap",
@@ -2052,6 +2055,7 @@ dependencies = [
 [[package]]
 name = "ruff_diagnostics"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
  "is-macro",
@@ -2062,6 +2066,7 @@ dependencies = [
 [[package]]
 name = "ruff_index"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
  "ruff_macros",
@@ -2071,6 +2076,7 @@ dependencies = [
 [[package]]
 name = "ruff_macros"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "heck 0.5.0",
  "itertools 0.15.0",
@@ -2084,6 +2090,7 @@ dependencies = [
 [[package]]
 name = "ruff_memory_usage"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
 ]
@@ -2091,6 +2098,7 @@ dependencies = [
 [[package]]
 name = "ruff_notebook"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anyhow",
  "rand 0.10.2",
@@ -2106,10 +2114,12 @@ dependencies = [
 [[package]]
 name = "ruff_options_metadata"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 
 [[package]]
 name = "ruff_python_ast"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "aho-corasick",
  "arrayvec",
@@ -2133,6 +2143,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_codegen"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_literal",
@@ -2144,6 +2155,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_edits"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "ruff_python_ast",
  "ruff_source_file",
@@ -2153,6 +2165,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_importer"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anyhow",
  "ruff_diagnostics",
@@ -2166,6 +2179,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_literal"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "bitflags 2.13.2",
  "icu_properties",
@@ -2176,6 +2190,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_parser"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "bitflags 2.13.2",
  "bstr",
@@ -2198,6 +2213,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_stdlib"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "bitflags 2.13.2",
  "unicode-ident",
@@ -2206,6 +2222,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_trivia"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "itertools 0.15.0",
  "memchr",
@@ -2219,6 +2236,7 @@ dependencies = [
 [[package]]
 name = "ruff_ranged_value"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
  "ruff_db",
@@ -2231,6 +2249,7 @@ dependencies = [
 [[package]]
 name = "ruff_source_file"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
  "memchr",
@@ -2241,6 +2260,7 @@ dependencies = [
 [[package]]
 name = "ruff_text_size"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "get-size2",
  "serde",
@@ -2993,6 +3013,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ty_combine"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "ordermap",
  "ruff_db",
@@ -3003,6 +3024,7 @@ dependencies = [
 [[package]]
 name = "ty_ide"
 version = "0.0.0"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "bitflags 2.13.2",
  "compact_str",
@@ -3038,6 +3060,7 @@ dependencies = [
 [[package]]
 name = "ty_module_resolver"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anyhow",
  "camino",
@@ -3063,6 +3086,7 @@ dependencies = [
 [[package]]
 name = "ty_project"
 version = "0.0.0"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3109,6 +3133,7 @@ dependencies = [
 [[package]]
 name = "ty_python_core"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "bitflags 2.13.2",
  "bitvec",
@@ -3139,6 +3164,7 @@ dependencies = [
 [[package]]
 name = "ty_python_semantic"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
@@ -3184,6 +3210,7 @@ dependencies = [
 [[package]]
 name = "ty_site_packages"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "camino",
  "colored",
@@ -3204,6 +3231,7 @@ dependencies = [
 [[package]]
 name = "ty_static"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "ruff_macros",
 ]
@@ -3211,6 +3239,7 @@ dependencies = [
 [[package]]
 name = "ty_vendored"
 version = "0.0.15"
+source = "git+https://github.com/tamird/ruff?rev=794db9be617dbc169549926c431af936eba0cba6#794db9be617dbc169549926c431af936eba0cba6"
 dependencies = [
  "path-slash",
  "ruff_db",
