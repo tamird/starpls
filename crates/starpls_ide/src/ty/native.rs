@@ -493,6 +493,24 @@ fn declarations(
                             writeln!(body, "            {}", quoted(&documentation))?;
                             writeln!(body, "            ...")?;
                         }
+                    } else if class.name == "json" && field.name == "decode" {
+                        // The root shape is known, while nested schema-dependent
+                        // uses retain gradual behavior through the Any intersection.
+                        // A supplied default can have any type; an omitted one
+                        // contributes no type variable to contextual inference.
+                        let documentation = callable_documentation(field, callable)?;
+                        let decoded = "_starpls_ty_extensions.Intersection[_starpls_typing.Any, None | _starpls_builtins.bool | _starpls_builtins.int | _starpls_builtins.float | _starpls_builtins.str | _starpls_builtins.list[_starpls_builtins.object] | _starpls_builtins.dict[_starpls_builtins.str, _starpls_builtins.object]]";
+                        for (default, fallback) in
+                            [("", ""), (", default: _JsonDefault", " | _JsonDefault")]
+                        {
+                            writeln!(body, "        @_starpls_typing.overload")?;
+                            writeln!(
+                                body,
+                                "        def decode(_starpls_self, x: _starpls_builtins.str, /{default}) -> {decoded}{fallback}:"
+                            )?;
+                            writeln!(body, "            {}", quoted(&documentation))?;
+                            writeln!(body, "            ...")?;
+                        }
                     } else {
                         write_function(
                             &mut body,
@@ -654,7 +672,7 @@ fn declarations(
         body.push_str("    pass\n");
     }
     let mut output = String::from(
-        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\nfrom ty_extensions._internal import Unknown as _starpls_unknown\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectKind = _starpls_typing.TypeVar(\"_SelectKind\", covariant=True, default=_starpls_typing.Any)\n_SelectPeerValue = _starpls_typing.TypeVar(\"_SelectPeerValue\")\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
+        "import builtins as _starpls_builtins\nimport typing as _starpls_typing\nimport ty_extensions as _starpls_ty_extensions\nfrom ty_extensions._internal import Unknown as _starpls_unknown\n\n_JsonDefault = _starpls_typing.TypeVar(\"_JsonDefault\")\n\n_StructField = _starpls_typing.TypeVar(\"_StructField\", covariant=True)\n_ProviderValue = _starpls_typing.TypeVar(\"_ProviderValue\", covariant=True)\n_DepsetElement = _starpls_typing.TypeVar(\"_DepsetElement\", covariant=True)\n_SelectValue = _starpls_typing.TypeVar(\"_SelectValue\", covariant=True)\n_SelectKind = _starpls_typing.TypeVar(\"_SelectKind\", covariant=True, default=_starpls_typing.Any)\n_SelectPeerValue = _starpls_typing.TypeVar(\"_SelectPeerValue\")\n_SelectCondition = _starpls_typing.TypeVar(\"_SelectCondition\", bound=\"_starpls_builtins.str | _starpls_types.Label\")\n_RuleAttributeName = _starpls_typing.TypeVar(\"_RuleAttributeName\", bound=\"_starpls_builtins.str\", default=\"_starpls_builtins.str\")\n_RuleAttribute = _starpls_typing.TypeVar(\"_RuleAttribute\", bound=\"_starpls_types.Attribute\", default=\"_starpls_types.Attribute\")\n_SelectLeft = _starpls_typing.TypeVar(\"_SelectLeft\")\n_SelectRight = _starpls_typing.TypeVar(\"_SelectRight\")\n_SelectKeyLeft = _starpls_typing.TypeVar(\"_SelectKeyLeft\")\n_SelectKeyRight = _starpls_typing.TypeVar(\"_SelectKeyRight\")\n_DefaultInfoFiles = _starpls_typing.TypeVar(\"_DefaultInfoFiles\", bound=\"_starpls_types.depset[_starpls_types.File] | None\", default=\"_starpls_types.depset[_starpls_types.File] | None\", covariant=True)\n_Executable = _starpls_typing.TypeVar(\"_Executable\", bound=\"_starpls_types.File | None\", default=\"_starpls_types.File | None\", covariant=True)\n_DefaultInfoFilesToRun = _starpls_typing.TypeVar(\"_DefaultInfoFilesToRun\", bound=\"_starpls_types.FilesToRunProvider | None\", default=\"_starpls_types.FilesToRunProvider | None\", covariant=True)\n_BuildSettingValue = _starpls_typing.TypeVar(\"_BuildSettingValue\", default=_starpls_typing.Any, covariant=True)\n_ContextAttrs = _starpls_typing.TypeVar(\"_ContextAttrs\", default=_starpls_builtins.object, covariant=True)\n\n_starpls_native_rule_available: _starpls_builtins.bool\n\nclass _starpls_types:\n",
     );
     output.push_str(&body);
     output.push('\n');
@@ -1309,6 +1327,95 @@ called = computed()
         );
         let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn json_decode_displays_its_result_domain() {
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(
+                starpls_bazel::decode_builtins(include_bytes!(
+                    "../../../starpls/src/builtin/builtin.pb"
+                ))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+        let source = "decoded = json.decode('{}')\ndecoded\n";
+        let file = analysis
+            .open_document(
+                Path::new("/decode.bzl"),
+                Dialect::Bazel,
+                None,
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let hover = analysis
+            .snapshot()
+            .hover(FilePosition {
+                file_id: file,
+                pos: u32::try_from(source.rfind("decoded").unwrap())
+                    .unwrap()
+                    .into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            hover.contents.value.contains("Any & int"),
+            "{}",
+            hover.contents.value
+        );
+    }
+
+    #[test]
+    fn json_decode_preserves_catalog_consumers() {
+        let source = r#"
+def catalog(contents):
+    tools = json.decode(contents)
+    for name, metadata in tools.items():
+        name.removeprefix("tool_")
+        metadata["version"].split(".")
+        for platform, binary in sorted(metadata["platforms"].items()):
+            platform.startswith("linux_")
+            binary["files"][0].upper()
+    for image in tools["images"]:
+        image.get("digest", "")
+
+json.decode("{}", None)
+json.decode("{}", default=struct(value="fallback"))
+"#;
+        for (source, errors) in [
+            (source, false),
+            ("json.decode(x='{}')", true),
+            ("json.decode(1)", true),
+            ("json.decode()", true),
+        ] {
+            let (mut analysis, _) = Analysis::new_for_test();
+            analysis
+                .set_builtin_defs(
+                    starpls_bazel::decode_builtins(include_bytes!(
+                        "../../../starpls/src/builtin/builtin.pb"
+                    ))
+                    .unwrap(),
+                    Default::default(),
+                )
+                .unwrap();
+            let file = analysis
+                .open_document(
+                    Path::new("/catalog.bzl"),
+                    Dialect::Bazel,
+                    None,
+                    source.to_owned(),
+                    1,
+                )
+                .unwrap();
+            let snapshot = analysis.snapshot();
+            let db = &snapshot.db;
+            let file = db.starlark_program_file(file);
+            let diagnostics = ty_python_semantic::check_file_unwrap(db, file);
+            assert_eq!(!diagnostics.is_empty(), errors, "{source}: {diagnostics:?}");
+        }
     }
 
     #[test]

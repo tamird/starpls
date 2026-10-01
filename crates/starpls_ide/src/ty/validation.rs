@@ -3252,6 +3252,110 @@ mod tests {
     }
 
     #[test]
+    fn json_decode_preserves_guarded_results_and_defaults() {
+        let predicate = "def is_dict(value): return type(value) == 'dict'\n";
+        let predicate_stub = "def is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\n";
+        for (parameters, argument, result, expected) in [
+            ("", "", "dict[str, object]", None),
+            ("", "", "dict[str, int]", Some("unsound-return-statement")),
+            (
+                "",
+                "",
+                "dict[int, object]",
+                Some("unsound-return-statement"),
+            ),
+            (
+                ", default: str",
+                ", default=default",
+                "dict[str, object]",
+                None,
+            ),
+            (
+                ", default: dict[str, object]",
+                ", default",
+                "dict[str, object]",
+                None,
+            ),
+            (
+                ", default: dict[int, object]",
+                ", default=default",
+                "dict[str, object]",
+                Some("invalid-return-type"),
+            ),
+            (
+                ", default: dict[str, int]",
+                ", default=default",
+                "dict[str, object]",
+                Some("invalid-return-type"),
+            ),
+            (
+                ", default: Any",
+                ", default=default",
+                "dict[str, object]",
+                Some("unsound-return-statement"),
+            ),
+            (
+                ", default",
+                ", default=default",
+                "dict[str, object]",
+                Some("unsound-return-statement"),
+            ),
+        ] {
+            let source_parameters = if parameters.is_empty() {
+                ""
+            } else {
+                ", default"
+            };
+            let source = format!(
+                "{predicate}def reset(value{source_parameters}):\n    decoded = json.decode(value{argument})\n    if not is_dict(decoded):\n        fail('Expected a dictionary')\n    return decoded\n"
+            );
+            let stub =
+                format!("{predicate_stub}def reset(value: str{parameters}) -> {result}: ...\n");
+            let diagnostics = validate(&source, &stub);
+            match expected {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|id| id == expected),
+                    "{stub}: {diagnostics:?}",
+                ),
+                None => assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}"),
+            }
+        }
+        for result in ["dict[str, object]", "str"] {
+            let diagnostics = validate(
+                "def decode(value): return json.decode(value)\n",
+                &format!("def decode(value: str) -> {result}: ...\n"),
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|id| id == "unsound-return-statement"),
+                "{result}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_decode_keeps_callee_input_requirements() {
+        for (input, rejected) in [("dict[Any, Any]", true), ("Mapping[str, object]", false)] {
+            let source = "def is_dict(value): return type(value) == 'dict'\ndef reset(value, consume):\n    decoded = json.decode(value)\n    if not is_dict(decoded):\n        fail('Expected a dictionary')\n    consume(decoded)\n    return decoded\n";
+            let stub = format!(
+                "def is_dict(value: object) -> TypeIs[dict[Any, Any]]: ...\ndef reset(value: str, consume: Callable[[{input}], None]) -> dict[str, object]: ...\n"
+            );
+            let diagnostics = validation_diagnostics(source, &stub);
+            if rejected {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| diagnostic.id().as_str()
+                        == "incomplete-stub-validation"
+                        && diagnostic.headline_message().contains("`reset`")),
+                    "{stub}: {diagnostics:?}"
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{stub}: {diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
     fn validation_checks_rule_attribute_inputs() {
         for (attrs, expected) in [
             (None, None),
