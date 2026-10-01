@@ -35,6 +35,10 @@ accepts `Provider[object] | Callable[..., object]` values and returns a readonly
 sequence with that element type. The shared result bound permits forwarding
 heterogeneous provider instances without assuming their fields. Bazel checks
 provider identity when these values are used as target keys.
+The transitioning alias factory returns a rule whose callback receives
+`exports: list[Target]` from its split transition and returns provider values.
+Its helper contracts require the local 0.14.6 patch that adds reset attributes
+to the settings dictionary before constructing the rule.
 Private builder contracts cover `_reset_on_attrs` and `_resettable`. Both
 use the shared `Builder` type for their receiver and result.
 `_clone_value_deeply` preserves scalar types, list element types, and
