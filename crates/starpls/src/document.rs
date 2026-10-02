@@ -175,6 +175,8 @@ pub(crate) struct DefaultFileLoader {
     configuration_inputs: RwLock<HashMap<PathBuf, Option<Vec<u8>>>>,
     repository_roots: RwLock<HashSet<PathBuf>>,
     configuration_revision: Option<u64>,
+    validate_repositories: bool,
+    source_overlays: HashSet<PathBuf>,
     defer_mappings: bool,
     repository_fetches: RwLock<HashMap<String, RepositoryFetch>>,
     repository_mappings: RwLock<HashMap<String, RepositoryMapping>>,
@@ -204,6 +206,8 @@ impl DefaultFileLoader {
             configuration_inputs: Default::default(),
             repository_roots: Default::default(),
             configuration_revision: None,
+            validate_repositories: false,
+            source_overlays: Default::default(),
             defer_mappings: false,
             repository_fetches: Default::default(),
             repository_mappings: Default::default(),
@@ -242,6 +246,12 @@ impl DefaultFileLoader {
 
     pub(crate) fn with_load_recording(mut self) -> Self {
         self.load_requests = Some(Default::default());
+        self
+    }
+
+    pub(crate) fn for_check(mut self, source_overlays: HashSet<PathBuf>) -> Self {
+        self.validate_repositories = true;
+        self.source_overlays = source_overlays;
         self
     }
 
@@ -584,7 +594,7 @@ impl DefaultFileLoader {
         if !self.is_ready() && self.label_needs_bazel_context(label, &repository) {
             return Ok(None);
         }
-        self.ensure_repository(&repository)?;
+        self.ensure_source_repository(&repository, from_path)?;
         if self.bzlmod_enabled
             && label.kind() == RepoKind::Apparent
             && self.repository_mapping(&repository.name)?.is_none()
@@ -656,6 +666,25 @@ impl DefaultFileLoader {
             self.finish_fetch([name.clone()], result.clone());
         }
         results
+    }
+
+    pub(crate) fn fetch_source_repositories<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        progress: impl FnMut(&str),
+    ) -> anyhow::Result<Vec<RepositoryFetchResult>> {
+        let mut repositories = Vec::new();
+        for path in paths {
+            if self.source_overlays.contains(path) {
+                continue;
+            }
+            if let Some(repository) = self.repository_for_path(path)? {
+                if !repository.name.is_empty() && self.begin_fetch(repository.name.clone()) {
+                    repositories.push(repository.name);
+                }
+            }
+        }
+        Ok(self.fetch_repositories(&repositories, progress))
     }
 
     pub(crate) fn selected_module(
@@ -802,19 +831,10 @@ impl DefaultFileLoader {
     fn ensure_repository(&self, repository: &Repository) -> anyhow::Result<()> {
         let fetches = self.repository_fetches.read();
         if let Some(RepositoryFetch::Failed(error)) = fetches.get(&repository.name) {
-            // Legacy query --keep_going can materialize the repository despite
-            // errors in unrelated packages. The editor still requires a ready
-            // repository after configuration changes.
-            if !self.bzlmod_enabled
-                && self.configuration_revision.is_none()
-                && repository.root.is_dir()
-            {
-                return Ok(());
-            }
             bail!("failed to fetch repository @@{}: {error}", repository.name);
         }
         if !repository.name.is_empty()
-            && self.configuration_revision.is_some()
+            && (self.configuration_revision.is_some() || self.validate_repositories)
             && fetches.get(&repository.name) != Some(&RepositoryFetch::Ready)
         {
             let _ = self.fetch_repo_sender.send(Task::FetchExternalRepoRequest(
@@ -824,9 +844,23 @@ impl DefaultFileLoader {
                 },
             ));
             bail!(
-                "repository @@{} must be fetched after the dependency change",
+                "repository @@{} must be fetched before reading its sources",
                 repository.name
             );
+        }
+        Ok(())
+    }
+
+    fn ensure_source_repository(&self, repository: &Repository, path: &Path) -> anyhow::Result<()> {
+        if self.source_overlays.contains(path) {
+            return Ok(());
+        }
+        self.ensure_repository(repository)
+    }
+
+    pub(crate) fn ensure_repository_for_path(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(repository) = self.repository_for_path(path)? {
+            self.ensure_source_repository(&repository, path)?;
         }
         Ok(())
     }
@@ -841,7 +875,7 @@ impl DefaultFileLoader {
     ) -> anyhow::Result<File> {
         let result = (|| {
             if let Some(repository) = &repository {
-                self.ensure_repository(repository)?;
+                self.ensure_source_repository(repository, &path)?;
             }
             if let Some(repository) = &repository {
                 self.record_repository(&path, Some(repository.clone()))?;

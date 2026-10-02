@@ -412,6 +412,36 @@ mod tests {
     }
 
     #[test]
+    fn source_overlays_validate_physical_siblings() {
+        let (mut checker, client) = overlay_checker(
+            "overlay-physical-sibling",
+            &[(
+                "stubs+/BUILD.bazel",
+                "build.txt",
+                "load(':dep.bzl', 'value')\nlen(value)\n",
+            )],
+        );
+        let dependency = checker.bazel_info.workspace.join("external/stubs+/dep.bzl");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "value = 'stale'\n").unwrap();
+        client
+            .fetch_files
+            .lock()
+            .unwrap()
+            .insert("stubs+".to_owned(), (dependency, "value = 42\n".to_owned()));
+        let result = checker.check_files().unwrap();
+        assert!(result.loads.unresolved.is_empty());
+        let [(_, diagnostics)] = result.diagnostics.as_slice() else {
+            panic!("expected one overlay: {:?}", result.diagnostics)
+        };
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected fresh sibling type: {diagnostics:?}")
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["stubs+"]);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn source_overlays_share_warm_buffers_with_distinct_repository_contexts() {
         let name = "overlay-shared-buffer";
@@ -559,12 +589,14 @@ mod tests {
                 fetch_checker(&format!("checker-mapping-refresh-{failed}"), true);
             for repository in ["rules+", "generated+"] {
                 std::fs::create_dir_all(external.join(repository)).unwrap();
+                checker.loader.finish_fetch([repository.to_owned()], Ok(()));
             }
             std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
             let generated = external.join("generated+/defs.bzl");
             std::fs::write(&generated, "value = 42\n").unwrap();
             let failure = if failed {
                 std::fs::create_dir_all(external.join("fail+")).unwrap();
+                checker.loader.finish_fetch(["fail+".to_owned()], Ok(()));
                 std::fs::write(
                     external.join("fail+/defs.bzl"),
                     "load('@dep//:defs.bzl', 'value')\nother = value\n",
@@ -639,6 +671,7 @@ mod tests {
             fetch_checker(&format!("checker-mapping-removed-load-{case}"), true);
         std::fs::create_dir_all(external.join("rules+")).unwrap();
         std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+        checker.loader.finish_fetch(["rules+".to_owned()], Ok(()));
         let generated = checker.bazel_info.workspace.join("generated.bzl");
         let old = checker.bazel_info.workspace.join("old.bzl");
         if let Some(old_source) = old_source {
@@ -718,6 +751,7 @@ mod tests {
             }
             std::fs::create_dir_all(external.join("rules+")).unwrap();
             std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+            checker.loader.finish_fetch(["rules+".to_owned()], Ok(()));
             let generated = checker.bazel_info.workspace.join("generated.bzl");
             std::fs::write(&generated, "value = 42\n").unwrap();
             let caller = checker.bazel_info.workspace.join("caller.bzl");
@@ -770,6 +804,220 @@ mod tests {
     }
 
     #[test]
+    fn existing_repositories_are_refreshed_before_inference() {
+        for (name, old, new, expected_errors) in [
+            ("missing", None, "str", 1),
+            ("stale-valid", Some("int"), "str", 1),
+            ("stale-invalid", Some("str"), "int", 0),
+        ] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-refresh-{name}"), true);
+            let dependency = external.join("rules+/defs.bzl");
+            std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+            let contents = |annotation| {
+                format!("value = 42\ndef consume(value: {annotation}) -> None:\n    print(value)\n")
+            };
+            if let Some(old) = old {
+                std::fs::write(&dependency, contents(old)).unwrap();
+            }
+            client
+                .fetch_files
+                .lock()
+                .unwrap()
+                .insert("rules+".to_owned(), (dependency, contents(new)));
+            let caller = checker.bazel_info.workspace.join("caller.bzl");
+            std::fs::write(
+                &caller,
+                "load('@rules//:defs.bzl', 'consume')\nconsume(42)\n",
+            )
+            .unwrap();
+            checker.load_file(&caller, true, &[], true).unwrap();
+            for _ in 0..2 {
+                let result = checker.check_files().unwrap();
+                assert!(result.loads.unresolved.is_empty());
+                let diagnostics: Vec<_> = result
+                    .diagnostics
+                    .iter()
+                    .flat_map(|(_, diagnostics)| diagnostics)
+                    .collect();
+                assert_eq!(
+                    diagnostics.len(),
+                    expected_errors,
+                    "{name}: {diagnostics:?}"
+                );
+                for diagnostic in diagnostics {
+                    assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+                }
+                assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_validation_rejects_existing_sources() {
+        for bzlmod in [false, true] {
+            let (mut checker, client, external) =
+                fetch_checker(&format!("checker-stale-failure-{bzlmod}"), bzlmod);
+            std::fs::create_dir_all(external.join("rules+")).unwrap();
+            std::fs::write(external.join("rules+/defs.bzl"), "value = 42\n").unwrap();
+            client
+                .fetch_failures
+                .lock()
+                .unwrap()
+                .insert("rules+".to_owned(), "validation refused".to_owned());
+            for _ in 0..2 {
+                let result = checker.check_files().unwrap();
+                let unresolved: Vec<_> = result.loads.unresolved.values().flatten().collect();
+                assert_eq!(unresolved.len(), 2);
+                for edge in unresolved {
+                    let starpls_ide::LoadResolution::Failed(message) = &edge.resolution else {
+                        panic!("expected fetch failure: {edge:?}")
+                    };
+                    assert!(message.contains("validation refused"), "{message}");
+                }
+                assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_external_inputs_are_refreshed_before_discovery() {
+        for (directory, missing, failed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join(
+                format!("checker-selected-repository-{directory}-{missing}-{failed}"),
+            );
+            let external = root.join("external");
+            let repository = external.join("rules+");
+            std::fs::create_dir_all(&external).unwrap();
+            let source = repository.join("defs.bzl");
+            if !missing {
+                std::fs::create_dir_all(&repository).unwrap();
+                std::fs::write(&source, "value: str = 'stale'\n").unwrap();
+            }
+            let client = Arc::new(TestBazelClient::default());
+            if failed {
+                client
+                    .fetch_failures
+                    .lock()
+                    .unwrap()
+                    .insert("rules+".to_owned(), "validation refused".to_owned());
+            } else {
+                client.fetch_files.lock().unwrap().insert(
+                    "rules+".to_owned(),
+                    (source.clone(), "value: str = 42\n".to_owned()),
+                );
+            }
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let loader =
+                DefaultFileLoader::new(client.clone(), root.clone(), None, external, sender, true);
+            let info = starpls_bazel::client::BazelInfo {
+                workspace: root,
+                ..Default::default()
+            };
+            let options = CheckCommand::default();
+            let (analysis, loader) = options
+                .prepare_analysis(loader, &info, Default::default())
+                .unwrap();
+            let selected = if directory { &repository } else { &source };
+            let mut checker = Checker::new(
+                analysis,
+                info,
+                vec![selected.to_str().unwrap().to_owned()],
+                &[],
+                loader,
+                receiver,
+                &options,
+            )
+            .unwrap();
+            if failed {
+                let [error] = checker.input_errors.as_slice() else {
+                    panic!("expected one failed input")
+                };
+                assert!(error.message.contains("validation refused"));
+                assert!(checker.files.is_empty());
+                assert!(checker.report_diagnostics(None).is_err());
+                assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+                continue;
+            }
+            let result = checker.check_files().unwrap();
+            assert!(checker.input_errors.is_empty());
+            assert!(result.loads.unresolved.is_empty());
+            let [(_, diagnostics)] = result.diagnostics.as_slice() else {
+                panic!("expected one source: {:?}", result.diagnostics)
+            };
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected updated source: {diagnostics:?}")
+            };
+            assert_eq!(diagnostic.id().as_str(), "invalid-assignment");
+            assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
+        }
+    }
+
+    #[test]
+    fn explicit_external_interfaces_are_refreshed_before_installation() {
+        let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join("checker-explicit-interface-freshness");
+        let external = root.join("external");
+        let interface = external.join("stubs+/defs.bzli");
+        std::fs::create_dir_all(interface.parent().unwrap()).unwrap();
+        std::fs::write(&interface, "value: str\n").unwrap();
+        std::fs::write(root.join("defs.bzl"), "value = 'implementation'\n").unwrap();
+        let caller = root.join("BUILD");
+        std::fs::write(&caller, "load(':defs.bzl', 'value')\nlen(value)\n").unwrap();
+        let client = Arc::new(TestBazelClient::default());
+        client
+            .fetch_files
+            .lock()
+            .unwrap()
+            .insert("stubs+".to_owned(), (interface, "value: int\n".to_owned()));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let loader =
+            DefaultFileLoader::new(client.clone(), root.clone(), None, external, sender, true);
+        let info = starpls_bazel::client::BazelInfo {
+            workspace: root,
+            ..Default::default()
+        };
+        let matches = <CheckCommand as clap::Args>::augment_args(clap::Command::new("check"))
+            .try_get_matches_from([
+                "check",
+                "--type_interface",
+                "defs.bzl=external/stubs+/defs.bzli",
+            ])
+            .unwrap();
+        let options = <CheckCommand as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+        let (analysis, loader) = options
+            .prepare_analysis(loader, &info, Default::default())
+            .unwrap();
+        let mut checker = Checker::new(
+            analysis,
+            info,
+            vec![caller.to_str().unwrap().to_owned()],
+            &[],
+            loader,
+            receiver,
+            &options,
+        )
+        .unwrap();
+        let result = checker.check_files().unwrap();
+        assert!(result.loads.unresolved.is_empty());
+        let diagnostics: Vec<_> = result
+            .diagnostics
+            .iter()
+            .flat_map(|(_, diagnostics)| diagnostics)
+            .collect();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected fresh interface type: {diagnostics:?}")
+        };
+        assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+        assert_eq!(*client.fetch_requests.lock().unwrap(), ["stubs+"]);
+    }
+
+    #[test]
     fn failed_or_incomplete_fetches_terminate_with_load_errors() {
         for mode in ["failed", "partial", "empty", "existing"] {
             let (mut checker, client, external) =
@@ -793,11 +1041,7 @@ mod tests {
             for _ in 0..2 {
                 assert!(checker.report_diagnostics(Some(&report_path)).is_err());
                 let requests = client.fetch_requests.lock().unwrap();
-                assert_eq!(
-                    requests.len(),
-                    usize::from(mode != "existing"),
-                    "{mode}: {requests:?}"
-                );
+                assert_eq!(requests.len(), 1, "{mode}: {requests:?}");
                 let report: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
                 assert_eq!(report["complete"], false);
@@ -884,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_queries_can_materialize_repositories_despite_package_errors() {
+    fn failed_legacy_queries_reject_materialized_sources() {
         let (mut checker, client, external) = fetch_checker("checker-fetch-legacy", false);
         client.fetch_files.lock().unwrap().insert(
             "rules+".to_owned(),
@@ -896,12 +1140,12 @@ mod tests {
         );
         let report_path = checker.bazel_info.workspace.join("coverage.json");
         for _ in 0..2 {
-            checker.report_diagnostics(Some(&report_path)).unwrap();
+            assert!(checker.report_diagnostics(Some(&report_path)).is_err());
             assert_eq!(*client.fetch_requests.lock().unwrap(), ["rules+"]);
             let report: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
-            assert_eq!(report["complete"], true);
-            assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 1);
+            assert_eq!(report["complete"], false);
+            assert_eq!(report["loaded_dependencies"].as_array().unwrap().len(), 0);
         }
     }
 
@@ -1553,10 +1797,32 @@ impl CheckCommand {
         info: &BazelInfo,
         rules: starpls_bazel::build::BuildLanguage,
     ) -> anyhow::Result<(Analysis, Arc<DefaultFileLoader>)> {
+        let mut overlays = HashSet::new();
+        for SourceOverlay {
+            logical,
+            physical: _,
+        } in &self.source_overlay
+        {
+            let logical = starpls_common::absolute_path(logical)?;
+            anyhow::ensure!(
+                overlays.insert(logical.clone()),
+                "duplicate source overlay for {}",
+                logical.display()
+            );
+        }
+        let loader = loader.for_check(overlays);
         // Package manifests can resolve source repositories relative to an
         // external annotation repository. Finish those synchronous queries
         // before deferring mappings discovered through the source graph.
         let prepared = self.type_interfaces.prepare(&loader, &info.workspace)?;
+        loader.fetch_source_repositories(prepared.paths(), |message| {
+            if self.progress {
+                eprintln!("{message}");
+            }
+        })?;
+        for path in prepared.paths() {
+            loader.ensure_repository_for_path(path)?;
+        }
         let loader = Arc::new(loader.with_deferred_mappings().with_load_recording());
         let mut analysis = Analysis::new(
             loader.clone(),
@@ -1568,14 +1834,8 @@ impl CheckCommand {
             },
         )?;
         analysis.set_builtin_defs(load_bazel_builtins(), rules)?;
-        let mut overlays = HashSet::new();
         for SourceOverlay { logical, physical } in &self.source_overlay {
             let logical = starpls_common::absolute_path(logical)?;
-            anyhow::ensure!(
-                overlays.insert(logical.clone()),
-                "duplicate source overlay for {}",
-                logical.display()
-            );
             let Some((Dialect::Bazel, context)) =
                 document::source_kind(&info.workspace, &logical, &[])
             else {
@@ -1792,6 +2052,26 @@ impl Checker {
             }
         }
         drop(snapshot);
+        let paths = paths
+            .iter()
+            .map(|path| starpls_common::absolute_path(Path::new(path)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // Validate all selected external repositories in one batch before
+        // walking their directories or admitting cached source files.
+        let fetches = checker.loader.fetch_source_repositories(
+            paths
+                .iter()
+                .filter(|path| !checker.ignored_paths.contains(path))
+                .map(PathBuf::as_path),
+            |message| {
+                if checker.progress {
+                    eprintln!("{message}");
+                }
+            },
+        )?;
+        if !fetches.is_empty() {
+            checker.analysis.invalidate_loads();
+        }
         for SourceOverlay {
             logical,
             physical: _,
@@ -1805,9 +2085,15 @@ impl Checker {
             }
         }
         for path in paths {
-            let path = starpls_common::absolute_path(Path::new(&path))?;
             if checker.ignored_paths.contains(&path) {
                 checker.exclusions.insert(path, Exclusion::Ignored);
+                continue;
+            }
+            if let Err(error) = checker.loader.ensure_repository_for_path(&path) {
+                checker.input_errors.push(InputError {
+                    path,
+                    message: format!("{error:#}"),
+                });
                 continue;
             }
             if checker.analysis.document(&path).is_some() {
@@ -1896,7 +2182,7 @@ impl Checker {
             self.exclusions.insert(path, Exclusion::NotBazel);
             return Ok(());
         }
-        self.loader.repository_for_path(&path)?;
+        self.loader.ensure_repository_for_path(&path)?;
 
         let info = api_context.map(|api_context| FileInfo::Bazel {
             api_context,

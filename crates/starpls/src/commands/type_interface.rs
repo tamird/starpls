@@ -107,6 +107,16 @@ pub(crate) struct PreparedInterfaces {
 }
 
 impl PreparedInterfaces {
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.registrations.iter().flat_map(
+            |Registration {
+                 source,
+                 interface,
+                 origin: _,
+             }| [source.as_path(), interface.as_path()],
+        )
+    }
+
     pub(crate) fn install(self, analysis: &mut Analysis, workspace: &Path) -> anyhow::Result<()> {
         let Self { registrations } = self;
         let mut mappings = Vec::with_capacity(registrations.len());
