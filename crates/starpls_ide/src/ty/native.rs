@@ -290,16 +290,33 @@ fn declarations(
     let declared_classes: BTreeSet<_> = classes.keys().cloned().collect();
     let mut body = String::new();
     if dialect == Dialect::Bazel {
-        // Bazel retains original callable providers here when autoload policy
-        // permits it. Other legacy members remain gradual.
+        // AutoloadSymbols.modifyBuildBzlEnv retains only non-rule autoload
+        // globals. Each member can be absent under Bazel's autoload policy.
+        // https://github.com/bazelbuild/bazel/blob/9.2.0/src/main/java/com/google/devtools/build/lib/packages/AutoloadSymbols.java
         body.push_str(
-            r#"    class _LegacyGlobals:
-        @_starpls_typing.overload
+            r#"    @_starpls_typing.final
+    class _LegacyGlobals:
+        if _starpls_native_rule_available:
+            AndroidIdeInfo: _starpls_typing.Any = ...
+            CcInfo: _starpls_typing.Any = ...
+            CcSharedLibraryHintInfo: _starpls_typing.Any = ...
+            CcSharedLibraryInfo: _starpls_typing.Any = ...
+            CcToolchainConfigInfo: _starpls_typing.Any = ...
+            DebugPackageInfo: _starpls_typing.Any = ...
+            JavaInfo: _starpls_typing.Any = ...
+            JavaPluginInfo: _starpls_typing.Any = ...
+            ProguardSpecProvider: _starpls_typing.Any = ...
+            ProtoInfo: _starpls_typing.Any = ...
+            PyCcLinkParamsProvider: _starpls_typing.Any = ...
+            PyInfo: _starpls_typing.Callable[..., _starpls_typing.Any] = ...
+            PyRuntimeInfo: _starpls_typing.Callable[..., _starpls_typing.Any] = ...
+            apple_common: _starpls_typing.Any = ...
+            cc_common: _starpls_typing.Any = ...
+            cc_proto_aspect: _starpls_typing.Any = ...
+            java_common: _starpls_typing.Any = ...
+            proto_common_do_not_use: _starpls_typing.Any = ...
         @_starpls_typing.type_check_only
-        def __getattr__(self, name: _starpls_typing.Literal["PyInfo", "PyRuntimeInfo"]) -> _starpls_typing.Callable[..., _starpls_typing.Any]: ...
-        @_starpls_typing.overload
-        @_starpls_typing.type_check_only
-        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_typing.Any: ...
+        def __getattr__(self, name: _starpls_builtins.str) -> _starpls_typing.Never: ...
 "#,
         );
     }
@@ -1437,6 +1454,52 @@ json.decode("{}", default=struct(value="fallback"))
     }
 
     #[test]
+    fn legacy_globals_preserve_macro_fallback() {
+        let builtins = starpls_bazel::decode_builtins(include_bytes!(
+            "../../../starpls/src/builtin/builtin.pb"
+        ))
+        .unwrap();
+        let (mut analysis, _) = Analysis::new_for_test();
+        analysis
+            .set_builtin_defs(builtins, Default::default())
+            .unwrap();
+        let source = r#"
+features = struct(macro = getattr(getattr(native, "legacy_globals", None), "macro", macro))
+def implementation(name, visibility, enabled):
+    pass
+example = features.macro(implementation = implementation, attrs = {"enabled": attr.bool()})
+def invalid_access():
+    native.legacy_globals.macro
+    attr.bool(default = "wrong")
+def use_example():
+    example(name = "valid", enabled = True)
+    example(name = "invalid", enabled = "wrong")
+"#;
+        let file = analysis
+            .open_document(
+                Path::new("/main.bzl"),
+                Dialect::Bazel,
+                Some(FileInfo::Bazel {
+                    api_context: APIContext::Bzl,
+                    is_external: false,
+                }),
+                source.to_owned(),
+                1,
+            )
+            .unwrap();
+        let diagnostics = analysis.snapshot().diagnostics(file).unwrap();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (diagnostic, expected) in diagnostics
+            .iter()
+            .zip(["default = \"wrong\"", "enabled = \"wrong\""])
+        {
+            assert_eq!(diagnostic.id().as_str(), "invalid-argument-type");
+            let range = diagnostic.range().unwrap();
+            assert_eq!(&source[range], expected);
+        }
+    }
+
+    #[test]
     fn legacy_globals_preserve_optional_provider_keys() {
         let builtins = starpls_bazel::decode_builtins(include_bytes!(
             "../../../starpls/src/builtin/builtin.pb"
@@ -1453,10 +1516,15 @@ nested_runtime = getattr(getattr(native, "legacy_globals", None), "PyRuntimeInfo
 direct_default = getattr(native.legacy_globals, "PyInfo", None)
 cc = native.legacy_globals.CcInfo
 java = native.legacy_globals.JavaInfo
+nested_java = getattr(getattr(native, "legacy_globals", None), "JavaInfo", None)
+java_default = getattr(getattr(native, "legacy_globals", None), "JavaInfo", 42)
 other_default = getattr(native.legacy_globals, "CcInfo", None)
 computed_name = json.encode(None)
 computed = getattr(native.legacy_globals, computed_name, None)
 no_default = getattr(native.legacy_globals, "PyInfo")
+missing = getattr(native.legacy_globals, "missing", False)
+native_rule = getattr(native.legacy_globals, "sh_binary", False)
+nested_missing = getattr(getattr(native, "legacy_globals", None), "missing", False)
 "#;
         let file = analysis
             .open_document(
@@ -1482,7 +1550,7 @@ no_default = getattr(native.legacy_globals, "PyInfo")
             .filter_map(Stmt::as_assign_stmt)
             .map(|assignment| assignment.value.inferred_type(&model).unwrap())
             .collect();
-        let [py, runtime, nested_py, nested_runtime, direct_default, cc, java, other_default, _name, computed, no_default] =
+        let [py, runtime, nested_py, nested_runtime, direct_default, cc, java, nested_java, java_default, other_default, _name, computed, no_default, missing, native_rule, nested_missing] =
             types.as_slice()
         else {
             panic!("expected the legacy member observations: {types:?}");
@@ -1494,8 +1562,19 @@ no_default = getattr(native.legacy_globals, "PyInfo")
         for actual in [nested_py, nested_runtime, direct_default] {
             assert_eq!(*actual, optional);
         }
-        for actual in [cc, java, other_default, computed, no_default] {
+        for actual in [
+            cc,
+            java,
+            nested_java,
+            java_default,
+            other_default,
+            computed,
+            no_default,
+        ] {
             assert_eq!(*actual, TyType::Dynamic(DynamicType::Any));
+        }
+        for actual in [missing, native_rule, nested_missing] {
+            assert_eq!(*actual, TyType::bool_literal(false));
         }
         let diagnostics = snapshot.diagnostics(file).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
